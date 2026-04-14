@@ -1,6 +1,6 @@
 # CLI-master-wrapper — Phase 0 Notes
 
-**Status:** MVP complete, hardening in progress
+**Status:** MVP complete, regression coverage and crash hardening in progress
 **Date:** 2026-04-15
 
 ## 1. PTY backend result
@@ -74,6 +74,10 @@
   - Codex needed a driver-specific single-line payload plus delayed submit.
   - Claude can still occasionally hold a landed prompt until another Enter arrives.
 - Next reliability slice should be a readiness/acknowledgement gate instead of more blind submit timing.
+- New hardening priority after live testing:
+  - preserve the currently working room flows with regression tests before more runtime edits
+  - add explicit crash/restart diagnostics so app exits are recorded with a reason
+  - fix the restart path seen when Codex attempts to send a routed message to Claude from inside its pane
 
 ## 10. Go / no-go recommendation
 
