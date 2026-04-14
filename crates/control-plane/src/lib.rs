@@ -26,6 +26,7 @@ pub fn encode_response(response: &SidebandResponse) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shared_types::RuntimeSnapshot;
 
     #[test]
     fn round_trips_request_json() {
@@ -39,5 +40,31 @@ mod tests {
             SidebandRequest::ListSessions { token } => assert_eq!(token, "abc"),
             _ => panic!("unexpected request variant"),
         }
+    }
+
+    #[test]
+    fn round_trips_response_json() {
+        let json = encode_response(&SidebandResponse {
+            ok: true,
+            message: "pong".into(),
+            snapshot: Some(RuntimeSnapshot {
+                sessions: vec![],
+                control_plane: None,
+                runtime_dir: "runtime".into(),
+                audit_log_path: "audit".into(),
+                generated_at: "2026-04-15T00:00:00Z".into(),
+            }),
+        })
+        .unwrap();
+        let decoded = decode_response(&json).unwrap();
+
+        assert!(decoded.ok);
+        assert_eq!(decoded.message, "pong");
+        assert!(decoded.snapshot.is_some());
+    }
+
+    #[test]
+    fn decode_request_rejects_invalid_json() {
+        assert!(decode_request("{not json}").is_err());
     }
 }

@@ -49,6 +49,11 @@
 ## 7. Test strategy decision
 
 - Unit tests for shared types, control-plane codec, and supervisor routing/state basics
+- Added regression coverage for the known-good runtime contracts:
+  - Claude and Codex launch specs
+  - control-plane request/response round-trips
+  - control-plane persistence, idempotence, and token validation
+  - supervisor refusal to route to non-running recipients
 - Full workspace verification via:
   - `cargo check`
   - `cargo test`

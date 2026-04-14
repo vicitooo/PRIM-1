@@ -765,16 +765,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shared_types::{MessageScope, RouteMessageRequest};
+    use shared_types::{MessageScope, RouteMessageRequest, SidebandRequest};
 
-    #[test]
-    fn snapshot_contains_default_sessions() {
-        let root = std::env::temp_dir().join(format!("cli-master-wrapper-test-{}", Uuid::new_v4()));
-        let supervisor = SupervisorHandle::new(SupervisorConfig {
+    fn test_supervisor() -> SupervisorHandle {
+        let root =
+            std::env::temp_dir().join(format!("cli-master-wrapper-test-{}", Uuid::new_v4()));
+        SupervisorHandle::new(SupervisorConfig {
             working_root: root.clone(),
             runtime_dir: root.join("runtime"),
         })
-        .unwrap();
+        .unwrap()
+    }
+
+    #[test]
+    fn snapshot_contains_default_sessions() {
+        let supervisor = test_supervisor();
 
         let snapshot = supervisor.snapshot();
         let names = snapshot
@@ -788,12 +793,7 @@ mod tests {
 
     #[test]
     fn room_targets_only_running_sessions() {
-        let root = std::env::temp_dir().join(format!("cli-master-wrapper-test-{}", Uuid::new_v4()));
-        let supervisor = SupervisorHandle::new(SupervisorConfig {
-            working_root: root.clone(),
-            runtime_dir: root.join("runtime"),
-        })
-        .unwrap();
+        let supervisor = test_supervisor();
 
         let recipients = supervisor.resolve_recipients("room", MessageScope::Room);
         assert!(recipients.is_empty());
@@ -856,5 +856,80 @@ mod tests {
                 delay: Duration::from_millis(500),
             }
         );
+    }
+
+    #[test]
+    fn start_control_plane_persists_status_file_and_snapshot() {
+        let supervisor = test_supervisor();
+
+        let status = supervisor.start_control_plane().unwrap();
+        let persisted: ControlPlaneStatus = serde_json::from_str(
+            &fs::read_to_string(supervisor.runtime_dir().join("control-plane.json")).unwrap(),
+        )
+        .unwrap();
+        let snapshot = supervisor.snapshot();
+
+        assert_eq!(persisted.endpoint, status.endpoint);
+        assert_eq!(persisted.token, status.token);
+        assert_eq!(
+            snapshot.control_plane.as_ref().map(|item| item.endpoint.as_str()),
+            Some(status.endpoint.as_str())
+        );
+    }
+
+    #[test]
+    fn start_control_plane_is_idempotent() {
+        let supervisor = test_supervisor();
+
+        let first = supervisor.start_control_plane().unwrap();
+        let second = supervisor.start_control_plane().unwrap();
+
+        assert_eq!(first.endpoint, second.endpoint);
+        assert_eq!(first.token, second.token);
+    }
+
+    #[test]
+    fn apply_sideband_request_rejects_invalid_token() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::Ping {
+            token: format!("{}-wrong", status.token),
+        });
+
+        assert!(!response.ok);
+        assert_eq!(response.message, "invalid control plane token");
+    }
+
+    #[test]
+    fn apply_sideband_list_sessions_returns_snapshot() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::ListSessions {
+            token: status.token,
+        });
+
+        assert!(response.ok);
+        assert_eq!(response.message, "sessions listed");
+        assert_eq!(response.snapshot.unwrap().sessions.len(), 2);
+    }
+
+    #[test]
+    fn route_message_requires_running_recipient() {
+        let supervisor = test_supervisor();
+
+        let error = supervisor
+            .route_message(RouteMessageRequest {
+                from: "victor".into(),
+                to: "claude".into(),
+                scope: MessageScope::Direct,
+                content: "hello".into(),
+            })
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("no running recipients available for 'claude'"));
     }
 }

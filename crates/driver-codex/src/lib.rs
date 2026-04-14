@@ -49,3 +49,49 @@ pub fn launch_spec(definition: &SessionDefinition) -> LaunchSpec {
         display_name: definition.title.clone(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_launch_spec_uses_cmd_shim_and_cwd_flag() {
+        let definition = default_session(r"D:\workspace");
+        let spec = launch_spec(&definition);
+
+        assert_eq!(spec.program, "cmd.exe");
+        assert_eq!(
+            spec.args,
+            vec![
+                "/d".to_string(),
+                "/c".to_string(),
+                "codex.cmd".to_string(),
+                "--no-alt-screen".to_string(),
+                "-C".to_string(),
+                r"D:\workspace".to_string(),
+            ]
+        );
+        assert_eq!(spec.working_dir, r"D:\workspace");
+        assert_eq!(spec.display_name, "Codex");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_launch_spec_uses_codex_binary_and_cwd_flag() {
+        let definition = default_session("/workspace");
+        let spec = launch_spec(&definition);
+
+        assert_eq!(spec.program, "codex");
+        assert_eq!(
+            spec.args,
+            vec![
+                "--no-alt-screen".to_string(),
+                "-C".to_string(),
+                "/workspace".to_string(),
+            ]
+        );
+        assert_eq!(spec.working_dir, "/workspace");
+        assert_eq!(spec.display_name, "Codex");
+    }
+}
