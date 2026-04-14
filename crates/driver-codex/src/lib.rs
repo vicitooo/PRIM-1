@@ -14,18 +14,35 @@ pub fn default_session(working_dir: &str) -> SessionDefinition {
 }
 
 pub fn launch_spec(definition: &SessionDefinition) -> LaunchSpec {
-    let mut args = vec![
-        "--no-alt-screen".into(),
-        "-C".into(),
-        definition.working_dir.clone(),
-    ];
+    let (program, mut args) = if cfg!(windows) {
+        (
+            "cmd.exe".to_string(),
+            vec![
+                "/d".into(),
+                "/c".into(),
+                "codex.cmd".into(),
+                "--no-alt-screen".into(),
+                "-C".into(),
+                definition.working_dir.clone(),
+            ],
+        )
+    } else {
+        (
+            definition
+                .command
+                .clone()
+                .unwrap_or_else(|| "codex".into()),
+            vec![
+                "--no-alt-screen".into(),
+                "-C".into(),
+                definition.working_dir.clone(),
+            ],
+        )
+    };
     args.extend(definition.args.clone());
 
     LaunchSpec {
-        program: definition
-            .command
-            .clone()
-            .unwrap_or_else(|| "codex".into()),
+        program,
         args,
         working_dir: definition.working_dir.clone(),
         env: definition.env.clone(),

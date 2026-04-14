@@ -9,8 +9,13 @@ param(
   [ValidateSet("direct", "room", "system", "private")]
   [string]$Scope = "direct",
   [string]$Content,
-  [string]$InfoFile = (Join-Path $PSScriptRoot "..\\.runtime\\control-plane.json")
+  [string]$InfoFile
 )
+
+if (-not $InfoFile) {
+  $scriptRoot = Split-Path -Parent $PSCommandPath
+  $InfoFile = Join-Path $scriptRoot "..\\.runtime\\control-plane.json"
+}
 
 $resolvedInfoFile = (Resolve-Path $InfoFile).Path
 $info = Get-Content $resolvedInfoFile | ConvertFrom-Json
