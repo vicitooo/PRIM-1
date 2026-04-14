@@ -54,7 +54,8 @@
   - `cargo test`
   - `npm run build`
   - `npm run tauri build`
-- Manual visual testing is still required for the GUI because this shell-only environment is not a reliable desktop smoke target.
+- Manual visual checkpoint has now been reached through `npm run tauri dev`: the desktop window opened and both Claude and Codex reached `ready`.
+- The raw packaged `.exe` path still needs a dedicated release-path investigation because it has shown inconsistent startup behavior versus the dev launcher.
 
 ## 8. Fallback decision
 
@@ -65,7 +66,7 @@
 
 ## 9. Unresolved blockers
 
-- Real interactive desktop validation still needs a normal user desktop session.
+- Release-path startup is still inconsistent compared with the dev launcher.
 - Resume/reattach semantics for Claude and Codex are not implemented yet.
 - The current UI only covers the main room workflow, not settings/main menu depth.
 
