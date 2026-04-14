@@ -109,6 +109,9 @@
   - the focused terminal pane now handles `Ctrl+Shift+C` for copy
   - the focused running terminal pane now handles `Ctrl+Shift+V` for paste
   - `Alt+V` is still passed through unchanged for screenshots
+- Copy-path follow-up fix after first live report:
+  - `Ctrl+Shift+C` no longer depends on strict DOM focus containment
+  - it now uses the last active terminal pane plus the current xterm selection, which better matches mouse-driven text selection
 - Remaining proof gap for that operator polish:
   - the frontend build passes, but the shortcut behavior still needs a live desktop-session validation before it is marked fully verified
 - Hardening added after the mailbox-route checkpoint:

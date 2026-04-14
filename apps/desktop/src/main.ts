@@ -500,7 +500,7 @@ function wireTerminalShortcuts(): void {
     }
 
     const activePane = activeTerminal();
-    if (!activePane || !activeTerminalOwnsFocus(activePane)) {
+    if (!activePane) {
       return;
     }
 
@@ -522,6 +522,9 @@ function wireTerminalShortcuts(): void {
     }
 
     if (key === "v") {
+      if (!activeTerminalOwnsFocus(activePane)) {
+        return;
+      }
       event.preventDefault();
       void pasteClipboardIntoTerminal(activePane);
     }
