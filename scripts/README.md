@@ -22,9 +22,28 @@ Scripts should wrap the control plane, not bypass the supervisor.
   - `restart`
   - `input`
   - `route`
+  - optional `-Quiet` mode for agent-friendly success/error output
 
 Example:
 
 ```powershell
 .\scripts\control-plane.ps1 -Action route -From victor -To claude -Scope direct -Content "Review the Codex pane."
+```
+
+- `agent-route.ps1`
+  Minimal agent-facing wrapper over `control-plane.ps1` for direct or room messages without the verbose JSON snapshot payload.
+
+Example:
+
+```powershell
+.\scripts\agent-route.ps1 -From codex -To claude -Content "Reply with exactly: CLAUDE ACK"
+```
+
+- `agent-ping.ps1`
+  Token-based smoke-test helper for agents. Builds the exact reply prompt for the target and routes it through the supervisor.
+
+Example:
+
+```powershell
+.\scripts\agent-ping.ps1 -From codex -To claude -Token CLAUDE_ACK
 ```

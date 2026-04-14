@@ -9,8 +9,44 @@ param(
   [ValidateSet("direct", "room", "system", "private")]
   [string]$Scope = "direct",
   [string]$Content,
-  [string]$InfoFile
+  [string]$InfoFile,
+  [switch]$Quiet
 )
+
+function Invoke-MailboxFallback {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Payload,
+
+    [Parameter(Mandatory = $true)]
+    [string]$RuntimeDir
+  )
+
+  $sidebandRoot = Join-Path $RuntimeDir "sideband"
+  $inboxDir = Join-Path $sidebandRoot "inbox"
+  $outboxDir = Join-Path $sidebandRoot "outbox"
+  New-Item -ItemType Directory -Force -Path $inboxDir | Out-Null
+  New-Item -ItemType Directory -Force -Path $outboxDir | Out-Null
+
+  $requestId = [guid]::NewGuid().ToString()
+  $requestPath = Join-Path $inboxDir "$requestId.json"
+  $responsePath = Join-Path $outboxDir "$requestId.json"
+
+  $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+  [System.IO.File]::WriteAllText($requestPath, $Payload, $utf8NoBom)
+
+  $deadline = [DateTime]::UtcNow.AddSeconds(10)
+  while ([DateTime]::UtcNow -lt $deadline) {
+    if (Test-Path -LiteralPath $responsePath) {
+      $raw = Get-Content -LiteralPath $responsePath -Raw
+      Remove-Item -LiteralPath $responsePath -Force -ErrorAction SilentlyContinue
+      return $raw
+    }
+    Start-Sleep -Milliseconds 100
+  }
+
+  throw "No response received from sideband mailbox."
+}
 
 if (-not $InfoFile) {
   $scriptRoot = Split-Path -Parent $PSCommandPath
@@ -70,23 +106,42 @@ $payload = switch ($Action) {
 }
 
 $json = $payload | ConvertTo-Json -Depth 8 -Compress
-
-$pipe = [System.IO.Pipes.NamedPipeClientStream]::new(".", $pipeName, [System.IO.Pipes.PipeDirection]::InOut)
-$pipe.Connect(5000)
+$runtimeDir = Split-Path -Parent $resolvedInfoFile
+$response = $null
 
 try {
-  $writer = [System.IO.StreamWriter]::new($pipe)
-  $writer.AutoFlush = $true
-  $reader = [System.IO.StreamReader]::new($pipe)
+  $pipe = [System.IO.Pipes.NamedPipeClientStream]::new(".", $pipeName, [System.IO.Pipes.PipeDirection]::InOut)
+  try {
+    $pipe.Connect(5000)
+    $writer = [System.IO.StreamWriter]::new($pipe)
+    $writer.AutoFlush = $true
+    $reader = [System.IO.StreamReader]::new($pipe)
 
-  $writer.WriteLine($json)
-  $response = $reader.ReadLine()
+    $writer.WriteLine($json)
+    $response = $reader.ReadLine()
+  } finally {
+    if ($pipe) {
+      $pipe.Dispose()
+    }
+  }
+} catch {
+  $response = Invoke-MailboxFallback -Payload $json -RuntimeDir $runtimeDir
+}
 
-  if (-not $response) {
-    throw "No response received from control plane."
+if (-not $response) {
+  throw "No response received from control plane."
+}
+
+$parsed = $response | ConvertFrom-Json
+
+if ($Quiet) {
+  if (-not $parsed.ok) {
+    Write-Error $parsed.message
+    exit 1
   }
 
-  $response | ConvertFrom-Json | ConvertTo-Json -Depth 8
-} finally {
-  $pipe.Dispose()
+  $parsed.message
+  exit 0
 }
+
+$parsed | ConvertTo-Json -Depth 8

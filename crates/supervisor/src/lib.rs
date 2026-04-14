@@ -29,6 +29,7 @@ type EventSink = Arc<dyn Fn(RuntimeEvent) + Send + Sync>;
 struct SubmitBehavior {
     sequence: &'static str,
     delay: Duration,
+    flatten_payload: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -376,20 +377,6 @@ impl SupervisorHandle {
 
         for recipient in recipients {
             let submit_behavior = self.submit_behavior_for_session(&recipient)?;
-            let synthetic = format!(
-                "\r\n\x1b[38;5;179m[{} -> {} / {}]\x1b[0m {}\r\n",
-                request.from,
-                recipient,
-                scope_label(request.scope),
-                request.content
-            );
-            self.emit(RuntimeEvent::SessionOutput {
-                session: recipient.clone(),
-                chunk: synthetic,
-                synthetic: true,
-                timestamp: now_rfc3339(),
-            });
-
             let payload = routed_message_payload(&request, submit_behavior);
             self.send_input(SendInputRequest {
                 name: recipient.clone(),
@@ -458,6 +445,7 @@ impl SupervisorHandle {
         });
 
         spawn_control_plane_thread(self.clone(), status.clone());
+        spawn_sideband_mailbox_thread(self.clone());
 
         Ok(status)
     }
@@ -487,13 +475,30 @@ impl SupervisorHandle {
     fn handle_pty_event(&self, session_name: &str, event: PtyEvent) {
         match event {
             PtyEvent::Output(chunk) => {
-                {
+                let transitioned_to_ready = {
                     let mut slots = self.inner.slots.lock();
                     if let Some(slot) = slots.get_mut(session_name) {
-                        slot.state = LifecycleState::Ready;
-                        slot.last_activity_at = Some(now_rfc3339());
+                        if slot.state != LifecycleState::Ready {
+                            slot.state = LifecycleState::Ready;
+                            slot.last_activity_at = Some(now_rfc3339());
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
                     }
+                };
+
+                if transitioned_to_ready {
+                    self.emit(RuntimeEvent::SessionState {
+                        session: session_name.into(),
+                        state: LifecycleState::Ready,
+                        reason: "session emitted output".into(),
+                        timestamp: now_rfc3339(),
+                    });
                 }
+
                 self.emit(RuntimeEvent::SessionOutput {
                     session: session_name.into(),
                     chunk,
@@ -608,7 +613,8 @@ impl SupervisorHandle {
 
 fn spawn_control_plane_thread(handle: SupervisorHandle, status: ControlPlaneStatus) {
     thread::spawn(move || {
-        let runtime = match tokio::runtime::Builder::new_current_thread()
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
             .enable_all()
             .build()
         {
@@ -631,6 +637,120 @@ fn spawn_control_plane_thread(handle: SupervisorHandle, status: ControlPlaneStat
     });
 }
 
+fn spawn_sideband_mailbox_thread(handle: SupervisorHandle) {
+    let runtime_dir = handle.runtime_dir().to_path_buf();
+    thread::spawn(move || {
+        let sideband_dir = runtime_dir.join("sideband");
+        let inbox_dir = sideband_dir.join("inbox");
+        let outbox_dir = sideband_dir.join("outbox");
+        let processed_dir = sideband_dir.join("processed");
+
+        if let Err(error) = fs::create_dir_all(&inbox_dir) {
+            eprintln!("failed to create sideband inbox: {error}");
+            return;
+        }
+        if let Err(error) = fs::create_dir_all(&outbox_dir) {
+            eprintln!("failed to create sideband outbox: {error}");
+            return;
+        }
+        if let Err(error) = fs::create_dir_all(&processed_dir) {
+            eprintln!("failed to create sideband archive: {error}");
+            return;
+        }
+
+        loop {
+            let mut requests = match fs::read_dir(&inbox_dir) {
+                Ok(entries) => entries
+                    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                    .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+                    .collect::<Vec<_>>(),
+                Err(error) => {
+                    eprintln!("failed to read sideband inbox: {error}");
+                    thread::sleep(Duration::from_millis(200));
+                    continue;
+                }
+            };
+
+            requests.sort();
+
+            for request_path in requests {
+                if let Err(error) = process_sideband_mailbox_file(
+                    &handle,
+                    &request_path,
+                    &outbox_dir,
+                    &processed_dir,
+                ) {
+                    eprintln!(
+                        "failed to process sideband mailbox request {}: {error}",
+                        request_path.display()
+                    );
+                }
+            }
+
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+}
+
+fn process_sideband_mailbox_file(
+    handle: &SupervisorHandle,
+    request_path: &Path,
+    outbox_dir: &Path,
+    processed_dir: &Path,
+) -> Result<()> {
+    let raw = fs::read_to_string(request_path)
+        .with_context(|| format!("failed to read mailbox request {}", request_path.display()))?;
+    let response = match decode_request(raw.trim()) {
+        Ok(request) => handle.apply_sideband_request(request),
+        Err(error) => {
+            let request_is_fresh = fs::metadata(request_path)
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| modified.elapsed().ok())
+                .map(|elapsed| elapsed < Duration::from_millis(500))
+                .unwrap_or(false);
+
+            if request_is_fresh {
+                return Ok(());
+            }
+
+            SidebandResponse {
+                ok: false,
+                message: format!("invalid sideband payload: {error}"),
+                snapshot: Some(handle.snapshot()),
+            }
+        }
+    };
+
+    let file_name = request_path
+        .file_name()
+        .with_context(|| format!("mailbox request missing file name: {}", request_path.display()))?;
+    let response_path = outbox_dir.join(file_name);
+    let temp_response_path = outbox_dir.join(format!("{}.tmp", file_name.to_string_lossy()));
+    fs::write(&temp_response_path, format!("{}\n", encode_response(&response)?))
+        .with_context(|| format!("failed to write mailbox response {}", temp_response_path.display()))?;
+    fs::rename(&temp_response_path, &response_path)
+        .with_context(|| format!("failed to publish mailbox response {}", response_path.display()))?;
+
+    let archived_request_path = processed_dir.join(file_name);
+    if archived_request_path.exists() {
+        fs::remove_file(&archived_request_path).with_context(|| {
+            format!(
+                "failed to clear archived mailbox request {}",
+                archived_request_path.display()
+            )
+        })?;
+    }
+    fs::rename(request_path, &archived_request_path).with_context(|| {
+        format!(
+            "failed to archive mailbox request {}",
+            request_path.display()
+        )
+    })?;
+
+    Ok(())
+}
+
 fn build_launch_spec(definition: &SessionDefinition) -> shared_types::LaunchSpec {
     match definition.driver {
         DriverKind::Claude => driver_claude::launch_spec(definition),
@@ -649,7 +769,7 @@ fn scope_label(scope: MessageScope) -> &'static str {
 }
 
 fn routed_message_payload(request: &RouteMessageRequest, behavior: SubmitBehavior) -> String {
-    if behavior.delay.is_zero() {
+    if !behavior.flatten_payload {
         return format!(
             "\n[{} message from {}]\n{}\n",
             scope_label(request.scope),
@@ -666,10 +786,17 @@ fn routed_message_submit_behavior(driver: DriverKind) -> SubmitBehavior {
         DriverKind::Codex => SubmitBehavior {
             sequence: "\r",
             delay: Duration::from_millis(500),
+            flatten_payload: true,
         },
-        DriverKind::Claude | DriverKind::GenericTerminal => SubmitBehavior {
+        DriverKind::Claude => SubmitBehavior {
+            sequence: "\r",
+            delay: Duration::from_millis(200),
+            flatten_payload: false,
+        },
+        DriverKind::GenericTerminal => SubmitBehavior {
             sequence: "\r",
             delay: Duration::ZERO,
+            flatten_payload: false,
         },
     }
 }
@@ -765,6 +892,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use control_plane::{decode_response, encode_request};
     use shared_types::{MessageScope, RouteMessageRequest, SidebandRequest};
 
     fn test_supervisor() -> SupervisorHandle {
@@ -833,6 +961,42 @@ mod tests {
     }
 
     #[test]
+    fn claude_payload_stays_multiline_even_with_delayed_submit() {
+        let payload = routed_message_payload(
+            &RouteMessageRequest {
+                from: "victor".into(),
+                to: "claude".into(),
+                scope: MessageScope::Direct,
+                content: "tell me\na joke".into(),
+            },
+            routed_message_submit_behavior(DriverKind::Claude),
+        );
+
+        assert!(payload.starts_with('\n'));
+        assert!(payload.ends_with('\n'));
+        assert!(payload.contains("[Direct message from victor]"));
+        assert!(payload.contains("tell me\na joke"));
+    }
+
+    #[test]
+    fn generic_terminal_payload_uses_multiline_prompt_shape() {
+        let payload = routed_message_payload(
+            &RouteMessageRequest {
+                from: "victor".into(),
+                to: "terminal".into(),
+                scope: MessageScope::Direct,
+                content: "hello".into(),
+            },
+            routed_message_submit_behavior(DriverKind::GenericTerminal),
+        );
+
+        assert!(payload.starts_with('\n'));
+        assert!(payload.ends_with('\n'));
+        assert!(payload.contains("[Direct message from victor]"));
+        assert!(payload.contains("hello"));
+    }
+
+    #[test]
     fn collapse_inline_content_reduces_whitespace() {
         assert_eq!(
             collapse_inline_content("  tell   me \n a\tjoke  "),
@@ -846,7 +1010,8 @@ mod tests {
             routed_message_submit_behavior(DriverKind::Claude),
             SubmitBehavior {
                 sequence: "\r",
-                delay: Duration::ZERO,
+                delay: Duration::from_millis(200),
+                flatten_payload: false,
             }
         );
         assert_eq!(
@@ -854,6 +1019,7 @@ mod tests {
             SubmitBehavior {
                 sequence: "\r",
                 delay: Duration::from_millis(500),
+                flatten_payload: true,
             }
         );
     }
@@ -886,6 +1052,63 @@ mod tests {
 
         assert_eq!(first.endpoint, second.endpoint);
         assert_eq!(first.token, second.token);
+    }
+
+    #[test]
+    fn mailbox_request_processing_writes_response_and_archives_request() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let sideband_dir = supervisor.runtime_dir().join("sideband-test-success");
+        let inbox_dir = sideband_dir.join("inbox");
+        let outbox_dir = sideband_dir.join("outbox");
+        let processed_dir = sideband_dir.join("processed");
+        fs::create_dir_all(&inbox_dir).unwrap();
+        fs::create_dir_all(&outbox_dir).unwrap();
+        fs::create_dir_all(&processed_dir).unwrap();
+
+        let request_path = inbox_dir.join("ping.json");
+        fs::write(
+            &request_path,
+            encode_request(&SidebandRequest::Ping {
+                token: status.token.clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        process_sideband_mailbox_file(&supervisor, &request_path, &outbox_dir, &processed_dir)
+            .unwrap();
+
+        let response = decode_response(&fs::read_to_string(outbox_dir.join("ping.json")).unwrap())
+            .unwrap();
+        assert!(response.ok);
+        assert_eq!(response.message, "pong");
+        assert!(processed_dir.join("ping.json").exists());
+        assert!(!request_path.exists());
+    }
+
+    #[test]
+    fn mailbox_request_processing_returns_error_for_invalid_payload() {
+        let supervisor = test_supervisor();
+        let sideband_dir = supervisor.runtime_dir().join("sideband-test-invalid");
+        let inbox_dir = sideband_dir.join("inbox");
+        let outbox_dir = sideband_dir.join("outbox");
+        let processed_dir = sideband_dir.join("processed");
+        fs::create_dir_all(&inbox_dir).unwrap();
+        fs::create_dir_all(&outbox_dir).unwrap();
+        fs::create_dir_all(&processed_dir).unwrap();
+
+        let request_path = inbox_dir.join("invalid.json");
+        fs::write(&request_path, "{not json}").unwrap();
+        thread::sleep(Duration::from_millis(600));
+
+        process_sideband_mailbox_file(&supervisor, &request_path, &outbox_dir, &processed_dir)
+            .unwrap();
+
+        let response =
+            decode_response(&fs::read_to_string(outbox_dir.join("invalid.json")).unwrap()).unwrap();
+        assert!(!response.ok);
+        assert!(response.message.contains("invalid sideband payload"));
     }
 
     #[test]

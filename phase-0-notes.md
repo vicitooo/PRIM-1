@@ -83,6 +83,24 @@
   - preserve the currently working room flows with regression tests before more runtime edits
   - add explicit crash/restart diagnostics so app exits are recorded with a reason
   - fix the restart path seen when Codex attempts to send a routed message to Claude from inside its pane
+- Validation rule from live UI debugging:
+  - do not mark a route or interaction as successful from screenshots alone
+  - do not mark it successful from audit/control-plane evidence alone
+  - require both the visible pane behavior and the source-of-truth runtime evidence to match
+- Hardening landed after the first live debugging loop:
+  - desktop process diagnostics now persist startup and command failures to `.runtime/desktop-events.jsonl`
+  - synthetic route banners were removed from the terminal panes so xterm stays aligned with the real PTY state
+  - `scripts/agent-route.ps1` provides a quieter agent-facing route helper than the raw JSON-heavy control-plane wrapper
+  - Claude routed submits now use a delayed Enter path rather than an immediate submit
+- Latest confirmed fix on 2026-04-15:
+  - the agent-facing mailbox fallback in `scripts/control-plane.ps1` now writes BOM-less UTF-8
+  - the supervised Codex worker itself applied that fix during a live debugging run
+  - the route only counts as fixed because both sources agreed:
+    - UI: Claude visibly received the direct message and replied with the requested token
+    - runtime evidence: audit/control-plane entries recorded the routed message
+- New hardening target after that fix:
+  - the supervisor can still report a stale `running` Codex session after the PTY process has already exited
+  - session liveness checks should be refreshed before snapshot/list/route paths report a session as available
 
 ## 10. Go / no-go recommendation
 
