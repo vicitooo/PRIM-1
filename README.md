@@ -13,6 +13,7 @@ The project is no longer docs-only. The first version now exists and includes:
 - a named-pipe control plane on Windows
 - JSONL audit logging under `.runtime/audit/`
 - a PowerShell helper at `scripts/control-plane.ps1`
+- an explicit control-surface reference at `CONTROL-SURFACE.md`
 - release outputs under `target/release/`
 
 Current verified commands:
@@ -21,6 +22,12 @@ Current verified commands:
 - `cargo test`
 - `cd apps/desktop && npm run build`
 - `cd apps/desktop && npm run tauri build`
+
+Current verified operator shortcuts:
+
+- `Ctrl+Shift+C` copies the current terminal selection in the focused pane
+- `Ctrl+Shift+V` pastes clipboard text into the focused running pane
+- `Alt+V` remains reserved for screenshots
 
 Known limitation in this shell-hosted environment:
 

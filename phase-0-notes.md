@@ -104,6 +104,13 @@
   - document the full command/control surface that terminal-launched agents can use against the wrapper
   - add `Ctrl+Shift+C` / `Ctrl+Shift+V` pane shortcuts
   - keep the existing `Alt+V` screenshot shortcut unchanged
+- Operator polish added after the hardening checkpoint:
+  - `CONTROL-SURFACE.md` documents the current UI controls, control-plane actions, and agent helper scripts
+  - the focused terminal pane now handles `Ctrl+Shift+C` for copy
+  - the focused running terminal pane now handles `Ctrl+Shift+V` for paste
+  - `Alt+V` is still passed through unchanged for screenshots
+- Remaining proof gap for that operator polish:
+  - the frontend build passes, but the shortcut behavior still needs a live desktop-session validation before it is marked fully verified
 - Hardening added after the mailbox-route checkpoint:
   - the Rust control-plane decoder now strips a UTF-8 BOM before decoding requests/responses
   - the supervisor refreshes session liveness before snapshot/start/stop/restart/send-input/route/resize paths

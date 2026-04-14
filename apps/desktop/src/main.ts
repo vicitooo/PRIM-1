@@ -190,6 +190,12 @@ class SessionTerminal {
     this.terminal.loadAddon(this.fitAddon);
     this.terminal.open(this.host);
     this.fitAddon.fit();
+    this.host.addEventListener("focusin", () => {
+      activeTerminalName = this.name;
+    });
+    this.host.addEventListener("mousedown", () => {
+      activeTerminalName = this.name;
+    });
     this.banner();
   }
 
@@ -291,11 +297,13 @@ const snapshotByName = new Map<string, SessionSnapshot>();
 const controlEndpoint = must<HTMLElement>("#control-endpoint");
 const auditPath = must<HTMLElement>("#audit-path");
 const runtimePath = must<HTMLElement>("#runtime-path");
+let activeTerminalName: (typeof SESSION_NAMES)[number] | null = null;
 
 wireButtons();
 wireRouter();
 wireControls();
 wireResize();
+wireTerminalShortcuts();
 
 void listen<RuntimeEvent>("runtime://event", ({ payload }) => {
   handleRuntimeEvent(payload);
@@ -479,6 +487,78 @@ function wireResize(): void {
     }
     systemFit.fit();
   });
+}
+
+function wireTerminalShortcuts(): void {
+  window.addEventListener("keydown", (event) => {
+    if (event.altKey && !event.ctrlKey && !event.metaKey) {
+      return;
+    }
+
+    if (!event.ctrlKey || !event.shiftKey || event.metaKey) {
+      return;
+    }
+
+    const activePane = activeTerminal();
+    if (!activePane || !activeTerminalOwnsFocus(activePane)) {
+      return;
+    }
+
+    const key = event.key.toLowerCase();
+    if (key === "c") {
+      const selection = activePane.terminal.getSelection();
+      if (!selection) {
+        return;
+      }
+
+      event.preventDefault();
+      void navigator.clipboard
+        .writeText(selection)
+        .then(() => writeSystem("info", `${SESSION_LABELS[activePane.name]} selection copied`))
+        .catch((error) =>
+          writeSystem("error", `copy failed for ${SESSION_LABELS[activePane.name]}: ${String(error)}`),
+        );
+      return;
+    }
+
+    if (key === "v") {
+      event.preventDefault();
+      void pasteClipboardIntoTerminal(activePane);
+    }
+  });
+}
+
+async function pasteClipboardIntoTerminal(pane: SessionTerminal): Promise<void> {
+  if (!snapshotByName.get(pane.name)?.running) {
+    writeSystem("warn", `${SESSION_LABELS[pane.name]} is not running; paste skipped`);
+    return;
+  }
+
+  try {
+    const clipboard = await navigator.clipboard.readText();
+    if (!clipboard) {
+      return;
+    }
+
+    await command<SessionSnapshot>("send_input", {
+      request: {
+        name: pane.name,
+        input: clipboard,
+      } satisfies SendInputRequest,
+    });
+    writeSystem("info", `${SESSION_LABELS[pane.name]} pasted ${clipboard.length} chars`);
+  } catch (error) {
+    writeSystem("error", `paste failed for ${SESSION_LABELS[pane.name]}: ${String(error)}`);
+  }
+}
+
+function activeTerminal(): SessionTerminal | null {
+  return activeTerminalName ? paneMap.get(activeTerminalName) ?? null : null;
+}
+
+function activeTerminalOwnsFocus(pane: SessionTerminal): boolean {
+  const activeElement = document.activeElement;
+  return activeElement instanceof Node && pane.host.contains(activeElement);
 }
 
 function writeSystem(level: "info" | "warn" | "error", message: string): void {
