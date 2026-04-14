@@ -115,6 +115,12 @@ pub fn run() {
         .setup(|app| {
             let supervisor = init_supervisor(&app.handle())?;
             app.manage(DesktopState { supervisor });
+            let main_window = app
+                .get_webview_window("main")
+                .ok_or_else(|| "missing main window".to_string())?;
+            main_window
+                .set_fullscreen(true)
+                .map_err(|error| error.to_string())?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

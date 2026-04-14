@@ -1,6 +1,6 @@
 # CLI-master-wrapper — Phase 0 Notes
 
-**Status:** Completed during the first MVP cut
+**Status:** MVP complete, hardening in progress
 **Date:** 2026-04-15
 
 ## 1. PTY backend result
@@ -69,6 +69,11 @@
 - Release-path startup is still inconsistent compared with the dev launcher.
 - Resume/reattach semantics for Claude and Codex are not implemented yet.
 - The current UI only covers the main room workflow, not settings/main menu depth.
+- Routed-message submit is improved but not fully hardened:
+  - Claude and Codex both accept routed prompts now.
+  - Codex needed a driver-specific single-line payload plus delayed submit.
+  - Claude can still occasionally hold a landed prompt until another Enter arrives.
+- Next reliability slice should be a readiness/acknowledgement gate instead of more blind submit timing.
 
 ## 10. Go / no-go recommendation
 

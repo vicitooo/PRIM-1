@@ -5,6 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
     thread,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -23,6 +24,12 @@ use tokio::{
 use uuid::Uuid;
 
 type EventSink = Arc<dyn Fn(RuntimeEvent) + Send + Sync>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SubmitBehavior {
+    sequence: &'static str,
+    delay: Duration,
+}
 
 #[derive(Debug, Clone)]
 pub struct SupervisorConfig {
@@ -368,6 +375,7 @@ impl SupervisorHandle {
         });
 
         for recipient in recipients {
+            let submit_behavior = self.submit_behavior_for_session(&recipient)?;
             let synthetic = format!(
                 "\r\n\x1b[38;5;179m[{} -> {} / {}]\x1b[0m {}\r\n",
                 request.from,
@@ -382,15 +390,17 @@ impl SupervisorHandle {
                 timestamp: now_rfc3339(),
             });
 
-            let payload = format!(
-                "\n[{} message from {}]\n{}\n\n",
-                scope_label(request.scope),
-                request.from,
-                request.content
-            );
+            let payload = routed_message_payload(&request, submit_behavior);
+            self.send_input(SendInputRequest {
+                name: recipient.clone(),
+                input: payload,
+            })?;
+            if !submit_behavior.delay.is_zero() {
+                thread::sleep(submit_behavior.delay);
+            }
             self.send_input(SendInputRequest {
                 name: recipient,
-                input: payload,
+                input: submit_behavior.sequence.into(),
             })?;
         }
 
@@ -464,6 +474,14 @@ impl SupervisorHandle {
                 .and_then(|slot| slot.running.as_ref().map(|_| vec![slot.definition.name.clone()]))
                 .unwrap_or_default(),
         }
+    }
+
+    fn submit_behavior_for_session(&self, name: &str) -> Result<SubmitBehavior> {
+        let slots = self.inner.slots.lock();
+        let slot = slots
+            .get(name)
+            .with_context(|| format!("unknown session '{name}'"))?;
+        Ok(routed_message_submit_behavior(slot.definition.driver))
     }
 
     fn handle_pty_event(&self, session_name: &str, event: PtyEvent) {
@@ -630,6 +648,36 @@ fn scope_label(scope: MessageScope) -> &'static str {
     }
 }
 
+fn routed_message_payload(request: &RouteMessageRequest, behavior: SubmitBehavior) -> String {
+    if behavior.delay.is_zero() {
+        return format!(
+            "\n[{} message from {}]\n{}\n",
+            scope_label(request.scope),
+            request.from,
+            request.content
+        );
+    }
+
+    collapse_inline_content(&request.content)
+}
+
+fn routed_message_submit_behavior(driver: DriverKind) -> SubmitBehavior {
+    match driver {
+        DriverKind::Codex => SubmitBehavior {
+            sequence: "\r",
+            delay: Duration::from_millis(500),
+        },
+        DriverKind::Claude | DriverKind::GenericTerminal => SubmitBehavior {
+            sequence: "\r",
+            delay: Duration::ZERO,
+        },
+    }
+}
+
+fn collapse_inline_content(content: &str) -> String {
+    content.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn control_plane_transport() -> &'static str {
     #[cfg(windows)]
     {
@@ -717,7 +765,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shared_types::MessageScope;
+    use shared_types::{MessageScope, RouteMessageRequest};
 
     #[test]
     fn snapshot_contains_default_sessions() {
@@ -749,5 +797,64 @@ mod tests {
 
         let recipients = supervisor.resolve_recipients("room", MessageScope::Room);
         assert!(recipients.is_empty());
+    }
+
+    #[test]
+    fn routed_message_payload_ends_with_terminal_submit() {
+        let payload = routed_message_payload(
+            &RouteMessageRequest {
+                from: "victor".into(),
+                to: "claude".into(),
+                scope: MessageScope::Direct,
+                content: "tell me a joke".into(),
+            },
+            routed_message_submit_behavior(DriverKind::Claude),
+        );
+
+        assert!(payload.ends_with('\n'));
+        assert!(payload.contains("[Direct message from victor]"));
+        assert!(payload.contains("tell me a joke"));
+    }
+
+    #[test]
+    fn codex_payload_is_single_line() {
+        let payload = routed_message_payload(
+            &RouteMessageRequest {
+                from: "victor".into(),
+                to: "codex".into(),
+                scope: MessageScope::Direct,
+                content: "tell me\na joke".into(),
+            },
+            routed_message_submit_behavior(DriverKind::Codex),
+        );
+
+        assert!(!payload.contains('\n'));
+        assert_eq!(payload, "tell me a joke");
+    }
+
+    #[test]
+    fn collapse_inline_content_reduces_whitespace() {
+        assert_eq!(
+            collapse_inline_content("  tell   me \n a\tjoke  "),
+            "tell me a joke"
+        );
+    }
+
+    #[test]
+    fn routed_message_submit_behavior_is_driver_aware() {
+        assert_eq!(
+            routed_message_submit_behavior(DriverKind::Claude),
+            SubmitBehavior {
+                sequence: "\r",
+                delay: Duration::ZERO,
+            }
+        );
+        assert_eq!(
+            routed_message_submit_behavior(DriverKind::Codex),
+            SubmitBehavior {
+                sequence: "\r",
+                delay: Duration::from_millis(500),
+            }
+        );
     }
 }
