@@ -99,8 +99,19 @@
     - UI: Claude visibly received the direct message and replied with the requested token
     - runtime evidence: audit/control-plane entries recorded the routed message
 - New hardening target after that fix:
-  - the supervisor can still report a stale `running` Codex session after the PTY process has already exited
   - session liveness checks should be refreshed before snapshot/list/route paths report a session as available
+- Deferred end-of-pass operator tasks:
+  - document the full command/control surface that terminal-launched agents can use against the wrapper
+  - add `Ctrl+Shift+C` / `Ctrl+Shift+V` pane shortcuts
+  - keep the existing `Alt+V` screenshot shortcut unchanged
+- Hardening added after the mailbox-route checkpoint:
+  - the Rust control-plane decoder now strips a UTF-8 BOM before decoding requests/responses
+  - the supervisor refreshes session liveness before snapshot/start/stop/restart/send-input/route/resize paths
+  - stale `running` sessions are pruned when the cached PID is no longer alive
+  - regression tests now cover:
+    - BOM-prefixed mailbox payload decoding
+    - stale running-session pruning on snapshot
+    - stale running-session rejection on send-input
 
 ## 10. Go / no-go recommendation
 

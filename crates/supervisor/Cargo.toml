@@ -10,6 +10,7 @@ control-plane = { path = "../control-plane" }
 driver-claude = { path = "../driver-claude" }
 driver-codex = { path = "../driver-codex" }
 driver-generic-terminal = { path = "../driver-generic-terminal" }
+libc.workspace = true
 parking_lot.workspace = true
 pty-host = { path = "../pty-host" }
 serde.workspace = true
@@ -17,3 +18,4 @@ serde_json.workspace = true
 shared-types = { path = "../shared-types" }
 tokio.workspace = true
 uuid.workspace = true
+windows-sys.workspace = true

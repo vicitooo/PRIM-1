@@ -3310,6 +3310,7 @@ dependencies = [
  "driver-claude",
  "driver-codex",
  "driver-generic-terminal",
+ "libc",
  "parking_lot",
  "pty-host",
  "serde",
@@ -3317,6 +3318,7 @@ dependencies = [
  "shared-types",
  "tokio",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

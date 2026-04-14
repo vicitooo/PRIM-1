@@ -17,6 +17,13 @@ pub enum PtyEvent {
 
 pub type PtyEventHandler = Arc<dyn Fn(PtyEvent) + Send + Sync>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PtyExitStatus {
+    pub exit_code: u32,
+    pub signal: Option<String>,
+    pub success: bool,
+}
+
 pub struct PtySession {
     master: Box<dyn MasterPty + Send>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
@@ -115,6 +122,16 @@ impl PtySession {
             .kill()
             .context("failed to kill PTY child")?;
         Ok(())
+    }
+
+    pub fn try_wait(&self) -> anyhow::Result<Option<PtyExitStatus>> {
+        let mut child = self.child.lock().expect("pty child poisoned");
+        let status = child.try_wait().context("failed to poll PTY child")?;
+        Ok(status.map(|status| PtyExitStatus {
+            exit_code: status.exit_code(),
+            signal: status.signal().map(ToOwned::to_owned),
+            success: status.success(),
+        }))
     }
 
     pub fn process_id(&self) -> Option<u32> {

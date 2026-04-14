@@ -8,7 +8,7 @@ pub const DEFAULT_ENDPOINT: &str = r"\\.\pipe\cli-master-wrapper";
 pub const DEFAULT_ENDPOINT: &str = "/tmp/cli-master-wrapper.sock";
 
 pub fn decode_request(raw: &str) -> anyhow::Result<SidebandRequest> {
-    serde_json::from_str(raw).context("failed to decode sideband request")
+    serde_json::from_str(strip_utf8_bom(raw)).context("failed to decode sideband request")
 }
 
 pub fn encode_request(request: &SidebandRequest) -> anyhow::Result<String> {
@@ -16,11 +16,15 @@ pub fn encode_request(request: &SidebandRequest) -> anyhow::Result<String> {
 }
 
 pub fn decode_response(raw: &str) -> anyhow::Result<SidebandResponse> {
-    serde_json::from_str(raw).context("failed to decode sideband response")
+    serde_json::from_str(strip_utf8_bom(raw)).context("failed to decode sideband response")
 }
 
 pub fn encode_response(response: &SidebandResponse) -> anyhow::Result<String> {
     serde_json::to_string(response).context("failed to encode sideband response")
+}
+
+fn strip_utf8_bom(raw: &str) -> &str {
+    raw.trim_start_matches('\u{feff}')
 }
 
 #[cfg(test)]
@@ -66,5 +70,22 @@ mod tests {
     #[test]
     fn decode_request_rejects_invalid_json() {
         assert!(decode_request("{not json}").is_err());
+    }
+
+    #[test]
+    fn decode_request_accepts_utf8_bom_prefixed_json() {
+        let json = format!(
+            "\u{feff}{}",
+            encode_request(&SidebandRequest::Ping {
+                token: "abc".into(),
+            })
+            .unwrap()
+        );
+
+        let decoded = decode_request(&json).unwrap();
+        match decoded {
+            SidebandRequest::Ping { token } => assert_eq!(token, "abc"),
+            _ => panic!("unexpected request variant"),
+        }
     }
 }

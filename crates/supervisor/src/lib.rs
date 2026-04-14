@@ -69,7 +69,7 @@ impl AuditLog {
 }
 
 struct RunningSession {
-    pty: PtySession,
+    pty: Option<PtySession>,
 }
 
 struct SessionSlot {
@@ -94,6 +94,10 @@ impl SessionSlot {
             last_activity_at: self.last_activity_at.clone(),
             last_error: self.last_error.clone(),
         }
+    }
+
+    fn title(&self) -> &str {
+        &self.definition.title
     }
 }
 
@@ -170,6 +174,7 @@ impl SupervisorHandle {
     }
 
     pub fn snapshot(&self) -> RuntimeSnapshot {
+        self.refresh_session_liveness();
         let mut sessions = self
             .inner
             .slots
@@ -189,6 +194,7 @@ impl SupervisorHandle {
     }
 
     pub fn start_session(&self, name: &str) -> Result<SessionSnapshot> {
+        self.refresh_session_liveness();
         let definition = {
             let mut slots = self.inner.slots.lock();
             let slot = slots
@@ -232,7 +238,7 @@ impl SupervisorHandle {
                         .get_mut(name)
                         .expect("session disappeared during spawn success");
                     slot.process_id = pty.process_id();
-                    slot.running = Some(RunningSession { pty });
+                    slot.running = Some(RunningSession { pty: Some(pty) });
                     slot.state = LifecycleState::Ready;
                     slot.last_activity_at = Some(now_rfc3339());
                     slot.snapshot()
@@ -279,6 +285,7 @@ impl SupervisorHandle {
     }
 
     pub fn stop_session(&self, name: &str) -> Result<SessionSnapshot> {
+        self.refresh_session_liveness();
         let pty = {
             let mut slots = self.inner.slots.lock();
             let slot = slots
@@ -287,7 +294,7 @@ impl SupervisorHandle {
             slot.state = LifecycleState::Closed;
             slot.process_id = None;
             slot.last_activity_at = Some(now_rfc3339());
-            slot.running.take().map(|running| running.pty)
+            slot.running.take().and_then(|running| running.pty)
         };
 
         if let Some(pty) = pty {
@@ -312,6 +319,7 @@ impl SupervisorHandle {
     }
 
     pub fn restart_session(&self, name: &str) -> Result<SessionSnapshot> {
+        self.refresh_session_liveness();
         {
             let mut slots = self.inner.slots.lock();
             let slot = slots
@@ -334,6 +342,7 @@ impl SupervisorHandle {
     }
 
     pub fn send_input(&self, request: SendInputRequest) -> Result<SessionSnapshot> {
+        self.refresh_session_liveness();
         let snapshot = {
             let mut slots = self.inner.slots.lock();
             let slot = slots
@@ -343,7 +352,11 @@ impl SupervisorHandle {
                 .running
                 .as_ref()
                 .ok_or_else(|| anyhow!("session '{}' is not running", request.name))?;
-            running.pty.send_input(&request.input)?;
+            running
+                .pty
+                .as_ref()
+                .ok_or_else(|| anyhow!("session '{}' transport is not available", request.name))?
+                .send_input(&request.input)?;
             slot.state = LifecycleState::Busy;
             slot.last_activity_at = Some(now_rfc3339());
             slot.snapshot()
@@ -360,6 +373,7 @@ impl SupervisorHandle {
     }
 
     pub fn route_message(&self, request: RouteMessageRequest) -> Result<RuntimeSnapshot> {
+        self.refresh_session_liveness();
         let recipients = self.resolve_recipients(&request.to, request.scope);
         if recipients.is_empty() {
             return Err(anyhow!("no running recipients available for '{}'", request.to));
@@ -401,6 +415,7 @@ impl SupervisorHandle {
     }
 
     pub fn resize_session(&self, name: &str, cols: u16, rows: u16) -> Result<()> {
+        self.refresh_session_liveness();
         let slots = self.inner.slots.lock();
         let slot = slots
             .get(name)
@@ -409,7 +424,11 @@ impl SupervisorHandle {
             .running
             .as_ref()
             .ok_or_else(|| anyhow!("session '{name}' is not running"))?;
-        running.pty.resize(cols, rows)?;
+        running
+            .pty
+            .as_ref()
+            .ok_or_else(|| anyhow!("session '{name}' transport is not available"))?
+            .resize(cols, rows)?;
         Ok(())
     }
 
@@ -470,6 +489,58 @@ impl SupervisorHandle {
             .get(name)
             .with_context(|| format!("unknown session '{name}'"))?;
         Ok(routed_message_submit_behavior(slot.definition.driver))
+    }
+
+    fn refresh_session_liveness(&self) {
+        let mut lifecycle_events = Vec::new();
+        let mut log_events = Vec::new();
+
+        {
+            let mut slots = self.inner.slots.lock();
+            for (session_name, slot) in slots.iter_mut() {
+                if slot.running.is_none() {
+                    continue;
+                }
+
+                let Some(process_id) = slot.process_id else {
+                    continue;
+                };
+
+                if process_id_is_running(process_id) {
+                    continue;
+                }
+
+                let timestamp = now_rfc3339();
+                slot.running = None;
+                slot.process_id = None;
+                slot.state = LifecycleState::Closed;
+                slot.last_activity_at = Some(timestamp.clone());
+                slot.last_error = None;
+
+                log_events.push(RuntimeEvent::SystemLog {
+                    level: LogLevel::Warn,
+                    message: format!(
+                        "{} process {} is no longer running; pruning stale session state",
+                        slot.title(),
+                        process_id
+                    ),
+                    timestamp: timestamp.clone(),
+                });
+                lifecycle_events.push(RuntimeEvent::SessionState {
+                    session: session_name.clone(),
+                    state: LifecycleState::Closed,
+                    reason: "process no longer running".into(),
+                    timestamp,
+                });
+            }
+        }
+
+        for event in log_events {
+            self.emit(event);
+        }
+        for event in lifecycle_events {
+            self.emit(event);
+        }
     }
 
     fn handle_pty_event(&self, session_name: &str, event: PtyEvent) {
@@ -609,6 +680,35 @@ impl SupervisorHandle {
             sink(event);
         }
     }
+}
+
+#[cfg(windows)]
+fn process_id_is_running(process_id: u32) -> bool {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, WAIT_TIMEOUT},
+        System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject},
+    };
+    const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+
+    unsafe {
+        let handle = OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE_ACCESS,
+            0,
+            process_id,
+        );
+        if handle.is_null() {
+            return false;
+        }
+
+        let wait_result = WaitForSingleObject(handle, 0);
+        let _ = CloseHandle(handle);
+        wait_result == WAIT_TIMEOUT
+    }
+}
+
+#[cfg(unix)]
+fn process_id_is_running(process_id: u32) -> bool {
+    unsafe { libc::kill(process_id as i32, 0) == 0 }
 }
 
 fn spawn_control_plane_thread(handle: SupervisorHandle, status: ControlPlaneStatus) {
@@ -905,6 +1005,14 @@ mod tests {
         .unwrap()
     }
 
+    fn install_stale_running_session(supervisor: &SupervisorHandle, name: &str) {
+        let mut slots = supervisor.inner.slots.lock();
+        let slot = slots.get_mut(name).unwrap();
+        slot.running = Some(RunningSession { pty: None });
+        slot.process_id = Some(u32::MAX);
+        slot.state = LifecycleState::Busy;
+    }
+
     #[test]
     fn snapshot_contains_default_sessions() {
         let supervisor = test_supervisor();
@@ -1112,6 +1220,37 @@ mod tests {
     }
 
     #[test]
+    fn mailbox_request_processing_accepts_bom_prefixed_payload() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let sideband_dir = supervisor.runtime_dir().join("sideband-test-bom");
+        let inbox_dir = sideband_dir.join("inbox");
+        let outbox_dir = sideband_dir.join("outbox");
+        let processed_dir = sideband_dir.join("processed");
+        fs::create_dir_all(&inbox_dir).unwrap();
+        fs::create_dir_all(&outbox_dir).unwrap();
+        fs::create_dir_all(&processed_dir).unwrap();
+
+        let request_path = inbox_dir.join("ping.json");
+        let raw = format!(
+            "\u{feff}{}",
+            encode_request(&SidebandRequest::Ping {
+                token: status.token.clone(),
+            })
+            .unwrap()
+        );
+        fs::write(&request_path, raw).unwrap();
+
+        process_sideband_mailbox_file(&supervisor, &request_path, &outbox_dir, &processed_dir)
+            .unwrap();
+
+        let response = decode_response(&fs::read_to_string(outbox_dir.join("ping.json")).unwrap())
+            .unwrap();
+        assert!(response.ok);
+        assert_eq!(response.message, "pong");
+    }
+
+    #[test]
     fn apply_sideband_request_rejects_invalid_token() {
         let supervisor = test_supervisor();
         let status = supervisor.start_control_plane().unwrap();
@@ -1154,5 +1293,37 @@ mod tests {
         assert!(error
             .to_string()
             .contains("no running recipients available for 'claude'"));
+    }
+
+    #[test]
+    fn snapshot_prunes_exited_running_session() {
+        let supervisor = test_supervisor();
+        install_stale_running_session(&supervisor, "codex");
+
+        let snapshot = supervisor.snapshot();
+        let codex = snapshot
+            .sessions
+            .into_iter()
+            .find(|session| session.name == "codex")
+            .unwrap();
+
+        assert!(!codex.running);
+        assert_eq!(codex.lifecycle_state, LifecycleState::Closed);
+        assert_eq!(codex.process_id, None);
+    }
+
+    #[test]
+    fn send_input_rejects_exited_session_after_liveness_refresh() {
+        let supervisor = test_supervisor();
+        install_stale_running_session(&supervisor, "codex");
+
+        let error = supervisor
+            .send_input(SendInputRequest {
+                name: "codex".into(),
+                input: "hello".into(),
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("session 'codex' is not running"));
     }
 }
