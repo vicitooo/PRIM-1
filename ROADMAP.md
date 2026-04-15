@@ -128,6 +128,26 @@ Future control improvements:
 - better selection/copy behavior
 - stronger resume behavior after interactive CLI exits
 
+### 3.7 Intelligent outage handling
+
+This does **not** belong to the current Claude/Codex room polish.
+
+It belongs to a later supervision/orchestration layer that can distinguish:
+
+- upstream API/service degradation while the child process is still alive
+- child-process crashes
+- PTY/control-plane transport failures
+- wrapper-level failures
+
+Future capabilities should include:
+
+- explicit degraded/outage state in the UI
+- error classification instead of treating all failures as generic session trouble
+- guarded restart/backoff policy for upstream-error storms
+- clearer operator guidance about when to restart, wait, or leave the session alone
+
+This becomes important once the wrapper is expected to run longer autonomous sessions, not just the current live room proof.
+
 ## 4. Guiding product rule
 
 Do not confuse:
@@ -152,5 +172,6 @@ Build in this order:
 4. expose generic terminal support in the UI
 5. add dynamic panes/workspace model
 6. validate Linux/macOS
+7. add intelligent outage handling before treating the system as an unattended operations runtime
 
 That keeps the project honest and prevents scope from outrunning the proof.
