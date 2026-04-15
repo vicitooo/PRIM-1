@@ -21,31 +21,32 @@ Treat incoming routed messages as if Victor had typed them into your pane. Respo
 
 ## 1. Sending a routed message
 
-The pane's working directory is the project root: `./`.
+The pane's working directory is the personal repo root: `<workspace>/`.
 
 From your shell (Bash tool for Claude, shell exec for Codex), use the wrapped form below as the canonical pattern:
 
 ```bash
-powershell -Command "& '.\scripts\agent-route.ps1' -From <you> -To <peer|room> -Scope <direct|room> -Content '<single-quoted message>'"
+powershell -Command "& './scripts/agent-route.ps1' -From <you> -To <peer|room> -Scope <direct|room> -Content '<single-quoted message>'"
 ```
 
 Examples:
 
 ```bash
 # Claude -> Codex direct
-powershell -Command "& '.\scripts\agent-route.ps1' -From claude -To codex -Scope direct -Content 'hello from claude'"
+powershell -Command "& './scripts/agent-route.ps1' -From claude -To codex -Scope direct -Content 'hello from claude'"
 
 # Codex -> Claude direct
-powershell -Command "& '.\scripts\agent-route.ps1' -From codex -To claude -Scope direct -Content 'hello from codex'"
+powershell -Command "& './scripts/agent-route.ps1' -From codex -To claude -Scope direct -Content 'hello from codex'"
 
 # Either -> shared room (Victor's status feed)
-powershell -Command "& '.\scripts\agent-route.ps1' -From claude -To room -Scope room -Content 'status update for Victor'"
+powershell -Command "& './scripts/agent-route.ps1' -From claude -To room -Scope room -Content 'status update for Victor'"
 ```
 
 Rules:
 
 - **Always single-quote `-Content`** so `!`, `@`, `$`, special characters survive PowerShell parsing.
 - **Treat the wrapped `powershell -Command "& '...\script.ps1' ..."` form as canonical on Windows.** It works from both PowerShell and Git Bash / MSYS shells, while bare `-File` calls can have their args silently mangled by MSYS before PowerShell sees them.
+- **Inside the panes, use the wrapper script's absolute path.** The panes now start from `<workspace>/`, not from the wrapper root, so relative `.\scripts\...` paths are no longer reliable there.
 - **Exit code 0** = supervisor accepted the route. Non-zero = supervisor rejected (peer not running, parsing error, pipe unreachable). Always check the exit code; do not assume success.
 - **Do not embed newlines** in `-Content`. Codex will flatten whitespace anyway; Claude tolerates newlines but it's noisier. Keep messages single-line.
 - **Do not call `control-plane.ps1` directly** for routing. Use `agent-route.ps1` — it's the hardened wrapper that the supervisor expects.
@@ -62,13 +63,13 @@ When Victor says "run the handshake test":
 3. **Announce to Victor via room:**
 
    ```bash
-   powershell -Command "& '.\scripts\agent-route.ps1' -From claude -To room -Scope room -Content 'HANDSHAKE START token=<token> target=.runtime/smoke/handshake-<token>.txt dispatching codex'"
+   powershell -Command "& './scripts/agent-route.ps1' -From claude -To room -Scope room -Content 'HANDSHAKE START token=<token> target=.runtime/smoke/handshake-<token>.txt dispatching codex'"
    ```
 
 4. **Dispatch Codex** with one direct routed message containing the path, the token, and the exact reply format you expect back:
 
    ```bash
-   powershell -Command "& '.\scripts\agent-route.ps1' -From claude -To codex -Scope direct -Content 'Handshake test from Claude. Create file at ./.runtime/smoke/handshake-<token>.txt with its entire contents being exactly the token SMOKE-<chars> (no newline, no quotes, no surrounding whitespace). When the file is written, reply to me with exactly: agent-route.ps1 -From codex -To claude -Scope direct -Content FILE_READY <token>. Do not do anything else. Do not touch any other file. Stop after replying.'"
+   powershell -Command "& './scripts/agent-route.ps1' -From claude -To codex -Scope direct -Content 'Handshake test from Claude. Create file at ./.runtime/smoke/handshake-<token>.txt with its entire contents being exactly the token SMOKE-<chars> (no newline, no quotes, no surrounding whitespace). When the file is written, reply to me with exactly: agent-route.ps1 -From codex -To claude -Scope direct -Content FILE_READY <token>. Do not do anything else. Do not touch any other file. Stop after replying.'"
    ```
 
 5. **End your turn and wait.** Do not loop, poll, or spawn anything. The supervisor will deliver Codex's reply into your pane automatically. When the next input arrives, continue at step 6.
@@ -81,11 +82,11 @@ When Victor says "run the handshake test":
 
    - **Pass** — file exists and contents match:
      ```bash
-     powershell -Command "& '.\scripts\agent-route.ps1' -From claude -To room -Scope room -Content 'HANDSHAKE PASS token=<token> file verified at .runtime/smoke/handshake-<token>.txt'"
+     powershell -Command "& './scripts/agent-route.ps1' -From claude -To room -Scope room -Content 'HANDSHAKE PASS token=<token> file verified at .runtime/smoke/handshake-<token>.txt'"
      ```
    - **Fail** — any mismatch, missing file, timeout, or error:
      ```bash
-     powershell -Command "& '.\scripts\agent-route.ps1' -From claude -To room -Scope room -Content 'HANDSHAKE FAIL token=<token> reason=<one-line reason>'"
+     powershell -Command "& './scripts/agent-route.ps1' -From claude -To room -Scope room -Content 'HANDSHAKE FAIL token=<token> reason=<one-line reason>'"
      ```
 
 9. **Stop.** Do not retry. Do not clean up the file. Wait for Victor's next instruction.
@@ -111,13 +112,13 @@ When a direct routed message arrives in your pane from `claude` containing the s
 4. **Reply to Claude** with the exact acknowledgement string Claude asked for:
 
    ```bash
-   powershell -Command "& '.\scripts\agent-route.ps1' -From codex -To claude -Scope direct -Content 'FILE_READY <token>'"
+   powershell -Command "& './scripts/agent-route.ps1' -From codex -To claude -Scope direct -Content 'FILE_READY <token>'"
    ```
 
 5. **Announce to Victor via room:**
 
    ```bash
-   powershell -Command "& '.\scripts\agent-route.ps1' -From codex -To room -Scope room -Content 'Handshake file written at .runtime/smoke/handshake-<token>.txt token=<token> replied to claude'"
+   powershell -Command "& './scripts/agent-route.ps1' -From codex -To room -Scope room -Content 'Handshake file written at .runtime/smoke/handshake-<token>.txt token=<token> replied to claude'"
    ```
 
 6. **Stop.** Do not touch any other file. Do not retry. Wait for the next instruction.
@@ -125,7 +126,7 @@ When a direct routed message arrives in your pane from `claude` containing the s
 If the message is malformed or the write fails, report it once via room, then stop:
 
 ```bash
-powershell -Command "& '.\scripts\agent-route.ps1' -From codex -To room -Scope room -Content 'HANDSHAKE FAIL (codex side) reason=<one-line reason>'"
+powershell -Command "& './scripts/agent-route.ps1' -From codex -To room -Scope room -Content 'HANDSHAKE FAIL (codex side) reason=<one-line reason>'"
 ```
 
 ## 4. Trigger prompts (for Victor to paste)

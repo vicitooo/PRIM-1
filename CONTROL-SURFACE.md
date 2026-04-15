@@ -147,6 +147,13 @@ powershell -Command "& '.\scripts\agent-key.ps1' -Session codex -Key down"
 
 ## 6. What agent-side terminal sessions can control today
 
+Supervised `claude` and `codex` panes now start from `<workspace>/`.
+
+That means:
+
+- repo-root context discovery happens from the personal repo root
+- inside-pane script calls should use absolute wrapper paths such as `./scripts/...` unless the caller first changes directory into the wrapper root
+
 From inside Claude/Codex, an agent can call the helper scripts to:
 
 - list sessions

@@ -214,6 +214,14 @@ fn resolve_project_root() -> Result<PathBuf, String> {
     Ok(normalize_path_for_child_processes(canonical))
 }
 
+fn resolve_agent_working_root(project_root: &Path) -> Result<PathBuf, String> {
+    let personal_root = project_root
+        .parent()
+        .ok_or_else(|| format!("failed to resolve personal repo root from {}", project_root.display()))?;
+
+    Ok(normalize_path_for_child_processes(personal_root.to_path_buf()))
+}
+
 fn normalize_path_for_child_processes(path: PathBuf) -> PathBuf {
     #[cfg(windows)]
     {
@@ -245,14 +253,19 @@ fn init_supervisor(
     project_root: PathBuf,
     diagnostics: &DesktopDiagnostics,
 ) -> Result<SupervisorHandle, String> {
+    let agent_working_root = resolve_agent_working_root(&project_root)?;
     let runtime_dir = project_root.join(".runtime");
     diagnostics.log(
         "info",
         "supervisor_init",
-        format!("runtime_dir={}", runtime_dir.display()),
+        format!(
+            "runtime_dir={} agent_working_root={}",
+            runtime_dir.display(),
+            agent_working_root.display()
+        ),
     );
     let supervisor = SupervisorHandle::new(SupervisorConfig {
-        working_root: project_root,
+        working_root: agent_working_root,
         runtime_dir,
     })
     .map_err(|error| error.to_string())?;
@@ -453,7 +466,8 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_path_for_child_processes, sanitize_terminal_output_for_ui, strip_osc_sequences,
+        normalize_path_for_child_processes, resolve_agent_working_root,
+        sanitize_terminal_output_for_ui, strip_osc_sequences,
     };
     use std::path::PathBuf;
 
@@ -500,6 +514,17 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn resolve_agent_working_root_returns_parent_repo_root() {
+        let path = PathBuf::from(r".");
+
+        assert_eq!(
+            resolve_agent_working_root(&path).unwrap(),
+            PathBuf::from(r"<workspace>")
+        );
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn normalize_path_for_child_processes_leaves_non_windows_paths_unchanged() {
@@ -508,6 +533,17 @@ mod tests {
         assert_eq!(
             normalize_path_for_child_processes(path.clone()),
             PathBuf::from("/workspace/cli-master-wrapper")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn resolve_agent_working_root_returns_parent_repo_root() {
+        let path = PathBuf::from("/workspace/cli-master-wrapper");
+
+        assert_eq!(
+            resolve_agent_working_root(&path).unwrap(),
+            PathBuf::from("/workspace")
         );
     }
 }
