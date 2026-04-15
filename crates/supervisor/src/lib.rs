@@ -379,7 +379,8 @@ impl SupervisorHandle {
 
     pub fn route_message(&self, request: RouteMessageRequest) -> Result<RuntimeSnapshot> {
         self.refresh_session_liveness();
-        let recipients = self.resolve_recipients(&request.to, request.scope);
+        let recipients =
+            self.resolve_recipients(&request.to, request.scope, Some(request.from.as_str()));
         if recipients.is_empty() {
             return Err(anyhow!(
                 "no running recipients available for '{}'",
@@ -477,12 +478,19 @@ impl SupervisorHandle {
         Ok(status)
     }
 
-    fn resolve_recipients(&self, to: &str, scope: MessageScope) -> Vec<String> {
+    fn resolve_recipients(
+        &self,
+        to: &str,
+        scope: MessageScope,
+        sender: Option<&str>,
+    ) -> Vec<String> {
         let slots = self.inner.slots.lock();
         match scope {
             MessageScope::Room => slots
                 .iter()
-                .filter_map(|(name, slot)| slot.running.as_ref().map(|_| name.clone()))
+                .filter_map(|(name, slot)| {
+                    (slot.running.is_some() && Some(name.as_str()) != sender).then(|| name.clone())
+                })
                 .collect(),
             _ => slots
                 .get(to)
@@ -1088,8 +1096,41 @@ mod tests {
     fn room_targets_only_running_sessions() {
         let supervisor = test_supervisor();
 
-        let recipients = supervisor.resolve_recipients("room", MessageScope::Room);
+        let recipients = supervisor.resolve_recipients("room", MessageScope::Room, Some("claude"));
         assert!(recipients.is_empty());
+    }
+
+    #[test]
+    fn room_targets_exclude_claude_sender() {
+        let supervisor = test_supervisor();
+        install_stale_running_session(&supervisor, "claude");
+        install_stale_running_session(&supervisor, "codex");
+
+        let recipients = supervisor.resolve_recipients("room", MessageScope::Room, Some("claude"));
+
+        assert_eq!(recipients, vec!["codex".to_string()]);
+    }
+
+    #[test]
+    fn room_targets_exclude_codex_sender() {
+        let supervisor = test_supervisor();
+        install_stale_running_session(&supervisor, "claude");
+        install_stale_running_session(&supervisor, "codex");
+
+        let recipients = supervisor.resolve_recipients("room", MessageScope::Room, Some("codex"));
+
+        assert_eq!(recipients, vec!["claude".to_string()]);
+    }
+
+    #[test]
+    fn direct_targets_ignore_sender_filter() {
+        let supervisor = test_supervisor();
+        install_stale_running_session(&supervisor, "claude");
+
+        let recipients =
+            supervisor.resolve_recipients("claude", MessageScope::Direct, Some("claude"));
+
+        assert_eq!(recipients, vec!["claude".to_string()]);
     }
 
     #[test]
