@@ -1,7 +1,7 @@
 {
   "poll_interval_seconds": 0.2,
   "arm_window_seconds": 3.0,
-  "assistant_wait_seconds": 60.0,
+  "assistant_wait_seconds": 300.0,
   "min_dispatch_interval_seconds": 5.0,
   "daily_dispatch_limit": 50,
   "captured_text_limit_chars": 400,
