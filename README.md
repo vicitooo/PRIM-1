@@ -33,6 +33,11 @@ Known limitation in this shell-hosted environment:
 
 - the release GUI binary created the control-plane file but did not stay alive in the non-interactive smoke check, so full visual validation still needs a normal desktop session
 
+Important scope note:
+
+- the current runtime architecture is more generic than the current UI/product surface
+- the current app still presents as a Claude/Codex room, not yet as a fully generic arbitrary-terminal workspace
+
 ## What this is
 
 `CLI-master-wrapper` is a local multi-agent runtime for terminal-first AI tools.
@@ -110,6 +115,22 @@ Supported communication modes:
 
 All routed messages should be visibly stamped in the target terminal and logged by the supervisor.
 
+## Clarified scope after the first live sessions
+
+The first real Windows sessions clarified three things:
+
+- the current app is a real Claude/Codex collaboration wrapper
+- the architecture can grow into a generic terminal supervisor
+- the product is not there yet
+
+What is still future work:
+
+- generic shell panes
+- dynamic pane counts/layouts
+- workspace/home view with folder-owned agent groups
+- many Claude/Codex instances with durable IDs
+- Linux/macOS validation and packaging
+
 ## First real use case
 
 The first target is not an overnight automation system.
@@ -141,6 +162,12 @@ The later 24/7 orchestration use cases are built on top of that, not before it.
 
 - [IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md)
   Build phases, milestones, first slices, and open questions.
+
+- [ROADMAP.md](ROADMAP.md)
+  Clarified future direction: generic terminals, dynamic panes, workspace/home model, multi-instance IDs, and cross-platform work.
+
+- [ARCHITECTURE-REVIEW.md](ARCHITECTURE-REVIEW.md)
+  Current-state review: strengths, weak spots, modularity, portability, and what still separates the current app from a true universal terminal wrapper.
 
 - [STACK-DECISIONS.md](STACK-DECISIONS.md)
   Locked decisions, v1 scope cuts, unresolved items, and decision guardrails.

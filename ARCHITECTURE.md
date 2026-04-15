@@ -25,6 +25,25 @@ The system consists of five main parts:
 
 These are distinct on purpose. Mixing them is what makes terminal automation brittle.
 
+### 2.1 Current product surface vs target architecture
+
+This distinction must stay explicit.
+
+Current product surface:
+
+- two hardcoded panes: Claude and Codex
+- Windows-first validation
+- collaboration through supervisor-mediated routing
+
+Target architecture:
+
+- generic terminal-first runtime
+- dynamic session set
+- dynamic pane/layout model
+- portable to Linux/macOS
+
+The current implementation is a **Claude/Codex proof built on a generic-shaped runtime**, not a finished generic terminal product.
+
 ## 3. Supervisor daemon
 
 The supervisor is the authority.
@@ -133,6 +152,16 @@ Each driver should define:
 - `generic_terminal`
 
 The generic terminal driver is important. It keeps the runtime from becoming product-specific.
+
+### 5.4 Reality check on current implementation
+
+The runtime already has a generic-terminal driver concept, but the current app does not yet expose it as a first-class product feature.
+
+That means:
+
+- the architecture supports generic sessions
+- the current UI still hardcodes Claude and Codex
+- turning the app into a true universal wrapper is a product step still ahead of us
 
 ## 6. Sideband control plane
 
@@ -262,6 +291,31 @@ There should also be a small retractable control surface for:
 - room actions
 
 The control surface should stay minimal and subordinate to the core room UX.
+
+### 8.2 Future pane model
+
+The current fixed two-pane layout is acceptable for the first proof, but it is not the final UI model.
+
+Future UI requirements:
+
+- add/remove panes
+- dynamic pane count
+- agent instance labels and IDs
+- layout presets for one, two, or many sessions
+- workspace-specific session groupings
+
+### 8.3 Workspace / home model
+
+The future UI should include a workspace/home layer above the live room.
+
+That layer should support:
+
+- a list of folders/projects
+- multiple agent sessions per folder
+- reopening prior rooms
+- identifying which Claude/Codex instance belongs to which workspace
+
+The room remains the core interaction surface, but it should no longer be the only surface.
 
 ### 8.1 Reconnect behavior
 
@@ -421,6 +475,18 @@ Minimum fields:
 
 Replay should read the audit log forward. A separate transcript system should not be invented unless the audit log proves insufficient.
 
+## 12.1 Multi-instance identity
+
+As the product grows past one Claude and one Codex, each session needs:
+
+- stable runtime ID
+- human-facing label
+- workspace association
+- driver kind
+- lifecycle state
+
+Names like `claude:research` are useful, but an internal stable ID is still required.
+
 ## 13. Failure handling for the room
 
 The room itself needs first-class failure behavior.
@@ -460,3 +526,29 @@ To be replaced:
 - orchestration of large agent trees
 
 The architecture should allow those later, but they are not required to prove the runtime.
+
+## 16. Portability stance
+
+The architecture is intentionally portable, but the product claim must stay conservative.
+
+Today:
+
+- Windows is the real validated target
+
+Planned:
+
+- Linux
+- macOS
+
+What portability means here:
+
+- same supervisor model
+- same PTY ownership model
+- same sideband control-plane model
+- different OS-specific validation and packaging work
+
+So the correct claim is:
+
+- **portable by design**
+- **Windows-proven**
+- **Linux/macOS not yet proven**

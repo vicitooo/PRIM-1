@@ -37,6 +37,16 @@ The architecture is considered proven when the following work end to end:
 
 If those eight work reliably, the foundation is real.
 
+## Current sequencing update
+
+After the first real Windows sessions, the near-term order is now:
+
+1. finish Claude/Codex collaboration polish
+2. capture an architecture review of strengths, weak spots, modularity, and portability
+3. only then widen the surface toward generic terminals and dynamic workspaces
+
+That prevents the project from pretending to be a universal wrapper before the current proof is stable.
+
 ## Phase 0 — Research and validation
 
 Purpose:
@@ -153,6 +163,10 @@ Deliverable:
 
 - adding a new terminal app does not require core supervisor changes
 
+Additional requirement:
+
+- quitting a supervised CLI must not imply “that pane is now a generic shell” unless the product explicitly switches that pane into a generic-terminal session model
+
 Rough budget:
 
 - **2-3 focused days**
@@ -178,6 +192,28 @@ Deliverable:
 Rough budget:
 
 - **1-2 focused days**
+
+## Phase 4.5 — Workspace and pane generalization
+
+Purpose:
+move from a fixed Claude/Codex app into a real multi-session operator product.
+
+Tasks:
+
+- dynamic session definitions
+- add/remove pane support
+- multi-instance addressing and durable IDs
+- workspace/home screen
+- folder/project grouping
+- generic shell pane entry
+
+Deliverable:
+
+- the wrapper is no longer structurally limited to one Claude and one Codex
+
+Rough budget:
+
+- **3-5 focused days**
 
 ## Phase 5 — Hardening
 
@@ -213,6 +249,22 @@ Tasks:
 - scheduled jobs
 
 These are intentionally deferred.
+
+## Phase 7 — Cross-platform productization
+
+Purpose:
+turn the portable architecture into a validated product beyond Windows.
+
+Tasks:
+
+- validate Linux runtime and control plane
+- validate macOS runtime and control plane
+- add helper parity outside PowerShell
+- validate packaging and operator workflow on each OS
+
+Deliverable:
+
+- “portable by design” becomes “portable in practice”
 
 ## Immediate implementation order
 

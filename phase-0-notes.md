@@ -122,6 +122,18 @@
     - BOM-prefixed mailbox payload decoding
     - stale running-session pruning on snapshot
     - stale running-session rejection on send-input
+- Clarified scope after the first real Windows sessions:
+  - the runtime architecture is generic, but the current product surface is still hardcoded to Claude and Codex
+  - quitting a Claude/Codex pane does not yet turn that pane into a freeform shell
+  - the next-level product vision is a workspace/home view that can hold multiple folders, each with multiple agent sessions
+  - agent instances need durable IDs and explicit addressing to support many Claudes and Codexes in parallel
+  - Linux and macOS are supported in the architecture direction, but not yet validated as product targets
+- Follow-up documentation landed after the architecture discussion:
+  - `ROADMAP.md` records the widened future scope
+  - `ARCHITECTURE-REVIEW.md` records strengths, weak spots, modularity, portability, and current limitations
+  - canonical docs now explicitly distinguish:
+    - current Claude/Codex product reality
+    - future generic-terminal product direction
 
 ## 10. Go / no-go recommendation
 
