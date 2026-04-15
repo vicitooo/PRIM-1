@@ -20,11 +20,13 @@
 html,
 body {
   margin: 0;
-  min-height: 100%;
+  height: 100%;
+  overflow: hidden;
 }
 
 body {
   min-height: 100vh;
+  overflow: hidden;
 }
 
 button,
@@ -70,19 +72,23 @@ textarea {
 }
 
 textarea {
-  resize: vertical;
+  resize: none;
+  overflow: auto;
 }
 
 #app {
-  min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
 }
 
 .app-shell {
-  min-height: 100vh;
+  height: 100vh;
+  max-height: 100vh;
   padding: 1.25rem;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) minmax(280px, 0.42fr);
+  grid-template-rows: auto minmax(0, 1fr) minmax(240px, 0.38fr);
   gap: 1rem;
+  overflow: hidden;
 }
 
 .topbar,
@@ -158,6 +164,7 @@ textarea {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  overflow: hidden;
 }
 
 .card-head {
@@ -201,6 +208,7 @@ textarea {
   gap: 0.65rem;
   margin: 0.9rem 0 0.75rem;
   flex-wrap: wrap;
+  flex-shrink: 0;
 }
 
 .terminal-host,
@@ -224,6 +232,9 @@ textarea {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0.85rem;
   margin-top: 0.85rem;
+  min-height: 0;
+  align-content: start;
+  overflow: hidden;
 }
 
 .router-form label {
@@ -238,6 +249,15 @@ textarea {
 
 .message-field {
   grid-column: 1 / -1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.message-field textarea {
+  min-height: 8rem;
+  max-height: min(18rem, 100%);
+  flex: 1 1 auto;
 }
 
 .control-flyout {
@@ -283,7 +303,7 @@ textarea {
 
 @media (max-width: 1280px) {
   .app-shell {
-    grid-template-rows: auto auto auto;
+    grid-template-rows: auto minmax(0, 1fr) minmax(260px, auto);
   }
 
   .workspace-grid,
