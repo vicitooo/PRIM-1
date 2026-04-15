@@ -35,7 +35,7 @@ DEFAULT_CONFIG = {
             "continue_template": "Compaction complete. Continue with the task as previously instructed.",
         },
         "context": {
-            "completion_markers": ["Context Usage"],
+            "completion_markers": ["Autocompact buffer"],
             "continue_template": "Your context usage: {captured_text}. Continue with the task.",
         },
         "help": {
@@ -287,7 +287,11 @@ class WatcherEngine:
     def build_continue_message(self, command: str, captured_chunks: list[str]) -> str:
         config = self.config.commands[command]
         captured_text = collapse_whitespace(" ".join(captured_chunks))
-        captured_text = captured_text[: self.config.captured_text_limit_chars].strip()
+        limit = self.config.captured_text_limit_chars
+        if len(captured_text) > limit:
+            captured_text = captured_text[-limit:].strip()
+        else:
+            captured_text = captured_text.strip()
 
         if "{captured_text}" in config.continue_template:
             return config.continue_template.format(captured_text=captured_text)
