@@ -34,12 +34,12 @@
 - Supported actions in the first version:
   - `ping`
   - `list`
-- `start`
-- `stop`
-- `restart`
-- `input`
-- `key`
-- `route`
+  - `start`
+  - `stop`
+  - `restart`
+  - `input`
+  - `key`
+  - `route`
 
 ## 6. Audit log decision
 
@@ -61,7 +61,8 @@
   - `npm run build`
   - `npm run tauri build`
 - Manual visual checkpoint has now been reached through `npm run tauri dev`: the desktop window opened and both Claude and Codex reached `ready`.
-- The raw packaged `.exe` path still needs a dedicated release-path investigation because it has shown inconsistent startup behavior versus the dev launcher.
+- Direct desktop validation has also been re-confirmed through `target/release/cli-master-wrapper-desktop.exe`.
+- Browser/Vite sessions remain useful for visual QA only; they are not runtime-valid because the Tauri `invoke` bridge is absent there.
 
 ## 8. Fallback decision
 
@@ -72,7 +73,6 @@
 
 ## 9. Unresolved blockers
 
-- Release-path startup is still inconsistent compared with the dev launcher.
 - Resume/reattach semantics for Claude and Codex are not implemented yet.
 - The current UI only covers the main room workflow, not settings/main menu depth.
 - Routed-message submit is improved but not fully hardened:
@@ -148,6 +148,17 @@
     - implemented
     - live-tested
     - still awaiting manual desktop validation
+- Final copy-behavior evidence from the release build:
+  - `Ctrl+Shift+C` works in the Claude and Codex panes on the real desktop app
+  - `Ctrl+Shift+V` remains the terminal paste path and `Alt+V` remains untouched for screenshots
+  - `Ctrl+C` over DOM text such as the control-plane path copies the DOM selection through the normal browser/OS path
+  - `Ctrl+Shift+C` is still terminal-specific and can prefer a stale `xterm` selection over a DOM selection
+  - system-log copy is not yet implemented safely and should not be merged into the shared copy path until precedence is explicit
+- Safe copy-design rule for the next slice:
+  - `DOM` text selection wins first
+  - if there is no `DOM` selection, use the last-active `xterm` surface with a live selection
+  - only after that should optional system-log `xterm` copy be added
+  - do not refactor the working Claude/Codex copy path into a single global resolver without tests for surface precedence
 
 ## 10. Go / no-go recommendation
 
