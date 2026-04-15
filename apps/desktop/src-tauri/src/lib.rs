@@ -196,12 +196,32 @@ fn resize_session(
 }
 
 fn resolve_project_root() -> Result<PathBuf, String> {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let canonical = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
         .join("..")
         .canonicalize()
-        .map_err(|error| format!("failed to resolve project root: {error}"))
+        .map_err(|error| format!("failed to resolve project root: {error}"))?;
+
+    Ok(normalize_path_for_child_processes(canonical))
+}
+
+fn normalize_path_for_child_processes(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        const VERBATIM_PREFIX: &str = r"\\?\";
+        const VERBATIM_UNC_PREFIX: &str = r"\\?\UNC\";
+
+        let path_text = path.to_string_lossy();
+        if let Some(rest) = path_text.strip_prefix(VERBATIM_UNC_PREFIX) {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = path_text.strip_prefix(VERBATIM_PREFIX) {
+            return PathBuf::from(rest);
+        }
+    }
+
+    path
 }
 
 fn install_panic_hook(diagnostics: DesktopDiagnostics) {
@@ -420,7 +440,10 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{sanitize_terminal_output_for_ui, strip_osc_sequences};
+    use super::{
+        normalize_path_for_child_processes, sanitize_terminal_output_for_ui, strip_osc_sequences,
+    };
+    use std::path::PathBuf;
 
     #[test]
     fn strip_osc_sequences_removes_bell_terminated_title_updates() {
@@ -440,6 +463,39 @@ mod tests {
         assert_eq!(
             sanitize_terminal_output_for_ui(input),
             "\x1b[31mwarn\x1b[0m"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalize_path_for_child_processes_strips_verbatim_drive_prefix() {
+        let path = PathBuf::from(r"\\?\.");
+
+        assert_eq!(
+            normalize_path_for_child_processes(path),
+            PathBuf::from(r".")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalize_path_for_child_processes_strips_verbatim_unc_prefix() {
+        let path = PathBuf::from(r"\\?\UNC\server\share\CLI-master-wrapper");
+
+        assert_eq!(
+            normalize_path_for_child_processes(path),
+            PathBuf::from(r"\\server\share\CLI-master-wrapper")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn normalize_path_for_child_processes_leaves_non_windows_paths_unchanged() {
+        let path = PathBuf::from("/workspace/cli-master-wrapper");
+
+        assert_eq!(
+            normalize_path_for_child_processes(path.clone()),
+            PathBuf::from("/workspace/cli-master-wrapper")
         );
     }
 }
