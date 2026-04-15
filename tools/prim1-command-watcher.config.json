@@ -15,7 +15,7 @@
     },
     "context": {
       "completion_markers": [
-        "Context Usage"
+        "Autocompact buffer"
       ],
       "continue_template": "Your context usage: {captured_text}. Continue with the task."
     },

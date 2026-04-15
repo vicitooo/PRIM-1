@@ -129,11 +129,79 @@ class WatcherEngineTests(unittest.TestCase):
             self.base + timedelta(seconds=1),
         )
         actions = self.engine.observe_event(
-            {"event": "session_output", "session": "claude", "chunk": "Context Usage 55% tokens"},
+            {
+                "event": "session_output",
+                "session": "claude",
+                "chunk": "Context Usage 55% tokens Autocompact buffer: 33k tokens (3.3%)",
+            },
             self.base + timedelta(seconds=2),
         )
         self.assertEqual(len(actions), 1)
-        self.assertIn("Context Usage 55% tokens", actions[0].message)
+        self.assertIn("Autocompact buffer", actions[0].message)
+
+    def test_context_does_not_arm_completion_on_slash_menu_description(self) -> None:
+        """Regression for Finding 17: the /context menu description contains
+        'current context usage' as a substring. The old 'Context Usage' marker
+        was case-insensitive substring-matched and falsely fired on the menu
+        text rendered while the user was typing /context before Enter."""
+        self.engine.observe_event(
+            {"event": "session_state", "session": "claude", "state": "busy", "reason": "input forwarded"},
+            self.base,
+        )
+        self.engine.observe_event(
+            {"event": "session_output", "session": "claude", "chunk": "/context"},
+            self.base + timedelta(seconds=1),
+        )
+        menu_chunk = (
+            "/context /context Visualize current context usage as a colored grid "
+            "/clear Start fresh /compact Clear conversation history but keep a summary in context "
+            "/model Set the AI model for Claude Code"
+        )
+        actions = self.engine.observe_event(
+            {"event": "session_output", "session": "claude", "chunk": menu_chunk},
+            self.base + timedelta(seconds=2),
+        )
+        self.assertEqual(
+            actions,
+            [],
+            "Menu description containing 'current context usage' must not fire the watcher",
+        )
+        self.assertEqual(self.engine.session_state("claude").mode, "armed")
+
+    def test_captured_text_tail_truncation_preserves_result_not_head_noise(self) -> None:
+        """Regression for Finding 17 tail-truncation fix: when captured_chunks
+        accumulate long head noise (e.g. slash-command menu render) followed
+        by the real command result (tail, containing the completion marker),
+        tail-truncation must include the marker in the captured text. Under
+        the old head-truncation, the first 400 chars were pure noise and the
+        marker phrase never made it into the dispatch message."""
+        limit = self.config.captured_text_limit_chars
+        head_noise = "/context " + ("menu-echo-noise " * ((limit // 16) + 5))
+        tail_result = "Context Usage 44k/1m tokens (4%) Autocompact buffer: 33k"
+        # Head noise alone exceeds the truncation window, so head-truncation
+        # would NEVER include 'Autocompact buffer' in its captured_text.
+        self.assertGreater(len(head_noise), limit)
+
+        self.engine.observe_event(
+            {"event": "session_state", "session": "claude", "state": "busy", "reason": "input forwarded"},
+            self.base,
+        )
+        self.engine.observe_event(
+            {"event": "session_output", "session": "claude", "chunk": "/context"},
+            self.base + timedelta(seconds=1),
+        )
+        self.engine.observe_event(
+            {"event": "session_output", "session": "claude", "chunk": head_noise},
+            self.base + timedelta(seconds=2),
+        )
+        actions = self.engine.observe_event(
+            {"event": "session_output", "session": "claude", "chunk": tail_result},
+            self.base + timedelta(seconds=3),
+        )
+        self.assertEqual(len(actions), 1)
+        # The decisive assertion: tail-truncation MUST include the marker
+        # phrase. Head-truncation would NOT.
+        self.assertIn("Autocompact buffer", actions[0].message)
 
     def test_rate_limit_suppresses_rapid_repeat_dispatches(self) -> None:
         state = self.engine.session_state("claude")
