@@ -46,8 +46,7 @@
     },
     "skills": {
       "completion_markers": [
-        "Use /skills",
-        "Skills"
+        "Choose an action"
       ],
       "continue_template": "Command complete. Continue with the task."
     }

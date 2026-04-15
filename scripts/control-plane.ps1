@@ -191,3 +191,8 @@ if ($Quiet) {
 }
 
 $parsed | ConvertTo-Json -Depth 8
+
+if (-not $parsed.ok) {
+  exit 1
+}
+exit 0

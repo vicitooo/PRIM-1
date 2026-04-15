@@ -35,9 +35,9 @@ function Convert-ToWrapperRelativePath {
   $normalizedRoot = [System.IO.Path]::GetFullPath($wrapperRoot)
 
   if ($normalizedAbsolute.StartsWith($normalizedRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
-    $suffix = $normalizedAbsolute.Substring($normalizedRoot.Length).TrimStart('\')
+    $suffix = ($normalizedAbsolute.Substring($normalizedRoot.Length).TrimStart('\') -replace '\\', '/')
     if ($suffix) {
-      return ($suffix -replace '\\', '/').Insert(0, '.')
+      return "./" + $suffix
     }
   }
 

@@ -55,7 +55,7 @@ DEFAULT_CONFIG = {
             "continue_template": "Command complete. Continue with the task.",
         },
         "skills": {
-            "completion_markers": ["Use /skills", "Skills"],
+            "completion_markers": ["Choose an action"],
             "continue_template": "Command complete. Continue with the task.",
         },
     },
