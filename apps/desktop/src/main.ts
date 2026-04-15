@@ -4,6 +4,11 @@ import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 
+import {
+  resolveCopySelection,
+  shouldWarnUnsupportedSystemSelection,
+  type CopySurface,
+} from "./copy-selection";
 import "./styles.css";
 import type {
   RouteMessageRequest,
@@ -192,9 +197,11 @@ class SessionTerminal {
     this.fitAddon.fit();
     this.host.addEventListener("focusin", () => {
       activeTerminalName = this.name;
+      activeCopySurface = this.name;
     });
     this.host.addEventListener("mousedown", () => {
       activeTerminalName = this.name;
+      activeCopySurface = this.name;
     });
     this.banner();
   }
@@ -290,14 +297,22 @@ const systemTerminal = new Terminal({
 });
 const systemFit = new FitAddon();
 systemTerminal.loadAddon(systemFit);
-systemTerminal.open(must<HTMLDivElement>("#system-terminal"));
+const systemTerminalHost = must<HTMLDivElement>("#system-terminal");
+systemTerminal.open(systemTerminalHost);
 systemFit.fit();
+systemTerminalHost.addEventListener("focusin", () => {
+  activeCopySurface = "system";
+});
+systemTerminalHost.addEventListener("mousedown", () => {
+  activeCopySurface = "system";
+});
 
 const snapshotByName = new Map<string, SessionSnapshot>();
 const controlEndpoint = must<HTMLElement>("#control-endpoint");
 const auditPath = must<HTMLElement>("#audit-path");
 const runtimePath = must<HTMLElement>("#runtime-path");
 let activeTerminalName: (typeof SESSION_NAMES)[number] | null = null;
+let activeCopySurface: CopySurface = null;
 
 wireButtons();
 wireRouter();
@@ -501,22 +516,45 @@ function wireTerminalShortcuts(): void {
 
     const key = event.key.toLowerCase();
     if (key === "c") {
-      const pane = activeTerminalSelectionPane();
-      if (!pane) {
+      const selection = resolveCopySelection({
+        domSelection: activeNonTerminalDomSelectionText(),
+        lastActiveSession: activeTerminalName,
+        terminalSelections: {
+          claude: paneMap.get("claude")?.terminal.getSelection() ?? null,
+          codex: paneMap.get("codex")?.terminal.getSelection() ?? null,
+        },
+      });
+      if (shouldWarnUnsupportedSystemSelection({
+        systemSelection: systemTerminal.getSelection(),
+        activeSurface: activeCopySurface,
+        resolvedSelection: selection,
+      })) {
+        event.preventDefault();
+        writeSystem("warn", "System log copy is not wired into Ctrl+Shift+C yet.");
         return;
       }
-
-      const selection = pane.terminal.getSelection();
       if (!selection) {
         return;
       }
 
       event.preventDefault();
       void navigator.clipboard
-        .writeText(selection)
-        .then(() => writeSystem("info", `${SESSION_LABELS[pane.name]} selection copied`))
+        .writeText(selection.text)
+        .then(() =>
+          writeSystem(
+            "info",
+            selection.kind === "dom"
+              ? "DOM selection copied"
+              : `${SESSION_LABELS[selection.session]} selection copied`,
+          ),
+        )
         .catch((error) =>
-          writeSystem("error", `copy failed for ${SESSION_LABELS[pane.name]}: ${String(error)}`),
+          writeSystem(
+            "error",
+            selection.kind === "dom"
+              ? `copy failed for DOM selection: ${String(error)}`
+              : `copy failed for ${SESSION_LABELS[selection.session]}: ${String(error)}`,
+          ),
         );
       return;
     }
@@ -564,20 +602,58 @@ function activeTerminal(): SessionTerminal | null {
   return activeTerminalName ? paneMap.get(activeTerminalName) ?? null : null;
 }
 
-function activeTerminalSelectionPane(): SessionTerminal | null {
-  const activePane = activeTerminal();
-  if (activePane?.terminal.getSelection()) {
-    return activePane;
+function activeNonTerminalDomSelectionText(): string | null {
+  return activeEditableSelectionText() ?? activeDocumentSelectionText();
+}
+
+function activeEditableSelectionText(): string | null {
+  const activeElement = document.activeElement;
+  if (activeElement instanceof HTMLTextAreaElement) {
+    return selectedEditableText(activeElement.value, activeElement.selectionStart, activeElement.selectionEnd);
   }
 
-  for (const pane of paneMap.values()) {
-    if (pane.terminal.getSelection()) {
-      activeTerminalName = pane.name;
-      return pane;
-    }
+  if (activeElement instanceof HTMLInputElement) {
+    return selectedEditableText(activeElement.value, activeElement.selectionStart, activeElement.selectionEnd);
   }
 
-  return activePane;
+  return null;
+}
+
+function selectedEditableText(
+  value: string,
+  start: number | null,
+  end: number | null,
+): string | null {
+  if (start == null || end == null || start === end) {
+    return null;
+  }
+
+  const selected = value.slice(start, end);
+  return selected.length > 0 ? selected : null;
+}
+
+function activeDocumentSelectionText(): string | null {
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
+    return null;
+  }
+
+  const range = selection.getRangeAt(0);
+  if (nodeInsideTerminalSurface(range.commonAncestorContainer)) {
+    return null;
+  }
+
+  const selected = selection.toString();
+  return selected.length > 0 ? selected : null;
+}
+
+function nodeInsideTerminalSurface(node: Node | null): boolean {
+  const element = node instanceof Element ? node : node?.parentElement;
+  if (!element) {
+    return false;
+  }
+
+  return Boolean(element.closest("[data-terminal], #system-terminal"));
 }
 
 function activeTerminalOwnsFocus(pane: SessionTerminal): boolean {
