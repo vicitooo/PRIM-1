@@ -21,6 +21,8 @@ Scripts should wrap the control plane, not bypass the supervisor.
   - `stop`
   - `restart`
   - `input`
+    - inline `-Content`
+    - file-based `-ContentFile`
   - `key`
   - `route`
   - optional `-Quiet` mode for agent-friendly success/error output
@@ -29,6 +31,7 @@ Example:
 
 ```powershell
 .\scripts\control-plane.ps1 -Action route -From victor -To claude -Scope direct -Content "Review the Codex pane."
+.\scripts\control-plane.ps1 -Action input -Session claude -ContentFile ".runtime\compact-prompts\compact-full.txt"
 ```
 
 - `agent-route.ps1`
@@ -65,4 +68,14 @@ Example:
 ```powershell
 .\scripts\agent-key.ps1 -Session claude -Key enter
 .\scripts\agent-key.ps1 -Session codex -Key down
+```
+
+- `agent-slash.ps1`
+  Minimal helper for slash commands that may take their arguments from a file, without shell-quoting the payload.
+
+Example:
+
+```powershell
+.\scripts\agent-slash.ps1 -Session claude -Slash compact -ArgsFile ".runtime\compact-prompts\compact-args.txt"
+.\scripts\agent-key.ps1 -Session claude -Key enter
 ```

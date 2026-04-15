@@ -78,6 +78,7 @@ Canonical examples:
 powershell -Command "& '.\scripts\control-plane.ps1' -Action list"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action start -Session claude"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action input -Session codex -Content 'hi'"
+powershell -Command "& '.\scripts\control-plane.ps1' -Action input -Session claude -ContentFile 'D:\tmp\compact.txt'"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action key -Session claude -Key enter"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action route -From victor -To room -Scope room -Content 'status ping'"
 ```
@@ -92,6 +93,11 @@ Behavior:
   - otherwise the helper falls back to `.runtime/control-plane.json`
 - `-Quiet` prints only the success/error message for agent-friendly use
 - `-Action input` injects raw text only; it does **not** press Enter for you
+- `-Action input` now accepts either:
+  - `-Content '<inline text>'`
+  - `-ContentFile '<path to UTF-8 text file>'`
+- `-Content` and `-ContentFile` are mutually exclusive
+- `-ContentFile` is only supported for `-Action input`
 - if you need a typed prompt to execute, follow `-Action input` with `-Action key -Key enter`
 - pane-bound credentials now live at:
   - `.runtime/control-plane-claude.json`
@@ -153,6 +159,15 @@ powershell -Command "& '.\scripts\agent-key.ps1' -Session claude -Key enter"
 powershell -Command "& '.\scripts\agent-key.ps1' -Session codex -Key down"
 ```
 
+### `scripts/agent-slash.ps1`
+
+Helper for slash commands where the command name is stable but the arguments may come from a file.
+
+```bash
+powershell -Command "& '.\scripts\agent-slash.ps1' -Session claude -Slash compact -ArgsFile 'D:\tmp\compact-args.txt'"
+powershell -Command "& '.\scripts\agent-key.ps1' -Session claude -Key enter"
+```
+
 ## 6. What agent-side terminal sessions can control today
 
 Supervised `claude` and `codex` panes now start from `<workspace>/`.
@@ -169,6 +184,7 @@ From inside Claude/Codex, an agent can call the helper scripts to:
 - stop a session
 - restart a session
 - send raw input to a session
+- send raw input from a content file without shell-quoting the payload
 - send PTY control keys to a session
 - route a direct message
 - route a room message

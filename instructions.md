@@ -51,6 +51,29 @@ Rules:
 - **Do not embed newlines** in `-Content`. Codex will flatten whitespace anyway; Claude tolerates newlines but it's noisier. Keep messages single-line.
 - **Do not call `control-plane.ps1` directly** for routing. Use `agent-route.ps1` — it's the hardened wrapper that the supervisor expects.
 
+### Slash-command payloads with quotes, dollars, or Windows paths
+
+If you need to inject a slash command whose payload is awkward to quote safely, write the payload body to a file first and let the control-plane helper read it directly.
+
+Examples:
+
+```bash
+# Full command already assembled in the file
+powershell -Command "& './scripts/control-plane.ps1' -Action input -Session claude -ContentFile './.runtime/compact-prompts/compact-full.txt'"
+powershell -Command "& './scripts/agent-key.ps1' -Session claude -Key enter"
+
+# Only the slash-command arguments live in the file
+powershell -Command "& './scripts/agent-slash.ps1' -Session claude -Slash compact -ArgsFile './.runtime/compact-prompts/compact-args.txt'"
+powershell -Command "& './scripts/agent-key.ps1' -Session claude -Key enter"
+```
+
+Rules:
+
+- `-ContentFile` is only for `control-plane.ps1 -Action input`
+- `-Content` and `-ContentFile` are mutually exclusive
+- `agent-slash.ps1` only injects the slash command; it does **not** submit it for you
+- write the content files as UTF-8 with no BOM when you control the writer
+
 ## 2. Claude's role (initiator)
 
 When Victor says "run the handshake test":

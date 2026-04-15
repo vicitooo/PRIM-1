@@ -11,6 +11,7 @@ param(
   [ValidateSet("direct", "room", "system", "private")]
   [string]$Scope = "direct",
   [string]$Content,
+  [string]$ContentFile,
   [string]$InfoFile,
   [switch]$Quiet
 )
@@ -48,6 +49,40 @@ function Invoke-MailboxFallback {
   }
 
   throw "No response received from sideband mailbox."
+}
+
+function Resolve-InputContent {
+  param(
+    [string]$InlineContent,
+    [string]$ContentFilePath
+  )
+
+  if ($InlineContent -and $ContentFilePath) {
+    throw "input accepts either -Content or -ContentFile, not both"
+  }
+
+  if (-not $ContentFilePath) {
+    return $InlineContent
+  }
+
+  $resolvedContentFile = $null
+  try {
+    $resolvedContentFile = (Resolve-Path -LiteralPath $ContentFilePath -ErrorAction Stop).Path
+  } catch {
+    throw "failed to resolve -ContentFile '$ContentFilePath'"
+  }
+
+  try {
+    return Get-Content -LiteralPath $resolvedContentFile -Raw -ErrorAction Stop
+  } catch {
+    throw "failed to read -ContentFile '$resolvedContentFile': $($_.Exception.Message)"
+  }
+}
+
+if ($Action -eq "input") {
+  $Content = Resolve-InputContent -InlineContent $Content -ContentFilePath $ContentFile
+} elseif ($ContentFile) {
+  throw "-ContentFile is only supported for -Action input"
 }
 
 if (-not $InfoFile -and $env:PRIM1_PANE_CREDENTIALS -and (Test-Path -LiteralPath $env:PRIM1_PANE_CREDENTIALS)) {
@@ -92,7 +127,7 @@ $payload = switch ($Action) {
   }
   "input" {
     if (-not $Session) { throw "input requires -Session" }
-    if (-not $Content) { throw "input requires -Content" }
+    if ([string]::IsNullOrEmpty($Content)) { throw "input requires -Content or -ContentFile" }
     @{ kind = "send_input"; token = $info.token; name = $Session; input = $Content }
   }
   "key" {

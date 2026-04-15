@@ -9,5 +9,13 @@ Expected v1 test mix:
 - opt-in real Claude/Codex tests
 - explicit stall/restart tests using controlled fixtures
 
-The detailed strategy should be locked during Phase 0.
+Current script-level coverage:
 
+- `tests/control-plane-content-file.ps1`
+  - validates `scripts/control-plane.ps1 -ContentFile`
+  - checks mutual exclusion with `-Content`
+  - checks missing-file failure
+  - checks non-`input` action rejection
+  - captures the mailbox fallback payload and asserts the exact string survives shell-hostile characters
+
+The detailed strategy should be locked during Phase 0.
