@@ -3,6 +3,19 @@
 **Status:** First MVP implemented
 **Date:** 2026-04-15
 
+## Last Known Good CLI Versions
+
+Recorded from Victor's machine on 2026-04-15 during the first successful live handshake:
+
+- `Claude Code 2.1.109`
+- `codex-cli 0.120.0`
+
+Important operational warning:
+
+- if either CLI is upgraded later, wrapper regressions may come from upstream CLI changes rather than wrapper code changes
+- future QA should always record wrapper commit + Claude version + Codex version together
+- detailed version and bug tracking now lives in `qa/MASTER.md`
+
 ## Current MVP
 
 The project is no longer docs-only. The first version now exists and includes:
