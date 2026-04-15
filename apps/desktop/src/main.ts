@@ -499,14 +499,14 @@ function wireTerminalShortcuts(): void {
       return;
     }
 
-    const activePane = activeTerminal();
-    if (!activePane) {
-      return;
-    }
-
     const key = event.key.toLowerCase();
     if (key === "c") {
-      const selection = activePane.terminal.getSelection();
+      const pane = activeTerminalSelectionPane();
+      if (!pane) {
+        return;
+      }
+
+      const selection = pane.terminal.getSelection();
       if (!selection) {
         return;
       }
@@ -514,10 +514,15 @@ function wireTerminalShortcuts(): void {
       event.preventDefault();
       void navigator.clipboard
         .writeText(selection)
-        .then(() => writeSystem("info", `${SESSION_LABELS[activePane.name]} selection copied`))
+        .then(() => writeSystem("info", `${SESSION_LABELS[pane.name]} selection copied`))
         .catch((error) =>
-          writeSystem("error", `copy failed for ${SESSION_LABELS[activePane.name]}: ${String(error)}`),
+          writeSystem("error", `copy failed for ${SESSION_LABELS[pane.name]}: ${String(error)}`),
         );
+      return;
+    }
+
+    const activePane = activeTerminal();
+    if (!activePane) {
       return;
     }
 
@@ -557,6 +562,22 @@ async function pasteClipboardIntoTerminal(pane: SessionTerminal): Promise<void> 
 
 function activeTerminal(): SessionTerminal | null {
   return activeTerminalName ? paneMap.get(activeTerminalName) ?? null : null;
+}
+
+function activeTerminalSelectionPane(): SessionTerminal | null {
+  const activePane = activeTerminal();
+  if (activePane?.terminal.getSelection()) {
+    return activePane;
+  }
+
+  for (const pane of paneMap.values()) {
+    if (pane.terminal.getSelection()) {
+      activeTerminalName = pane.name;
+      return pane;
+    }
+  }
+
+  return activePane;
 }
 
 function activeTerminalOwnsFocus(pane: SessionTerminal): boolean {

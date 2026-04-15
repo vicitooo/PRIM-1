@@ -34,11 +34,12 @@
 - Supported actions in the first version:
   - `ping`
   - `list`
-  - `start`
-  - `stop`
-  - `restart`
-  - `input`
-  - `route`
+- `start`
+- `stop`
+- `restart`
+- `input`
+- `key`
+- `route`
 
 ## 6. Audit log decision
 
@@ -134,6 +135,19 @@
   - canonical docs now explicitly distinguish:
     - current Claude/Codex product reality
     - future generic-terminal product direction
+- Current execution priority after that documentation pass:
+  - stay on current-product polish only
+  - treat autonomous controls as top priority for continued development
+  - document the usable control surface together with:
+    - logs
+    - screenshot-assisted validation
+    - agent-facing helper scripts
+- Active polish slice after that priority reset:
+  - finish the sideband `key` action and the `agent-key.ps1` helper
+  - update the docs so they distinguish clearly between:
+    - implemented
+    - live-tested
+    - still awaiting manual desktop validation
 
 ## 10. Go / no-go recommendation
 

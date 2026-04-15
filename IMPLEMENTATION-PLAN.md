@@ -41,11 +41,12 @@ If those eight work reliably, the foundation is real.
 
 After the first real Windows sessions, the near-term order is now:
 
-1. finish Claude/Codex collaboration polish
-2. capture an architecture review of strengths, weak spots, modularity, and portability
-3. only then widen the surface toward generic terminals and dynamic workspaces
+1. finish the autonomous control surface needed for local agent-driven operation
+2. finish Claude/Codex collaboration polish on top of that control surface
+3. keep the evidence loop explicit: logs plus UI or screenshot confirmation
+4. only then widen the surface toward generic terminals and dynamic workspaces
 
-That prevents the project from pretending to be a universal wrapper before the current proof is stable.
+The architecture review is already written. The current work is polish and hardening, not new product scope.
 
 ## Phase 0 — Research and validation
 

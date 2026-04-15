@@ -32,6 +32,7 @@ These shortcuts are for the focused terminal pane.
 
 - `Ctrl+Shift+C`
   - copies the current xterm selection
+  - implementation is in place, but live desktop re-validation is still pending
 - `Ctrl+Shift+V`
   - pastes clipboard text into the focused running pane
 - `Alt+V`
@@ -56,6 +57,7 @@ Supported actions:
 - `stop`
 - `restart`
 - `input`
+- `key`
 - `route`
 
 Examples:
@@ -64,6 +66,7 @@ Examples:
 powershell -ExecutionPolicy Bypass -File .\scripts\control-plane.ps1 -Action list
 powershell -ExecutionPolicy Bypass -File .\scripts\control-plane.ps1 -Action start -Session claude
 powershell -ExecutionPolicy Bypass -File .\scripts\control-plane.ps1 -Action input -Session codex -Content "hi"
+powershell -ExecutionPolicy Bypass -File .\scripts\control-plane.ps1 -Action key -Session claude -Key enter
 powershell -ExecutionPolicy Bypass -File .\scripts\control-plane.ps1 -Action route -From victor -To room -Scope room -Content "status ping"
 ```
 
@@ -91,6 +94,15 @@ Token-based smoke-test helper.
 powershell -ExecutionPolicy Bypass -File .\scripts\agent-ping.ps1 -From claude -To codex -Token CODEX_ACK
 ```
 
+### `scripts/agent-key.ps1`
+
+Minimal helper for PTY control keys such as Enter, arrows, Tab, Esc, and `Ctrl+C`.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\agent-key.ps1 -Session claude -Key enter
+powershell -ExecutionPolicy Bypass -File .\scripts\agent-key.ps1 -Session codex -Key down
+```
+
 ## 5. What agent-side terminal sessions can control today
 
 From inside Claude/Codex, an agent can call the helper scripts to:
@@ -100,12 +112,24 @@ From inside Claude/Codex, an agent can call the helper scripts to:
 - stop a session
 - restart a session
 - send raw input to a session
+- send PTY control keys to a session
 - route a direct message
 - route a room message
 - ping another agent with a tokenized smoke test
 
-## 6. Current limits
+## 6. Autonomous validation loop
 
-- no dedicated sideband action yet for arrow keys / tab / esc / ctrl+c
+Current rule for proving behavior:
+
+- use runtime evidence from `.runtime/audit/` or `.runtime/desktop-events.jsonl`
+- use UI evidence from the live window or a screenshot capture
+- only mark the interaction as working when both sources agree
+
+For desktop-only visuals, the current screenshot capture path is:
+
+- `<workspace>/tools/screenshot/screenshot.py`
+
+## 7. Current limits
+
 - no OS-dialog control outside the PTY
 - no external connector yet for Telegram or remote clients

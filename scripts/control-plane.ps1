@@ -1,9 +1,11 @@
 param(
   [Parameter(Mandatory = $true)]
-  [ValidateSet("ping", "list", "start", "stop", "restart", "input", "route")]
+  [ValidateSet("ping", "list", "start", "stop", "restart", "input", "key", "route")]
   [string]$Action,
 
   [string]$Session,
+  [ValidateSet("enter", "up", "down", "left", "right", "tab", "esc", "ctrl_c")]
+  [string]$Key,
   [string]$From = "victor",
   [string]$To,
   [ValidateSet("direct", "room", "system", "private")]
@@ -88,6 +90,11 @@ $payload = switch ($Action) {
     if (-not $Session) { throw "input requires -Session" }
     if (-not $Content) { throw "input requires -Content" }
     @{ kind = "send_input"; token = $info.token; name = $Session; input = $Content }
+  }
+  "key" {
+    if (-not $Session) { throw "key requires -Session" }
+    if (-not $Key) { throw "key requires -Key" }
+    @{ kind = "send_key"; token = $info.token; name = $Session; key = $Key }
   }
   "route" {
     if (-not $To) { throw "route requires -To" }

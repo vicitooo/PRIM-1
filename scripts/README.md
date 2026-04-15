@@ -21,6 +21,7 @@ Scripts should wrap the control plane, not bypass the supervisor.
   - `stop`
   - `restart`
   - `input`
+  - `key`
   - `route`
   - optional `-Quiet` mode for agent-friendly success/error output
 
@@ -46,4 +47,22 @@ Example:
 
 ```powershell
 .\scripts\agent-ping.ps1 -From codex -To claude -Token CLAUDE_ACK
+```
+
+- `agent-key.ps1`
+  Minimal helper for PTY control keys routed through the supervisor. Supports:
+  - `enter`
+  - `up`
+  - `down`
+  - `left`
+  - `right`
+  - `tab`
+  - `esc`
+  - `ctrl_c`
+
+Example:
+
+```powershell
+.\scripts\agent-key.ps1 -Session claude -Key enter
+.\scripts\agent-key.ps1 -Session codex -Key down
 ```

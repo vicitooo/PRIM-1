@@ -28,10 +28,7 @@ pub fn launch_spec(definition: &SessionDefinition) -> LaunchSpec {
         )
     } else {
         (
-            definition
-                .command
-                .clone()
-                .unwrap_or_else(|| "codex".into()),
+            definition.command.clone().unwrap_or_else(|| "codex".into()),
             vec![
                 "--no-alt-screen".into(),
                 "-C".into(),

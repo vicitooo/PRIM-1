@@ -1,7 +1,7 @@
 # CLI-master-wrapper
 
 **Status:** First MVP implemented
-**Date:** 2026-04-14
+**Date:** 2026-04-15
 
 ## Current MVP
 
@@ -12,7 +12,8 @@ The project is no longer docs-only. The first version now exists and includes:
 - xterm.js panes for Claude, Codex, and the system log
 - a named-pipe control plane on Windows
 - JSONL audit logging under `.runtime/audit/`
-- a PowerShell helper at `scripts/control-plane.ps1`
+- desktop crash/startup diagnostics in `.runtime/desktop-events.jsonl`
+- PowerShell helpers under `scripts/`
 - an explicit control-surface reference at `CONTROL-SURFACE.md`
 - release outputs under `target/release/`
 
@@ -23,11 +24,19 @@ Current verified commands:
 - `cd apps/desktop && npm run build`
 - `cd apps/desktop && npm run tauri build`
 
-Current verified operator shortcuts:
+Current operator shortcut status:
 
-- `Ctrl+Shift+C` copies the current terminal selection in the focused pane
-- `Ctrl+Shift+V` pastes clipboard text into the focused running pane
+- `Ctrl+Shift+C` copy support is implemented for the active terminal pane, but live desktop re-validation is still pending
+- `Ctrl+Shift+V` paste into the focused running pane is implemented and already live-tested
 - `Alt+V` remains reserved for screenshots
+
+Current autonomous control surface:
+
+- `scripts/control-plane.ps1` exposes `ping`, `list`, `start`, `stop`, `restart`, `input`, `key`, and `route`
+- `scripts/agent-route.ps1`, `scripts/agent-ping.ps1`, and `scripts/agent-key.ps1` give agents a quieter wrapper over the control plane
+- runtime evidence lives in `.runtime/audit/` and `.runtime/desktop-events.jsonl`
+- desktop UI validation can be captured with `<workspace>/tools/screenshot/screenshot.py`
+- no interaction is considered proven from logs alone or screenshots alone; both sources need to agree
 
 Known limitation in this shell-hosted environment:
 
@@ -114,6 +123,12 @@ Supported communication modes:
 - Codex -> room
 
 All routed messages should be visibly stamped in the target terminal and logged by the supervisor.
+
+The current polish priority is narrower than the long-term roadmap:
+
+- make the Claude/Codex room reliable
+- make the wrapper controllable by local helper scripts without manual intervention
+- keep that control surface explicit in docs so autonomous debugging stays grounded in real evidence
 
 ## Clarified scope after the first live sessions
 

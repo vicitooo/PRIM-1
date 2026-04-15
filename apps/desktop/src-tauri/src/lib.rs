@@ -4,8 +4,8 @@ use std::{
     io::Write,
     panic,
     path::{Path, PathBuf},
-    sync::mpsc,
     sync::Arc,
+    sync::mpsc,
     thread,
     time::Duration,
 };
@@ -74,9 +74,11 @@ fn start_session(
     state: State<'_, DesktopState>,
     request: StartSessionRequest,
 ) -> Result<SessionSnapshot, String> {
-    state
-        .diagnostics
-        .log("info", "start_session", format!("requested {}", request.name));
+    state.diagnostics.log(
+        "info",
+        "start_session",
+        format!("requested {}", request.name),
+    );
     state
         .supervisor
         .start_session(&request.name)
@@ -95,9 +97,11 @@ fn stop_session(
     state: State<'_, DesktopState>,
     request: StopSessionRequest,
 ) -> Result<SessionSnapshot, String> {
-    state
-        .diagnostics
-        .log("info", "stop_session", format!("requested {}", request.name));
+    state.diagnostics.log(
+        "info",
+        "stop_session",
+        format!("requested {}", request.name),
+    );
     state
         .supervisor
         .stop_session(&request.name)
@@ -116,9 +120,11 @@ fn restart_session(
     state: State<'_, DesktopState>,
     request: RestartSessionRequest,
 ) -> Result<SessionSnapshot, String> {
-    state
-        .diagnostics
-        .log("info", "restart_session", format!("requested {}", request.name));
+    state.diagnostics.log(
+        "info",
+        "restart_session",
+        format!("requested {}", request.name),
+    );
     state
         .supervisor
         .restart_session(&request.name)
@@ -137,15 +143,12 @@ fn send_input(
     state: State<'_, DesktopState>,
     request: SendInputRequest,
 ) -> Result<SessionSnapshot, String> {
-    state
-        .supervisor
-        .send_input(request)
-        .map_err(|error| {
-            state
-                .diagnostics
-                .log("error", "send_input_failed", error.to_string());
-            error.to_string()
-        })
+    state.supervisor.send_input(request).map_err(|error| {
+        state
+            .diagnostics
+            .log("error", "send_input_failed", error.to_string());
+        error.to_string()
+    })
 }
 
 #[tauri::command]
@@ -164,15 +167,12 @@ fn route_message(
             request.content.len()
         ),
     );
-    state
-        .supervisor
-        .route_message(request)
-        .map_err(|error| {
-            state
-                .diagnostics
-                .log("error", "route_message_failed", error.to_string());
-            error.to_string()
-        })
+    state.supervisor.route_message(request).map_err(|error| {
+        state
+            .diagnostics
+            .log("error", "route_message_failed", error.to_string());
+        error.to_string()
+    })
 }
 
 #[tauri::command]
@@ -347,10 +347,7 @@ fn strip_osc_sequences(input: &str) -> String {
                     index += 1;
                     break;
                 }
-                if bytes[index] == 0x1b
-                    && index + 1 < bytes.len()
-                    && bytes[index + 1] == b'\\'
-                {
+                if bytes[index] == 0x1b && index + 1 < bytes.len() && bytes[index + 1] == b'\\' {
                     index += 2;
                     break;
                 }
@@ -370,7 +367,8 @@ fn strip_osc_sequences(input: &str) -> String {
 pub fn run() {
     let project_root = resolve_project_root().expect("failed to resolve project root");
     let runtime_dir = project_root.join(".runtime");
-    let diagnostics = DesktopDiagnostics::new(&runtime_dir).expect("failed to initialize diagnostics");
+    let diagnostics =
+        DesktopDiagnostics::new(&runtime_dir).expect("failed to initialize diagnostics");
     install_panic_hook(diagnostics.clone());
     diagnostics.log("info", "process_start", "desktop process booting");
     let setup_diagnostics = diagnostics.clone();
@@ -380,8 +378,11 @@ pub fn run() {
     tauri::Builder::default()
         .setup(move |app| {
             setup_diagnostics.log("info", "tauri_setup", "starting setup");
-            let supervisor =
-                init_supervisor(&app.handle(), setup_project_root.clone(), &setup_diagnostics)?;
+            let supervisor = init_supervisor(
+                &app.handle(),
+                setup_project_root.clone(),
+                &setup_diagnostics,
+            )?;
             app.manage(DesktopState {
                 supervisor,
                 diagnostics: setup_diagnostics.clone(),
@@ -406,7 +407,11 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|error| {
-            exit_diagnostics.log("error", "process_exit", format!("tauri run failed: {error}"));
+            exit_diagnostics.log(
+                "error",
+                "process_exit",
+                format!("tauri run failed: {error}"),
+            );
             panic!("error while running tauri application: {error}");
         });
 
@@ -432,6 +437,9 @@ mod tests {
     #[test]
     fn sanitize_terminal_output_for_ui_keeps_non_osc_content() {
         let input = "\x1b[31mwarn\x1b[0m\x1b]0;ignored\x07";
-        assert_eq!(sanitize_terminal_output_for_ui(input), "\x1b[31mwarn\x1b[0m");
+        assert_eq!(
+            sanitize_terminal_output_for_ui(input),
+            "\x1b[31mwarn\x1b[0m"
+        );
     }
 }

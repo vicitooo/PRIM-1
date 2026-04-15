@@ -44,6 +44,19 @@ pub enum LogLevel {
     Error,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlKey {
+    Enter,
+    Up,
+    Down,
+    Left,
+    Right,
+    Tab,
+    Esc,
+    CtrlC,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnvVar {
     pub key: String,
@@ -169,13 +182,38 @@ pub enum RuntimeEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SidebandRequest {
-    Ping { token: String },
-    ListSessions { token: String },
-    StartSession { token: String, name: String },
-    StopSession { token: String, name: String },
-    RestartSession { token: String, name: String },
-    SendInput { token: String, name: String, input: String },
-    RouteMessage { token: String, request: RouteMessageRequest },
+    Ping {
+        token: String,
+    },
+    ListSessions {
+        token: String,
+    },
+    StartSession {
+        token: String,
+        name: String,
+    },
+    StopSession {
+        token: String,
+        name: String,
+    },
+    RestartSession {
+        token: String,
+        name: String,
+    },
+    SendInput {
+        token: String,
+        name: String,
+        input: String,
+    },
+    SendKey {
+        token: String,
+        name: String,
+        key: ControlKey,
+    },
+    RouteMessage {
+        token: String,
+        request: RouteMessageRequest,
+    },
 }
 
 impl SidebandRequest {
@@ -187,6 +225,7 @@ impl SidebandRequest {
             | Self::StopSession { token, .. }
             | Self::RestartSession { token, .. }
             | Self::SendInput { token, .. }
+            | Self::SendKey { token, .. }
             | Self::RouteMessage { token, .. } => token,
         }
     }
@@ -205,8 +244,10 @@ mod tests {
 
     #[test]
     fn sideband_token_accessor_returns_expected_value() {
-        let request = SidebandRequest::Ping {
+        let request = SidebandRequest::SendKey {
             token: "secret".into(),
+            name: "claude".into(),
+            key: ControlKey::Enter,
         };
 
         assert_eq!(request.token(), "secret");

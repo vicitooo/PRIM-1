@@ -57,8 +57,14 @@ impl PtySession {
             .with_context(|| format!("failed to spawn {}", spec.program))?;
         drop(pair.slave);
 
-        let reader = pair.master.try_clone_reader().context("failed to clone PTY reader")?;
-        let writer = pair.master.take_writer().context("failed to take PTY writer")?;
+        let reader = pair
+            .master
+            .try_clone_reader()
+            .context("failed to clone PTY reader")?;
+        let writer = pair
+            .master
+            .take_writer()
+            .context("failed to take PTY writer")?;
         let child = Arc::new(Mutex::new(child));
         let process_id = child.lock().ok().and_then(|guard| guard.process_id());
 

@@ -14,13 +14,11 @@ use control_plane::{DEFAULT_ENDPOINT, decode_request, encode_response};
 use parking_lot::{Mutex, RwLock};
 use pty_host::{PtyEvent, PtyEventHandler, PtySession};
 use shared_types::{
-    ControlPlaneStatus, DriverKind, LifecycleState, LogLevel, MessageScope, RouteMessageRequest,
-    RuntimeEvent, RuntimeSnapshot, SendInputRequest, SessionDefinition, SessionSnapshot,
-    SidebandRequest, SidebandResponse, now_rfc3339,
+    ControlKey, ControlPlaneStatus, DriverKind, LifecycleState, LogLevel, MessageScope,
+    RouteMessageRequest, RuntimeEvent, RuntimeSnapshot, SendInputRequest, SessionDefinition,
+    SessionSnapshot, SidebandRequest, SidebandResponse, now_rfc3339,
 };
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
-};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use uuid::Uuid;
 
 type EventSink = Arc<dyn Fn(RuntimeEvent) + Send + Sync>;
@@ -372,11 +370,21 @@ impl SupervisorHandle {
         Ok(snapshot)
     }
 
+    pub fn send_control_key(&self, name: &str, key: ControlKey) -> Result<SessionSnapshot> {
+        self.send_input(SendInputRequest {
+            name: name.into(),
+            input: control_key_sequence(key).into(),
+        })
+    }
+
     pub fn route_message(&self, request: RouteMessageRequest) -> Result<RuntimeSnapshot> {
         self.refresh_session_liveness();
         let recipients = self.resolve_recipients(&request.to, request.scope);
         if recipients.is_empty() {
-            return Err(anyhow!("no running recipients available for '{}'", request.to));
+            return Err(anyhow!(
+                "no running recipients available for '{}'",
+                request.to
+            ));
         }
 
         let route_id = Uuid::new_v4();
@@ -478,7 +486,11 @@ impl SupervisorHandle {
                 .collect(),
             _ => slots
                 .get(to)
-                .and_then(|slot| slot.running.as_ref().map(|_| vec![slot.definition.name.clone()]))
+                .and_then(|slot| {
+                    slot.running
+                        .as_ref()
+                        .map(|_| vec![slot.definition.name.clone()])
+                })
                 .unwrap_or_default(),
         }
     }
@@ -640,9 +652,9 @@ impl SupervisorHandle {
         let outcome = match request {
             SidebandRequest::Ping { .. } => Ok("pong".into()),
             SidebandRequest::ListSessions { .. } => Ok("sessions listed".into()),
-            SidebandRequest::StartSession { name, .. } => self
-                .start_session(&name)
-                .map(|_| format!("started {name}")),
+            SidebandRequest::StartSession { name, .. } => {
+                self.start_session(&name).map(|_| format!("started {name}"))
+            }
             SidebandRequest::StopSession { name, .. } => {
                 self.stop_session(&name).map(|_| format!("stopped {name}"))
             }
@@ -652,6 +664,9 @@ impl SupervisorHandle {
             SidebandRequest::SendInput { name, input, .. } => self
                 .send_input(SendInputRequest { name, input })
                 .map(|_| "input sent".into()),
+            SidebandRequest::SendKey { name, key, .. } => self
+                .send_control_key(&name, key)
+                .map(|_| format!("key {:?} sent", key)),
             SidebandRequest::RouteMessage { request, .. } => {
                 self.route_message(request).map(|_| "message routed".into())
             }
@@ -822,15 +837,30 @@ fn process_sideband_mailbox_file(
         }
     };
 
-    let file_name = request_path
-        .file_name()
-        .with_context(|| format!("mailbox request missing file name: {}", request_path.display()))?;
+    let file_name = request_path.file_name().with_context(|| {
+        format!(
+            "mailbox request missing file name: {}",
+            request_path.display()
+        )
+    })?;
     let response_path = outbox_dir.join(file_name);
     let temp_response_path = outbox_dir.join(format!("{}.tmp", file_name.to_string_lossy()));
-    fs::write(&temp_response_path, format!("{}\n", encode_response(&response)?))
-        .with_context(|| format!("failed to write mailbox response {}", temp_response_path.display()))?;
-    fs::rename(&temp_response_path, &response_path)
-        .with_context(|| format!("failed to publish mailbox response {}", response_path.display()))?;
+    fs::write(
+        &temp_response_path,
+        format!("{}\n", encode_response(&response)?),
+    )
+    .with_context(|| {
+        format!(
+            "failed to write mailbox response {}",
+            temp_response_path.display()
+        )
+    })?;
+    fs::rename(&temp_response_path, &response_path).with_context(|| {
+        format!(
+            "failed to publish mailbox response {}",
+            response_path.display()
+        )
+    })?;
 
     let archived_request_path = processed_dir.join(file_name);
     if archived_request_path.exists() {
@@ -905,6 +935,19 @@ fn collapse_inline_content(content: &str) -> String {
     content.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn control_key_sequence(key: ControlKey) -> &'static str {
+    match key {
+        ControlKey::Enter => "\r",
+        ControlKey::Up => "\x1b[A",
+        ControlKey::Down => "\x1b[B",
+        ControlKey::Right => "\x1b[C",
+        ControlKey::Left => "\x1b[D",
+        ControlKey::Tab => "\t",
+        ControlKey::Esc => "\x1b",
+        ControlKey::CtrlC => "\x03",
+    }
+}
+
 fn control_plane_transport() -> &'static str {
     #[cfg(windows)]
     {
@@ -930,14 +973,20 @@ fn control_plane_endpoint() -> String {
 }
 
 #[cfg(windows)]
-async fn run_windows_pipe_server(handle: SupervisorHandle, status: ControlPlaneStatus) -> Result<()> {
+async fn run_windows_pipe_server(
+    handle: SupervisorHandle,
+    status: ControlPlaneStatus,
+) -> Result<()> {
     use tokio::net::windows::named_pipe::ServerOptions;
 
     loop {
         let server = ServerOptions::new()
             .create(&status.endpoint)
             .with_context(|| format!("failed to create named pipe {}", status.endpoint))?;
-        server.connect().await.context("failed to connect named pipe")?;
+        server
+            .connect()
+            .await
+            .context("failed to connect named pipe")?;
         let handle_clone = handle.clone();
         tokio::spawn(async move {
             if let Err(error) = handle_sideband_stream(handle_clone, server).await {
@@ -948,7 +997,10 @@ async fn run_windows_pipe_server(handle: SupervisorHandle, status: ControlPlaneS
 }
 
 #[cfg(unix)]
-async fn run_unix_socket_server(handle: SupervisorHandle, status: ControlPlaneStatus) -> Result<()> {
+async fn run_unix_socket_server(
+    handle: SupervisorHandle,
+    status: ControlPlaneStatus,
+) -> Result<()> {
     use tokio::net::UnixListener;
 
     let _ = fs::remove_file(&status.endpoint);
@@ -956,7 +1008,10 @@ async fn run_unix_socket_server(handle: SupervisorHandle, status: ControlPlaneSt
         .with_context(|| format!("failed to bind unix socket {}", status.endpoint))?;
 
     loop {
-        let (stream, _) = listener.accept().await.context("failed to accept unix socket")?;
+        let (stream, _) = listener
+            .accept()
+            .await
+            .context("failed to accept unix socket")?;
         let handle_clone = handle.clone();
         tokio::spawn(async move {
             if let Err(error) = handle_sideband_stream(handle_clone, stream).await {
@@ -985,7 +1040,10 @@ where
         .write_all(payload.as_bytes())
         .await
         .context("failed to write sideband response")?;
-    write_half.flush().await.context("failed to flush sideband response")?;
+    write_half
+        .flush()
+        .await
+        .context("failed to flush sideband response")?;
     Ok(())
 }
 
@@ -996,8 +1054,7 @@ mod tests {
     use shared_types::{MessageScope, RouteMessageRequest, SidebandRequest};
 
     fn test_supervisor() -> SupervisorHandle {
-        let root =
-            std::env::temp_dir().join(format!("cli-master-wrapper-test-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("cli-master-wrapper-test-{}", Uuid::new_v4()));
         SupervisorHandle::new(SupervisorConfig {
             working_root: root.clone(),
             runtime_dir: root.join("runtime"),
@@ -1113,6 +1170,18 @@ mod tests {
     }
 
     #[test]
+    fn control_key_sequences_match_terminal_expectations() {
+        assert_eq!(control_key_sequence(ControlKey::Enter), "\r");
+        assert_eq!(control_key_sequence(ControlKey::Up), "\x1b[A");
+        assert_eq!(control_key_sequence(ControlKey::Down), "\x1b[B");
+        assert_eq!(control_key_sequence(ControlKey::Left), "\x1b[D");
+        assert_eq!(control_key_sequence(ControlKey::Right), "\x1b[C");
+        assert_eq!(control_key_sequence(ControlKey::Tab), "\t");
+        assert_eq!(control_key_sequence(ControlKey::Esc), "\x1b");
+        assert_eq!(control_key_sequence(ControlKey::CtrlC), "\x03");
+    }
+
+    #[test]
     fn routed_message_submit_behavior_is_driver_aware() {
         assert_eq!(
             routed_message_submit_behavior(DriverKind::Claude),
@@ -1146,7 +1215,10 @@ mod tests {
         assert_eq!(persisted.endpoint, status.endpoint);
         assert_eq!(persisted.token, status.token);
         assert_eq!(
-            snapshot.control_plane.as_ref().map(|item| item.endpoint.as_str()),
+            snapshot
+                .control_plane
+                .as_ref()
+                .map(|item| item.endpoint.as_str()),
             Some(status.endpoint.as_str())
         );
     }
@@ -1187,8 +1259,8 @@ mod tests {
         process_sideband_mailbox_file(&supervisor, &request_path, &outbox_dir, &processed_dir)
             .unwrap();
 
-        let response = decode_response(&fs::read_to_string(outbox_dir.join("ping.json")).unwrap())
-            .unwrap();
+        let response =
+            decode_response(&fs::read_to_string(outbox_dir.join("ping.json")).unwrap()).unwrap();
         assert!(response.ok);
         assert_eq!(response.message, "pong");
         assert!(processed_dir.join("ping.json").exists());
@@ -1244,8 +1316,8 @@ mod tests {
         process_sideband_mailbox_file(&supervisor, &request_path, &outbox_dir, &processed_dir)
             .unwrap();
 
-        let response = decode_response(&fs::read_to_string(outbox_dir.join("ping.json")).unwrap())
-            .unwrap();
+        let response =
+            decode_response(&fs::read_to_string(outbox_dir.join("ping.json")).unwrap()).unwrap();
         assert!(response.ok);
         assert_eq!(response.message, "pong");
     }
@@ -1290,9 +1362,26 @@ mod tests {
             })
             .unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("no running recipients available for 'claude'"));
+        assert!(
+            error
+                .to_string()
+                .contains("no running recipients available for 'claude'")
+        );
+    }
+
+    #[test]
+    fn send_control_key_rejects_non_running_session() {
+        let supervisor = test_supervisor();
+
+        let error = supervisor
+            .send_control_key("claude", ControlKey::Enter)
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("session 'claude' is not running")
+        );
     }
 
     #[test]

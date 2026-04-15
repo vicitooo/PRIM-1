@@ -30,7 +30,7 @@ fn strip_utf8_bom(raw: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shared_types::RuntimeSnapshot;
+    use shared_types::{ControlKey, RuntimeSnapshot};
 
     #[test]
     fn round_trips_request_json() {
@@ -42,6 +42,26 @@ mod tests {
 
         match decoded {
             SidebandRequest::ListSessions { token } => assert_eq!(token, "abc"),
+            _ => panic!("unexpected request variant"),
+        }
+    }
+
+    #[test]
+    fn round_trips_send_key_request_json() {
+        let json = encode_request(&SidebandRequest::SendKey {
+            token: "abc".into(),
+            name: "claude".into(),
+            key: ControlKey::CtrlC,
+        })
+        .unwrap();
+        let decoded = decode_request(&json).unwrap();
+
+        match decoded {
+            SidebandRequest::SendKey { token, name, key } => {
+                assert_eq!(token, "abc");
+                assert_eq!(name, "claude");
+                assert_eq!(key, ControlKey::CtrlC);
+            }
             _ => panic!("unexpected request variant"),
         }
     }
