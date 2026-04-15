@@ -1,16 +1,17 @@
 import { describe, expect, it } from "vitest";
 
-import { resolveCopySelection, shouldWarnUnsupportedSystemSelection } from "./copy-selection";
+import { resolveCopySelection } from "./copy-selection";
 
 describe("resolveCopySelection", () => {
-  it("prefers DOM selection over a live terminal selection", () => {
+  it("prefers DOM selection over terminal selections", () => {
     const result = resolveCopySelection({
       domSelection: String.raw`\\.\pipe\cli-master-wrapper-27788`,
-      lastActiveSession: "claude",
+      activeSurface: "claude",
       terminalSelections: {
         claude: "Claude pane ready.",
         codex: null,
       },
+      systemSelection: "[11:57:10 AM] UI attached to supervisor.",
     });
 
     expect(result).toEqual({
@@ -19,14 +20,15 @@ describe("resolveCopySelection", () => {
     });
   });
 
-  it("uses the last active terminal selection when there is no DOM selection", () => {
+  it("uses the active agent pane selection when there is no DOM selection", () => {
     const result = resolveCopySelection({
       domSelection: null,
-      lastActiveSession: "codex",
+      activeSurface: "codex",
       terminalSelections: {
         claude: "Claude pane ready.",
         codex: "Codex pane ready.",
       },
+      systemSelection: "[11:57:10 AM] UI attached to supervisor.",
     });
 
     expect(result).toEqual({
@@ -36,60 +38,66 @@ describe("resolveCopySelection", () => {
     });
   });
 
-  it("does not fall back to another pane when the last active pane has no selection", () => {
+  it("copies the system log when the system surface is active", () => {
     const result = resolveCopySelection({
       domSelection: null,
-      lastActiveSession: "codex",
+      activeSurface: "system",
+      terminalSelections: {
+        claude: "Claude pane ready.",
+        codex: "Codex pane ready.",
+      },
+      systemSelection: "[11:57:10 AM] UI attached to supervisor.",
+    });
+
+    expect(result).toEqual({
+      kind: "system",
+      text: "[11:57:10 AM] UI attached to supervisor.",
+    });
+  });
+
+  it("does not fall back to another surface when the active pane has no selection", () => {
+    const result = resolveCopySelection({
+      domSelection: null,
+      activeSurface: "codex",
       terminalSelections: {
         claude: "Claude pane ready.",
         codex: null,
       },
+      systemSelection: "[11:57:10 AM] UI attached to supervisor.",
     });
 
     expect(result).toBeNull();
+  });
+
+  it("does not fall back to the system log after the user clicks back into an agent pane", () => {
+    const result = resolveCopySelection({
+      domSelection: null,
+      activeSurface: "codex",
+      terminalSelections: {
+        claude: null,
+        codex: "Codex pane ready.",
+      },
+      systemSelection: "[11:57:10 AM] UI attached to supervisor.",
+    });
+
+    expect(result).toEqual({
+      kind: "session",
+      session: "codex",
+      text: "Codex pane ready.",
+    });
   });
 
   it("returns null when nothing is selected", () => {
     const result = resolveCopySelection({
       domSelection: null,
-      lastActiveSession: null,
+      activeSurface: null,
       terminalSelections: {
         claude: null,
         codex: null,
       },
+      systemSelection: null,
     });
 
     expect(result).toBeNull();
-  });
-});
-
-describe("shouldWarnUnsupportedSystemSelection", () => {
-  it("warns only when the system log is the active copy surface", () => {
-    const result = shouldWarnUnsupportedSystemSelection({
-      systemSelection: "[11:57:10 AM] UI attached to supervisor.",
-      activeSurface: "system",
-      resolvedSelection: null,
-    });
-
-    expect(result).toBe(true);
-  });
-
-  it("does not warn after the user clicks back into an agent pane", () => {
-    const resolvedSelection = resolveCopySelection({
-      domSelection: null,
-      lastActiveSession: "codex",
-      terminalSelections: {
-        claude: null,
-        codex: "Codex pane ready.",
-      },
-    });
-
-    const result = shouldWarnUnsupportedSystemSelection({
-      systemSelection: "[11:57:10 AM] UI attached to supervisor.",
-      activeSurface: "codex",
-      resolvedSelection,
-    });
-
-    expect(result).toBe(false);
   });
 });

@@ -6,7 +6,6 @@ import "@xterm/xterm/css/xterm.css";
 
 import {
   resolveCopySelection,
-  shouldWarnUnsupportedSystemSelection,
   type CopySurface,
 } from "./copy-selection";
 import "./styles.css";
@@ -518,21 +517,13 @@ function wireTerminalShortcuts(): void {
     if (key === "c") {
       const selection = resolveCopySelection({
         domSelection: activeNonTerminalDomSelectionText(),
-        lastActiveSession: activeTerminalName,
+        activeSurface: activeCopySurface,
         terminalSelections: {
           claude: paneMap.get("claude")?.terminal.getSelection() ?? null,
           codex: paneMap.get("codex")?.terminal.getSelection() ?? null,
         },
-      });
-      if (shouldWarnUnsupportedSystemSelection({
         systemSelection: systemTerminal.getSelection(),
-        activeSurface: activeCopySurface,
-        resolvedSelection: selection,
-      })) {
-        event.preventDefault();
-        writeSystem("warn", "System log copy is not wired into Ctrl+Shift+C yet.");
-        return;
-      }
+      });
       if (!selection) {
         return;
       }
@@ -545,6 +536,8 @@ function wireTerminalShortcuts(): void {
             "info",
             selection.kind === "dom"
               ? "DOM selection copied"
+              : selection.kind === "system"
+                ? "System log selection copied"
               : `${SESSION_LABELS[selection.session]} selection copied`,
           ),
         )
@@ -553,6 +546,8 @@ function wireTerminalShortcuts(): void {
             "error",
             selection.kind === "dom"
               ? `copy failed for DOM selection: ${String(error)}`
+              : selection.kind === "system"
+                ? `copy failed for System log: ${String(error)}`
               : `copy failed for ${SESSION_LABELS[selection.session]}: ${String(error)}`,
           ),
         );

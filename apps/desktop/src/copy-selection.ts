@@ -10,18 +10,17 @@ export type CopySelectionResult =
       kind: "session";
       session: SessionName;
       text: string;
+    }
+  | {
+      kind: "system";
+      text: string;
     };
 
 export interface ResolveCopySelectionInput {
   domSelection: string | null;
-  lastActiveSession: SessionName | null;
-  terminalSelections: Record<SessionName, string | null>;
-}
-
-export interface SystemSelectionGuardInput {
-  systemSelection: string | null;
   activeSurface: CopySurface;
-  resolvedSelection: CopySelectionResult | null;
+  terminalSelections: Record<SessionName, string | null>;
+  systemSelection: string | null;
 }
 
 export function resolveCopySelection(
@@ -35,29 +34,34 @@ export function resolveCopySelection(
     };
   }
 
-  if (!input.lastActiveSession) {
-    return null;
+  if (input.activeSurface === "system") {
+    const systemSelection = normalizeSelectionText(input.systemSelection);
+    if (!systemSelection) {
+      return null;
+    }
+
+    return {
+      kind: "system",
+      text: systemSelection,
+    };
   }
 
-  const terminalSelection = normalizeSelectionText(
-    input.terminalSelections[input.lastActiveSession],
-  );
-  if (!terminalSelection) {
-    return null;
+  if (input.activeSurface === "claude" || input.activeSurface === "codex") {
+    const terminalSelection = normalizeSelectionText(
+      input.terminalSelections[input.activeSurface],
+    );
+    if (!terminalSelection) {
+      return null;
+    }
+
+    return {
+      kind: "session",
+      session: input.activeSurface,
+      text: terminalSelection,
+    };
   }
 
-  return {
-    kind: "session",
-    session: input.lastActiveSession,
-    text: terminalSelection,
-  };
-}
-
-export function shouldWarnUnsupportedSystemSelection(
-  input: SystemSelectionGuardInput,
-): boolean {
-  const systemSelection = normalizeSelectionText(input.systemSelection);
-  return Boolean(systemSelection && input.activeSurface === "system" && !input.resolvedSelection);
+  return null;
 }
 
 function normalizeSelectionText(text: string | null | undefined): string | null {
