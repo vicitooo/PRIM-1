@@ -504,6 +504,21 @@ function wireResize(): void {
 }
 
 function wireTerminalShortcuts(): void {
+  window.addEventListener(
+    "keydown",
+    (event) => {
+      if (event.key !== "F11") {
+        return;
+      }
+
+      event.preventDefault();
+      void command<void>("toggle_fullscreen").catch((error) =>
+        writeSystem("error", `fullscreen toggle failed: ${String(error)}`),
+      );
+    },
+    { capture: true },
+  );
+
   window.addEventListener("keydown", (event) => {
     if (event.altKey && !event.ctrlKey && !event.metaKey) {
       return;

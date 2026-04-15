@@ -15,7 +15,7 @@ use shared_types::{
     StartSessionRequest, StopSessionRequest,
 };
 use supervisor::{SupervisorConfig, SupervisorHandle};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 
 #[derive(Clone)]
 struct DesktopDiagnostics {
@@ -193,6 +193,14 @@ fn resize_session(
             );
             error.to_string()
         })
+}
+
+#[tauri::command]
+fn toggle_fullscreen(window: WebviewWindow) -> Result<(), String> {
+    let is_fullscreen = window.is_fullscreen().map_err(|error| error.to_string())?;
+    window
+        .set_fullscreen(!is_fullscreen)
+        .map_err(|error| error.to_string())
 }
 
 fn resolve_project_root() -> Result<PathBuf, String> {
@@ -426,7 +434,8 @@ pub fn run() {
             restart_session,
             send_input,
             route_message,
-            resize_session
+            resize_session,
+            toggle_fullscreen
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|error| {
