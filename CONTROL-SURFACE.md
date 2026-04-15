@@ -86,9 +86,17 @@ Behavior:
 
 - named pipe first
 - mailbox fallback second
+- default credential resolution is now layered:
+  - explicit `-InfoFile` wins
+  - otherwise `PRIM1_PANE_CREDENTIALS` is used when present inside a supervised pane
+  - otherwise the helper falls back to `.runtime/control-plane.json`
 - `-Quiet` prints only the success/error message for agent-friendly use
 - `-Action input` injects raw text only; it does **not** press Enter for you
 - if you need a typed prompt to execute, follow `-Action input` with `-Action key -Key enter`
+- pane-bound credentials now live at:
+  - `.runtime/control-plane-claude.json`
+  - `.runtime/control-plane-codex.json`
+- the master credentials file `.runtime/control-plane.json` remains the operator/debug backdoor
 
 ## 4. Calling from Git Bash / MSYS shells
 
@@ -165,6 +173,17 @@ From inside Claude/Codex, an agent can call the helper scripts to:
 - route a direct message
 - route a room message
 - ping another agent with a tokenized smoke test
+
+Peer slash-command policy:
+
+- `send_input` and `send_key` now honor a supervisor policy boundary when called with pane-bound credentials
+- default posture is locked down:
+  - a pane-bound token can control its own pane
+  - a pane-bound token cannot inject slash commands or PTY keys into a different pane
+  - the rejection message is `peer slash commands are disabled by this wrapper's policy (PRIM1_PEER_SLASH_COMMANDS_ALLOWED=0)`
+- routed messages are still allowed across panes; the lockdown only covers `send_input` / `send_key`
+- operators using the master credentials bypass the lockdown unconditionally
+- the gate is reversible at wrapper startup with `PRIM1_PEER_SLASH_COMMANDS_ALLOWED=1`
 
 ## 7. Autonomous validation loop
 

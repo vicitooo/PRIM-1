@@ -69,7 +69,7 @@ When Victor says "run the handshake test":
 4. **Dispatch Codex** with one direct routed message containing the path, the token, and the exact reply format you expect back:
 
    ```bash
-   powershell -Command "& './scripts/agent-route.ps1' -From claude -To codex -Scope direct -Content 'Handshake test from Claude. Create file at ./.runtime/smoke/handshake-<token>.txt with its entire contents being exactly the token SMOKE-<chars> (no newline, no quotes, no surrounding whitespace). When the file is written, reply to me with exactly: agent-route.ps1 -From codex -To claude -Scope direct -Content FILE_READY <token>. Do not do anything else. Do not touch any other file. Stop after replying.'"
+   powershell -Command "& './scripts/agent-route.ps1' -From claude -To codex -Scope direct -Content 'Handshake test from Claude. Create file at ./.runtime/smoke/handshake-<token>.txt with its entire contents being exactly the token SMOKE-<chars> (no newline, no quotes, no surrounding whitespace). When the file is written, reply to me with exactly: FILE_READY <token>. Do not do anything else. Do not touch any other file. Stop after replying.'"
    ```
 
 5. **End your turn and wait.** Do not loop, poll, or spawn anything. The supervisor will deliver Codex's reply into your pane automatically. When the next input arrives, continue at step 6.

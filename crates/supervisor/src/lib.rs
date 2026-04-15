@@ -14,7 +14,7 @@ use control_plane::{DEFAULT_ENDPOINT, decode_request, encode_request, encode_res
 use parking_lot::{Mutex, RwLock};
 use pty_host::{PtyEvent, PtyEventHandler, PtySession};
 use shared_types::{
-    ControlKey, ControlPlaneStatus, DriverKind, LifecycleState, LogLevel, MessageScope,
+    ControlKey, ControlPlaneStatus, DriverKind, EnvVar, LifecycleState, LogLevel, MessageScope,
     RouteMessageRequest, RuntimeEvent, RuntimeSnapshot, SendInputRequest, SessionDefinition,
     SessionSnapshot, SidebandRequest, SidebandResponse, now_rfc3339,
 };
@@ -37,6 +37,7 @@ struct SubmitBehavior {
 pub struct SupervisorConfig {
     pub working_root: PathBuf,
     pub runtime_dir: PathBuf,
+    pub peer_slash_commands_allowed: bool,
 }
 
 struct AuditLog {
@@ -108,6 +109,9 @@ struct SupervisorInner {
     slots: Mutex<HashMap<String, SessionSlot>>,
     event_sink: RwLock<Option<EventSink>>,
     control_plane: RwLock<Option<ControlPlaneStatus>>,
+    token_bindings: Mutex<HashMap<String, Option<String>>>,
+    session_control_planes: Mutex<HashMap<String, ControlPlaneStatus>>,
+    peer_slash_commands_allowed: bool,
 }
 
 #[derive(Clone)]
@@ -155,6 +159,9 @@ impl SupervisorHandle {
                 slots: Mutex::new(slots),
                 event_sink: RwLock::new(None),
                 control_plane: RwLock::new(None),
+                token_bindings: Mutex::new(HashMap::new()),
+                session_control_planes: Mutex::new(HashMap::new()),
+                peer_slash_commands_allowed: config.peer_slash_commands_allowed,
             }),
         })
     }
@@ -224,6 +231,7 @@ impl SupervisorHandle {
                 .clone()
         };
 
+        let definition = self.prepare_definition_for_spawn(&definition)?;
         let spec = build_launch_spec(&definition);
         let session_name = definition.name.clone();
         let handle = self.clone();
@@ -474,6 +482,10 @@ impl SupervisorHandle {
         .context("failed to persist control plane info file")?;
 
         *self.inner.control_plane.write() = Some(status.clone());
+        self.inner
+            .token_bindings
+            .lock()
+            .insert(status.token.clone(), None);
         self.emit(RuntimeEvent::ControlPlaneReady {
             endpoint: status.endpoint.clone(),
             transport: status.transport.clone(),
@@ -650,7 +662,7 @@ impl SupervisorHandle {
     }
 
     fn apply_sideband_request(&self, request: SidebandRequest) -> SidebandResponse {
-        let Some(control_plane) = self.inner.control_plane.read().clone() else {
+        let Some(_) = self.inner.control_plane.read().clone() else {
             return SidebandResponse {
                 ok: false,
                 message: "control plane not ready".into(),
@@ -658,7 +670,12 @@ impl SupervisorHandle {
             };
         };
 
-        if request.token() != control_plane.token {
+        if !self
+            .inner
+            .token_bindings
+            .lock()
+            .contains_key(request.token())
+        {
             return SidebandResponse {
                 ok: false,
                 message: "invalid control plane token".into(),
@@ -678,11 +695,13 @@ impl SupervisorHandle {
             SidebandRequest::RestartSession { name, .. } => self
                 .restart_session(&name)
                 .map(|_| format!("restarted {name}")),
-            SidebandRequest::SendInput { name, input, .. } => self
-                .send_input(SendInputRequest { name, input })
+            SidebandRequest::SendInput { token, name, input } => self
+                .validate_session_action_token(&token, &name)
+                .and_then(|_| self.send_input(SendInputRequest { name, input }))
                 .map(|_| "input sent".into()),
-            SidebandRequest::SendKey { name, key, .. } => self
-                .send_control_key(&name, key)
+            SidebandRequest::SendKey { token, name, key } => self
+                .validate_session_action_token(&token, &name)
+                .and_then(|_| self.send_control_key(&name, key))
                 .map(|_| format!("key {:?} sent", key)),
             SidebandRequest::RouteMessage { request, .. } => {
                 self.route_message(request).map(|_| "message routed".into())
@@ -711,6 +730,85 @@ impl SupervisorHandle {
         if let Some(sink) = self.inner.event_sink.read().as_ref() {
             sink(event);
         }
+    }
+}
+
+impl SupervisorHandle {
+    fn prepare_definition_for_spawn(&self, definition: &SessionDefinition) -> Result<SessionDefinition> {
+        let mut prepared = definition.clone();
+
+        if let Some(status) = self.ensure_session_control_plane_status(&definition.name)? {
+            prepared.env.push(EnvVar {
+                key: "PRIM1_PANE_IDENTITY".into(),
+                value: definition.name.clone(),
+            });
+            prepared.env.push(EnvVar {
+                key: "PRIM1_PANE_CREDENTIALS".into(),
+                value: status.info_path,
+            });
+        }
+
+        Ok(prepared)
+    }
+
+    fn ensure_session_control_plane_status(&self, session_name: &str) -> Result<Option<ControlPlaneStatus>> {
+        let Some(control_plane) = self.inner.control_plane.read().clone() else {
+            return Ok(None);
+        };
+
+        let info_path = self
+            .runtime_dir()
+            .join(format!("control-plane-{session_name}.json"));
+        let info_path_text = info_path.display().to_string();
+
+        let status = {
+            let mut statuses = self.inner.session_control_planes.lock();
+            statuses
+                .entry(session_name.to_string())
+                .or_insert_with(|| {
+                    let status = ControlPlaneStatus {
+                        transport: control_plane.transport.clone(),
+                        endpoint: control_plane.endpoint.clone(),
+                        token: Uuid::new_v4().to_string(),
+                        info_path: info_path_text.clone(),
+                    };
+                    self.inner
+                        .token_bindings
+                        .lock()
+                        .insert(status.token.clone(), Some(session_name.to_string()));
+                    status
+                })
+                .clone()
+        };
+
+        fs::write(&info_path, serde_json::to_string_pretty(&status)?)
+            .with_context(|| format!("failed to persist session control plane info file {}", info_path.display()))?;
+
+        Ok(Some(status))
+    }
+
+    fn validate_session_action_token(&self, token: &str, target_session: &str) -> Result<()> {
+        let binding = self
+            .inner
+            .token_bindings
+            .lock()
+            .get(token)
+            .cloned()
+            .ok_or_else(|| anyhow!("invalid control plane token"))?;
+
+        if self.inner.peer_slash_commands_allowed {
+            return Ok(());
+        }
+
+        if let Some(bound_session) = binding {
+            if bound_session != target_session {
+                return Err(anyhow!(
+                    "peer slash commands are disabled by this wrapper's policy (PRIM1_PEER_SLASH_COMMANDS_ALLOWED=0)"
+                ));
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -1211,6 +1309,20 @@ mod tests {
         SupervisorHandle::new(SupervisorConfig {
             working_root: root.clone(),
             runtime_dir: root.join("runtime"),
+            peer_slash_commands_allowed: false,
+        })
+        .unwrap()
+    }
+
+    fn test_supervisor_with_peer_slash_commands_allowed(allowed: bool) -> SupervisorHandle {
+        let root = std::env::temp_dir().join(format!(
+            "cli-master-wrapper-peer-policy-test-{}",
+            Uuid::new_v4()
+        ));
+        SupervisorHandle::new(SupervisorConfig {
+            working_root: root.clone(),
+            runtime_dir: root.join("runtime"),
+            peer_slash_commands_allowed: allowed,
         })
         .unwrap()
     }
@@ -1221,6 +1333,15 @@ mod tests {
         slot.running = Some(RunningSession { pty: None });
         slot.process_id = Some(u32::MAX);
         slot.state = LifecycleState::Busy;
+    }
+
+    fn session_token(supervisor: &SupervisorHandle, name: &str) -> String {
+        supervisor.start_control_plane().unwrap();
+        supervisor
+            .ensure_session_control_plane_status(name)
+            .unwrap()
+            .unwrap()
+            .token
     }
 
     #[test]
@@ -1584,6 +1705,79 @@ mod tests {
 
         assert!(!response.ok);
         assert_eq!(response.message, "invalid control plane token");
+    }
+
+    #[test]
+    fn pane_bound_send_input_rejects_peer_target_when_lockdown_is_on() {
+        let supervisor = test_supervisor_with_peer_slash_commands_allowed(false);
+        let claude_token = session_token(&supervisor, "claude");
+
+        let error = supervisor
+            .validate_session_action_token(&claude_token, "codex")
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "peer slash commands are disabled by this wrapper's policy (PRIM1_PEER_SLASH_COMMANDS_ALLOWED=0)"
+        );
+    }
+
+    #[test]
+    fn pane_bound_send_input_allows_same_session_when_lockdown_is_on() {
+        let supervisor = test_supervisor_with_peer_slash_commands_allowed(false);
+        let claude_token = session_token(&supervisor, "claude");
+
+        supervisor
+            .validate_session_action_token(&claude_token, "claude")
+            .unwrap();
+    }
+
+    #[test]
+    fn master_token_bypasses_peer_lockdown() {
+        let supervisor = test_supervisor_with_peer_slash_commands_allowed(false);
+        let status = supervisor.start_control_plane().unwrap();
+
+        supervisor
+            .validate_session_action_token(&status.token, "codex")
+            .unwrap();
+    }
+
+    #[test]
+    fn pane_bound_send_key_allows_peer_target_when_lockdown_is_off() {
+        let supervisor = test_supervisor_with_peer_slash_commands_allowed(true);
+        let claude_token = session_token(&supervisor, "claude");
+
+        supervisor
+            .validate_session_action_token(&claude_token, "codex")
+            .unwrap();
+    }
+
+    #[test]
+    fn prepare_definition_for_spawn_injects_pane_credentials_env() {
+        let supervisor = test_supervisor();
+        supervisor.start_control_plane().unwrap();
+        let definition = {
+            let slots = supervisor.inner.slots.lock();
+            slots.get("claude").unwrap().definition.clone()
+        };
+
+        let prepared = supervisor.prepare_definition_for_spawn(&definition).unwrap();
+        let credentials = supervisor
+            .runtime_dir()
+            .join("control-plane-claude.json");
+
+        assert!(
+            prepared.env.iter().any(|env| {
+                env.key == "PRIM1_PANE_IDENTITY" && env.value == "claude"
+            })
+        );
+        assert!(
+            prepared.env.iter().any(|env| {
+                env.key == "PRIM1_PANE_CREDENTIALS"
+                    && env.value == credentials.display().to_string()
+            })
+        );
+        assert!(credentials.exists());
     }
 
     #[test]

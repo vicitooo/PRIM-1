@@ -222,6 +222,16 @@ fn resolve_agent_working_root(project_root: &Path) -> Result<PathBuf, String> {
     Ok(normalize_path_for_child_processes(personal_root.to_path_buf()))
 }
 
+fn peer_slash_commands_allowed_from_env() -> bool {
+    std::env::var("PRIM1_PEER_SLASH_COMMANDS_ALLOWED")
+        .ok()
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            normalized == "1" || normalized == "true"
+        })
+        .unwrap_or(false)
+}
+
 fn normalize_path_for_child_processes(path: PathBuf) -> PathBuf {
     #[cfg(windows)]
     {
@@ -255,18 +265,21 @@ fn init_supervisor(
 ) -> Result<SupervisorHandle, String> {
     let agent_working_root = resolve_agent_working_root(&project_root)?;
     let runtime_dir = project_root.join(".runtime");
+    let peer_slash_commands_allowed = peer_slash_commands_allowed_from_env();
     diagnostics.log(
         "info",
         "supervisor_init",
         format!(
-            "runtime_dir={} agent_working_root={}",
+            "runtime_dir={} agent_working_root={} peer_slash_commands_allowed={}",
             runtime_dir.display(),
-            agent_working_root.display()
+            agent_working_root.display(),
+            peer_slash_commands_allowed
         ),
     );
     let supervisor = SupervisorHandle::new(SupervisorConfig {
         working_root: agent_working_root,
         runtime_dir,
+        peer_slash_commands_allowed,
     })
     .map_err(|error| error.to_string())?;
 
@@ -466,7 +479,8 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_path_for_child_processes, resolve_agent_working_root,
+        normalize_path_for_child_processes, peer_slash_commands_allowed_from_env,
+        resolve_agent_working_root,
         sanitize_terminal_output_for_ui, strip_osc_sequences,
     };
     use std::path::PathBuf;
@@ -523,6 +537,46 @@ mod tests {
             resolve_agent_working_root(&path).unwrap(),
             PathBuf::from(r"<workspace>")
         );
+    }
+
+    #[test]
+    fn peer_slash_commands_allowed_defaults_to_false() {
+        let previous = std::env::var_os("PRIM1_PEER_SLASH_COMMANDS_ALLOWED");
+        unsafe {
+            std::env::remove_var("PRIM1_PEER_SLASH_COMMANDS_ALLOWED");
+        }
+
+        assert!(!peer_slash_commands_allowed_from_env());
+
+        if let Some(value) = previous {
+            unsafe {
+                std::env::set_var("PRIM1_PEER_SLASH_COMMANDS_ALLOWED", value);
+            }
+        }
+    }
+
+    #[test]
+    fn peer_slash_commands_allowed_accepts_one_and_true() {
+        let previous = std::env::var_os("PRIM1_PEER_SLASH_COMMANDS_ALLOWED");
+
+        unsafe {
+            std::env::set_var("PRIM1_PEER_SLASH_COMMANDS_ALLOWED", "1");
+        }
+        assert!(peer_slash_commands_allowed_from_env());
+
+        unsafe {
+            std::env::set_var("PRIM1_PEER_SLASH_COMMANDS_ALLOWED", "true");
+        }
+        assert!(peer_slash_commands_allowed_from_env());
+
+        match previous {
+            Some(value) => unsafe {
+                std::env::set_var("PRIM1_PEER_SLASH_COMMANDS_ALLOWED", value);
+            },
+            None => unsafe {
+                std::env::remove_var("PRIM1_PEER_SLASH_COMMANDS_ALLOWED");
+            },
+        }
     }
 
     #[cfg(not(windows))]

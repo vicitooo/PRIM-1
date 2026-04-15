@@ -50,6 +50,10 @@ function Invoke-MailboxFallback {
   throw "No response received from sideband mailbox."
 }
 
+if (-not $InfoFile -and $env:PRIM1_PANE_CREDENTIALS -and (Test-Path -LiteralPath $env:PRIM1_PANE_CREDENTIALS)) {
+  $InfoFile = $env:PRIM1_PANE_CREDENTIALS
+}
+
 if (-not $InfoFile) {
   $scriptRoot = Split-Path -Parent $PSCommandPath
   $InfoFile = Join-Path $scriptRoot "..\\.runtime\\control-plane.json"
