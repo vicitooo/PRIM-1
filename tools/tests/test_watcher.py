@@ -168,6 +168,100 @@ class WatcherEngineTests(unittest.TestCase):
         )
         self.assertEqual(self.engine.session_state("claude").mode, "armed")
 
+    def test_compact_marker_fires_on_conversation_compacted(self) -> None:
+        """Verify /compact fires on 'Conversation compacted' marker text."""
+        self.engine.observe_event(
+            {"event": "session_state", "session": "claude", "state": "busy", "reason": "input forwarded"},
+            self.base,
+        )
+        self.engine.observe_event(
+            {"event": "session_output", "session": "claude", "chunk": "/compact keep what matters"},
+            self.base + timedelta(seconds=1),
+        )
+        actions = self.engine.observe_event(
+            {"event": "session_output", "session": "claude", "chunk": "Conversation compacted (ctrl+o for history)"},
+            self.base + timedelta(seconds=30),
+        )
+        self.assertEqual(len(actions), 1)
+        self.assertIsInstance(actions[0], DispatchAction)
+        self.assertEqual(actions[0].command, "compact")
+        self.assertIn("Compaction complete", actions[0].message)
+
+    def test_compact_does_not_arm_completion_on_slash_menu_description(self) -> None:
+        """Regression for the same bug class as Finding 17: the /compact menu
+        description must not trigger completion. The current Claude Code menu
+        description for /compact is 'Clear conversation history but keep a
+        summary in context. Optional: /compact [instructions for summarization]'
+        which does NOT contain the 'Conversation compacted' marker text — so
+        this test locks in that property. If a future Claude Code version adds
+        'conversation compacted' to the menu description, this test will fire
+        and force us to pick a tighter marker."""
+        self.engine.observe_event(
+            {"event": "session_state", "session": "claude", "state": "busy", "reason": "input forwarded"},
+            self.base,
+        )
+        self.engine.observe_event(
+            {"event": "session_output", "session": "claude", "chunk": "/compact"},
+            self.base + timedelta(seconds=1),
+        )
+        menu_chunk = (
+            "/compact /compact Clear conversation history but keep a summary in context. "
+            "Optional: /compact [instructions for summarization] /clear Start fresh "
+            "/context Visualize current context usage as a colored grid"
+        )
+        actions = self.engine.observe_event(
+            {"event": "session_output", "session": "claude", "chunk": menu_chunk},
+            self.base + timedelta(seconds=2),
+        )
+        self.assertEqual(
+            actions,
+            [],
+            "Menu description for /compact must not fire the watcher — the 'Conversation compacted' marker must be specific to the actual result",
+        )
+
+    def test_skills_marker_fires_on_choose_an_action(self) -> None:
+        """Regression for watcher /skills marker tightening. The prior marker
+        'Skills' was too generic (any chunk containing that substring would
+        false-fire). The new marker 'Choose an action' is unique to the /skills
+        selector UI in Codex CLI and must fire cleanly."""
+        self.engine.observe_event(
+            {"event": "session_state", "session": "codex", "state": "busy", "reason": "input forwarded"},
+            self.base,
+        )
+        self.engine.observe_event(
+            {"event": "session_output", "session": "codex", "chunk": "/skills"},
+            self.base + timedelta(seconds=1),
+        )
+        actions = self.engine.observe_event(
+            {"event": "session_output", "session": "codex", "chunk": "Skills Enable/Disable Skills Choose an action Press enter to confirm"},
+            self.base + timedelta(seconds=2),
+        )
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].command, "skills")
+
+    def test_skills_does_not_fire_on_bare_skills_word(self) -> None:
+        """Regression: the old 'Skills' marker would false-fire on any chunk
+        containing the word 'Skills' — including boot banners, help text, and
+        unrelated output. The new 'Choose an action' marker must NOT fire on
+        a bare 'Skills' mention."""
+        self.engine.observe_event(
+            {"event": "session_state", "session": "codex", "state": "busy", "reason": "input forwarded"},
+            self.base,
+        )
+        self.engine.observe_event(
+            {"event": "session_output", "session": "codex", "chunk": "/skills"},
+            self.base + timedelta(seconds=1),
+        )
+        actions = self.engine.observe_event(
+            {"event": "session_output", "session": "codex", "chunk": "Your Skills directory has 42 skills loaded"},
+            self.base + timedelta(seconds=2),
+        )
+        self.assertEqual(
+            actions,
+            [],
+            "Old 'Skills' marker regression: 'Choose an action' marker must not fire on bare 'Skills' word",
+        )
+
     def test_captured_text_tail_truncation_preserves_result_not_head_noise(self) -> None:
         """Regression for Finding 17 tail-truncation fix: when captured_chunks
         accumulate long head noise (e.g. slash-command menu render) followed
