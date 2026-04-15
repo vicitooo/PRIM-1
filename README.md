@@ -26,7 +26,8 @@ Current verified commands:
 
 Current operator shortcut status:
 
-- `Ctrl+Shift+C` copy support is implemented for the active terminal pane, but live desktop re-validation is still pending
+- `Ctrl+Shift+C` is verified on the real desktop build for Claude, Codex, and System log selections
+- when a normal `DOM` selection exists, `Ctrl+Shift+C` now copies that `DOM` selection first instead of stale terminal text
 - `Ctrl+Shift+V` paste into the focused running pane is implemented and already live-tested
 - `Alt+V` remains reserved for screenshots
 

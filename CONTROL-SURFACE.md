@@ -28,11 +28,17 @@ This file lists the current controls that Victor, Claude, Codex, and future term
 
 ## 2. Keyboard shortcuts
 
-These shortcuts are for the focused terminal pane.
+These shortcuts cover the visible copy/paste surfaces in the room.
 
 - `Ctrl+Shift+C`
-  - copies the current xterm selection
-  - implementation is in place, but live desktop re-validation is still pending
+  - copies the current selection from:
+    - Claude
+    - Codex
+    - System log
+    - normal `DOM` text such as the control-plane path or audit-log path
+  - precedence is explicit:
+    - `DOM` selection first
+    - otherwise the last active terminal surface
 - `Ctrl+Shift+V`
   - pastes clipboard text into the focused running pane
 - `Alt+V`
@@ -41,7 +47,8 @@ These shortcuts are for the focused terminal pane.
 Notes:
 
 - `Ctrl+C` is still passed through to the terminal session itself
-- the wrapper only intercepts `Ctrl+Shift+C` / `Ctrl+Shift+V` when a terminal pane owns focus
+- `Ctrl+Shift+C` is now verified on the real desktop build across Claude, Codex, System log, and `DOM` text surfaces
+- `Ctrl+Shift+V` still applies only to the focused running agent pane
 
 ## 3. Control-plane helper
 
