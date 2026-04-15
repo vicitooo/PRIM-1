@@ -23,28 +23,29 @@ Treat incoming routed messages as if Victor had typed them into your pane. Respo
 
 The pane's working directory is the project root: `./`.
 
-From your shell (Bash tool for Claude, shell exec for Codex):
+From your shell (Bash tool for Claude, shell exec for Codex), use the wrapped form below as the canonical pattern:
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\agent-route.ps1 -From <you> -To <peer|room> -Scope <direct|room> -Content '<single-quoted message>'
+```bash
+powershell -Command "& '.\scripts\agent-route.ps1' -From <you> -To <peer|room> -Scope <direct|room> -Content '<single-quoted message>'"
 ```
 
 Examples:
 
-```powershell
+```bash
 # Claude -> Codex direct
-powershell -ExecutionPolicy Bypass -File .\scripts\agent-route.ps1 -From claude -To codex -Scope direct -Content 'hello from claude'
+powershell -Command "& '.\scripts\agent-route.ps1' -From claude -To codex -Scope direct -Content 'hello from claude'"
 
 # Codex -> Claude direct
-powershell -ExecutionPolicy Bypass -File .\scripts\agent-route.ps1 -From codex -To claude -Scope direct -Content 'hello from codex'
+powershell -Command "& '.\scripts\agent-route.ps1' -From codex -To claude -Scope direct -Content 'hello from codex'"
 
 # Either -> shared room (Victor's status feed)
-powershell -ExecutionPolicy Bypass -File .\scripts\agent-route.ps1 -From claude -To room -Scope room -Content 'status update for Victor'
+powershell -Command "& '.\scripts\agent-route.ps1' -From claude -To room -Scope room -Content 'status update for Victor'"
 ```
 
 Rules:
 
 - **Always single-quote `-Content`** so `!`, `@`, `$`, special characters survive PowerShell parsing.
+- **Treat the wrapped `powershell -Command "& '...\script.ps1' ..."` form as canonical on Windows.** It works from both PowerShell and Git Bash / MSYS shells, while bare `-File` calls can have their args silently mangled by MSYS before PowerShell sees them.
 - **Exit code 0** = supervisor accepted the route. Non-zero = supervisor rejected (peer not running, parsing error, pipe unreachable). Always check the exit code; do not assume success.
 - **Do not embed newlines** in `-Content`. Codex will flatten whitespace anyway; Claude tolerates newlines but it's noisier. Keep messages single-line.
 - **Do not call `control-plane.ps1` directly** for routing. Use `agent-route.ps1` — it's the hardened wrapper that the supervisor expects.
@@ -60,14 +61,14 @@ When Victor says "run the handshake test":
 
 3. **Announce to Victor via room:**
 
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File .\scripts\agent-route.ps1 -From claude -To room -Scope room -Content 'HANDSHAKE START token=<token> target=.runtime/smoke/handshake-<token>.txt dispatching codex'
+   ```bash
+   powershell -Command "& '.\scripts\agent-route.ps1' -From claude -To room -Scope room -Content 'HANDSHAKE START token=<token> target=.runtime/smoke/handshake-<token>.txt dispatching codex'"
    ```
 
 4. **Dispatch Codex** with one direct routed message containing the path, the token, and the exact reply format you expect back:
 
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File .\scripts\agent-route.ps1 -From claude -To codex -Scope direct -Content 'Handshake test from Claude. Create file at ./.runtime/smoke/handshake-<token>.txt with its entire contents being exactly the token SMOKE-<chars> (no newline, no quotes, no surrounding whitespace). When the file is written, reply to me with exactly: agent-route.ps1 -From codex -To claude -Scope direct -Content FILE_READY <token>. Do not do anything else. Do not touch any other file. Stop after replying.'
+   ```bash
+   powershell -Command "& '.\scripts\agent-route.ps1' -From claude -To codex -Scope direct -Content 'Handshake test from Claude. Create file at ./.runtime/smoke/handshake-<token>.txt with its entire contents being exactly the token SMOKE-<chars> (no newline, no quotes, no surrounding whitespace). When the file is written, reply to me with exactly: agent-route.ps1 -From codex -To claude -Scope direct -Content FILE_READY <token>. Do not do anything else. Do not touch any other file. Stop after replying.'"
    ```
 
 5. **End your turn and wait.** Do not loop, poll, or spawn anything. The supervisor will deliver Codex's reply into your pane automatically. When the next input arrives, continue at step 6.
@@ -79,12 +80,12 @@ When Victor says "run the handshake test":
 8. **Report the result via room:**
 
    - **Pass** — file exists and contents match:
-     ```powershell
-     powershell -ExecutionPolicy Bypass -File .\scripts\agent-route.ps1 -From claude -To room -Scope room -Content 'HANDSHAKE PASS token=<token> file verified at .runtime/smoke/handshake-<token>.txt'
+     ```bash
+     powershell -Command "& '.\scripts\agent-route.ps1' -From claude -To room -Scope room -Content 'HANDSHAKE PASS token=<token> file verified at .runtime/smoke/handshake-<token>.txt'"
      ```
    - **Fail** — any mismatch, missing file, timeout, or error:
-     ```powershell
-     powershell -ExecutionPolicy Bypass -File .\scripts\agent-route.ps1 -From claude -To room -Scope room -Content 'HANDSHAKE FAIL token=<token> reason=<one-line reason>'
+     ```bash
+     powershell -Command "& '.\scripts\agent-route.ps1' -From claude -To room -Scope room -Content 'HANDSHAKE FAIL token=<token> reason=<one-line reason>'"
      ```
 
 9. **Stop.** Do not retry. Do not clean up the file. Wait for Victor's next instruction.
@@ -97,34 +98,34 @@ When a direct routed message arrives in your pane from `claude` containing the s
 
 2. **Ensure the parent directory exists:**
 
-   ```powershell
-   powershell -ExecutionPolicy Bypass -Command "New-Item -ItemType Directory -Force -Path (Split-Path -Parent '<path>') | Out-Null"
+   ```bash
+   powershell -Command "& { New-Item -ItemType Directory -Force -Path (Split-Path -Parent '<path>') | Out-Null }"
    ```
 
 3. **Write the file with the token as its exact contents, no trailing newline, no BOM:**
 
-   ```powershell
-   powershell -ExecutionPolicy Bypass -Command "[System.IO.File]::WriteAllText('<path>', '<token>', [System.Text.UTF8Encoding]::new($false))"
+   ```bash
+   powershell -Command "& { [System.IO.File]::WriteAllText('<path>', '<token>', [System.Text.UTF8Encoding]::new([bool]0)) }"
    ```
 
 4. **Reply to Claude** with the exact acknowledgement string Claude asked for:
 
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File .\scripts\agent-route.ps1 -From codex -To claude -Scope direct -Content 'FILE_READY <token>'
+   ```bash
+   powershell -Command "& '.\scripts\agent-route.ps1' -From codex -To claude -Scope direct -Content 'FILE_READY <token>'"
    ```
 
 5. **Announce to Victor via room:**
 
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File .\scripts\agent-route.ps1 -From codex -To room -Scope room -Content 'Handshake file written at .runtime/smoke/handshake-<token>.txt token=<token> replied to claude'
+   ```bash
+   powershell -Command "& '.\scripts\agent-route.ps1' -From codex -To room -Scope room -Content 'Handshake file written at .runtime/smoke/handshake-<token>.txt token=<token> replied to claude'"
    ```
 
 6. **Stop.** Do not touch any other file. Do not retry. Wait for the next instruction.
 
 If the message is malformed or the write fails, report it once via room, then stop:
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\agent-route.ps1 -From codex -To room -Scope room -Content 'HANDSHAKE FAIL (codex side) reason=<one-line reason>'
+```bash
+powershell -Command "& '.\scripts\agent-route.ps1' -From codex -To room -Scope room -Content 'HANDSHAKE FAIL (codex side) reason=<one-line reason>'"
 ```
 
 ## 4. Trigger prompts (for Victor to paste)
@@ -138,6 +139,11 @@ powershell -ExecutionPolicy Bypass -File .\scripts\agent-route.ps1 -From codex -
 > Read `./instructions.md`. Section 3 is your role (Codex — responder). Stand by for Claude's routed message and respond as instructed.
 
 Order matters only weakly (Codex can be primed before or after Claude starts). What matters is that Codex has read its role before Claude's dispatch arrives, otherwise Codex will try to interpret the incoming message without context.
+
+Important:
+
+- when you shell out, prefer the exact wrapped commands from this file instead of rewriting them
+- do not substitute `False` for `[bool]0` in the file-write command; the wrapped form is written that way specifically so Git Bash / MSYS and nested PowerShell both preserve the no-BOM intent
 
 ## 5. What success looks like (Victor's view)
 
