@@ -209,11 +209,48 @@ Current rule for proving behavior:
 - use UI evidence from the live window or a screenshot capture
 - only mark the interaction as working when both sources agree
 
+## 8. Python watcher
+
+Watcher entrypoints:
+
+- `tools/prim1-command-watcher.py`
+- `tools/prim1_command_watcher.py`
+- config: `tools/prim1-command-watcher.config.json`
+
+Run:
+
+```bash
+python tools/prim1-command-watcher.py
+```
+
+Behavior:
+
+- tails `.runtime/audit/YYYY-MM-DD.jsonl` from EOF
+- watches each session independently
+- auto-arms only on prompt-echo slash-command lines such as `/fast` or `› /fast`
+- ignores static slash hints embedded in banners such as Codex's `/model to change`
+- dispatches the continue signal through `scripts/control-plane.ps1`
+- logs runtime events to `.runtime/watcher.log`
+- writes alerts to `.runtime/watcher-alerts/`
+- enforces:
+  - per-session minimum dispatch interval
+  - per-session daily dispatch limit
+  - assistant-turn timeout after a continue dispatch
+
+Current verified path:
+
+- use Codex `/fast` for Codex-side verification; Codex does not expose a `/help` command
+- use Claude `/help` for Claude-side slash-command verification
+- Codex `/fast` completion is detected
+- watcher dispatches `Command complete. Continue with the task.`
+- Codex produces the follow-up assistant turn
+- the watcher stays quiet during the normal Claude/Codex handshake flow
+
 For desktop-only visuals, the current screenshot capture path is:
 
 - `<workspace>/tools/screenshot/screenshot.py`
 
-## 8. Current limits
+## 9. Current limits
 
 - no OS-dialog control outside the PTY
 - no external connector yet for Telegram or remote clients

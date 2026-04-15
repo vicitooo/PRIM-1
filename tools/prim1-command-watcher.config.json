@@ -1,0 +1,65 @@
+{
+  "poll_interval_seconds": 0.2,
+  "arm_window_seconds": 3.0,
+  "assistant_wait_seconds": 60.0,
+  "min_dispatch_interval_seconds": 5.0,
+  "daily_dispatch_limit": 50,
+  "captured_text_limit_chars": 400,
+  "commands": {
+    "compact": {
+      "completion_markers": [
+        "Conversation compacted",
+        "Compacted"
+      ],
+      "continue_template": "Compaction complete. Continue with the task as previously instructed."
+    },
+    "context": {
+      "completion_markers": [
+        "Context Usage"
+      ],
+      "continue_template": "Your context usage: {captured_text}. Continue with the task."
+    },
+    "help": {
+      "completion_markers": [
+        "For more help:"
+      ],
+      "continue_template": "Command complete. Continue with the task."
+    },
+    "fast": {
+      "completion_markers": [
+        "Fast mode set to"
+      ],
+      "continue_template": "Command complete. Continue with the task."
+    },
+    "model": {
+      "completion_markers": [
+        "to change"
+      ],
+      "continue_template": "Command complete. Continue with the task."
+    },
+    "permissions": {
+      "completion_markers": [
+        "Permissions",
+        "bypass permissions"
+      ],
+      "continue_template": "Command complete. Continue with the task."
+    },
+    "skills": {
+      "completion_markers": [
+        "Use /skills",
+        "Skills"
+      ],
+      "continue_template": "Command complete. Continue with the task."
+    }
+  },
+  "assistant_turn_markers": {
+    "claude": [
+      "Hyperspacing",
+      "thinking with high effort"
+    ],
+    "codex": [
+      "Working",
+      "thinking"
+    ]
+  }
+}

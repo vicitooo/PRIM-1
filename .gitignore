@@ -1,2 +1,4 @@
 /target/
 /.runtime/
+__pycache__/
+*.pyc
