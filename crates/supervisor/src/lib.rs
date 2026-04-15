@@ -31,7 +31,14 @@ struct SubmitBehavior {
     sequence: &'static str,
     delay: Duration,
     flatten_payload: bool,
+    max_chunk_chars: Option<usize>,
 }
+
+// Exploration Finding 10 showed that very long routed messages could arrive
+// truncated inside Claude's queued-message rendering even though the audit log
+// still held the full routed_message payload. Keeping each Claude-targeted
+// routed input below a conservative size is the least invasive mitigation.
+const CLAUDE_ROUTED_MESSAGE_MAX_CHARS: usize = 500;
 
 #[derive(Debug, Clone)]
 pub struct SupervisorConfig {
@@ -411,18 +418,19 @@ impl SupervisorHandle {
 
         for recipient in recipients {
             let submit_behavior = self.submit_behavior_for_session(&recipient)?;
-            let payload = routed_message_payload(&request, submit_behavior);
-            self.send_input(SendInputRequest {
-                name: recipient.clone(),
-                input: payload,
-            })?;
-            if !submit_behavior.delay.is_zero() {
-                thread::sleep(submit_behavior.delay);
+            for payload in routed_message_payloads(&request, submit_behavior) {
+                self.send_input(SendInputRequest {
+                    name: recipient.clone(),
+                    input: payload,
+                })?;
+                if !submit_behavior.delay.is_zero() {
+                    thread::sleep(submit_behavior.delay);
+                }
+                self.send_input(SendInputRequest {
+                    name: recipient.clone(),
+                    input: submit_behavior.sequence.into(),
+                })?;
             }
-            self.send_input(SendInputRequest {
-                name: recipient,
-                input: submit_behavior.sequence.into(),
-            })?;
         }
 
         self.emit(RuntimeEvent::SystemLog {
@@ -1014,16 +1022,48 @@ fn scope_label(scope: MessageScope) -> &'static str {
 }
 
 fn routed_message_payload(request: &RouteMessageRequest, behavior: SubmitBehavior) -> String {
-    if !behavior.flatten_payload {
-        return format!(
-            "\n[{} message from {}]\n{}\n",
-            scope_label(request.scope),
-            request.from,
-            request.content
-        );
-    }
+    routed_message_payloads(request, behavior)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+}
 
-    collapse_inline_content(&request.content)
+fn routed_message_payloads(
+    request: &RouteMessageRequest,
+    behavior: SubmitBehavior,
+) -> Vec<String> {
+    let message_content = if behavior.flatten_payload {
+        collapse_inline_content(&request.content)
+    } else {
+        request.content.clone()
+    };
+    let content_chunks = split_routed_message_content(
+        &message_content,
+        behavior.max_chunk_chars,
+    );
+    let total_parts = content_chunks.len();
+
+    content_chunks
+        .into_iter()
+        .enumerate()
+        .map(|(index, chunk)| {
+            let header = routed_message_header(
+                request.scope,
+                &request.from,
+                index + 1,
+                total_parts,
+            );
+            if behavior.flatten_payload {
+                if chunk.is_empty() {
+                    header
+                } else {
+                    format!("{header} {chunk}")
+                }
+            } else {
+                format!("\n{header}\n{chunk}\n")
+            }
+        })
+        .collect()
 }
 
 fn routed_message_submit_behavior(driver: DriverKind) -> SubmitBehavior {
@@ -1032,16 +1072,19 @@ fn routed_message_submit_behavior(driver: DriverKind) -> SubmitBehavior {
             sequence: "\r",
             delay: Duration::from_millis(500),
             flatten_payload: true,
+            max_chunk_chars: None,
         },
         DriverKind::Claude => SubmitBehavior {
             sequence: "\r",
             delay: Duration::from_millis(200),
             flatten_payload: false,
+            max_chunk_chars: Some(CLAUDE_ROUTED_MESSAGE_MAX_CHARS),
         },
         DriverKind::GenericTerminal => SubmitBehavior {
             sequence: "\r",
             delay: Duration::ZERO,
             flatten_payload: false,
+            max_chunk_chars: None,
         },
     }
 }
@@ -1180,6 +1223,83 @@ fn try_probe_control_plane_endpoint(endpoint: &str, payload: &str, timeout: Dura
 
 fn collapse_inline_content(content: &str) -> String {
     content.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn routed_message_header(
+    scope: MessageScope,
+    sender: &str,
+    part_number: usize,
+    total_parts: usize,
+) -> String {
+    if total_parts <= 1 {
+        return format!("[{} message from {}]", scope_label(scope), sender);
+    }
+
+    format!(
+        "[{} message from {} | part {}/{}]",
+        scope_label(scope),
+        sender,
+        part_number,
+        total_parts
+    )
+}
+
+fn split_routed_message_content(content: &str, max_chunk_chars: Option<usize>) -> Vec<String> {
+    let Some(max_chunk_chars) = max_chunk_chars else {
+        return vec![content.to_string()];
+    };
+
+    if content.chars().count() <= max_chunk_chars {
+        return vec![content.to_string()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut remaining = content.trim();
+
+    while remaining.chars().count() > max_chunk_chars {
+        let split_index = split_point_within_limit(remaining, max_chunk_chars);
+        let (chunk, tail) = remaining.split_at(split_index);
+        let chunk = chunk.trim();
+        if !chunk.is_empty() {
+            chunks.push(chunk.to_string());
+        }
+        remaining = tail.trim_start();
+    }
+
+    if !remaining.is_empty() {
+        chunks.push(remaining.to_string());
+    }
+
+    if chunks.is_empty() {
+        vec![String::new()]
+    } else {
+        chunks
+    }
+}
+
+fn split_point_within_limit(content: &str, max_chunk_chars: usize) -> usize {
+    let mut last_whitespace_index = None;
+    let mut char_count = 0;
+
+    for (index, ch) in content.char_indices() {
+        if char_count == max_chunk_chars {
+            break;
+        }
+        if ch.is_whitespace() {
+            last_whitespace_index = Some(index);
+        }
+        char_count += 1;
+    }
+
+    if let Some(index) = last_whitespace_index {
+        return index;
+    }
+
+    content
+        .char_indices()
+        .nth(max_chunk_chars)
+        .map(|(index, _)| index)
+        .unwrap_or(content.len())
 }
 
 fn control_key_sequence(key: ControlKey) -> &'static str {
@@ -1429,7 +1549,7 @@ mod tests {
         );
 
         assert!(!payload.contains('\n'));
-        assert_eq!(payload, "tell me a joke");
+        assert_eq!(payload, "[Direct message from victor] tell me a joke");
     }
 
     #[test]
@@ -1477,6 +1597,56 @@ mod tests {
     }
 
     #[test]
+    fn long_claude_payloads_are_chunked_with_part_headers() {
+        let long_content = (0..120)
+            .map(|index| format!("segment-{index:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let payloads = routed_message_payloads(
+            &RouteMessageRequest {
+                from: "codex".into(),
+                to: "claude".into(),
+                scope: MessageScope::Room,
+                content: long_content.clone(),
+            },
+            routed_message_submit_behavior(DriverKind::Claude),
+        );
+
+        assert!(payloads.len() > 1);
+        assert!(payloads[0].contains("[Room message from codex | part 1/"));
+        assert!(payloads.last().unwrap().contains("| part "));
+        let reassembled = payloads
+            .iter()
+            .map(|payload| {
+                payload
+                    .lines()
+                    .skip(2)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .trim()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(collapse_inline_content(&reassembled), long_content);
+    }
+
+    #[test]
+    fn codex_payload_keeps_flattened_provenance_marker() {
+        let payload = routed_message_payload(
+            &RouteMessageRequest {
+                from: "claude".into(),
+                to: "codex".into(),
+                scope: MessageScope::Room,
+                content: "status update".into(),
+            },
+            routed_message_submit_behavior(DriverKind::Codex),
+        );
+
+        assert_eq!(payload, "[Room message from claude] status update");
+    }
+
+    #[test]
     fn control_key_sequences_match_terminal_expectations() {
         assert_eq!(control_key_sequence(ControlKey::Enter), "\r");
         assert_eq!(control_key_sequence(ControlKey::Up), "\x1b[A");
@@ -1496,6 +1666,7 @@ mod tests {
                 sequence: "\r",
                 delay: Duration::from_millis(200),
                 flatten_payload: false,
+                max_chunk_chars: Some(CLAUDE_ROUTED_MESSAGE_MAX_CHARS),
             }
         );
         assert_eq!(
@@ -1504,6 +1675,7 @@ mod tests {
                 sequence: "\r",
                 delay: Duration::from_millis(500),
                 flatten_payload: true,
+                max_chunk_chars: None,
             }
         );
     }

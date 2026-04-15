@@ -14,8 +14,8 @@ You (Claude or Codex) are running inside a supervised terminal pane. A Rust supe
 
 ### What incoming routed messages look like
 
-- **Claude receives** a routed message as multiline input of the shape `\n[Direct message from codex]\n<content>\n` followed by an automatic Enter ~200ms later. The `[Direct message from <peer>]` prefix (or `[Room message from <peer>]` for room scope) is how you identify a routed message vs. a direct user input from Victor.
-- **Codex receives** a routed message as a single-line flattened payload followed by an automatic Enter ~500ms later. No prefix. Incoming routed text is whitespace-collapsed.
+- **Claude receives** a routed message as multiline input of the shape `\n[Direct message from codex]\n<content>\n` followed by an automatic Enter ~200ms later. The `[Direct message from <peer>]` prefix (or `[Room message from <peer>]` for room scope) is how you identify a routed message vs. a direct user input from Victor. Long routed messages may arrive as multiple part-labeled messages such as `[Room message from codex | part 1/3]`.
+- **Codex receives** a routed message as a single-line flattened payload followed by an automatic Enter ~500ms later. Incoming routed text is whitespace-collapsed, but it now keeps an explicit provenance marker: `[Direct message from claude] <content>` or `[Room message from claude] <content>`. Long routed messages may arrive as multiple part-labeled messages.
 
 Treat incoming routed messages as if Victor had typed them into your pane. Respond normally, following the role spec below.
 
@@ -78,24 +78,42 @@ Rules:
 
 When Victor says "run the handshake test":
 
-1. **Generate a run token.** Pick 5 random uppercase hex characters. Form `SMOKE-<chars>` (example: `SMOKE-A3F1B`). Store it for the rest of the run; do not change it.
+1. **Generate a run token and timestamped target path.**
 
-2. **Pick the target path:**
-   `./.runtime/smoke/handshake-<token>.txt`
-
-3. **Announce to Victor via room:**
-
-   ```bash
-   powershell -Command "& './scripts/agent-route.ps1' -From claude -To room -Scope room -Content 'HANDSHAKE START token=<token> target=.runtime/smoke/handshake-<token>.txt dispatching codex'"
-   ```
-
-4. **Dispatch Codex** with one direct routed message containing the path, the token, and the exact reply format you expect back:
+   Use the helper so the run always gets:
+   - 8 uppercase hex characters
+   - a UTC timestamp in the file name
+   - a unique absolute and relative path pair
 
    ```bash
-   powershell -Command "& './scripts/agent-route.ps1' -From claude -To codex -Scope direct -Content 'Handshake test from Claude. Create file at ./.runtime/smoke/handshake-<token>.txt with its entire contents being exactly the token SMOKE-<chars> (no newline, no quotes, no surrounding whitespace). When the file is written, reply to me with exactly: FILE_READY <token>. Do not do anything else. Do not touch any other file. Stop after replying.'"
+   powershell -Command "& './scripts/new-smoke-token.ps1'"
    ```
 
-5. **End your turn and wait.** Do not loop, poll, or spawn anything. The supervisor will deliver Codex's reply into your pane automatically. When the next input arrives, continue at step 6.
+   It returns JSON with:
+   - `token` — example: `SMOKE-1A2B3C4D`
+   - `absolute_path`
+   - `relative_path`
+   - `timestamp_utc`
+
+2. **Announce to Victor via the canonical helper:**
+
+   ```bash
+   powershell -Command "& './scripts/handshake-route.ps1' -Actor claude -Action start -Token '<token>' -Path '<absolute_path>'"
+   ```
+
+3. **Dispatch Codex** with the canonical direct message builder. Do not hand-write the preamble.
+
+   ```bash
+   powershell -Command "& './scripts/handshake-route.ps1' -Actor claude -Action dispatch -Token '<token>' -Path '<absolute_path>'"
+   ```
+
+4. **Launch the external timeout watchdog** before ending your turn. Claude cannot self-tick while idle in the PTY, so timeout failure reporting must come from a separate process.
+
+   ```bash
+   powershell -Command "Start-Process powershell -WindowStyle Hidden -ArgumentList '-ExecutionPolicy','Bypass','-File','./scripts/handshake-watchdog.ps1','-Token','<token>'"
+   ```
+
+5. **End your turn and wait.** Do not loop or retry. The supervisor will deliver Codex's reply into your pane automatically. When the next input arrives, continue at step 6.
 
 6. **Recognize the reply.** When you see input of the shape `[Direct message from codex] FILE_READY <token>` (token must match what you generated), continue. If you see anything else from Codex — an error message, a question, a mismatched token — skip to step 8 and report `HANDSHAKE FAIL`.
 
@@ -105,18 +123,18 @@ When Victor says "run the handshake test":
 
    - **Pass** — file exists and contents match:
      ```bash
-     powershell -Command "& './scripts/agent-route.ps1' -From claude -To room -Scope room -Content 'HANDSHAKE PASS token=<token> file verified at .runtime/smoke/handshake-<token>.txt'"
+     powershell -Command "& './scripts/handshake-route.ps1' -Actor claude -Action pass -Token '<token>' -Path '<absolute_path>'"
      ```
    - **Fail** — any mismatch, missing file, timeout, or error:
      ```bash
-     powershell -Command "& './scripts/agent-route.ps1' -From claude -To room -Scope room -Content 'HANDSHAKE FAIL token=<token> reason=<one-line reason>'"
+     powershell -Command "& './scripts/handshake-route.ps1' -Actor claude -Action fail -Token '<token>' -Reason '<one-line reason>'"
      ```
 
 9. **Stop.** Do not retry. Do not clean up the file. Wait for Victor's next instruction.
 
 ## 3. Codex's role (responder)
 
-When a direct routed message arrives in your pane from `claude` containing the substring `Handshake test from Claude`:
+When a direct routed message arrives in your pane from `claude` that begins with the exact canonical preamble `Handshake test from Claude.`:
 
 1. **Parse** the path and the token from the message body. Both are given explicitly as literal strings.
 
@@ -135,21 +153,21 @@ When a direct routed message arrives in your pane from `claude` containing the s
 4. **Reply to Claude** with the exact acknowledgement string Claude asked for:
 
    ```bash
-   powershell -Command "& './scripts/agent-route.ps1' -From codex -To claude -Scope direct -Content 'FILE_READY <token>'"
+   powershell -Command "& './scripts/handshake-route.ps1' -Actor codex -Action ready -Token '<token>'"
    ```
 
 5. **Announce to Victor via room:**
 
    ```bash
-   powershell -Command "& './scripts/agent-route.ps1' -From codex -To room -Scope room -Content 'Handshake file written at .runtime/smoke/handshake-<token>.txt token=<token> replied to claude'"
+   powershell -Command "& './scripts/handshake-route.ps1' -Actor codex -Action status -Token '<token>' -Path '<path>'"
    ```
 
 6. **Stop.** Do not touch any other file. Do not retry. Wait for the next instruction.
 
-If the message is malformed or the write fails, report it once via room, then stop:
+If the message is malformed, missing the canonical preamble, or the write fails, report it once via room, then stop:
 
 ```bash
-powershell -Command "& './scripts/agent-route.ps1' -From codex -To room -Scope room -Content 'HANDSHAKE FAIL (codex side) reason=<one-line reason>'"
+powershell -Command "& './scripts/handshake-route.ps1' -Actor codex -Action fail -Token '<token-if-known-or-UNKNOWN>' -Reason '<one-line reason>'"
 ```
 
 ## 4. Trigger prompts (for Victor to paste)
@@ -177,7 +195,7 @@ In order, the room feed should show:
 2. `Handshake file written at ... token=<token> replied to claude` — from codex
 3. `HANDSHAKE PASS token=<token> file verified at ...` — from claude
 
-Plus: the file exists at `.runtime/smoke/handshake-<token>.txt` with exact token contents, no app restart, no pane reset, no timeouts.
+Plus: the file exists at the timestamped path returned by `new-smoke-token.ps1`, with exact token contents, no app restart, no pane reset, and no timeout FAIL.
 
 If any of those four signals is missing, the test failed regardless of what the agents report.
 
@@ -186,6 +204,7 @@ If any of those four signals is missing, the test failed regardless of what the 
 - **Do not retry.** Every failure reports to room once and stops. The point of the first test is to surface bugs, not to paper over them.
 - **Do not clean up.** Leave the temp file and partial state in place so Victor can inspect it.
 - **Do not invent a fix.** If Claude thinks Codex misbehaved (wrong token, wrong path, timeout), Claude reports `HANDSHAKE FAIL` and stops. Victor debugs.
+- **Do not hand-write the canonical route strings.** Use `new-smoke-token.ps1`, `handshake-route.ps1`, and `handshake-watchdog.ps1` so the timestamped path, canonical preamble, and timeout semantics stay aligned.
 - **Do not talk to each other outside the protocol.** The only messages during this test are the ones specified above. No chitchat, no status probes, no "are you there" pings.
 
 ## 7. Scope of this document

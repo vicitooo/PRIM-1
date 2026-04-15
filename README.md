@@ -48,6 +48,7 @@ Current autonomous control surface:
 
 - `scripts/control-plane.ps1` exposes `ping`, `list`, `start`, `stop`, `restart`, `input`, `key`, and `route`
 - `scripts/agent-route.ps1`, `scripts/agent-ping.ps1`, and `scripts/agent-key.ps1` give agents a quieter wrapper over the control plane
+- `scripts/new-smoke-token.ps1`, `scripts/handshake-route.ps1`, and `scripts/handshake-watchdog.ps1` now harden the handshake protocol against token collisions, malformed dispatches, and silent stalls
 - runtime evidence lives in `.runtime/audit/` and `.runtime/desktop-events.jsonl`
 - desktop UI validation can be captured with `<workspace>/tools/screenshot/screenshot.py`
 - no interaction is considered proven from logs alone or screenshots alone; both sources need to agree
@@ -142,6 +143,7 @@ The current polish priority is narrower than the long-term roadmap:
 
 - make the Claude/Codex room reliable
 - make the wrapper controllable by local helper scripts without manual intervention
+- preserve routed-message provenance on both panes and avoid long-message corruption into Claude
 - keep that control surface explicit in docs so autonomous debugging stays grounded in real evidence
 
 ## Clarified scope after the first live sessions

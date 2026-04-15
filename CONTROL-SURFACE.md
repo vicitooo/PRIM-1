@@ -168,6 +168,53 @@ powershell -Command "& '.\scripts\agent-slash.ps1' -Session claude -Slash compac
 powershell -Command "& '.\scripts\agent-key.ps1' -Session claude -Key enter"
 ```
 
+### `scripts/new-smoke-token.ps1`
+
+Helper that generates a unique handshake token and timestamped smoke-file path.
+
+```bash
+powershell -Command "& '.\scripts\new-smoke-token.ps1'"
+```
+
+Returns JSON with:
+
+- `token`
+- `timestamp_utc`
+- `relative_path`
+- `absolute_path`
+
+### `scripts/handshake-route.ps1`
+
+Canonical handshake message builder/router. Use it instead of hand-writing the route strings.
+
+```bash
+powershell -Command "& '.\scripts\handshake-route.ps1' -Actor claude -Action start -Token 'SMOKE-1A2B3C4D' -Path '.\.runtime\smoke\handshake-20260415T120000Z-SMOKE-1A2B3C4D.txt'"
+powershell -Command "& '.\scripts\handshake-route.ps1' -Actor claude -Action dispatch -Token 'SMOKE-1A2B3C4D' -Path '.\.runtime\smoke\handshake-20260415T120000Z-SMOKE-1A2B3C4D.txt'"
+powershell -Command "& '.\scripts\handshake-route.ps1' -Actor codex -Action ready -Token 'SMOKE-1A2B3C4D'"
+```
+
+Supported actions:
+
+- Claude:
+  - `start`
+  - `dispatch`
+  - `pass`
+  - `fail`
+- Codex:
+  - `ready`
+  - `status`
+  - `fail`
+
+`-DryRun` prints the exact routed payload JSON without sending it.
+
+### `scripts/handshake-watchdog.ps1`
+
+External handshake timeout watcher. It polls the audit log for a terminal marker and routes a canonical Claude-side timeout FAIL if no `FILE_READY`, `HANDSHAKE PASS`, or `HANDSHAKE FAIL` appears before the deadline.
+
+```bash
+powershell -Command "& '.\scripts\handshake-watchdog.ps1' -Token 'SMOKE-1A2B3C4D'"
+```
+
 ## 6. What agent-side terminal sessions can control today
 
 Supervised `claude` and `codex` panes now start from `<workspace>/`.
@@ -189,6 +236,15 @@ From inside Claude/Codex, an agent can call the helper scripts to:
 - route a direct message
 - route a room message
 - ping another agent with a tokenized smoke test
+- generate unique handshake tokens and timestamped smoke paths
+- route canonical handshake messages without hand-written preambles
+- run an external handshake timeout watchdog
+
+Routed-message delivery shape:
+
+- Claude receives multiline routed input with `[Direct|Room message from <sender>]` headers
+- Codex receives flattened single-line routed input, but it now also keeps the same provenance header instead of dropping it
+- long routed messages destined for Claude are split into part-labeled routed inputs to avoid the queued-message truncation found in exploration
 
 Peer slash-command policy:
 

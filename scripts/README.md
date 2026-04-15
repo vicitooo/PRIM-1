@@ -79,3 +79,31 @@ Example:
 .\scripts\agent-slash.ps1 -Session claude -Slash compact -ArgsFile ".runtime\compact-prompts\compact-args.txt"
 .\scripts\agent-key.ps1 -Session claude -Key enter
 ```
+
+- `new-smoke-token.ps1`
+  Generates a unique `SMOKE-XXXXXXXX` token plus a UTC-timestamped handshake file path.
+
+Example:
+
+```powershell
+.\scripts\new-smoke-token.ps1
+```
+
+- `handshake-route.ps1`
+  Canonical builder/router for handshake messages so agents stop hand-writing fragile preambles and status lines.
+
+Example:
+
+```powershell
+.\scripts\handshake-route.ps1 -Actor claude -Action start -Token "SMOKE-1A2B3C4D" -Path ".\.runtime\smoke\handshake-20260415T120000Z-SMOKE-1A2B3C4D.txt"
+.\scripts\handshake-route.ps1 -Actor codex -Action ready -Token "SMOKE-1A2B3C4D"
+```
+
+- `handshake-watchdog.ps1`
+  External handshake timeout watcher. Polls the audit log and routes a canonical timeout FAIL if the run stalls without a terminal marker.
+
+Example:
+
+```powershell
+.\scripts\handshake-watchdog.ps1 -Token "SMOKE-1A2B3C4D"
+```

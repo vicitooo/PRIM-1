@@ -18,4 +18,9 @@ Current script-level coverage:
   - checks non-`input` action rejection
   - captures the mailbox fallback payload and asserts the exact string survives shell-hostile characters
 
+- `tests/handshake-helpers.ps1`
+  - validates `scripts/new-smoke-token.ps1`
+  - validates canonical `scripts/handshake-route.ps1` payload generation in `-DryRun` mode
+  - validates `scripts/handshake-watchdog.ps1` success detection and timeout dry-run behavior against synthetic audit files
+
 The detailed strategy should be locked during Phase 0.
