@@ -255,7 +255,10 @@ fn init_supervisor(
     });
     let control_plane = supervisor
         .start_control_plane()
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            diagnostics.log("error", "control_plane_start_failed", error.to_string());
+            error.to_string()
+        })?;
     diagnostics.log(
         "info",
         "control_plane_ready",

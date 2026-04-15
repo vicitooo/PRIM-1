@@ -5,12 +5,12 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
-use control_plane::{DEFAULT_ENDPOINT, decode_request, encode_response};
+use control_plane::{DEFAULT_ENDPOINT, decode_request, encode_request, encode_response};
 use parking_lot::{Mutex, RwLock};
 use pty_host::{PtyEvent, PtyEventHandler, PtySession};
 use shared_types::{
@@ -22,6 +22,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use uuid::Uuid;
 
 type EventSink = Arc<dyn Fn(RuntimeEvent) + Send + Sync>;
+
+const CONTROL_PLANE_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+const CONTROL_PLANE_PROBE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SubmitBehavior {
@@ -446,20 +449,26 @@ impl SupervisorHandle {
             return Ok(existing);
         }
 
+        let info_path = self.runtime_dir().join("control-plane.json");
+        if let Some(existing_status) = load_existing_control_plane_status(&info_path)? {
+            if probe_control_plane_owner(&existing_status, CONTROL_PLANE_PROBE_TIMEOUT)? {
+                return Err(anyhow!(
+                    "another wrapper instance is already holding the control plane at {}. Close the other instance before starting a new one.",
+                    existing_status.endpoint
+                ));
+            }
+        }
+
         let endpoint = control_plane_endpoint();
         let status = ControlPlaneStatus {
             transport: control_plane_transport().into(),
             endpoint: endpoint.clone(),
             token: Uuid::new_v4().to_string(),
-            info_path: self
-                .runtime_dir()
-                .join("control-plane.json")
-                .display()
-                .to_string(),
+            info_path: info_path.display().to_string(),
         };
 
         fs::write(
-            self.runtime_dir().join("control-plane.json"),
+            &info_path,
             serde_json::to_string_pretty(&status)?,
         )
         .context("failed to persist control plane info file")?;
@@ -939,6 +948,138 @@ fn routed_message_submit_behavior(driver: DriverKind) -> SubmitBehavior {
     }
 }
 
+fn load_existing_control_plane_status(info_path: &Path) -> Result<Option<ControlPlaneStatus>> {
+    if !info_path.exists() {
+        return Ok(None);
+    }
+
+    let raw = fs::read_to_string(info_path).with_context(|| {
+        format!(
+            "failed to read existing control plane info file {}",
+            info_path.display()
+        )
+    })?;
+    let status = serde_json::from_str::<ControlPlaneStatus>(&raw).with_context(|| {
+        format!(
+            "failed to parse existing control plane info file {}",
+            info_path.display()
+        )
+    })?;
+    Ok(Some(status))
+}
+
+fn probe_control_plane_owner(status: &ControlPlaneStatus, timeout: Duration) -> Result<bool> {
+    let payload = format!(
+        "{}\n",
+        encode_request(&SidebandRequest::Ping {
+            token: status.token.clone(),
+        })?
+    );
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+
+        if try_probe_control_plane_endpoint(&status.endpoint, &payload, remaining)? {
+            return Ok(true);
+        }
+
+        let sleep_for = CONTROL_PLANE_PROBE_RETRY_INTERVAL
+            .min(deadline.saturating_duration_since(Instant::now()));
+        if sleep_for.is_zero() {
+            return Ok(false);
+        }
+
+        thread::sleep(sleep_for);
+    }
+}
+
+#[cfg(windows)]
+fn try_probe_control_plane_endpoint(endpoint: &str, payload: &str, timeout: Duration) -> Result<bool> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .context("failed to create control-plane probe runtime")?;
+
+    runtime.block_on(async {
+        let client = match ClientOptions::new().open(endpoint) {
+            Ok(client) => client,
+            Err(_) => return Ok(false),
+        };
+
+        tokio::time::timeout(timeout, async move {
+            let (read_half, mut write_half) = tokio::io::split(client);
+            write_half
+                .write_all(payload.as_bytes())
+                .await
+                .context("failed to write probe request")?;
+            write_half
+                .flush()
+                .await
+                .context("failed to flush probe request")?;
+
+            let mut reader = BufReader::new(read_half);
+            let mut line = String::new();
+            let bytes = reader
+                .read_line(&mut line)
+                .await
+                .context("failed to read probe response")?;
+            Ok::<bool, anyhow::Error>(bytes > 0)
+        })
+        .await
+        .map_err(|_| anyhow!("control-plane probe timed out"))?
+    })
+}
+
+#[cfg(unix)]
+fn try_probe_control_plane_endpoint(endpoint: &str, payload: &str, timeout: Duration) -> Result<bool> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .context("failed to create control-plane probe runtime")?;
+
+    runtime.block_on(async {
+        let client = match tokio::time::timeout(
+            timeout,
+            tokio::net::UnixStream::connect(endpoint),
+        )
+        .await
+        {
+            Ok(Ok(client)) => client,
+            Ok(Err(_)) | Err(_) => return Ok(false),
+        };
+
+        tokio::time::timeout(timeout, async move {
+            let (read_half, mut write_half) = tokio::io::split(client);
+            write_half
+                .write_all(payload.as_bytes())
+                .await
+                .context("failed to write probe request")?;
+            write_half
+                .flush()
+                .await
+                .context("failed to flush probe request")?;
+
+            let mut reader = BufReader::new(read_half);
+            let mut line = String::new();
+            let bytes = reader
+                .read_line(&mut line)
+                .await
+                .context("failed to read probe response")?;
+            Ok::<bool, anyhow::Error>(bytes > 0)
+        })
+        .await
+        .map_err(|_| anyhow!("control-plane probe timed out"))?
+    })
+}
+
 fn collapse_inline_content(content: &str) -> String {
     content.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -1063,6 +1204,10 @@ mod tests {
 
     fn test_supervisor() -> SupervisorHandle {
         let root = std::env::temp_dir().join(format!("cli-master-wrapper-test-{}", Uuid::new_v4()));
+        test_supervisor_with_root(root)
+    }
+
+    fn test_supervisor_with_root(root: PathBuf) -> SupervisorHandle {
         SupervisorHandle::new(SupervisorConfig {
             working_root: root.clone(),
             runtime_dir: root.join("runtime"),
@@ -1273,6 +1418,71 @@ mod tests {
 
         assert_eq!(first.endpoint, second.endpoint);
         assert_eq!(first.token, second.token);
+    }
+
+    fn wait_for_live_probe(status: &ControlPlaneStatus) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if probe_control_plane_owner(status, Duration::from_millis(250)).unwrap() {
+                return;
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for control-plane probe response at {}",
+                status.endpoint
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn start_control_plane_refuses_to_overwrite_live_owner() {
+        let root = std::env::temp_dir().join(format!(
+            "cli-master-wrapper-live-owner-test-{}",
+            Uuid::new_v4()
+        ));
+        let first = test_supervisor_with_root(root.clone());
+        let first_status = first.start_control_plane().unwrap();
+        wait_for_live_probe(&first_status);
+        let control_plane_path = first.runtime_dir().join("control-plane.json");
+        let before = fs::read_to_string(&control_plane_path).unwrap();
+
+        let second = test_supervisor_with_root(root);
+        let error = second.start_control_plane().unwrap_err();
+
+        assert!(
+            error.to_string().contains("another wrapper instance is already holding the control plane"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(fs::read_to_string(&control_plane_path).unwrap(), before);
+    }
+
+    #[test]
+    fn start_control_plane_overwrites_dead_owner_file() {
+        let root = std::env::temp_dir().join(format!(
+            "cli-master-wrapper-dead-owner-test-{}",
+            Uuid::new_v4()
+        ));
+        let supervisor = test_supervisor_with_root(root);
+        let info_path = supervisor.runtime_dir().join("control-plane.json");
+        fs::create_dir_all(supervisor.runtime_dir()).unwrap();
+        let stale = ControlPlaneStatus {
+            transport: control_plane_transport().into(),
+            endpoint: format!("{DEFAULT_ENDPOINT}-dead-{}", Uuid::new_v4()),
+            token: "stale-token".into(),
+            info_path: info_path.display().to_string(),
+        };
+        fs::write(&info_path, serde_json::to_string_pretty(&stale).unwrap()).unwrap();
+
+        let status = supervisor.start_control_plane().unwrap();
+        let persisted: ControlPlaneStatus =
+            serde_json::from_str(&fs::read_to_string(&info_path).unwrap()).unwrap();
+
+        assert_eq!(persisted.endpoint, status.endpoint);
+        assert_eq!(persisted.token, status.token);
+        assert_ne!(persisted.endpoint, stale.endpoint);
+        assert_ne!(persisted.token, stale.token);
     }
 
     #[test]

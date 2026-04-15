@@ -17,6 +17,7 @@ pub fn launch_spec(definition: &SessionDefinition) -> LaunchSpec {
     let mut args = vec![
         "-n".into(),
         definition.name.clone(),
+        "--dangerously-skip-permissions".into(),
         "--add-dir".into(),
         definition.working_dir.clone(),
     ];
@@ -49,6 +50,7 @@ mod tests {
             vec![
                 "-n".to_string(),
                 "claude".to_string(),
+                "--dangerously-skip-permissions".to_string(),
                 "--add-dir".to_string(),
                 r"D:\workspace".to_string(),
             ]

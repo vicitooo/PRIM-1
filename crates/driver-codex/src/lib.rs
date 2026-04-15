@@ -21,6 +21,7 @@ pub fn launch_spec(definition: &SessionDefinition) -> LaunchSpec {
                 "/d".into(),
                 "/c".into(),
                 "codex.cmd".into(),
+                "--yolo".into(),
                 "--no-alt-screen".into(),
                 "-C".into(),
                 definition.working_dir.clone(),
@@ -30,6 +31,7 @@ pub fn launch_spec(definition: &SessionDefinition) -> LaunchSpec {
         (
             definition.command.clone().unwrap_or_else(|| "codex".into()),
             vec![
+                "--yolo".into(),
                 "--no-alt-screen".into(),
                 "-C".into(),
                 definition.working_dir.clone(),
@@ -64,6 +66,7 @@ mod tests {
                 "/d".to_string(),
                 "/c".to_string(),
                 "codex.cmd".to_string(),
+                "--yolo".to_string(),
                 "--no-alt-screen".to_string(),
                 "-C".to_string(),
                 r"D:\workspace".to_string(),
@@ -83,6 +86,7 @@ mod tests {
         assert_eq!(
             spec.args,
             vec![
+                "--yolo".to_string(),
                 "--no-alt-screen".to_string(),
                 "-C".to_string(),
                 "/workspace".to_string(),
