@@ -232,15 +232,24 @@ impl SidebandRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SidebandResponsePayload {
+    Reserved,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SidebandResponse {
     pub ok: bool,
     pub message: String,
     pub snapshot: Option<RuntimeSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<SidebandResponsePayload>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn sideband_token_accessor_returns_expected_value() {
@@ -251,5 +260,40 @@ mod tests {
         };
 
         assert_eq!(request.token(), "secret");
+    }
+
+    #[test]
+    fn sideband_response_serializes_without_payload_field_when_none() {
+        let value = serde_json::to_value(SidebandResponse {
+            ok: true,
+            message: "pong".into(),
+            snapshot: None,
+            payload: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            value,
+            json!({
+                "ok": true,
+                "message": "pong",
+                "snapshot": null,
+            })
+        );
+    }
+
+    #[test]
+    fn sideband_response_deserializes_legacy_format_without_payload_field() {
+        let response: SidebandResponse = serde_json::from_value(json!({
+            "ok": true,
+            "message": "pong",
+            "snapshot": null,
+        }))
+        .unwrap();
+
+        assert!(response.ok);
+        assert_eq!(response.message, "pong");
+        assert_eq!(response.snapshot, None);
+        assert_eq!(response.payload, None);
     }
 }

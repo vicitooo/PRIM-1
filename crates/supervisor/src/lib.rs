@@ -661,6 +661,7 @@ impl SupervisorHandle {
                 ok: false,
                 message: "control plane not ready".into(),
                 snapshot: None,
+                payload: None,
             };
         };
 
@@ -674,6 +675,7 @@ impl SupervisorHandle {
                 ok: false,
                 message: "invalid control plane token".into(),
                 snapshot: None,
+                payload: None,
             };
         }
 
@@ -707,11 +709,13 @@ impl SupervisorHandle {
                 ok: true,
                 message,
                 snapshot: Some(self.snapshot()),
+                payload: None,
             },
             Err(error) => SidebandResponse {
                 ok: false,
                 message: error.to_string(),
                 snapshot: Some(self.snapshot()),
+                payload: None,
             },
         }
     }
@@ -975,6 +979,7 @@ fn process_sideband_mailbox_file(
                 ok: false,
                 message: format!("invalid sideband payload: {error}"),
                 snapshot: Some(handle.snapshot()),
+                payload: None,
             }
         }
     };
