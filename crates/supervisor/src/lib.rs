@@ -14,9 +14,9 @@ use control_plane::{DEFAULT_ENDPOINT, decode_request, encode_request, encode_res
 use parking_lot::{Mutex, RwLock};
 use pty_host::{PtyEvent, PtyEventHandler, PtySession};
 use shared_types::{
-    ControlKey, ControlPlaneStatus, DriverKind, EnvVar, LifecycleState, LogLevel, MessageScope,
-    RouteMessageRequest, RuntimeEvent, RuntimeSnapshot, SendInputRequest, SessionDefinition,
-    SessionSnapshot, SidebandRequest, SidebandResponse, now_rfc3339,
+    ControlKey, ControlPlaneStatus, DeliverMessageRequest, DriverKind, EnvVar, LifecycleState,
+    LogLevel, MessageScope, RouteMessageRequest, RuntimeEvent, RuntimeSnapshot, SendInputRequest,
+    SessionDefinition, SessionSnapshot, SidebandRequest, SidebandResponse, now_rfc3339,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use uuid::Uuid;
@@ -431,6 +431,14 @@ impl SupervisorHandle {
         Ok(self.snapshot())
     }
 
+    pub fn deliver_message(&self, request: DeliverMessageRequest) -> Result<SessionSnapshot> {
+        let (snapshot, submit_behavior, payloads) =
+            self.prepare_delivery_for_session(&request.name, &request.content)?;
+
+        self.deliver_prepared_payloads(&request.name, &payloads, submit_behavior)?;
+        Ok(snapshot)
+    }
+
     pub fn resize_session(&self, name: &str, cols: u16, rows: u16) -> Result<()> {
         self.refresh_session_liveness();
         let slots = self.inner.slots.lock();
@@ -691,6 +699,14 @@ impl SupervisorHandle {
             SidebandRequest::RestartSession { name, .. } => self
                 .restart_session(&name)
                 .map(|_| format!("restarted {name}")),
+            SidebandRequest::DeliverMessage {
+                token,
+                name,
+                content,
+            } => self
+                .validate_deliver_message_token(&token, &name)
+                .and_then(|_| self.deliver_message(DeliverMessageRequest { name, content }))
+                .map(|_| "delivered".into()),
             SidebandRequest::SendInput { token, name, input } => self
                 .validate_session_action_token(&token, &name)
                 .and_then(|_| self.send_input(SendInputRequest { name, input }))
@@ -817,6 +833,51 @@ impl SupervisorHandle {
         }
 
         Ok(())
+    }
+
+    fn validate_deliver_message_token(&self, token: &str, target_session: &str) -> Result<()> {
+        let binding = self
+            .inner
+            .token_bindings
+            .lock()
+            .get(token)
+            .cloned()
+            .ok_or_else(|| anyhow!("invalid control plane token"))?;
+
+        if let Some(bound_session) = binding {
+            if bound_session != target_session {
+                return Err(anyhow!(
+                    "deliver_message: pane-bound token cannot target other sessions; use route_message instead"
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn prepare_delivery_for_session(
+        &self,
+        session_name: &str,
+        content: &str,
+    ) -> Result<(SessionSnapshot, SubmitBehavior, Vec<String>)> {
+        if content.trim_start().starts_with('/') {
+            return Err(anyhow!(
+                "deliver_message: slash commands are not supported; use send_input"
+            ));
+        }
+
+        self.refresh_session_liveness();
+        let slots = self.inner.slots.lock();
+        let slot = slots
+            .get(session_name)
+            .with_context(|| format!("unknown session '{}'", session_name))?;
+        if slot.running.is_none() {
+            return Err(anyhow!("session '{}' is not running", session_name));
+        }
+
+        let submit_behavior = routed_message_submit_behavior(slot.definition.driver);
+        let payloads = prepare_direct_message(slot.definition.driver, content);
+        Ok((slot.snapshot(), submit_behavior, payloads))
     }
 
     fn deliver_prepared_payloads(
@@ -1486,6 +1547,19 @@ mod tests {
         slot.state = LifecycleState::Busy;
     }
 
+    fn install_synthetic_running_session(
+        supervisor: &SupervisorHandle,
+        name: &str,
+        driver: DriverKind,
+    ) {
+        let mut slots = supervisor.inner.slots.lock();
+        let slot = slots.get_mut(name).unwrap();
+        slot.definition.driver = driver;
+        slot.running = Some(RunningSession { pty: None });
+        slot.process_id = None;
+        slot.state = LifecycleState::Busy;
+    }
+
     fn session_token(supervisor: &SupervisorHandle, name: &str) -> String {
         supervisor.start_control_plane().unwrap();
         supervisor
@@ -1977,6 +2051,114 @@ mod tests {
         supervisor
             .validate_session_action_token(&status.token, "codex")
             .unwrap();
+    }
+
+    #[test]
+    fn deliver_message_rejects_slash_command() {
+        let supervisor = test_supervisor();
+
+        let error = supervisor
+            .deliver_message(DeliverMessageRequest {
+                name: "claude".into(),
+                content: "/compact".into(),
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "deliver_message: slash commands are not supported; use send_input"
+        );
+    }
+
+    #[test]
+    fn deliver_message_rejects_slash_command_with_leading_whitespace() {
+        let supervisor = test_supervisor();
+
+        let error = supervisor
+            .deliver_message(DeliverMessageRequest {
+                name: "claude".into(),
+                content: "  /compact".into(),
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "deliver_message: slash commands are not supported; use send_input"
+        );
+    }
+
+    #[test]
+    fn deliver_message_pane_bound_token_rejects_other_session() {
+        let supervisor = test_supervisor();
+        let claude_token = session_token(&supervisor, "claude");
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::DeliverMessage {
+            token: claude_token,
+            name: "codex".into(),
+            content: "status update".into(),
+        });
+
+        assert!(!response.ok);
+        assert_eq!(
+            response.message,
+            "deliver_message: pane-bound token cannot target other sessions; use route_message instead"
+        );
+    }
+
+    #[test]
+    fn deliver_message_pane_bound_token_accepts_own_session() {
+        let supervisor = test_supervisor();
+        let claude_token = session_token(&supervisor, "claude");
+        install_stale_running_session(&supervisor, "claude");
+
+        supervisor
+            .validate_deliver_message_token(&claude_token, "claude")
+            .unwrap();
+    }
+
+    #[test]
+    fn deliver_message_master_token_accepts_any_session() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        install_stale_running_session(&supervisor, "codex");
+
+        supervisor
+            .validate_deliver_message_token(&status.token, "codex")
+            .unwrap();
+    }
+
+    #[test]
+    fn deliver_message_claude_delivers_multi_line_intact() {
+        let supervisor = test_supervisor();
+        install_synthetic_running_session(&supervisor, "claude", DriverKind::Claude);
+
+        let (snapshot, submit_behavior, payloads) = supervisor
+            .prepare_delivery_for_session("claude", "line one\nline two")
+            .unwrap();
+
+        assert_eq!(snapshot.name, "claude");
+        assert_eq!(
+            submit_behavior,
+            routed_message_submit_behavior(DriverKind::Claude)
+        );
+        assert_eq!(payloads, vec!["line one\nline two".to_string()]);
+    }
+
+    #[test]
+    fn deliver_message_codex_delivers_flattened_single_line() {
+        let supervisor = test_supervisor();
+        install_synthetic_running_session(&supervisor, "codex", DriverKind::Codex);
+
+        let (snapshot, submit_behavior, payloads) = supervisor
+            .prepare_delivery_for_session("codex", "line one\nline two")
+            .unwrap();
+
+        assert_eq!(snapshot.name, "codex");
+        assert_eq!(
+            submit_behavior,
+            routed_message_submit_behavior(DriverKind::Codex)
+        );
+        assert_eq!(payloads, vec!["line one line two".to_string()]);
     }
 
     #[test]

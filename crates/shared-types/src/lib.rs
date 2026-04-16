@@ -144,6 +144,12 @@ pub struct RestartSessionRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeliverMessageRequest {
+    pub name: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum RuntimeEvent {
     SessionOutput {
@@ -200,6 +206,11 @@ pub enum SidebandRequest {
         token: String,
         name: String,
     },
+    DeliverMessage {
+        token: String,
+        name: String,
+        content: String,
+    },
     SendInput {
         token: String,
         name: String,
@@ -224,6 +235,7 @@ impl SidebandRequest {
             | Self::StartSession { token, .. }
             | Self::StopSession { token, .. }
             | Self::RestartSession { token, .. }
+            | Self::DeliverMessage { token, .. }
             | Self::SendInput { token, .. }
             | Self::SendKey { token, .. }
             | Self::RouteMessage { token, .. } => token,
