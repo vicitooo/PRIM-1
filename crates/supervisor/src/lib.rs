@@ -16,7 +16,8 @@ use pty_host::{PtyEvent, PtyEventHandler, PtySession};
 use shared_types::{
     ControlKey, ControlPlaneStatus, DeliverMessageRequest, DriverKind, EnvVar, LifecycleState,
     LogLevel, MessageScope, RouteMessageRequest, RuntimeEvent, RuntimeSnapshot, SendInputRequest,
-    SessionDefinition, SessionSnapshot, SidebandRequest, SidebandResponse, now_rfc3339,
+    SessionDefinition, SessionSnapshot, SidebandRequest, SidebandResponse, SidebandResponsePayload,
+    WaitQuietRequest, now_rfc3339,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use uuid::Uuid;
@@ -87,6 +88,7 @@ struct SessionSlot {
     running: Option<RunningSession>,
     process_id: Option<u32>,
     last_activity_at: Option<String>,
+    last_real_output_at: Option<Instant>,
     last_error: Option<String>,
 }
 
@@ -142,6 +144,7 @@ impl SupervisorHandle {
                 running: None,
                 process_id: None,
                 last_activity_at: None,
+                last_real_output_at: None,
                 last_error: None,
             },
         );
@@ -155,6 +158,7 @@ impl SupervisorHandle {
                 running: None,
                 process_id: None,
                 last_activity_at: None,
+                last_real_output_at: None,
                 last_error: None,
             },
         );
@@ -222,6 +226,7 @@ impl SupervisorHandle {
             slot.state = LifecycleState::Starting;
             slot.last_error = None;
             slot.last_activity_at = Some(now_rfc3339());
+            slot.last_real_output_at = None;
             let snapshot = slot.snapshot();
             drop(slots);
             self.emit(RuntimeEvent::SessionState {
@@ -257,6 +262,7 @@ impl SupervisorHandle {
                     slot.running = Some(RunningSession { pty: Some(pty) });
                     slot.state = LifecycleState::Ready;
                     slot.last_activity_at = Some(now_rfc3339());
+                    slot.last_real_output_at = None;
                     slot.snapshot()
                 };
                 self.emit(RuntimeEvent::SystemLog {
@@ -282,6 +288,7 @@ impl SupervisorHandle {
                     slot.process_id = None;
                     slot.state = LifecycleState::Failed;
                     slot.last_error = Some(error.to_string());
+                    slot.last_real_output_at = None;
                     slot.snapshot()
                 };
                 self.emit(RuntimeEvent::SystemLog {
@@ -310,6 +317,7 @@ impl SupervisorHandle {
             slot.state = LifecycleState::Closed;
             slot.process_id = None;
             slot.last_activity_at = Some(now_rfc3339());
+            slot.last_real_output_at = None;
             slot.running.take().and_then(|running| running.pty)
         };
 
@@ -589,16 +597,19 @@ impl SupervisorHandle {
     fn handle_pty_event(&self, session_name: &str, event: PtyEvent) {
         match event {
             PtyEvent::Output(chunk) => {
+                let has_real_content = chunk_has_real_content(&chunk);
                 let transitioned_to_ready = {
                     let mut slots = self.inner.slots.lock();
                     if let Some(slot) = slots.get_mut(session_name) {
+                        let transitioned = slot.state != LifecycleState::Ready;
                         if slot.state != LifecycleState::Ready {
                             slot.state = LifecycleState::Ready;
                             slot.last_activity_at = Some(now_rfc3339());
-                            true
-                        } else {
-                            false
                         }
+                        if has_real_content {
+                            slot.last_real_output_at = Some(Instant::now());
+                        }
+                        transitioned
                     } else {
                         false
                     }
@@ -628,6 +639,7 @@ impl SupervisorHandle {
                         slot.process_id = None;
                         slot.state = LifecycleState::Closed;
                         slot.last_activity_at = Some(now_rfc3339());
+                        slot.last_real_output_at = None;
                     }
                 }
                 self.emit(RuntimeEvent::SessionState {
@@ -646,6 +658,7 @@ impl SupervisorHandle {
                         slot.running = None;
                         slot.process_id = None;
                         slot.last_activity_at = Some(now_rfc3339());
+                        slot.last_real_output_at = None;
                     }
                 }
                 self.emit(RuntimeEvent::SystemLog {
@@ -664,6 +677,14 @@ impl SupervisorHandle {
     }
 
     fn apply_sideband_request(&self, request: SidebandRequest) -> SidebandResponse {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("failed to create wait_quiet runtime");
+        runtime.block_on(self.apply_sideband_request_async(request))
+    }
+
+    async fn apply_sideband_request_async(&self, request: SidebandRequest) -> SidebandResponse {
         let Some(_) = self.inner.control_plane.read().clone() else {
             return SidebandResponse {
                 ok: false,
@@ -699,6 +720,20 @@ impl SupervisorHandle {
             SidebandRequest::RestartSession { name, .. } => self
                 .restart_session(&name)
                 .map(|_| format!("restarted {name}")),
+            SidebandRequest::WaitQuiet {
+                name,
+                quiet_seconds,
+                timeout_seconds,
+                ..
+            } => {
+                return self
+                    .wait_quiet(WaitQuietRequest {
+                        name,
+                        quiet_seconds,
+                        timeout_seconds,
+                    })
+                    .await;
+            }
             SidebandRequest::DeliverMessage {
                 token,
                 name,
@@ -878,6 +913,65 @@ impl SupervisorHandle {
         let submit_behavior = routed_message_submit_behavior(slot.definition.driver);
         let payloads = prepare_direct_message(slot.definition.driver, content);
         Ok((slot.snapshot(), submit_behavior, payloads))
+    }
+
+    async fn wait_quiet(&self, request: WaitQuietRequest) -> SidebandResponse {
+        self.refresh_session_liveness();
+        let quiet_window = Duration::from_secs(request.quiet_seconds as u64);
+        let timeout = Duration::from_secs(request.timeout_seconds as u64);
+        let wait_started_at = Instant::now();
+
+        loop {
+            self.refresh_session_liveness();
+            let status = {
+                let slots = self.inner.slots.lock();
+                let Some(slot) = slots.get(&request.name) else {
+                    return SidebandResponse {
+                        ok: false,
+                        message: format!("unknown session '{}'", request.name),
+                        snapshot: Some(self.snapshot()),
+                        payload: None,
+                    };
+                };
+                if slot.running.is_none() {
+                    return SidebandResponse {
+                        ok: false,
+                        message: format!("session '{}' is not running", request.name),
+                        snapshot: Some(self.snapshot()),
+                        payload: None,
+                    };
+                }
+
+                let last_real_output_at = slot.last_real_output_at.unwrap_or(wait_started_at);
+                Instant::now()
+                    .saturating_duration_since(last_real_output_at)
+                    .as_millis() as u64
+            };
+
+            if status >= quiet_window.as_millis() as u64 {
+                return SidebandResponse {
+                    ok: true,
+                    message: "session is quiet".into(),
+                    snapshot: Some(self.snapshot()),
+                    payload: Some(SidebandResponsePayload::WaitQuiet {
+                        quiet_duration_ms: status,
+                    }),
+                };
+            }
+
+            if Instant::now().saturating_duration_since(wait_started_at) >= timeout {
+                return SidebandResponse {
+                    ok: false,
+                    message: "wait_quiet timed out".into(),
+                    snapshot: Some(self.snapshot()),
+                    payload: Some(SidebandResponsePayload::WaitQuietTimeout {
+                        last_output_age_ms: status,
+                    }),
+                };
+            }
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     fn deliver_prepared_payloads(
@@ -1407,6 +1501,73 @@ fn control_key_sequence(key: ControlKey) -> &'static str {
     }
 }
 
+fn chunk_has_real_content(chunk: &str) -> bool {
+    if chunk.len() < 3 {
+        return false;
+    }
+
+    let visible = strip_terminal_control_sequences(chunk);
+    let trimmed = visible.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let mut chars = trimmed.chars();
+    if let (Some(ch), None) = (chars.next(), chars.next()) {
+        let codepoint = ch as u32;
+        if (0x2800..=0x28ff).contains(&codepoint) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn strip_terminal_control_sequences(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] == 0x1b {
+            if index + 1 < bytes.len() && bytes[index + 1] == b']' {
+                index += 2;
+                while index < bytes.len() {
+                    if bytes[index] == 0x07 {
+                        index += 1;
+                        break;
+                    }
+                    if bytes[index] == 0x1b && index + 1 < bytes.len() && bytes[index + 1] == b'\\'
+                    {
+                        index += 2;
+                        break;
+                    }
+                    index += 1;
+                }
+                continue;
+            }
+
+            if index + 1 < bytes.len() && bytes[index + 1] == b'[' {
+                index += 2;
+                while index < bytes.len() {
+                    let byte = bytes[index];
+                    if (0x40..=0x7e).contains(&byte) {
+                        index += 1;
+                        break;
+                    }
+                    index += 1;
+                }
+                continue;
+            }
+        }
+
+        output.push(bytes[index]);
+        index += 1;
+    }
+
+    String::from_utf8_lossy(&output).replace('\r', "")
+}
+
 fn control_plane_transport() -> &'static str {
     #[cfg(windows)]
     {
@@ -1493,7 +1654,7 @@ where
         .context("failed to read sideband request")?;
 
     let request = decode_request(line.trim()).context("invalid sideband payload")?;
-    let response = handle.apply_sideband_request(request);
+    let response = handle.apply_sideband_request_async(request).await;
     let payload = format!("{}\n", encode_response(&response)?);
     write_half
         .write_all(payload.as_bytes())
@@ -1545,6 +1706,7 @@ mod tests {
         slot.running = Some(RunningSession { pty: None });
         slot.process_id = Some(u32::MAX);
         slot.state = LifecycleState::Busy;
+        slot.last_real_output_at = None;
     }
 
     fn install_synthetic_running_session(
@@ -1558,6 +1720,7 @@ mod tests {
         slot.running = Some(RunningSession { pty: None });
         slot.process_id = None;
         slot.state = LifecycleState::Busy;
+        slot.last_real_output_at = None;
     }
 
     fn session_token(supervisor: &SupervisorHandle, name: &str) -> String {
@@ -1793,6 +1956,26 @@ mod tests {
         assert_eq!(control_key_sequence(ControlKey::Tab), "\t");
         assert_eq!(control_key_sequence(ControlKey::Esc), "\x1b");
         assert_eq!(control_key_sequence(ControlKey::CtrlC), "\x03");
+    }
+
+    #[test]
+    fn classifier_ignores_pure_ansi_escape() {
+        assert!(!chunk_has_real_content("\x1b[2K\x1b[1G"));
+    }
+
+    #[test]
+    fn classifier_ignores_title_bar_update() {
+        assert!(!chunk_has_real_content("\x1b]0;claude\x07"));
+    }
+
+    #[test]
+    fn classifier_ignores_braille_spinner_char() {
+        assert!(!chunk_has_real_content("\x1b[?25l⠙\x1b[?25h"));
+    }
+
+    #[test]
+    fn classifier_treats_multichar_text_as_real_content() {
+        assert!(chunk_has_real_content("Working"));
     }
 
     #[test]
@@ -2159,6 +2342,79 @@ mod tests {
             routed_message_submit_behavior(DriverKind::Codex)
         );
         assert_eq!(payloads, vec!["line one line two".to_string()]);
+    }
+
+    #[test]
+    fn wait_quiet_returns_after_no_real_content_for_n_sec() {
+        let supervisor = test_supervisor();
+        install_synthetic_running_session(&supervisor, "claude", DriverKind::Claude);
+        let status = supervisor.start_control_plane().unwrap();
+        let started = Instant::now();
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::WaitQuiet {
+            token: status.token,
+            name: "claude".into(),
+            quiet_seconds: 1,
+            timeout_seconds: 2,
+        });
+
+        assert!(started.elapsed() >= Duration::from_millis(900));
+        assert!(response.ok);
+        match response.payload {
+            Some(SidebandResponsePayload::WaitQuiet { quiet_duration_ms }) => {
+                assert!(quiet_duration_ms >= 1000);
+            }
+            other => panic!("unexpected wait_quiet payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wait_quiet_timeout_reports_last_output_age() {
+        let supervisor = test_supervisor();
+        install_synthetic_running_session(&supervisor, "claude", DriverKind::Claude);
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            slots.get_mut("claude").unwrap().last_real_output_at = Some(Instant::now());
+        }
+        let status = supervisor.start_control_plane().unwrap();
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::WaitQuiet {
+            token: status.token,
+            name: "claude".into(),
+            quiet_seconds: 2,
+            timeout_seconds: 1,
+        });
+
+        assert!(!response.ok);
+        match response.payload {
+            Some(SidebandResponsePayload::WaitQuietTimeout { last_output_age_ms }) => {
+                assert!(last_output_age_ms < 2000);
+            }
+            other => panic!("unexpected wait_quiet timeout payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wait_quiet_real_content_resets_timer() {
+        let supervisor = test_supervisor();
+        install_synthetic_running_session(&supervisor, "claude", DriverKind::Claude);
+        let status = supervisor.start_control_plane().unwrap();
+        let refresher = supervisor.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            refresher.handle_pty_event("claude", PtyEvent::Output("Working".into()));
+        });
+        let started = Instant::now();
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::WaitQuiet {
+            token: status.token,
+            name: "claude".into(),
+            quiet_seconds: 1,
+            timeout_seconds: 3,
+        });
+
+        assert!(response.ok);
+        assert!(started.elapsed() >= Duration::from_millis(1100));
     }
 
     #[test]

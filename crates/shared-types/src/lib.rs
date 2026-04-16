@@ -149,6 +149,16 @@ pub struct DeliverMessageRequest {
     pub content: String,
 }
 
+/// Waits until a session has emitted no "real content" for the requested
+/// quiet window. This is not equivalent to "assistant turn finished":
+/// assistants may go quiet during long think phases while still in flight.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WaitQuietRequest {
+    pub name: String,
+    pub quiet_seconds: u32,
+    pub timeout_seconds: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum RuntimeEvent {
@@ -211,6 +221,12 @@ pub enum SidebandRequest {
         name: String,
         content: String,
     },
+    WaitQuiet {
+        token: String,
+        name: String,
+        quiet_seconds: u32,
+        timeout_seconds: u32,
+    },
     SendInput {
         token: String,
         name: String,
@@ -236,6 +252,7 @@ impl SidebandRequest {
             | Self::StopSession { token, .. }
             | Self::RestartSession { token, .. }
             | Self::DeliverMessage { token, .. }
+            | Self::WaitQuiet { token, .. }
             | Self::SendInput { token, .. }
             | Self::SendKey { token, .. }
             | Self::RouteMessage { token, .. } => token,
@@ -247,6 +264,8 @@ impl SidebandRequest {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SidebandResponsePayload {
     Reserved,
+    WaitQuiet { quiet_duration_ms: u64 },
+    WaitQuietTimeout { last_output_age_ms: u64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
