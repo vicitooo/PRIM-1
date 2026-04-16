@@ -215,11 +215,16 @@ fn resolve_project_root() -> Result<PathBuf, String> {
 }
 
 fn resolve_agent_working_root(project_root: &Path) -> Result<PathBuf, String> {
-    let personal_root = project_root
-        .parent()
-        .ok_or_else(|| format!("failed to resolve personal repo root from {}", project_root.display()))?;
+    let personal_root = project_root.parent().ok_or_else(|| {
+        format!(
+            "failed to resolve personal repo root from {}",
+            project_root.display()
+        )
+    })?;
 
-    Ok(normalize_path_for_child_processes(personal_root.to_path_buf()))
+    Ok(normalize_path_for_child_processes(
+        personal_root.to_path_buf(),
+    ))
 }
 
 fn peer_slash_commands_allowed_from_env() -> bool {
@@ -287,12 +292,10 @@ fn init_supervisor(
     supervisor.set_event_sink(move |event| {
         let _ = ui_event_tx.send(event);
     });
-    let control_plane = supervisor
-        .start_control_plane()
-        .map_err(|error| {
-            diagnostics.log("error", "control_plane_start_failed", error.to_string());
-            error.to_string()
-        })?;
+    let control_plane = supervisor.start_control_plane().map_err(|error| {
+        diagnostics.log("error", "control_plane_start_failed", error.to_string());
+        error.to_string()
+    })?;
     diagnostics.log(
         "info",
         "control_plane_ready",
@@ -480,8 +483,7 @@ pub fn run() {
 mod tests {
     use super::{
         normalize_path_for_child_processes, peer_slash_commands_allowed_from_env,
-        resolve_agent_working_root,
-        sanitize_terminal_output_for_ui, strip_osc_sequences,
+        resolve_agent_working_root, sanitize_terminal_output_for_ui, strip_osc_sequences,
     };
     use std::path::PathBuf;
 

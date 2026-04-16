@@ -51,7 +51,9 @@ fn wrapper_root_for_session(working_dir: &str) -> String {
     if is_wrapper_root {
         working_dir.to_string()
     } else {
-        path.join("CLI-master-wrapper").to_string_lossy().into_owned()
+        path.join("CLI-master-wrapper")
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
