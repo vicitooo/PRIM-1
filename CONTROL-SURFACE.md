@@ -69,6 +69,8 @@ Supported actions:
 - `stop`
 - `restart`
 - `input`
+- `deliver`
+- `wait_quiet`
 - `key`
 - `route`
 
@@ -79,6 +81,8 @@ powershell -Command "& '.\scripts\control-plane.ps1' -Action list"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action start -Session claude"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action input -Session codex -Content 'hi'"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action input -Session claude -ContentFile 'D:\tmp\compact.txt'"
+powershell -Command "& '.\scripts\control-plane.ps1' -Action deliver -Session claude -Content 'hello from victor'"
+powershell -Command "& '.\scripts\control-plane.ps1' -Action wait_quiet -Session claude -QuietSec 2 -TimeoutSec 10"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action key -Session claude -Key enter"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action route -From victor -To room -Scope room -Content 'status ping'"
 ```
@@ -96,8 +100,14 @@ Behavior:
 - `-Action input` now accepts either:
   - `-Content '<inline text>'`
   - `-ContentFile '<path to UTF-8 text file>'`
+- `-Action deliver` delivers a conversational message with driver-aware preprocessing and Enter submission
+- `-Action deliver` accepts either:
+  - `-Content '<inline text>'`
+  - `-ContentFile '<path to UTF-8 text file>'`
+- `-Action wait_quiet` waits for no real session content for `-QuietSec` seconds, up to `-TimeoutSec`
+- `wait_quiet` is **not** turn-completion detection; long-think phases may go quiet while the assistant is still in flight
 - `-Content` and `-ContentFile` are mutually exclusive
-- `-ContentFile` is only supported for `-Action input`
+- `-ContentFile` is only supported for `-Action input` or `-Action deliver`
 - if you need a typed prompt to execute, follow `-Action input` with `-Action key -Key enter`
 - pane-bound credentials now live at:
   - `.runtime/control-plane-claude.json`

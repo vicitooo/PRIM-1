@@ -23,6 +23,10 @@ Scripts should wrap the control plane, not bypass the supervisor.
   - `input`
     - inline `-Content`
     - file-based `-ContentFile`
+  - `deliver`
+    - inline `-Content`
+    - file-based `-ContentFile`
+  - `wait_quiet`
   - `key`
   - `route`
   - optional `-Quiet` mode for agent-friendly success/error output
@@ -32,6 +36,8 @@ Example:
 ```powershell
 .\scripts\control-plane.ps1 -Action route -From victor -To claude -Scope direct -Content "Review the Codex pane."
 .\scripts\control-plane.ps1 -Action input -Session claude -ContentFile ".runtime\compact-prompts\compact-full.txt"
+.\scripts\control-plane.ps1 -Action deliver -Session claude -Content "Multi-line`nmessage body"
+.\scripts\control-plane.ps1 -Action wait_quiet -Session claude -QuietSec 2 -TimeoutSec 10
 ```
 
 - `agent-route.ps1`

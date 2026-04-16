@@ -1,6 +1,6 @@
 param(
   [Parameter(Mandatory = $true)]
-  [ValidateSet("ping", "list", "start", "stop", "restart", "input", "key", "route")]
+  [ValidateSet("ping", "list", "start", "stop", "restart", "input", "deliver", "wait_quiet", "key", "route")]
   [string]$Action,
 
   [string]$Session,
@@ -12,6 +12,8 @@ param(
   [string]$Scope = "direct",
   [string]$Content,
   [string]$ContentFile,
+  [int]$QuietSec,
+  [int]$TimeoutSec,
   [string]$InfoFile,
   [switch]$Quiet
 )
@@ -51,14 +53,15 @@ function Invoke-MailboxFallback {
   throw "No response received from sideband mailbox."
 }
 
-function Resolve-InputContent {
+function Resolve-MessageContent {
   param(
+    [string]$ActionName,
     [string]$InlineContent,
     [string]$ContentFilePath
   )
 
   if ($InlineContent -and $ContentFilePath) {
-    throw "input accepts either -Content or -ContentFile, not both"
+    throw "$ActionName accepts either -Content or -ContentFile, not both"
   }
 
   if (-not $ContentFilePath) {
@@ -79,10 +82,10 @@ function Resolve-InputContent {
   }
 }
 
-if ($Action -eq "input") {
-  $Content = Resolve-InputContent -InlineContent $Content -ContentFilePath $ContentFile
+if ($Action -in @("input", "deliver")) {
+  $Content = Resolve-MessageContent -ActionName $Action -InlineContent $Content -ContentFilePath $ContentFile
 } elseif ($ContentFile) {
-  throw "-ContentFile is only supported for -Action input"
+  throw "-ContentFile is only supported for -Action input or -Action deliver"
 }
 
 if (-not $InfoFile -and $env:PRIM1_PANE_CREDENTIALS -and (Test-Path -LiteralPath $env:PRIM1_PANE_CREDENTIALS)) {
@@ -129,6 +132,23 @@ $payload = switch ($Action) {
     if (-not $Session) { throw "input requires -Session" }
     if ([string]::IsNullOrEmpty($Content)) { throw "input requires -Content or -ContentFile" }
     @{ kind = "send_input"; token = $info.token; name = $Session; input = $Content }
+  }
+  "deliver" {
+    if (-not $Session) { throw "deliver requires -Session" }
+    if ([string]::IsNullOrEmpty($Content)) { throw "deliver requires -Content or -ContentFile" }
+    @{ kind = "deliver_message"; token = $info.token; name = $Session; content = $Content }
+  }
+  "wait_quiet" {
+    if (-not $Session) { throw "wait_quiet requires -Session" }
+    if ($QuietSec -le 0) { throw "wait_quiet requires -QuietSec > 0" }
+    if ($TimeoutSec -le 0) { throw "wait_quiet requires -TimeoutSec > 0" }
+    @{
+      kind = "wait_quiet"
+      token = $info.token
+      name = $Session
+      quiet_seconds = $QuietSec
+      timeout_seconds = $TimeoutSec
+    }
   }
   "key" {
     if (-not $Session) { throw "key requires -Session" }
