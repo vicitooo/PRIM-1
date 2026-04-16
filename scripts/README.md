@@ -40,6 +40,11 @@ Example:
 .\scripts\control-plane.ps1 -Action wait_quiet -Session claude -QuietSec 2 -TimeoutSec 10
 ```
 
+Notes:
+
+- mailbox fallback keeps a 10-second response window by default
+- `deliver` and `wait_quiet` honor `-TimeoutSec` for longer mailbox-backed waits when needed
+
 - `agent-route.ps1`
   Minimal agent-facing wrapper over `control-plane.ps1` for direct or room messages without the verbose JSON snapshot payload.
 

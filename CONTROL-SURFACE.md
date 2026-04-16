@@ -106,6 +106,8 @@ Behavior:
   - `-ContentFile '<path to UTF-8 text file>'`
 - `-Action wait_quiet` waits for no real session content for `-QuietSec` seconds, up to `-TimeoutSec`
 - `wait_quiet` is **not** turn-completion detection; long-think phases may go quiet while the assistant is still in flight
+- mailbox fallback still defaults to a 10-second response window for ordinary actions
+- `deliver` and `wait_quiet` now pass their explicit `-TimeoutSec` through to the mailbox fallback when provided
 - `-Content` and `-ContentFile` are mutually exclusive
 - `-ContentFile` is only supported for `-Action input` or `-Action deliver`
 - if you need a typed prompt to execute, follow `-Action input` with `-Action key -Key enter`

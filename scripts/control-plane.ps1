@@ -24,7 +24,9 @@ function Invoke-MailboxFallback {
     [string]$Payload,
 
     [Parameter(Mandatory = $true)]
-    [string]$RuntimeDir
+    [string]$RuntimeDir,
+
+    [int]$TimeoutSec = 10
   )
 
   $sidebandRoot = Join-Path $RuntimeDir "sideband"
@@ -40,7 +42,7 @@ function Invoke-MailboxFallback {
   $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
   [System.IO.File]::WriteAllText($requestPath, $Payload, $utf8NoBom)
 
-  $deadline = [DateTime]::UtcNow.AddSeconds(10)
+  $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
   while ([DateTime]::UtcNow -lt $deadline) {
     if (Test-Path -LiteralPath $responsePath) {
       $raw = Get-Content -LiteralPath $responsePath -Raw
@@ -174,6 +176,11 @@ $payload = switch ($Action) {
 $json = $payload | ConvertTo-Json -Depth 8 -Compress
 $runtimeDir = Split-Path -Parent $resolvedInfoFile
 $response = $null
+$mailboxTimeoutSec = 10
+
+if ($TimeoutSec -gt 0 -and $Action -in @("deliver", "wait_quiet")) {
+  $mailboxTimeoutSec = $TimeoutSec
+}
 
 try {
   $pipe = [System.IO.Pipes.NamedPipeClientStream]::new(".", $pipeName, [System.IO.Pipes.PipeDirection]::InOut)
@@ -191,7 +198,7 @@ try {
     }
   }
 } catch {
-  $response = Invoke-MailboxFallback -Payload $json -RuntimeDir $runtimeDir
+  $response = Invoke-MailboxFallback -Payload $json -RuntimeDir $runtimeDir -TimeoutSec $mailboxTimeoutSec
 }
 
 if (-not $response) {

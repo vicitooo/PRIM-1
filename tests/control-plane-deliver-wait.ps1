@@ -196,6 +196,31 @@ try {
       Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
     }
   }
+
+  Remove-Item -LiteralPath $testRuntime.CapturePath -Force -ErrorAction SilentlyContinue
+  $job = Start-MailboxResponder -RuntimeDir $testRuntime.RuntimeDir -CapturePath $testRuntime.CapturePath -ResponseJson $waitQuietResponse -DelayMs 11000
+  try {
+    $started = [DateTime]::UtcNow
+    $result = Invoke-ControlPlane -Arguments @(
+      "-File", $controlPlaneScript,
+      "-Action", "wait_quiet",
+      "-Session", "claude",
+      "-QuietSec", "1",
+      "-TimeoutSec", "12",
+      "-InfoFile", $testRuntime.InfoPath
+    )
+    $elapsedMs = ([DateTime]::UtcNow - $started).TotalMilliseconds
+    Assert-Equal $result.ExitCode 0 "wait_quiet should honor the extended mailbox timeout."
+    Assert-True ($elapsedMs -ge 10500) "wait_quiet should wait beyond the old 10-second mailbox cap."
+
+    Wait-Job -Job $job -Timeout 25 | Out-Null
+    $captured = Get-Content -LiteralPath $testRuntime.CapturePath -Raw | ConvertFrom-Json
+    Assert-Equal $captured.timeout_seconds 12 "Expected the long wait_quiet timeout to be forwarded."
+  } finally {
+    if ($job) {
+      Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    }
+  }
 } finally {
   Remove-Item -LiteralPath $testRuntime.Root -Recurse -Force -ErrorAction SilentlyContinue
 }
