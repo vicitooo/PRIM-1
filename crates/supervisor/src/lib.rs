@@ -418,19 +418,8 @@ impl SupervisorHandle {
 
         for recipient in recipients {
             let submit_behavior = self.submit_behavior_for_session(&recipient)?;
-            for payload in routed_message_payloads(&request, submit_behavior) {
-                self.send_input(SendInputRequest {
-                    name: recipient.clone(),
-                    input: payload,
-                })?;
-                if !submit_behavior.delay.is_zero() {
-                    thread::sleep(submit_behavior.delay);
-                }
-                self.send_input(SendInputRequest {
-                    name: recipient.clone(),
-                    input: submit_behavior.sequence.into(),
-                })?;
-            }
+            let payloads = routed_message_payloads(&request, submit_behavior);
+            self.deliver_prepared_payloads(&recipient, &payloads, submit_behavior)?;
         }
 
         self.emit(RuntimeEvent::SystemLog {
@@ -483,11 +472,8 @@ impl SupervisorHandle {
             info_path: info_path.display().to_string(),
         };
 
-        fs::write(
-            &info_path,
-            serde_json::to_string_pretty(&status)?,
-        )
-        .context("failed to persist control plane info file")?;
+        fs::write(&info_path, serde_json::to_string_pretty(&status)?)
+            .context("failed to persist control plane info file")?;
 
         *self.inner.control_plane.write() = Some(status.clone());
         self.inner
@@ -742,7 +728,10 @@ impl SupervisorHandle {
 }
 
 impl SupervisorHandle {
-    fn prepare_definition_for_spawn(&self, definition: &SessionDefinition) -> Result<SessionDefinition> {
+    fn prepare_definition_for_spawn(
+        &self,
+        definition: &SessionDefinition,
+    ) -> Result<SessionDefinition> {
         let mut prepared = definition.clone();
 
         if let Some(status) = self.ensure_session_control_plane_status(&definition.name)? {
@@ -759,7 +748,10 @@ impl SupervisorHandle {
         Ok(prepared)
     }
 
-    fn ensure_session_control_plane_status(&self, session_name: &str) -> Result<Option<ControlPlaneStatus>> {
+    fn ensure_session_control_plane_status(
+        &self,
+        session_name: &str,
+    ) -> Result<Option<ControlPlaneStatus>> {
         let Some(control_plane) = self.inner.control_plane.read().clone() else {
             return Ok(None);
         };
@@ -789,8 +781,12 @@ impl SupervisorHandle {
                 .clone()
         };
 
-        fs::write(&info_path, serde_json::to_string_pretty(&status)?)
-            .with_context(|| format!("failed to persist session control plane info file {}", info_path.display()))?;
+        fs::write(&info_path, serde_json::to_string_pretty(&status)?).with_context(|| {
+            format!(
+                "failed to persist session control plane info file {}",
+                info_path.display()
+            )
+        })?;
 
         Ok(Some(status))
     }
@@ -814,6 +810,29 @@ impl SupervisorHandle {
                     "peer slash commands are disabled by this wrapper's policy (PRIM1_PEER_SLASH_COMMANDS_ALLOWED=0)"
                 ));
             }
+        }
+
+        Ok(())
+    }
+
+    fn deliver_prepared_payloads(
+        &self,
+        session_name: &str,
+        payloads: &[String],
+        submit_behavior: SubmitBehavior,
+    ) -> Result<()> {
+        for payload in payloads {
+            self.send_input(SendInputRequest {
+                name: session_name.into(),
+                input: payload.clone(),
+            })?;
+            if !submit_behavior.delay.is_zero() {
+                thread::sleep(submit_behavior.delay);
+            }
+            self.send_input(SendInputRequest {
+                name: session_name.into(),
+                input: submit_behavior.sequence.into(),
+            })?;
         }
 
         Ok(())
@@ -1028,31 +1047,27 @@ fn routed_message_payload(request: &RouteMessageRequest, behavior: SubmitBehavio
         .unwrap_or_default()
 }
 
-fn routed_message_payloads(
-    request: &RouteMessageRequest,
-    behavior: SubmitBehavior,
-) -> Vec<String> {
-    let message_content = if behavior.flatten_payload {
-        collapse_inline_content(&request.content)
-    } else {
-        request.content.clone()
-    };
-    let content_chunks = split_routed_message_content(
-        &message_content,
-        behavior.max_chunk_chars,
-    );
+fn routed_message_payloads(request: &RouteMessageRequest, behavior: SubmitBehavior) -> Vec<String> {
+    let message_content = prepare_direct_message(
+        if behavior.flatten_payload {
+            DriverKind::Codex
+        } else {
+            DriverKind::Claude
+        },
+        &request.content,
+    )
+    .into_iter()
+    .next()
+    .unwrap_or_default();
+    let content_chunks = split_routed_message_content(&message_content, behavior.max_chunk_chars);
     let total_parts = content_chunks.len();
 
     content_chunks
         .into_iter()
         .enumerate()
         .map(|(index, chunk)| {
-            let header = routed_message_header(
-                request.scope,
-                &request.from,
-                index + 1,
-                total_parts,
-            );
+            let header =
+                routed_message_header(request.scope, &request.from, index + 1, total_parts);
             if behavior.flatten_payload {
                 if chunk.is_empty() {
                     header
@@ -1086,6 +1101,13 @@ fn routed_message_submit_behavior(driver: DriverKind) -> SubmitBehavior {
             flatten_payload: false,
             max_chunk_chars: None,
         },
+    }
+}
+
+fn prepare_direct_message(driver: DriverKind, content: &str) -> Vec<String> {
+    match driver {
+        DriverKind::Codex => vec![collapse_inline_content(content)],
+        DriverKind::Claude | DriverKind::GenericTerminal => vec![content.to_string()],
     }
 }
 
@@ -1139,7 +1161,11 @@ fn probe_control_plane_owner(status: &ControlPlaneStatus, timeout: Duration) -> 
 }
 
 #[cfg(windows)]
-fn try_probe_control_plane_endpoint(endpoint: &str, payload: &str, timeout: Duration) -> Result<bool> {
+fn try_probe_control_plane_endpoint(
+    endpoint: &str,
+    payload: &str,
+    timeout: Duration,
+) -> Result<bool> {
     use tokio::net::windows::named_pipe::ClientOptions;
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1179,7 +1205,11 @@ fn try_probe_control_plane_endpoint(endpoint: &str, payload: &str, timeout: Dura
 }
 
 #[cfg(unix)]
-fn try_probe_control_plane_endpoint(endpoint: &str, payload: &str, timeout: Duration) -> Result<bool> {
+fn try_probe_control_plane_endpoint(
+    endpoint: &str,
+    payload: &str,
+    timeout: Duration,
+) -> Result<bool> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -1187,15 +1217,11 @@ fn try_probe_control_plane_endpoint(endpoint: &str, payload: &str, timeout: Dura
         .context("failed to create control-plane probe runtime")?;
 
     runtime.block_on(async {
-        let client = match tokio::time::timeout(
-            timeout,
-            tokio::net::UnixStream::connect(endpoint),
-        )
-        .await
-        {
-            Ok(Ok(client)) => client,
-            Ok(Err(_)) | Err(_) => return Ok(false),
-        };
+        let client =
+            match tokio::time::timeout(timeout, tokio::net::UnixStream::connect(endpoint)).await {
+                Ok(Ok(client)) => client,
+                Ok(Err(_)) | Err(_) => return Ok(false),
+            };
 
         tokio::time::timeout(timeout, async move {
             let (read_half, mut write_half) = tokio::io::split(client);
@@ -1597,6 +1623,38 @@ mod tests {
     }
 
     #[test]
+    fn prepare_direct_message_claude_single_line_preserves_content() {
+        assert_eq!(
+            prepare_direct_message(DriverKind::Claude, "tell me a joke"),
+            vec!["tell me a joke".to_string()]
+        );
+    }
+
+    #[test]
+    fn prepare_direct_message_claude_multiline_no_chunking_under_limit() {
+        assert_eq!(
+            prepare_direct_message(DriverKind::Claude, "tell me\na joke"),
+            vec!["tell me\na joke".to_string()]
+        );
+    }
+
+    #[test]
+    fn prepare_direct_message_codex_flattens_newlines_to_spaces() {
+        assert_eq!(
+            prepare_direct_message(DriverKind::Codex, "tell me\na joke"),
+            vec!["tell me a joke".to_string()]
+        );
+    }
+
+    #[test]
+    fn prepare_direct_message_codex_flattens_carriage_returns() {
+        assert_eq!(
+            prepare_direct_message(DriverKind::Codex, "tell\rme\r\na joke"),
+            vec!["tell me a joke".to_string()]
+        );
+    }
+
+    #[test]
     fn long_claude_payloads_are_chunked_with_part_headers() {
         let long_content = (0..120)
             .map(|index| format!("segment-{index:03}"))
@@ -1745,7 +1803,9 @@ mod tests {
         let error = second.start_control_plane().unwrap_err();
 
         assert!(
-            error.to_string().contains("another wrapper instance is already holding the control plane"),
+            error
+                .to_string()
+                .contains("another wrapper instance is already holding the control plane"),
             "unexpected error: {error}"
         );
         assert_eq!(fs::read_to_string(&control_plane_path).unwrap(), before);
@@ -1933,22 +1993,20 @@ mod tests {
             slots.get("claude").unwrap().definition.clone()
         };
 
-        let prepared = supervisor.prepare_definition_for_spawn(&definition).unwrap();
-        let credentials = supervisor
-            .runtime_dir()
-            .join("control-plane-claude.json");
+        let prepared = supervisor
+            .prepare_definition_for_spawn(&definition)
+            .unwrap();
+        let credentials = supervisor.runtime_dir().join("control-plane-claude.json");
 
         assert!(
-            prepared.env.iter().any(|env| {
-                env.key == "PRIM1_PANE_IDENTITY" && env.value == "claude"
-            })
+            prepared
+                .env
+                .iter()
+                .any(|env| { env.key == "PRIM1_PANE_IDENTITY" && env.value == "claude" })
         );
-        assert!(
-            prepared.env.iter().any(|env| {
-                env.key == "PRIM1_PANE_CREDENTIALS"
-                    && env.value == credentials.display().to_string()
-            })
-        );
+        assert!(prepared.env.iter().any(|env| {
+            env.key == "PRIM1_PANE_CREDENTIALS" && env.value == credentials.display().to_string()
+        }));
         assert!(credentials.exists());
     }
 
