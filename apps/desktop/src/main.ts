@@ -27,7 +27,7 @@ app.innerHTML = `
     <header class="topbar">
       <div>
         <p class="eyebrow">Victor / Claude / Codex</p>
-        <h1>CLI Master Wrapper</h1>
+        <h1>PRIM-001</h1>
       </div>
       <div class="meta-strip">
         <div class="meta-card">
