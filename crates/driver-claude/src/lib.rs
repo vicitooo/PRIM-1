@@ -17,22 +17,47 @@ pub fn default_session(working_dir: &str) -> SessionDefinition {
 
 pub fn launch_spec(definition: &SessionDefinition) -> LaunchSpec {
     let wrapper_root = wrapper_root_for_session(&definition.working_dir);
-    let mut args = vec![
-        "-n".into(),
-        definition.name.clone(),
-        "--dangerously-skip-permissions".into(),
-        "--add-dir".into(),
-        definition.working_dir.clone(),
-        "--add-dir".into(),
-        wrapper_root,
-    ];
+
+    let (program, mut args) = if cfg!(windows) {
+        // On Windows, claude is installed as a .cmd shim via npm.
+        // portable_pty's CommandBuilder can't resolve .cmd files directly,
+        // so we launch via cmd.exe (same pattern as the Codex driver).
+        (
+            "cmd.exe".to_string(),
+            vec![
+                "/d".into(),
+                "/c".into(),
+                "claude.cmd".into(),
+                "-n".into(),
+                definition.name.clone(),
+                "--dangerously-skip-permissions".into(),
+                "--add-dir".into(),
+                definition.working_dir.clone(),
+                "--add-dir".into(),
+                wrapper_root,
+            ],
+        )
+    } else {
+        (
+            definition
+                .command
+                .clone()
+                .unwrap_or_else(|| "claude".into()),
+            vec![
+                "-n".into(),
+                definition.name.clone(),
+                "--dangerously-skip-permissions".into(),
+                "--add-dir".into(),
+                definition.working_dir.clone(),
+                "--add-dir".into(),
+                wrapper_root,
+            ],
+        )
+    };
     args.extend(definition.args.clone());
 
     LaunchSpec {
-        program: definition
-            .command
-            .clone()
-            .unwrap_or_else(|| "claude".into()),
+        program,
         args,
         working_dir: definition.working_dir.clone(),
         env: definition.env.clone(),
@@ -61,9 +86,36 @@ fn wrapper_root_for_session(working_dir: &str) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
     #[test]
-    fn launch_spec_includes_named_session_and_allowed_dirs() {
-        let definition = default_session(r"<workspace>");
+    fn windows_launch_spec_uses_cmd_shim() {
+        let definition = default_session(r"C:\Projects\workspace");
+        let spec = launch_spec(&definition);
+
+        assert_eq!(spec.program, "cmd.exe");
+        assert_eq!(
+            spec.args,
+            vec![
+                "/d".to_string(),
+                "/c".to_string(),
+                "claude.cmd".to_string(),
+                "-n".to_string(),
+                "claude".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+                "--add-dir".to_string(),
+                r"C:\Projects\workspace".to_string(),
+                "--add-dir".to_string(),
+                r"C:\Projects\workspace\CLI-master-wrapper".to_string(),
+            ]
+        );
+        assert_eq!(spec.working_dir, r"C:\Projects\workspace");
+        assert_eq!(spec.display_name, "Claude");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_launch_spec_uses_claude_binary() {
+        let definition = default_session("/home/alice/mywork");
         let spec = launch_spec(&definition);
 
         assert_eq!(spec.program, "claude");
@@ -74,20 +126,20 @@ mod tests {
                 "claude".to_string(),
                 "--dangerously-skip-permissions".to_string(),
                 "--add-dir".to_string(),
-                r"<workspace>".to_string(),
+                "/home/alice/mywork".to_string(),
                 "--add-dir".to_string(),
-                r".".to_string(),
+                "/home/alice/projects/prim1".to_string(),
             ]
         );
-        assert_eq!(spec.working_dir, r"<workspace>");
+        assert_eq!(spec.working_dir, "/home/alice/mywork");
         assert_eq!(spec.display_name, "Claude");
     }
 
     #[test]
     fn wrapper_root_helper_keeps_existing_wrapper_path() {
         assert_eq!(
-            wrapper_root_for_session(r"."),
-            r"."
+            wrapper_root_for_session(r"C:\Projects\workspace\CLI-master-wrapper"),
+            r"C:\Projects\workspace\CLI-master-wrapper"
         );
     }
 }
