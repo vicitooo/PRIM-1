@@ -155,7 +155,6 @@ impl AuditLog {
 
 struct RunningSession {
     pty: Option<Box<dyn PtySession>>,
-    generation: SessionGeneration,
 }
 
 struct SessionSlot {
@@ -283,6 +282,7 @@ impl SupervisorHandle {
         Ok(slot.generation)
     }
 
+    #[cfg(test)]
     fn current_generation(&self, name: &str) -> Option<SessionGeneration> {
         self.inner
             .slots
@@ -507,10 +507,7 @@ impl SupervisorHandle {
                     }
 
                     slot.process_id = pty.process_id();
-                    slot.running = Some(RunningSession {
-                        pty: Some(pty),
-                        generation: expected,
-                    });
+                    slot.running = Some(RunningSession { pty: Some(pty) });
                     slot.state = LifecycleState::Ready;
                     slot.last_activity_at = Some(now_rfc3339());
                     slot.last_real_output_at = None;
@@ -2000,6 +1997,7 @@ fn session_name_of(request: &SidebandRequest) -> Option<&str> {
     }
 }
 
+#[cfg(test)]
 fn routed_message_payload(request: &RouteMessageRequest, behavior: SubmitBehavior) -> String {
     routed_message_payloads(request, behavior)
         .into_iter()
@@ -2671,10 +2669,7 @@ mod tests {
     fn install_stale_running_session(supervisor: &SupervisorHandle, name: &str) {
         let mut slots = supervisor.inner.slots.lock();
         let slot = slots.get_mut(name).unwrap();
-        slot.running = Some(RunningSession {
-            pty: None,
-            generation: slot.generation,
-        });
+        slot.running = Some(RunningSession { pty: None });
         slot.process_id = Some(u32::MAX);
         slot.state = LifecycleState::Busy;
         slot.last_real_output_at = None;
@@ -2688,10 +2683,7 @@ mod tests {
         let mut slots = supervisor.inner.slots.lock();
         let slot = slots.get_mut(name).unwrap();
         slot.definition.driver = driver;
-        slot.running = Some(RunningSession {
-            pty: None,
-            generation: slot.generation,
-        });
+        slot.running = Some(RunningSession { pty: None });
         slot.process_id = None;
         slot.state = LifecycleState::Busy;
         slot.last_real_output_at = None;
@@ -2706,10 +2698,7 @@ mod tests {
         let mut slots = supervisor.inner.slots.lock();
         let slot = slots.get_mut(name).unwrap();
         slot.definition.driver = driver;
-        slot.running = Some(RunningSession {
-            pty: Some(pty),
-            generation: slot.generation,
-        });
+        slot.running = Some(RunningSession { pty: Some(pty) });
         slot.process_id = None;
         slot.state = LifecycleState::Busy;
         slot.last_real_output_at = None;
@@ -3418,7 +3407,6 @@ mod tests {
             let slot = slots.get_mut("claude").unwrap();
             slot.generation = 2;
             slot.state = LifecycleState::Busy;
-            slot.running.as_mut().unwrap().generation = 2;
         }
         let events = Arc::new(Mutex::new(Vec::<RuntimeEvent>::new()));
         let captured = events.clone();
@@ -3604,7 +3592,7 @@ mod tests {
         let slots = supervisor.inner.slots.lock();
         let slot = slots.get("claude").unwrap();
         assert_eq!(slot.state, LifecycleState::Ready);
-        assert_eq!(slot.running.as_ref().unwrap().generation, 2);
+        assert_eq!(slot.generation, 2);
     }
 
     #[test]
@@ -3648,7 +3636,7 @@ mod tests {
         let slots = supervisor.inner.slots.lock();
         let slot = slots.get("claude").unwrap();
         assert_eq!(slot.state, LifecycleState::Ready);
-        assert_eq!(slot.running.as_ref().unwrap().generation, 2);
+        assert_eq!(slot.generation, 2);
     }
 
     #[test]
