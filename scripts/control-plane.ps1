@@ -208,6 +208,11 @@ if (-not $response) {
 $parsed = $response | ConvertFrom-Json
 
 if ($Quiet) {
+  if ($parsed.timed_out) {
+    Write-Error ("TIMED OUT: " + $parsed.message)
+    exit 124
+  }
+
   if (-not $parsed.ok) {
     Write-Error $parsed.message
     exit 1
@@ -215,6 +220,11 @@ if ($Quiet) {
 
   $parsed.message
   exit 0
+}
+
+if ($parsed.timed_out) {
+  Write-Host ("TIMED OUT: " + $parsed.message)
+  exit 124
 }
 
 $parsed | ConvertTo-Json -Depth 8

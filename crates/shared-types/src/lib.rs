@@ -6,6 +6,12 @@ pub fn now_rfc3339() -> String {
     Utc::now().to_rfc3339()
 }
 
+pub type SessionGeneration = u64;
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum DriverKind {
@@ -193,6 +199,24 @@ pub enum RuntimeEvent {
         info_path: String,
         timestamp: String,
     },
+    SidebandRequestLifecycle {
+        request_id: String,
+        action: String,
+        session: Option<String>,
+        phase: SidebandPhase,
+        elapsed_ms: u64,
+        timestamp: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum SidebandPhase {
+    Started,
+    SlowWarning,
+    TimedOut,
+    Completed,
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -273,6 +297,8 @@ pub struct SidebandResponse {
     pub ok: bool,
     pub message: String,
     pub snapshot: Option<RuntimeSnapshot>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub timed_out: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<SidebandResponsePayload>,
 }
@@ -299,6 +325,7 @@ mod tests {
             ok: true,
             message: "pong".into(),
             snapshot: None,
+            timed_out: false,
             payload: None,
         })
         .unwrap();
@@ -325,6 +352,35 @@ mod tests {
         assert!(response.ok);
         assert_eq!(response.message, "pong");
         assert_eq!(response.snapshot, None);
+        assert!(!response.timed_out);
         assert_eq!(response.payload, None);
+    }
+
+    #[test]
+    fn sideband_response_roundtrips_timed_out_flag() {
+        let response = SidebandResponse {
+            ok: false,
+            message: "timed out".into(),
+            snapshot: None,
+            timed_out: true,
+            payload: None,
+        };
+
+        let roundtrip: SidebandResponse =
+            serde_json::from_value(serde_json::to_value(response.clone()).unwrap()).unwrap();
+
+        assert_eq!(roundtrip, response);
+    }
+
+    #[test]
+    fn sideband_phase_uses_snake_case() {
+        assert_eq!(
+            serde_json::to_value(SidebandPhase::SlowWarning).unwrap(),
+            json!("slow_warning")
+        );
+        assert_eq!(
+            serde_json::to_value(SidebandPhase::TimedOut).unwrap(),
+            json!("timed_out")
+        );
     }
 }

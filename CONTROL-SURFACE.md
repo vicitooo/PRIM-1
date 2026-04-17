@@ -116,6 +116,37 @@ Behavior:
   - `.runtime/control-plane-codex.json`
 - the master credentials file `.runtime/control-plane.json` remains the operator/debug backdoor
 
+### 3a. Sideband timeout contract
+
+Per-action supervisor budgets:
+
+- `ping` / `list`: 2 s
+- `send_input` / `key`: 5 s
+- `deliver`: 10 s
+- `stop`: 10 s
+- `route`: 15 s
+- `wait_quiet`: requested timeout + 5 s supervisor budget
+- `start`: 60 s
+- `restart`: 70 s
+
+What callers see:
+
+- `timed_out: true` now returns exit code `124`
+- non-`-Quiet` mode prints `TIMED OUT: <message>` instead of JSON for timeout responses
+- `-Quiet` mode also surfaces the timeout banner and exits `124`
+
+Lane-aware retry rule:
+
+- lifecycle ops (`start` / `stop` / `restart`) are retryable after checking `list` first because retries advance the session generation and stale workers self-abort
+- side-effecting ops (`deliver` / `send_input` / `key` / `route`) are **not** automatically retry-safe on timeout; retry only if you have independent proof nothing landed
+- read-only ops (`ping` / `list` / `wait_quiet`) can be retried normally
+
+Mailbox poison queue:
+
+- if the supervisor cannot publish/archive a mailbox response after retries, it moves the stuck inbox file to `.runtime/sideband/poison/`
+- a sibling `.error` file captures the publish failure detail
+- manual recovery is inspect -> copy evidence -> remove or replay the poisoned request; the queue exists so one bad file does not pin the mailbox thread
+
 ## 4. Calling from Git Bash / MSYS shells
 
 On Windows, callers running under Git Bash / MSYS should treat the wrapped `powershell -Command "& '...\script.ps1' ..."` pattern as canonical.

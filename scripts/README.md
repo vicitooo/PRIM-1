@@ -44,6 +44,8 @@ Notes:
 
 - mailbox fallback keeps a 10-second response window by default
 - `deliver` and `wait_quiet` honor `-TimeoutSec` for longer mailbox-backed waits when needed
+- timeout responses now print `TIMED OUT: <message>` and exit `124`
+- ordinary non-timeout failures still exit `1`
 
 - `agent-route.ps1`
   Minimal agent-facing wrapper over `control-plane.ps1` for direct or room messages without the verbose JSON snapshot payload.

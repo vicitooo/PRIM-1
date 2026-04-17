@@ -12,12 +12,12 @@ use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use control_plane::{DEFAULT_ENDPOINT, decode_request, encode_request, encode_response};
 use parking_lot::{Mutex, RwLock};
-use pty_host::{PtyEvent, PtyEventHandler, PtySession};
+use pty_host::{ConcretePtySession, PtyEvent, PtyEventHandler, PtySession};
 use shared_types::{
-    ControlKey, ControlPlaneStatus, DeliverMessageRequest, DriverKind, EnvVar, LifecycleState,
-    LogLevel, MessageScope, RouteMessageRequest, RuntimeEvent, RuntimeSnapshot, SendInputRequest,
-    SessionDefinition, SessionSnapshot, SidebandRequest, SidebandResponse, SidebandResponsePayload,
-    WaitQuietRequest, now_rfc3339,
+    ControlKey, ControlPlaneStatus, DeliverMessageRequest, DriverKind, EnvVar, LaunchSpec,
+    LifecycleState, LogLevel, MessageScope, RouteMessageRequest, RuntimeEvent, RuntimeSnapshot,
+    SendInputRequest, SessionDefinition, SessionGeneration, SessionSnapshot, SidebandPhase,
+    SidebandRequest, SidebandResponse, SidebandResponsePayload, WaitQuietRequest, now_rfc3339,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use uuid::Uuid;
@@ -33,6 +33,81 @@ struct SubmitBehavior {
     delay: Duration,
     flatten_payload: bool,
     max_chunk_chars: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpLane {
+    Lifecycle,
+    SideEffect,
+}
+
+struct SidebandTimeouts;
+
+impl SidebandTimeouts {
+    fn lane(request: &SidebandRequest) -> OpLane {
+        match request {
+            SidebandRequest::StartSession { .. }
+            | SidebandRequest::StopSession { .. }
+            | SidebandRequest::RestartSession { .. } => OpLane::Lifecycle,
+            _ => OpLane::SideEffect,
+        }
+    }
+
+    fn budget(request: &SidebandRequest) -> Duration {
+        match request {
+            SidebandRequest::Ping { .. } => Duration::from_secs(2),
+            SidebandRequest::ListSessions { .. } => Duration::from_secs(2),
+            SidebandRequest::StartSession { .. } => Duration::from_secs(60),
+            SidebandRequest::StopSession { .. } => Duration::from_secs(10),
+            SidebandRequest::RestartSession { .. } => Duration::from_secs(70),
+            SidebandRequest::WaitQuiet {
+                timeout_seconds, ..
+            } => Duration::from_secs((*timeout_seconds as u64).saturating_add(5)),
+            SidebandRequest::DeliverMessage { .. } => Duration::from_secs(10),
+            SidebandRequest::SendInput { .. } => Duration::from_secs(5),
+            SidebandRequest::SendKey { .. } => Duration::from_secs(5),
+            SidebandRequest::RouteMessage { .. } => Duration::from_secs(15),
+        }
+    }
+}
+
+trait PtySpawner: Send + Sync {
+    fn spawn(&self, spec: &LaunchSpec, handler: PtyEventHandler) -> Result<Box<dyn PtySession>>;
+}
+
+struct ConcretePtySpawner;
+
+impl PtySpawner for ConcretePtySpawner {
+    fn spawn(&self, spec: &LaunchSpec, handler: PtyEventHandler) -> Result<Box<dyn PtySession>> {
+        Ok(Box::new(ConcretePtySession::spawn(spec, handler)?))
+    }
+}
+
+trait MailboxFs: Send + Sync {
+    fn read_to_string(&self, path: &Path) -> std::io::Result<String>;
+    fn write(&self, path: &Path, contents: &[u8]) -> std::io::Result<()>;
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()>;
+    fn remove_file(&self, path: &Path) -> std::io::Result<()>;
+}
+
+struct StdMailboxFs;
+
+impl MailboxFs for StdMailboxFs {
+    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+        fs::read_to_string(path)
+    }
+
+    fn write(&self, path: &Path, contents: &[u8]) -> std::io::Result<()> {
+        fs::write(path, contents)
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        fs::rename(from, to)
+    }
+
+    fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        fs::remove_file(path)
+    }
 }
 
 // Exploration Finding 10 showed that very long routed messages could arrive
@@ -79,13 +154,15 @@ impl AuditLog {
 }
 
 struct RunningSession {
-    pty: Option<PtySession>,
+    pty: Option<Box<dyn PtySession>>,
+    generation: SessionGeneration,
 }
 
 struct SessionSlot {
     definition: SessionDefinition,
     state: LifecycleState,
     running: Option<RunningSession>,
+    generation: SessionGeneration,
     process_id: Option<u32>,
     last_activity_at: Option<String>,
     last_real_output_at: Option<Instant>,
@@ -121,6 +198,11 @@ struct SupervisorInner {
     token_bindings: Mutex<HashMap<String, Option<String>>>,
     session_control_planes: Mutex<HashMap<String, ControlPlaneStatus>>,
     peer_slash_commands_allowed: bool,
+    pty_spawner: RwLock<Arc<dyn PtySpawner>>,
+    mailbox_fs: RwLock<Arc<dyn MailboxFs>>,
+    stale_event_drop_counts: Mutex<HashMap<(String, SessionGeneration), u64>>,
+    #[cfg(test)]
+    last_detached_worker: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
 
 #[derive(Clone)]
@@ -142,6 +224,7 @@ impl SupervisorHandle {
                 definition: claude,
                 state: LifecycleState::Closed,
                 running: None,
+                generation: 0,
                 process_id: None,
                 last_activity_at: None,
                 last_real_output_at: None,
@@ -156,6 +239,7 @@ impl SupervisorHandle {
                 definition: codex,
                 state: LifecycleState::Closed,
                 running: None,
+                generation: 0,
                 process_id: None,
                 last_activity_at: None,
                 last_real_output_at: None,
@@ -173,6 +257,11 @@ impl SupervisorHandle {
                 token_bindings: Mutex::new(HashMap::new()),
                 session_control_planes: Mutex::new(HashMap::new()),
                 peer_slash_commands_allowed: config.peer_slash_commands_allowed,
+                pty_spawner: RwLock::new(Arc::new(ConcretePtySpawner)),
+                mailbox_fs: RwLock::new(Arc::new(StdMailboxFs)),
+                stale_event_drop_counts: Mutex::new(HashMap::new()),
+                #[cfg(test)]
+                last_detached_worker: Mutex::new(None),
             }),
         })
     }
@@ -185,11 +274,71 @@ impl SupervisorHandle {
         self.inner.audit.path()
     }
 
+    fn bump_session_generation(&self, name: &str) -> Result<SessionGeneration> {
+        let mut slots = self.inner.slots.lock();
+        let slot = slots
+            .get_mut(name)
+            .with_context(|| format!("unknown session '{name}'"))?;
+        slot.generation = slot.generation.wrapping_add(1);
+        Ok(slot.generation)
+    }
+
+    fn current_generation(&self, name: &str) -> Option<SessionGeneration> {
+        self.inner
+            .slots
+            .lock()
+            .get(name)
+            .map(|slot| slot.generation)
+    }
+
     pub fn set_event_sink<F>(&self, sink: F)
     where
         F: Fn(RuntimeEvent) + Send + Sync + 'static,
     {
         *self.inner.event_sink.write() = Some(Arc::new(sink));
+    }
+
+    fn emit_sideband_lifecycle(
+        &self,
+        request_id: &str,
+        action: &str,
+        session: Option<&str>,
+        phase: SidebandPhase,
+        elapsed: Duration,
+    ) {
+        self.emit(RuntimeEvent::SidebandRequestLifecycle {
+            request_id: request_id.to_string(),
+            action: action.to_string(),
+            session: session.map(ToOwned::to_owned),
+            phase,
+            elapsed_ms: elapsed.as_millis() as u64,
+            timestamp: now_rfc3339(),
+        });
+    }
+
+    #[cfg(test)]
+    fn set_pty_spawner_for_tests(&self, spawner: Arc<dyn PtySpawner>) {
+        *self.inner.pty_spawner.write() = spawner;
+    }
+
+    #[cfg(test)]
+    fn set_mailbox_fs_for_tests(&self, mailbox_fs: Arc<dyn MailboxFs>) {
+        *self.inner.mailbox_fs.write() = mailbox_fs;
+    }
+
+    #[cfg(test)]
+    fn set_last_detached_worker_receiver(&self, receiver: std::sync::mpsc::Receiver<()>) {
+        *self.inner.last_detached_worker.lock() = Some(receiver);
+    }
+
+    #[cfg(test)]
+    fn test_wait_for_last_worker(&self, timeout: Duration) -> bool {
+        self.inner
+            .last_detached_worker
+            .lock()
+            .take()
+            .and_then(|receiver| receiver.recv_timeout(timeout).ok())
+            .is_some()
     }
 
     pub fn snapshot(&self) -> RuntimeSnapshot {
@@ -214,11 +363,105 @@ impl SupervisorHandle {
 
     pub fn start_session(&self, name: &str) -> Result<SessionSnapshot> {
         self.refresh_session_liveness();
+        let expected = {
+            let mut slots = self.inner.slots.lock();
+            let slot = slots
+                .get_mut(name)
+                .with_context(|| format!("unknown session '{name}'"))?;
+            if slot.running.is_some() {
+                return Ok(slot.snapshot());
+            }
+            slot.generation = slot.generation.wrapping_add(1);
+            slot.generation
+        };
+        self.start_session_at(name, expected)
+    }
+
+    pub fn stop_session(&self, name: &str) -> Result<SessionSnapshot> {
+        let expected = self.bump_session_generation(name)?;
+        self.stop_session_at(name, expected)
+    }
+
+    pub fn restart_session(&self, name: &str) -> Result<SessionSnapshot> {
+        self.refresh_session_liveness();
+        let expected_stop = self.bump_session_generation(name)?;
+        self.restart_session_at(name, expected_stop)
+    }
+
+    fn stop_session_at(&self, name: &str, expected: SessionGeneration) -> Result<SessionSnapshot> {
+        self.refresh_session_liveness();
+        let pty = {
+            let mut slots = self.inner.slots.lock();
+            let slot = slots
+                .get_mut(name)
+                .with_context(|| format!("unknown session '{name}'"))?;
+            if slot.generation != expected {
+                return Err(anyhow!(
+                    "stop_session_at superseded: expected gen {expected}, current {}",
+                    slot.generation
+                ));
+            }
+
+            slot.state = LifecycleState::Closed;
+            slot.process_id = None;
+            slot.last_activity_at = Some(now_rfc3339());
+            slot.last_real_output_at = None;
+            slot.running.take().and_then(|running| running.pty)
+        };
+
+        if let Some(pty) = pty {
+            let (tx, rx) = std::sync::mpsc::channel();
+            thread::spawn(move || {
+                let _ = pty.kill();
+                let _ = tx.send(());
+            });
+            if rx.recv_timeout(Duration::from_secs(5)).is_err() {
+                self.emit(RuntimeEvent::SystemLog {
+                    level: LogLevel::Warn,
+                    message: format!(
+                        "pty.kill() for session '{name}' (gen {expected}) did not return within 5s; proceeding (resource may be leaked)"
+                    ),
+                    timestamp: now_rfc3339(),
+                });
+            }
+        }
+
+        let snapshot = {
+            let slots = self.inner.slots.lock();
+            let slot = slots
+                .get(name)
+                .expect("session disappeared during stop_session_at");
+            if slot.generation != expected {
+                return Err(anyhow!(
+                    "stop_session_at superseded mid-op: expected gen {expected}, current {}",
+                    slot.generation
+                ));
+            }
+            slot.snapshot()
+        };
+
+        self.emit(RuntimeEvent::SessionState {
+            session: snapshot.name.clone(),
+            state: snapshot.lifecycle_state,
+            reason: "session stopped".into(),
+            timestamp: now_rfc3339(),
+        });
+        Ok(snapshot)
+    }
+
+    fn start_session_at(&self, name: &str, expected: SessionGeneration) -> Result<SessionSnapshot> {
+        self.refresh_session_liveness();
         let definition = {
             let mut slots = self.inner.slots.lock();
             let slot = slots
                 .get_mut(name)
                 .with_context(|| format!("unknown session '{name}'"))?;
+            if slot.generation != expected {
+                return Err(anyhow!(
+                    "start_session_at superseded: expected gen {expected}, current {}",
+                    slot.generation
+                ));
+            }
             if slot.running.is_some() {
                 return Ok(slot.snapshot());
             }
@@ -228,19 +471,16 @@ impl SupervisorHandle {
             slot.last_activity_at = Some(now_rfc3339());
             slot.last_real_output_at = None;
             let snapshot = slot.snapshot();
+            let definition = slot.definition.clone();
             drop(slots);
+
             self.emit(RuntimeEvent::SessionState {
-                session: snapshot.name.clone(),
-                state: snapshot.lifecycle_state,
+                session: snapshot.name,
+                state: LifecycleState::Starting,
                 reason: "launch requested".into(),
                 timestamp: now_rfc3339(),
             });
-            let slots = self.inner.slots.lock();
-            slots
-                .get(name)
-                .expect("session disappeared after state update")
-                .definition
-                .clone()
+            definition
         };
 
         let definition = self.prepare_definition_for_spawn(&definition)?;
@@ -248,18 +488,29 @@ impl SupervisorHandle {
         let session_name = definition.name.clone();
         let handle = self.clone();
         let handler: PtyEventHandler = Arc::new(move |event| {
-            handle.handle_pty_event(&session_name, event);
+            handle.handle_pty_event(&session_name, expected, event);
         });
 
-        match PtySession::spawn(&spec, handler) {
+        match self.inner.pty_spawner.read().clone().spawn(&spec, handler) {
             Ok(pty) => {
                 let snapshot = {
                     let mut slots = self.inner.slots.lock();
                     let slot = slots
                         .get_mut(name)
-                        .expect("session disappeared during spawn success");
+                        .expect("session disappeared during start_session_at success");
+                    if slot.generation != expected {
+                        let _ = pty.kill();
+                        return Err(anyhow!(
+                            "start_session_at superseded mid-spawn: expected gen {expected}, current {}",
+                            slot.generation
+                        ));
+                    }
+
                     slot.process_id = pty.process_id();
-                    slot.running = Some(RunningSession { pty: Some(pty) });
+                    slot.running = Some(RunningSession {
+                        pty: Some(pty),
+                        generation: expected,
+                    });
                     slot.state = LifecycleState::Ready;
                     slot.last_activity_at = Some(now_rfc3339());
                     slot.last_real_output_at = None;
@@ -279,76 +530,51 @@ impl SupervisorHandle {
                 Ok(snapshot)
             }
             Err(error) => {
-                let snapshot = {
-                    let mut slots = self.inner.slots.lock();
-                    let slot = slots
-                        .get_mut(name)
-                        .expect("session disappeared during spawn failure");
+                let mut slots = self.inner.slots.lock();
+                let slot = slots
+                    .get_mut(name)
+                    .expect("session disappeared during start_session_at failure");
+                if slot.generation == expected {
                     slot.running = None;
                     slot.process_id = None;
                     slot.state = LifecycleState::Failed;
                     slot.last_error = Some(error.to_string());
                     slot.last_real_output_at = None;
-                    slot.snapshot()
-                };
-                self.emit(RuntimeEvent::SystemLog {
-                    level: LogLevel::Error,
-                    message: format!("Failed to start {}: {error}", snapshot.title),
-                    timestamp: now_rfc3339(),
-                });
-                self.emit(RuntimeEvent::SessionState {
-                    session: snapshot.name.clone(),
-                    state: snapshot.lifecycle_state,
-                    reason: "spawn failed".into(),
-                    timestamp: now_rfc3339(),
-                });
+                    let snapshot = slot.snapshot();
+                    drop(slots);
+                    self.emit(RuntimeEvent::SystemLog {
+                        level: LogLevel::Error,
+                        message: format!("Failed to start {}: {error}", snapshot.title),
+                        timestamp: now_rfc3339(),
+                    });
+                    self.emit(RuntimeEvent::SessionState {
+                        session: snapshot.name.clone(),
+                        state: snapshot.lifecycle_state,
+                        reason: "spawn failed".into(),
+                        timestamp: now_rfc3339(),
+                    });
+                }
                 Err(error)
             }
         }
     }
 
-    pub fn stop_session(&self, name: &str) -> Result<SessionSnapshot> {
-        self.refresh_session_liveness();
-        let pty = {
-            let mut slots = self.inner.slots.lock();
-            let slot = slots
-                .get_mut(name)
-                .with_context(|| format!("unknown session '{name}'"))?;
-            slot.state = LifecycleState::Closed;
-            slot.process_id = None;
-            slot.last_activity_at = Some(now_rfc3339());
-            slot.last_real_output_at = None;
-            slot.running.take().and_then(|running| running.pty)
-        };
-
-        if let Some(pty) = pty {
-            let _ = pty.kill();
-        }
-
-        let snapshot = self
-            .inner
-            .slots
-            .lock()
-            .get(name)
-            .expect("session disappeared during stop")
-            .snapshot();
-
-        self.emit(RuntimeEvent::SessionState {
-            session: snapshot.name.clone(),
-            state: snapshot.lifecycle_state,
-            reason: "session stopped".into(),
-            timestamp: now_rfc3339(),
-        });
-        Ok(snapshot)
-    }
-
-    pub fn restart_session(&self, name: &str) -> Result<SessionSnapshot> {
-        self.refresh_session_liveness();
+    fn restart_session_at(
+        &self,
+        name: &str,
+        expected_stop: SessionGeneration,
+    ) -> Result<SessionSnapshot> {
         {
             let mut slots = self.inner.slots.lock();
             let slot = slots
                 .get_mut(name)
                 .with_context(|| format!("unknown session '{name}'"))?;
+            if slot.generation != expected_stop {
+                return Err(anyhow!(
+                    "restart_session_at superseded: expected gen {expected_stop}, current {}",
+                    slot.generation
+                ));
+            }
             slot.state = LifecycleState::Restarting;
             slot.last_activity_at = Some(now_rfc3339());
             let snapshot = slot.snapshot();
@@ -361,8 +587,9 @@ impl SupervisorHandle {
             });
         }
 
-        let _ = self.stop_session(name);
-        self.start_session(name)
+        self.stop_session_at(name, expected_stop)?;
+        let expected_start = self.bump_session_generation(name)?;
+        self.start_session_at(name, expected_start)
     }
 
     pub fn send_input(&self, request: SendInputRequest) -> Result<SessionSnapshot> {
@@ -594,7 +821,39 @@ impl SupervisorHandle {
         }
     }
 
-    fn handle_pty_event(&self, session_name: &str, event: PtyEvent) {
+    fn handle_pty_event(
+        &self,
+        session_name: &str,
+        event_generation: SessionGeneration,
+        event: PtyEvent,
+    ) {
+        let should_log_stale_event = {
+            let slots = self.inner.slots.lock();
+            let current = slots.get(session_name).map(|slot| slot.generation);
+            current != Some(event_generation)
+        };
+
+        if should_log_stale_event {
+            let counter = {
+                let mut counts = self.inner.stale_event_drop_counts.lock();
+                let key = (session_name.to_string(), event_generation);
+                let count = counts.entry(key).or_insert(0);
+                *count += 1;
+                *count
+            };
+
+            if counter == 1 || counter % 10 == 0 {
+                self.emit(RuntimeEvent::SystemLog {
+                    level: LogLevel::Info,
+                    message: format!(
+                        "Dropped stale PTY event for session '{session_name}' generation {event_generation} (count={counter})"
+                    ),
+                    timestamp: now_rfc3339(),
+                });
+            }
+            return;
+        }
+
         match event {
             PtyEvent::Output(chunk) => {
                 let has_real_content = chunk_has_real_content(&chunk);
@@ -684,42 +943,82 @@ impl SupervisorHandle {
         runtime.block_on(self.apply_sideband_request_async(request))
     }
 
-    async fn apply_sideband_request_async(&self, request: SidebandRequest) -> SidebandResponse {
+    fn validate_sideband_request(&self, token: &str) -> Option<SidebandResponse> {
         let Some(_) = self.inner.control_plane.read().clone() else {
-            return SidebandResponse {
+            return Some(SidebandResponse {
                 ok: false,
                 message: "control plane not ready".into(),
                 snapshot: None,
+                timed_out: false,
                 payload: None,
-            };
+            });
         };
 
-        if !self
-            .inner
-            .token_bindings
-            .lock()
-            .contains_key(request.token())
-        {
-            return SidebandResponse {
+        if !self.inner.token_bindings.lock().contains_key(token) {
+            return Some(SidebandResponse {
                 ok: false,
                 message: "invalid control plane token".into(),
                 snapshot: None,
+                timed_out: false,
                 payload: None,
-            };
+            });
+        }
+
+        None
+    }
+
+    fn sideband_response_from_outcome(&self, outcome: Result<String>) -> SidebandResponse {
+        match outcome {
+            Ok(message) => SidebandResponse {
+                ok: true,
+                message,
+                snapshot: Some(self.snapshot()),
+                timed_out: false,
+                payload: None,
+            },
+            Err(error) => SidebandResponse {
+                ok: false,
+                message: error.to_string(),
+                snapshot: Some(self.snapshot()),
+                timed_out: false,
+                payload: None,
+            },
+        }
+    }
+
+    fn apply_lifecycle_request_at(
+        &self,
+        request: SidebandRequest,
+        expected_generation: Option<SessionGeneration>,
+    ) -> SidebandResponse {
+        if let Some(response) = self.validate_sideband_request(request.token()) {
+            return response;
+        }
+
+        let outcome = match (request, expected_generation) {
+            (SidebandRequest::StartSession { name, .. }, Some(expected)) => self
+                .start_session_at(&name, expected)
+                .map(|_| format!("started {name}")),
+            (SidebandRequest::StopSession { name, .. }, Some(expected)) => self
+                .stop_session_at(&name, expected)
+                .map(|_| format!("stopped {name}")),
+            (SidebandRequest::RestartSession { name, .. }, Some(expected)) => self
+                .restart_session_at(&name, expected)
+                .map(|_| format!("restarted {name}")),
+            (other, _) => return self.apply_sideband_request(other),
+        };
+
+        self.sideband_response_from_outcome(outcome)
+    }
+
+    async fn apply_side_effect_request_async(&self, request: SidebandRequest) -> SidebandResponse {
+        if let Some(response) = self.validate_sideband_request(request.token()) {
+            return response;
         }
 
         let outcome = match request {
             SidebandRequest::Ping { .. } => Ok("pong".into()),
             SidebandRequest::ListSessions { .. } => Ok("sessions listed".into()),
-            SidebandRequest::StartSession { name, .. } => {
-                self.start_session(&name).map(|_| format!("started {name}"))
-            }
-            SidebandRequest::StopSession { name, .. } => {
-                self.stop_session(&name).map(|_| format!("stopped {name}"))
-            }
-            SidebandRequest::RestartSession { name, .. } => self
-                .restart_session(&name)
-                .map(|_| format!("restarted {name}")),
             SidebandRequest::WaitQuiet {
                 name,
                 quiet_seconds,
@@ -738,36 +1037,252 @@ impl SupervisorHandle {
                 token,
                 name,
                 content,
-            } => self
-                .validate_deliver_message_token(&token, &name)
-                .and_then(|_| self.deliver_message(DeliverMessageRequest { name, content }))
-                .map(|_| "delivered".into()),
-            SidebandRequest::SendInput { token, name, input } => self
-                .validate_session_action_token(&token, &name)
-                .and_then(|_| self.send_input(SendInputRequest { name, input }))
-                .map(|_| "input sent".into()),
-            SidebandRequest::SendKey { token, name, key } => self
-                .validate_session_action_token(&token, &name)
-                .and_then(|_| self.send_control_key(&name, key))
-                .map(|_| format!("key {:?} sent", key)),
+            } => {
+                tokio::task::yield_now().await;
+                self.validate_deliver_message_token(&token, &name)
+                    .and_then(|_| self.deliver_message(DeliverMessageRequest { name, content }))
+                    .map(|_| "delivered".into())
+            }
+            SidebandRequest::SendInput { token, name, input } => {
+                tokio::task::yield_now().await;
+                self.validate_session_action_token(&token, &name)
+                    .and_then(|_| self.send_input(SendInputRequest { name, input }))
+                    .map(|_| "input sent".into())
+            }
+            SidebandRequest::SendKey { token, name, key } => {
+                tokio::task::yield_now().await;
+                self.validate_session_action_token(&token, &name)
+                    .and_then(|_| self.send_control_key(&name, key))
+                    .map(|_| format!("key {:?} sent", key))
+            }
             SidebandRequest::RouteMessage { request, .. } => {
+                tokio::task::yield_now().await;
                 self.route_message(request).map(|_| "message routed".into())
+            }
+            lifecycle => {
+                return SidebandResponse {
+                    ok: false,
+                    message: format!(
+                        "side-effect dispatcher received unexpected lifecycle request '{}'",
+                        action_label_for(&lifecycle)
+                    ),
+                    snapshot: Some(self.snapshot()),
+                    timed_out: false,
+                    payload: None,
+                };
             }
         };
 
-        match outcome {
-            Ok(message) => SidebandResponse {
-                ok: true,
-                message,
-                snapshot: Some(self.snapshot()),
-                payload: None,
+        self.sideband_response_from_outcome(outcome)
+    }
+
+    async fn apply_sideband_request_async(&self, request: SidebandRequest) -> SidebandResponse {
+        let request_id = Uuid::new_v4().to_string();
+        let action = action_label_for(&request).to_string();
+        let session = session_name_of(&request).map(str::to_string);
+        let budget = SidebandTimeouts::budget(&request);
+        let started = Instant::now();
+
+        self.emit_sideband_lifecycle(
+            &request_id,
+            &action,
+            session.as_deref(),
+            SidebandPhase::Started,
+            Duration::ZERO,
+        );
+
+        let response = match SidebandTimeouts::lane(&request) {
+            OpLane::Lifecycle => {
+                self.run_detached_with_timeout_async(
+                    request.clone(),
+                    budget,
+                    &request_id,
+                    &action,
+                    session.as_deref(),
+                )
+                .await
+            }
+            OpLane::SideEffect => {
+                self.run_inline_with_timeout_async(
+                    request.clone(),
+                    budget,
+                    &request_id,
+                    &action,
+                    session.as_deref(),
+                )
+                .await
+            }
+        };
+
+        if !response.timed_out {
+            let phase = if response.ok {
+                SidebandPhase::Completed
+            } else {
+                SidebandPhase::Failed
+            };
+            self.emit_sideband_lifecycle(
+                &request_id,
+                &action,
+                session.as_deref(),
+                phase,
+                started.elapsed(),
+            );
+        }
+
+        response
+    }
+
+    async fn run_detached_with_timeout_async(
+        &self,
+        request: SidebandRequest,
+        budget: Duration,
+        request_id: &str,
+        action: &str,
+        session: Option<&str>,
+    ) -> SidebandResponse {
+        let expected_generation = match session {
+            Some(name) => match self.bump_session_generation(name) {
+                Ok(expected) => Some(expected),
+                Err(error) => return self.sideband_response_from_outcome(Err(error)),
             },
-            Err(error) => SidebandResponse {
-                ok: false,
-                message: error.to_string(),
-                snapshot: Some(self.snapshot()),
-                payload: None,
-            },
+            None => None,
+        };
+
+        let handle = self.clone();
+        let lifecycle_request = request.clone();
+        let mut worker = tokio::task::spawn_blocking(move || {
+            handle.apply_lifecycle_request_at(lifecycle_request, expected_generation)
+        });
+        let slow_warn_at = budget / 2;
+        let started = Instant::now();
+        let mut warned = false;
+        let slow_warning = tokio::time::sleep(slow_warn_at);
+        tokio::pin!(slow_warning);
+        let deadline = tokio::time::sleep(budget);
+        tokio::pin!(deadline);
+
+        loop {
+            tokio::select! {
+                join_result = &mut worker => {
+                    let elapsed = started.elapsed();
+                    if !warned && elapsed >= slow_warn_at {
+                        self.emit_sideband_lifecycle(
+                            request_id,
+                            action,
+                            session,
+                            SidebandPhase::SlowWarning,
+                            elapsed,
+                        );
+                    }
+
+                    return match join_result {
+                        Ok(response) => response,
+                        Err(join_error) => SidebandResponse {
+                            ok: false,
+                            message: format!("worker join failed: {join_error}"),
+                            snapshot: Some(self.snapshot()),
+                            timed_out: false,
+                            payload: None,
+                        },
+                    };
+                }
+                _ = &mut slow_warning, if !warned => {
+                    warned = true;
+                    self.emit_sideband_lifecycle(
+                        request_id,
+                        action,
+                        session,
+                        SidebandPhase::SlowWarning,
+                        started.elapsed(),
+                    );
+                }
+                _ = &mut deadline => {
+                    let elapsed = started.elapsed();
+                    self.emit_sideband_lifecycle(
+                        request_id,
+                        action,
+                        session,
+                        SidebandPhase::TimedOut,
+                        elapsed,
+                    );
+                    return SidebandResponse {
+                        ok: false,
+                        message: format!(
+                            "lifecycle op '{action}' timed out after {}ms",
+                            elapsed.as_millis()
+                        ),
+                        snapshot: Some(self.snapshot()),
+                        timed_out: true,
+                        payload: None,
+                    };
+                }
+            }
+        }
+    }
+
+    async fn run_inline_with_timeout_async(
+        &self,
+        request: SidebandRequest,
+        budget: Duration,
+        request_id: &str,
+        action: &str,
+        session: Option<&str>,
+    ) -> SidebandResponse {
+        let slow_warn_at = budget / 2;
+        let started = Instant::now();
+        let mut warned = false;
+        let operation = self.apply_side_effect_request_async(request);
+        tokio::pin!(operation);
+        let slow_warning = tokio::time::sleep(slow_warn_at);
+        tokio::pin!(slow_warning);
+        let deadline = tokio::time::sleep(budget);
+        tokio::pin!(deadline);
+
+        loop {
+            tokio::select! {
+                response = &mut operation => {
+                    let elapsed = started.elapsed();
+                    if !warned && elapsed >= slow_warn_at {
+                        self.emit_sideband_lifecycle(
+                            request_id,
+                            action,
+                            session,
+                            SidebandPhase::SlowWarning,
+                            elapsed,
+                        );
+                    }
+                    return response;
+                }
+                _ = &mut slow_warning, if !warned => {
+                    warned = true;
+                    self.emit_sideband_lifecycle(
+                        request_id,
+                        action,
+                        session,
+                        SidebandPhase::SlowWarning,
+                        started.elapsed(),
+                    );
+                }
+                _ = &mut deadline => {
+                    self.emit_sideband_lifecycle(
+                        request_id,
+                        action,
+                        session,
+                        SidebandPhase::TimedOut,
+                        budget,
+                    );
+                    return SidebandResponse {
+                        ok: false,
+                        message: format!(
+                            "side-effect op '{action}' timed out after {}ms (boundary pre-PTY-write unless documented otherwise)",
+                            budget.as_millis()
+                        ),
+                        snapshot: Some(self.snapshot()),
+                        timed_out: true,
+                        payload: None,
+                    };
+                }
+            }
         }
     }
 
@@ -930,6 +1445,7 @@ impl SupervisorHandle {
                         ok: false,
                         message: format!("unknown session '{}'", request.name),
                         snapshot: Some(self.snapshot()),
+                        timed_out: false,
                         payload: None,
                     };
                 };
@@ -938,6 +1454,7 @@ impl SupervisorHandle {
                         ok: false,
                         message: format!("session '{}' is not running", request.name),
                         snapshot: Some(self.snapshot()),
+                        timed_out: false,
                         payload: None,
                     };
                 }
@@ -953,6 +1470,7 @@ impl SupervisorHandle {
                     ok: true,
                     message: "session is quiet".into(),
                     snapshot: Some(self.snapshot()),
+                    timed_out: false,
                     payload: Some(SidebandResponsePayload::WaitQuiet {
                         quiet_duration_ms: status,
                     }),
@@ -964,6 +1482,7 @@ impl SupervisorHandle {
                     ok: false,
                     message: "wait_quiet timed out".into(),
                     snapshot: Some(self.snapshot()),
+                    timed_out: false,
                     payload: Some(SidebandResponsePayload::WaitQuietTimeout {
                         last_output_age_ms: status,
                     }),
@@ -1114,10 +1633,12 @@ fn process_sideband_mailbox_file(
     outbox_dir: &Path,
     processed_dir: &Path,
 ) -> Result<()> {
-    let raw = fs::read_to_string(request_path)
+    let mailbox_fs = handle.inner.mailbox_fs.read().clone();
+    let raw = mailbox_fs
+        .read_to_string(request_path)
         .with_context(|| format!("failed to read mailbox request {}", request_path.display()))?;
-    let response = match decode_request(raw.trim()) {
-        Ok(request) => handle.apply_sideband_request(request),
+    let request = match decode_request(raw.trim()) {
+        Ok(request) => request,
         Err(error) => {
             let request_is_fresh = fs::metadata(request_path)
                 .ok()
@@ -1130,15 +1651,221 @@ fn process_sideband_mailbox_file(
                 return Ok(());
             }
 
-            SidebandResponse {
+            let response = SidebandResponse {
                 ok: false,
                 message: format!("invalid sideband payload: {error}"),
                 snapshot: Some(handle.snapshot()),
+                timed_out: false,
                 payload: None,
-            }
+            };
+            return write_and_archive_response(
+                handle,
+                request_path,
+                outbox_dir,
+                processed_dir,
+                &response,
+            );
         }
     };
 
+    let request_id = Uuid::new_v4().to_string();
+    let action = action_label_for(&request);
+    let session = session_name_of(&request);
+    let budget = SidebandTimeouts::budget(&request);
+    let started = Instant::now();
+
+    handle.emit_sideband_lifecycle(
+        &request_id,
+        action,
+        session,
+        SidebandPhase::Started,
+        Duration::ZERO,
+    );
+
+    let response = match SidebandTimeouts::lane(&request) {
+        OpLane::Lifecycle => run_detached_with_timeout(
+            handle,
+            request.clone(),
+            budget,
+            &request_id,
+            action,
+            session,
+        ),
+        OpLane::SideEffect => run_inline_with_timeout(
+            handle,
+            request.clone(),
+            budget,
+            &request_id,
+            action,
+            session,
+        ),
+    };
+
+    if !response.timed_out {
+        let phase = if response.ok {
+            SidebandPhase::Completed
+        } else {
+            SidebandPhase::Failed
+        };
+        handle.emit_sideband_lifecycle(&request_id, action, session, phase, started.elapsed());
+    }
+
+    write_and_archive_response(handle, request_path, outbox_dir, processed_dir, &response)
+}
+
+fn run_detached_with_timeout(
+    handle: &SupervisorHandle,
+    request: SidebandRequest,
+    budget: Duration,
+    request_id: &str,
+    action: &str,
+    session: Option<&str>,
+) -> SidebandResponse {
+    let expected_generation = match session {
+        Some(name) => match handle.bump_session_generation(name) {
+            Ok(expected) => Some(expected),
+            Err(error) => return handle.sideband_response_from_outcome(Err(error)),
+        },
+        None => None,
+    };
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    #[cfg(test)]
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+    #[cfg(test)]
+    handle.set_last_detached_worker_receiver(done_rx);
+
+    let worker_handle = handle.clone();
+    thread::spawn(move || {
+        let response = worker_handle.apply_lifecycle_request_at(request, expected_generation);
+        let _ = tx.send(response);
+        #[cfg(test)]
+        let _ = done_tx.send(());
+    });
+
+    let slow_warn_at = budget / 2;
+    let started = Instant::now();
+    let mut warned = false;
+
+    loop {
+        let elapsed = started.elapsed();
+        let remaining = budget.saturating_sub(elapsed);
+        let tick = remaining.min(Duration::from_millis(500));
+        match rx.recv_timeout(tick) {
+            Ok(response) => return response,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let elapsed = started.elapsed();
+                if !warned && elapsed >= slow_warn_at {
+                    warned = true;
+                    handle.emit_sideband_lifecycle(
+                        request_id,
+                        action,
+                        session,
+                        SidebandPhase::SlowWarning,
+                        elapsed,
+                    );
+                }
+                if elapsed >= budget {
+                    handle.emit_sideband_lifecycle(
+                        request_id,
+                        action,
+                        session,
+                        SidebandPhase::TimedOut,
+                        elapsed,
+                    );
+                    return SidebandResponse {
+                        ok: false,
+                        message: format!(
+                            "lifecycle op '{action}' timed out after {}ms",
+                            elapsed.as_millis()
+                        ),
+                        snapshot: Some(handle.snapshot()),
+                        timed_out: true,
+                        payload: None,
+                    };
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return SidebandResponse {
+                    ok: false,
+                    message: "lifecycle worker panicked".into(),
+                    snapshot: Some(handle.snapshot()),
+                    timed_out: false,
+                    payload: None,
+                };
+            }
+        }
+    }
+}
+
+fn run_inline_with_timeout(
+    handle: &SupervisorHandle,
+    request: SidebandRequest,
+    budget: Duration,
+    request_id: &str,
+    action: &str,
+    session: Option<&str>,
+) -> SidebandResponse {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("failed to build inline side-effect runtime");
+    let started = Instant::now();
+    let slow_warn_at = budget / 2;
+    let handle_clone = handle.clone();
+    let request_clone = request.clone();
+    let result = runtime.block_on(async move {
+        tokio::time::timeout(
+            budget,
+            handle_clone.apply_side_effect_request_async(request_clone),
+        )
+        .await
+    });
+
+    let elapsed = started.elapsed();
+    if elapsed >= slow_warn_at {
+        handle.emit_sideband_lifecycle(
+            request_id,
+            action,
+            session,
+            SidebandPhase::SlowWarning,
+            elapsed,
+        );
+    }
+
+    match result {
+        Ok(response) => response,
+        Err(_) => {
+            handle.emit_sideband_lifecycle(
+                request_id,
+                action,
+                session,
+                SidebandPhase::TimedOut,
+                budget,
+            );
+            SidebandResponse {
+                ok: false,
+                message: format!(
+                    "side-effect op '{action}' timed out after {}ms (boundary pre-PTY-write unless documented otherwise)",
+                    budget.as_millis()
+                ),
+                snapshot: Some(handle.snapshot()),
+                timed_out: true,
+                payload: None,
+            }
+        }
+    }
+}
+
+fn write_and_archive_response(
+    handle: &SupervisorHandle,
+    request_path: &Path,
+    outbox_dir: &Path,
+    processed_dir: &Path,
+    response: &SidebandResponse,
+) -> Result<()> {
+    let mailbox_fs = handle.inner.mailbox_fs.read().clone();
     let file_name = request_path.file_name().with_context(|| {
         format!(
             "mailbox request missing file name: {}",
@@ -1147,40 +1874,84 @@ fn process_sideband_mailbox_file(
     })?;
     let response_path = outbox_dir.join(file_name);
     let temp_response_path = outbox_dir.join(format!("{}.tmp", file_name.to_string_lossy()));
-    fs::write(
-        &temp_response_path,
-        format!("{}\n", encode_response(&response)?),
-    )
-    .with_context(|| {
-        format!(
-            "failed to write mailbox response {}",
-            temp_response_path.display()
-        )
-    })?;
-    fs::rename(&temp_response_path, &response_path).with_context(|| {
-        format!(
-            "failed to publish mailbox response {}",
-            response_path.display()
-        )
-    })?;
-
+    let payload = format!("{}\n", encode_response(response)?);
     let archived_request_path = processed_dir.join(file_name);
-    if archived_request_path.exists() {
-        fs::remove_file(&archived_request_path).with_context(|| {
+
+    let mut last_error = None;
+    for _attempt in 0..3 {
+        let result: Result<()> = (|| {
+            mailbox_fs
+                .write(&temp_response_path, payload.as_bytes())
+                .with_context(|| {
+                    format!(
+                        "failed to write mailbox response {}",
+                        temp_response_path.display()
+                    )
+                })?;
+            mailbox_fs
+                .rename(&temp_response_path, &response_path)
+                .with_context(|| {
+                    format!(
+                        "failed to publish mailbox response {}",
+                        response_path.display()
+                    )
+                })?;
+            if archived_request_path.exists() {
+                mailbox_fs
+                    .remove_file(&archived_request_path)
+                    .with_context(|| {
+                        format!(
+                            "failed to clear archived mailbox request {}",
+                            archived_request_path.display()
+                        )
+                    })?;
+            }
+            mailbox_fs
+                .rename(request_path, &archived_request_path)
+                .with_context(|| {
+                    format!(
+                        "failed to archive mailbox request {}",
+                        request_path.display()
+                    )
+                })?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = Some(error);
+                let _ = mailbox_fs.remove_file(&temp_response_path);
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+
+    let error = last_error.expect("archive retries should record an error");
+    let poison_dir = request_path
+        .parent()
+        .with_context(|| format!("request path missing parent: {}", request_path.display()))?
+        .parent()
+        .with_context(|| format!("sideband inbox missing parent: {}", request_path.display()))?
+        .join("poison");
+    fs::create_dir_all(&poison_dir)
+        .with_context(|| format!("failed to create poison directory {}", poison_dir.display()))?;
+    let poison_path = poison_dir.join(format!(
+        "{}-{}",
+        now_rfc3339().replace(':', "-"),
+        file_name.to_string_lossy()
+    ));
+    mailbox_fs
+        .rename(request_path, &poison_path)
+        .with_context(|| {
             format!(
-                "failed to clear archived mailbox request {}",
-                archived_request_path.display()
+                "failed to poison mailbox request {}",
+                request_path.display()
             )
         })?;
-    }
-    fs::rename(request_path, &archived_request_path).with_context(|| {
-        format!(
-            "failed to archive mailbox request {}",
-            request_path.display()
-        )
-    })?;
-
-    Ok(())
+    fs::write(poison_path.with_extension("error"), format!("{error:#}\n"))
+        .with_context(|| format!("failed to write poison error {}", poison_path.display()))?;
+    Err(error)
 }
 
 fn build_launch_spec(definition: &SessionDefinition) -> shared_types::LaunchSpec {
@@ -1197,6 +1968,35 @@ fn scope_label(scope: MessageScope) -> &'static str {
         MessageScope::Room => "Room",
         MessageScope::System => "System",
         MessageScope::Private => "Private",
+    }
+}
+
+fn action_label_for(request: &SidebandRequest) -> &'static str {
+    match request {
+        SidebandRequest::Ping { .. } => "ping",
+        SidebandRequest::ListSessions { .. } => "list_sessions",
+        SidebandRequest::StartSession { .. } => "start_session",
+        SidebandRequest::StopSession { .. } => "stop_session",
+        SidebandRequest::RestartSession { .. } => "restart_session",
+        SidebandRequest::DeliverMessage { .. } => "deliver_message",
+        SidebandRequest::WaitQuiet { .. } => "wait_quiet",
+        SidebandRequest::SendInput { .. } => "send_input",
+        SidebandRequest::SendKey { .. } => "send_key",
+        SidebandRequest::RouteMessage { .. } => "route_message",
+    }
+}
+
+fn session_name_of(request: &SidebandRequest) -> Option<&str> {
+    match request {
+        SidebandRequest::StartSession { name, .. }
+        | SidebandRequest::StopSession { name, .. }
+        | SidebandRequest::RestartSession { name, .. }
+        | SidebandRequest::DeliverMessage { name, .. }
+        | SidebandRequest::WaitQuiet { name, .. }
+        | SidebandRequest::SendInput { name, .. }
+        | SidebandRequest::SendKey { name, .. } => Some(name.as_str()),
+        SidebandRequest::RouteMessage { request, .. } => Some(request.to.as_str()),
+        SidebandRequest::Ping { .. } | SidebandRequest::ListSessions { .. } => None,
     }
 }
 
@@ -1671,7 +2471,175 @@ where
 mod tests {
     use super::*;
     use control_plane::{decode_response, encode_request};
+    use parking_lot::Condvar;
+    use pty_host::PtySession as PtySessionTrait;
     use shared_types::{MessageScope, RouteMessageRequest, SidebandRequest};
+    use std::{
+        collections::VecDeque,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    #[derive(Clone, Copy)]
+    enum MockKillBehavior {
+        Immediate,
+        Sleep(Duration),
+    }
+
+    struct MockPtySession {
+        process_id: Option<u32>,
+        send_input_count: Arc<AtomicUsize>,
+        kill_count: Arc<AtomicUsize>,
+        kill_behavior: MockKillBehavior,
+    }
+
+    impl PtySessionTrait for MockPtySession {
+        fn send_input(&self, _input: &str) -> Result<()> {
+            self.send_input_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn resize(&self, _cols: u16, _rows: u16) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill(&self) -> Result<()> {
+            self.kill_count.fetch_add(1, Ordering::SeqCst);
+            if let MockKillBehavior::Sleep(duration) = self.kill_behavior {
+                thread::sleep(duration);
+            }
+            Ok(())
+        }
+
+        fn try_wait(&self) -> Result<Option<pty_host::PtyExitStatus>> {
+            Ok(None)
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            self.process_id
+        }
+    }
+
+    fn mock_pty_session(
+        process_id: Option<u32>,
+        kill_behavior: MockKillBehavior,
+    ) -> (Box<dyn PtySessionTrait>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let send_input_count = Arc::new(AtomicUsize::new(0));
+        let kill_count = Arc::new(AtomicUsize::new(0));
+        (
+            Box::new(MockPtySession {
+                process_id,
+                send_input_count: send_input_count.clone(),
+                kill_count: kill_count.clone(),
+                kill_behavior,
+            }) as Box<dyn PtySessionTrait>,
+            send_input_count,
+            kill_count,
+        )
+    }
+
+    struct QueuePtySpawner {
+        sessions: Mutex<VecDeque<Box<dyn PtySessionTrait>>>,
+    }
+
+    impl QueuePtySpawner {
+        fn new(sessions: Vec<Box<dyn PtySessionTrait>>) -> Self {
+            Self {
+                sessions: Mutex::new(sessions.into()),
+            }
+        }
+    }
+
+    impl PtySpawner for QueuePtySpawner {
+        fn spawn(
+            &self,
+            _spec: &LaunchSpec,
+            _handler: PtyEventHandler,
+        ) -> Result<Box<dyn PtySessionTrait>> {
+            self.sessions
+                .lock()
+                .pop_front()
+                .ok_or_else(|| anyhow!("no queued PTY sessions"))
+        }
+    }
+
+    struct StagedPtySpawner {
+        release_gate: Arc<(Mutex<bool>, Condvar)>,
+        stage_first_spawn: AtomicBool,
+        sessions: Mutex<VecDeque<Box<dyn PtySessionTrait>>>,
+    }
+
+    impl StagedPtySpawner {
+        fn new(
+            release_gate: Arc<(Mutex<bool>, Condvar)>,
+            sessions: Vec<Box<dyn PtySessionTrait>>,
+        ) -> Self {
+            Self {
+                release_gate,
+                stage_first_spawn: AtomicBool::new(true),
+                sessions: Mutex::new(sessions.into()),
+            }
+        }
+    }
+
+    impl PtySpawner for StagedPtySpawner {
+        fn spawn(
+            &self,
+            _spec: &LaunchSpec,
+            _handler: PtyEventHandler,
+        ) -> Result<Box<dyn PtySessionTrait>> {
+            let session = self
+                .sessions
+                .lock()
+                .pop_front()
+                .ok_or_else(|| anyhow!("no staged PTY sessions"))?;
+
+            if self.stage_first_spawn.swap(false, Ordering::SeqCst) {
+                let (lock, cvar) = &*self.release_gate;
+                let mut released = lock.lock();
+                while !*released {
+                    cvar.wait(&mut released);
+                }
+            }
+
+            Ok(session)
+        }
+    }
+
+    struct FailingRenameMailboxFs {
+        rename_failures_remaining: AtomicUsize,
+    }
+
+    impl FailingRenameMailboxFs {
+        fn new(rename_failures: usize) -> Self {
+            Self {
+                rename_failures_remaining: AtomicUsize::new(rename_failures),
+            }
+        }
+    }
+
+    impl MailboxFs for FailingRenameMailboxFs {
+        fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+            fs::read_to_string(path)
+        }
+
+        fn write(&self, path: &Path, contents: &[u8]) -> std::io::Result<()> {
+            fs::write(path, contents)
+        }
+
+        fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            if self.rename_failures_remaining.load(Ordering::SeqCst) > 0 {
+                self.rename_failures_remaining
+                    .fetch_sub(1, Ordering::SeqCst);
+                return Err(std::io::Error::other("synthetic rename failure"));
+            }
+            fs::rename(from, to)
+        }
+
+        fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+            fs::remove_file(path)
+        }
+    }
 
     fn test_supervisor() -> SupervisorHandle {
         let root = std::env::temp_dir().join(format!("cli-master-wrapper-test-{}", Uuid::new_v4()));
@@ -1703,7 +2671,10 @@ mod tests {
     fn install_stale_running_session(supervisor: &SupervisorHandle, name: &str) {
         let mut slots = supervisor.inner.slots.lock();
         let slot = slots.get_mut(name).unwrap();
-        slot.running = Some(RunningSession { pty: None });
+        slot.running = Some(RunningSession {
+            pty: None,
+            generation: slot.generation,
+        });
         slot.process_id = Some(u32::MAX);
         slot.state = LifecycleState::Busy;
         slot.last_real_output_at = None;
@@ -1717,7 +2688,28 @@ mod tests {
         let mut slots = supervisor.inner.slots.lock();
         let slot = slots.get_mut(name).unwrap();
         slot.definition.driver = driver;
-        slot.running = Some(RunningSession { pty: None });
+        slot.running = Some(RunningSession {
+            pty: None,
+            generation: slot.generation,
+        });
+        slot.process_id = None;
+        slot.state = LifecycleState::Busy;
+        slot.last_real_output_at = None;
+    }
+
+    fn install_mock_running_session(
+        supervisor: &SupervisorHandle,
+        name: &str,
+        driver: DriverKind,
+        pty: Box<dyn PtySessionTrait>,
+    ) {
+        let mut slots = supervisor.inner.slots.lock();
+        let slot = slots.get_mut(name).unwrap();
+        slot.definition.driver = driver;
+        slot.running = Some(RunningSession {
+            pty: Some(pty),
+            generation: slot.generation,
+        });
         slot.process_id = None;
         slot.state = LifecycleState::Busy;
         slot.last_real_output_at = None;
@@ -2402,7 +3394,7 @@ mod tests {
         let refresher = supervisor.clone();
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(200));
-            refresher.handle_pty_event("claude", PtyEvent::Output("Working".into()));
+            refresher.handle_pty_event("claude", 0, PtyEvent::Output("Working".into()));
         });
         let started = Instant::now();
 
@@ -2415,6 +3407,297 @@ mod tests {
 
         assert!(response.ok);
         assert!(started.elapsed() >= Duration::from_millis(1100));
+    }
+
+    #[test]
+    fn handle_pty_event_drops_stale_generation() {
+        let supervisor = test_supervisor();
+        install_synthetic_running_session(&supervisor, "claude", DriverKind::Claude);
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_mut("claude").unwrap();
+            slot.generation = 2;
+            slot.state = LifecycleState::Busy;
+            slot.running.as_mut().unwrap().generation = 2;
+        }
+        let events = Arc::new(Mutex::new(Vec::<RuntimeEvent>::new()));
+        let captured = events.clone();
+        supervisor.set_event_sink(move |event| {
+            captured.lock().push(event);
+        });
+
+        supervisor.handle_pty_event("claude", 1, PtyEvent::Output("Working".into()));
+
+        assert_eq!(supervisor.current_generation("claude"), Some(2));
+        let slot = supervisor
+            .inner
+            .slots
+            .lock()
+            .get("claude")
+            .unwrap()
+            .snapshot();
+        assert_eq!(slot.lifecycle_state, LifecycleState::Busy);
+        let events = events.lock();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SystemLog { message, .. }
+                if message.contains("Dropped stale PTY event")
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::SessionOutput { .. }))
+        );
+    }
+
+    #[test]
+    fn sideband_lifecycle_events_emitted_for_mailbox_ping() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let events = Arc::new(Mutex::new(Vec::<RuntimeEvent>::new()));
+        let captured = events.clone();
+        supervisor.set_event_sink(move |event| {
+            captured.lock().push(event);
+        });
+
+        let sideband_dir = supervisor.runtime_dir().join("sideband-test-lifecycle");
+        let inbox_dir = sideband_dir.join("inbox");
+        let outbox_dir = sideband_dir.join("outbox");
+        let processed_dir = sideband_dir.join("processed");
+        fs::create_dir_all(&inbox_dir).unwrap();
+        fs::create_dir_all(&outbox_dir).unwrap();
+        fs::create_dir_all(&processed_dir).unwrap();
+
+        let request_path = inbox_dir.join("ping.json");
+        fs::write(
+            &request_path,
+            encode_request(&SidebandRequest::Ping {
+                token: status.token.clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        process_sideband_mailbox_file(&supervisor, &request_path, &outbox_dir, &processed_dir)
+            .unwrap();
+
+        let lifecycle_events = events
+            .lock()
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::SidebandRequestLifecycle {
+                    request_id,
+                    action,
+                    phase,
+                    ..
+                } => Some((request_id.clone(), action.clone(), *phase)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(lifecycle_events.len(), 2);
+        assert_eq!(lifecycle_events[0].1, "ping");
+        assert_eq!(lifecycle_events[0].2, SidebandPhase::Started);
+        assert_eq!(lifecycle_events[1].2, SidebandPhase::Completed);
+        assert_eq!(lifecycle_events[0].0, lifecycle_events[1].0);
+    }
+
+    #[test]
+    fn sideband_lifecycle_events_emitted_for_pipe_ping() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let events = Arc::new(Mutex::new(Vec::<RuntimeEvent>::new()));
+        let captured = events.clone();
+        supervisor.set_event_sink(move |event| {
+            captured.lock().push(event);
+        });
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        let response = runtime.block_on(async {
+            let (client, server) = tokio::io::duplex(4096);
+            let handle = supervisor.clone();
+            let request_payload = format!(
+                "{}\n",
+                encode_request(&SidebandRequest::Ping {
+                    token: status.token.clone(),
+                })
+                .unwrap()
+            );
+
+            let server_task = tokio::spawn(async move {
+                handle_sideband_stream(handle, server).await.unwrap();
+            });
+
+            let (read_half, mut write_half) = tokio::io::split(client);
+            write_half
+                .write_all(request_payload.as_bytes())
+                .await
+                .unwrap();
+            write_half.flush().await.unwrap();
+
+            let mut reader = BufReader::new(read_half);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            server_task.await.unwrap();
+
+            decode_response(line.trim()).unwrap()
+        });
+
+        assert!(response.ok);
+        assert_eq!(response.message, "pong");
+
+        let lifecycle_events = events
+            .lock()
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::SidebandRequestLifecycle {
+                    request_id,
+                    action,
+                    phase,
+                    ..
+                } => Some((request_id.clone(), action.clone(), *phase)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(lifecycle_events.len(), 2);
+        assert_eq!(lifecycle_events[0].1, "ping");
+        assert_eq!(lifecycle_events[0].2, SidebandPhase::Started);
+        assert_eq!(lifecycle_events[1].2, SidebandPhase::Completed);
+        assert_eq!(lifecycle_events[0].0, lifecycle_events[1].0);
+    }
+
+    #[test]
+    fn detached_stop_late_events_filtered_by_generation() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let (old_pty, _, old_kill_count) =
+            mock_pty_session(None, MockKillBehavior::Sleep(Duration::from_millis(200)));
+        install_mock_running_session(&supervisor, "claude", DriverKind::Claude, old_pty);
+        let (new_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        supervisor.set_pty_spawner_for_tests(Arc::new(QueuePtySpawner::new(vec![new_pty])));
+
+        let response = run_detached_with_timeout(
+            &supervisor,
+            SidebandRequest::StopSession {
+                token: status.token.clone(),
+                name: "claude".into(),
+            },
+            Duration::from_millis(50),
+            "req-stop",
+            "stop_session",
+            Some("claude"),
+        );
+        assert!(response.timed_out);
+
+        let snapshot = supervisor.start_session("claude").unwrap();
+        assert_eq!(snapshot.lifecycle_state, LifecycleState::Ready);
+        assert!(supervisor.test_wait_for_last_worker(Duration::from_secs(1)));
+        assert_eq!(supervisor.current_generation("claude"), Some(2));
+        assert!(old_kill_count.load(Ordering::SeqCst) >= 1);
+
+        let slots = supervisor.inner.slots.lock();
+        let slot = slots.get("claude").unwrap();
+        assert_eq!(slot.state, LifecycleState::Ready);
+        assert_eq!(slot.running.as_ref().unwrap().generation, 2);
+    }
+
+    #[test]
+    fn detached_start_orphan_pty_killed_on_generation_mismatch() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (first_pty, _, first_kill_count) = mock_pty_session(None, MockKillBehavior::Immediate);
+        let (second_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        supervisor.set_pty_spawner_for_tests(Arc::new(StagedPtySpawner::new(
+            gate.clone(),
+            vec![first_pty, second_pty],
+        )));
+
+        let response = run_detached_with_timeout(
+            &supervisor,
+            SidebandRequest::StartSession {
+                token: status.token.clone(),
+                name: "claude".into(),
+            },
+            Duration::from_millis(50),
+            "req-start",
+            "start_session",
+            Some("claude"),
+        );
+        assert!(response.timed_out);
+
+        let snapshot = supervisor.start_session("claude").unwrap();
+        assert_eq!(snapshot.lifecycle_state, LifecycleState::Ready);
+        {
+            let (lock, cvar) = &*gate;
+            let mut released = lock.lock();
+            *released = true;
+            cvar.notify_all();
+        }
+
+        assert!(supervisor.test_wait_for_last_worker(Duration::from_secs(1)));
+        assert_eq!(first_kill_count.load(Ordering::SeqCst), 1);
+        assert_eq!(supervisor.current_generation("claude"), Some(2));
+
+        let slots = supervisor.inner.slots.lock();
+        let slot = slots.get("claude").unwrap();
+        assert_eq!(slot.state, LifecycleState::Ready);
+        assert_eq!(slot.running.as_ref().unwrap().generation, 2);
+    }
+
+    #[test]
+    fn mailbox_poison_queue_catches_rename_failure() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        supervisor.set_mailbox_fs_for_tests(Arc::new(FailingRenameMailboxFs::new(3)));
+        let sideband_dir = supervisor.runtime_dir().join("sideband-test-poison");
+        let inbox_dir = sideband_dir.join("inbox");
+        let outbox_dir = sideband_dir.join("outbox");
+        let processed_dir = sideband_dir.join("processed");
+        fs::create_dir_all(&inbox_dir).unwrap();
+        fs::create_dir_all(&outbox_dir).unwrap();
+        fs::create_dir_all(&processed_dir).unwrap();
+
+        let request_path = inbox_dir.join("ping.json");
+        fs::write(
+            &request_path,
+            encode_request(&SidebandRequest::Ping {
+                token: status.token.clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error =
+            process_sideband_mailbox_file(&supervisor, &request_path, &outbox_dir, &processed_dir)
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("failed to publish mailbox response")
+        );
+
+        let poison_dir = sideband_dir.join("poison");
+        let poison_entries = fs::read_dir(&poison_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .collect::<Vec<_>>();
+        assert!(
+            poison_entries
+                .iter()
+                .any(|path| path.extension().and_then(|ext| ext.to_str()) != Some("error"))
+        );
+        assert!(
+            poison_entries
+                .iter()
+                .any(|path| path.extension().and_then(|ext| ext.to_str()) == Some("error"))
+        );
     }
 
     #[test]

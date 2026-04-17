@@ -24,14 +24,22 @@ pub struct PtyExitStatus {
     pub success: bool,
 }
 
-pub struct PtySession {
+pub trait PtySession: Send {
+    fn send_input(&self, input: &str) -> anyhow::Result<()>;
+    fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()>;
+    fn kill(&self) -> anyhow::Result<()>;
+    fn try_wait(&self) -> anyhow::Result<Option<PtyExitStatus>>;
+    fn process_id(&self) -> Option<u32>;
+}
+
+pub struct ConcretePtySession {
     master: Box<dyn MasterPty + Send>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     process_id: Option<u32>,
 }
 
-impl PtySession {
+impl ConcretePtySession {
     pub fn spawn(spec: &LaunchSpec, handler: PtyEventHandler) -> anyhow::Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -99,8 +107,10 @@ impl PtySession {
             process_id,
         })
     }
+}
 
-    pub fn send_input(&self, input: &str) -> anyhow::Result<()> {
+impl PtySession for ConcretePtySession {
+    fn send_input(&self, input: &str) -> anyhow::Result<()> {
         let mut writer = self.writer.lock().expect("pty writer poisoned");
         writer
             .write_all(input.as_bytes())
@@ -109,7 +119,7 @@ impl PtySession {
         Ok(())
     }
 
-    pub fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()> {
+    fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()> {
         self.master
             .resize(PtySize {
                 rows,
@@ -121,7 +131,7 @@ impl PtySession {
         Ok(())
     }
 
-    pub fn kill(&self) -> anyhow::Result<()> {
+    fn kill(&self) -> anyhow::Result<()> {
         self.child
             .lock()
             .expect("pty child poisoned")
@@ -130,7 +140,7 @@ impl PtySession {
         Ok(())
     }
 
-    pub fn try_wait(&self) -> anyhow::Result<Option<PtyExitStatus>> {
+    fn try_wait(&self) -> anyhow::Result<Option<PtyExitStatus>> {
         let mut child = self.child.lock().expect("pty child poisoned");
         let status = child.try_wait().context("failed to poll PTY child")?;
         Ok(status.map(|status| PtyExitStatus {
@@ -140,7 +150,7 @@ impl PtySession {
         }))
     }
 
-    pub fn process_id(&self) -> Option<u32> {
+    fn process_id(&self) -> Option<u32> {
         self.process_id
     }
 }

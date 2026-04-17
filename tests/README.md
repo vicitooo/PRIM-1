@@ -18,6 +18,16 @@ Current script-level coverage:
   - checks non-`input` action rejection
   - captures the mailbox fallback payload and asserts the exact string survives shell-hostile characters
 
+- `tests/control-plane-deliver-wait.ps1`
+  - validates `scripts/control-plane.ps1 -Action deliver`
+  - validates `scripts/control-plane.ps1 -Action wait_quiet`
+  - verifies mailbox fallback preserves request payloads and extended wait budgets
+
+- `tests/control-plane-timeouts.ps1`
+  - validates `scripts/control-plane.ps1` timeout surfacing
+  - checks `timed_out: true` returns exit code `124`
+  - checks the `TIMED OUT: <message>` banner in both normal and `-Quiet` modes
+
 - `tests/handshake-helpers.ps1`
   - validates `scripts/new-smoke-token.ps1`
   - validates canonical `scripts/handshake-route.ps1` payload generation in `-DryRun` mode
