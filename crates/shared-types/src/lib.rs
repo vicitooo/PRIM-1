@@ -166,6 +166,47 @@ pub struct WaitQuietRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventCursor {
+    pub audit_file: String,
+    pub byte_offset: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct EventFilter {
+    pub include_kinds: Vec<String>,
+    pub include_sessions: Vec<String>,
+    pub include_scopes: Vec<String>,
+}
+
+impl EventFilter {
+    pub const ALL_KINDS: &'static str = "all";
+    pub const DEFAULT_INCLUDE_KINDS: [&'static str; 5] = [
+        "session_state",
+        "routed_message",
+        "system_log",
+        "control_plane_ready",
+        "sideband_request_lifecycle",
+    ];
+
+    pub fn includes_kind(&self, kind: &str) -> bool {
+        if self
+            .include_kinds
+            .iter()
+            .any(|candidate| candidate == Self::ALL_KINDS)
+        {
+            return true;
+        }
+
+        if self.include_kinds.is_empty() {
+            return Self::DEFAULT_INCLUDE_KINDS.contains(&kind);
+        }
+
+        self.include_kinds.iter().any(|candidate| candidate == kind)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum RuntimeEvent {
     SessionOutput {
@@ -251,6 +292,13 @@ pub enum SidebandRequest {
         quiet_seconds: u32,
         timeout_seconds: u32,
     },
+    EventsSince {
+        token: String,
+        cursor: Option<EventCursor>,
+        max_events: Option<u32>,
+        max_wait_seconds: Option<u32>,
+        filter: Option<EventFilter>,
+    },
     SendInput {
         token: String,
         name: String,
@@ -277,6 +325,7 @@ impl SidebandRequest {
             | Self::RestartSession { token, .. }
             | Self::DeliverMessage { token, .. }
             | Self::WaitQuiet { token, .. }
+            | Self::EventsSince { token, .. }
             | Self::SendInput { token, .. }
             | Self::SendKey { token, .. }
             | Self::RouteMessage { token, .. } => token,
@@ -288,8 +337,21 @@ impl SidebandRequest {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SidebandResponsePayload {
     Reserved,
-    WaitQuiet { quiet_duration_ms: u64 },
-    WaitQuietTimeout { last_output_age_ms: u64 },
+    WaitQuiet {
+        quiet_duration_ms: u64,
+    },
+    WaitQuietTimeout {
+        last_output_age_ms: u64,
+    },
+    EventsSince {
+        events: Vec<RuntimeEvent>,
+        next_cursor: EventCursor,
+        gap_detected: bool,
+        as_of: String,
+    },
+    EventsSinceError {
+        echoed_cursor: serde_json::Value,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -382,5 +444,78 @@ mod tests {
             serde_json::to_value(SidebandPhase::TimedOut).unwrap(),
             json!("timed_out")
         );
+    }
+
+    #[test]
+    fn event_cursor_roundtrips_json() {
+        let cursor = EventCursor {
+            audit_file: "2026-04-18.jsonl".into(),
+            byte_offset: 42,
+        };
+
+        let roundtrip: EventCursor =
+            serde_json::from_value(serde_json::to_value(cursor.clone()).unwrap()).unwrap();
+
+        assert_eq!(roundtrip, cursor);
+    }
+
+    #[test]
+    fn event_cursor_rejects_legacy_date_shape() {
+        let error = serde_json::from_value::<EventCursor>(json!({
+            "date": "2026-04-18",
+            "byte_offset": 42
+        }))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("audit_file"));
+    }
+
+    #[test]
+    fn filter_default_excludes_session_output() {
+        let filter = EventFilter::default();
+
+        assert!(!filter.includes_kind("session_output"));
+    }
+
+    #[test]
+    fn filter_default_includes_sideband_request_lifecycle() {
+        let filter = EventFilter::default();
+
+        assert!(filter.includes_kind("sideband_request_lifecycle"));
+    }
+
+    #[test]
+    fn filter_all_includes_session_output() {
+        let filter = EventFilter {
+            include_kinds: vec!["all".into()],
+            include_sessions: Vec::new(),
+            include_scopes: Vec::new(),
+        };
+
+        assert!(filter.includes_kind("session_output"));
+    }
+
+    #[test]
+    fn events_since_error_roundtrips_echoed_cursor_shapes() {
+        let payloads = vec![
+            SidebandResponsePayload::EventsSinceError {
+                echoed_cursor: json!({
+                    "audit_file": "2026-04-18.jsonl",
+                    "byte_offset": 12
+                }),
+            },
+            SidebandResponsePayload::EventsSinceError {
+                echoed_cursor: json!("malformed"),
+            },
+            SidebandResponsePayload::EventsSinceError {
+                echoed_cursor: serde_json::Value::Null,
+            },
+        ];
+
+        for payload in payloads {
+            let roundtrip: SidebandResponsePayload =
+                serde_json::from_value(serde_json::to_value(payload.clone()).unwrap()).unwrap();
+            assert_eq!(roundtrip, payload);
+        }
     }
 }

@@ -1,9 +1,12 @@
 use std::{
     collections::HashMap,
-    fs::{self, OpenOptions},
-    io::Write,
+    fs::{self, File, OpenOptions},
+    io::{BufRead, BufReader as StdBufReader, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -14,10 +17,11 @@ use control_plane::{DEFAULT_ENDPOINT, decode_request, encode_request, encode_res
 use parking_lot::{Mutex, RwLock};
 use pty_host::{ConcretePtySession, PtyEvent, PtyEventHandler, PtySession};
 use shared_types::{
-    ControlKey, ControlPlaneStatus, DeliverMessageRequest, DriverKind, EnvVar, LaunchSpec,
-    LifecycleState, LogLevel, MessageScope, RouteMessageRequest, RuntimeEvent, RuntimeSnapshot,
-    SendInputRequest, SessionDefinition, SessionGeneration, SessionSnapshot, SidebandPhase,
-    SidebandRequest, SidebandResponse, SidebandResponsePayload, WaitQuietRequest, now_rfc3339,
+    ControlKey, ControlPlaneStatus, DeliverMessageRequest, DriverKind, EnvVar, EventCursor,
+    EventFilter, LaunchSpec, LifecycleState, LogLevel, MessageScope, RouteMessageRequest,
+    RuntimeEvent, RuntimeSnapshot, SendInputRequest, SessionDefinition, SessionGeneration,
+    SessionSnapshot, SidebandPhase, SidebandRequest, SidebandResponse, SidebandResponsePayload,
+    WaitQuietRequest, now_rfc3339,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use uuid::Uuid;
@@ -63,6 +67,10 @@ impl SidebandTimeouts {
             SidebandRequest::WaitQuiet {
                 timeout_seconds, ..
             } => Duration::from_secs((*timeout_seconds as u64).saturating_add(5)),
+            SidebandRequest::EventsSince {
+                max_wait_seconds, ..
+            } => Duration::from_secs(max_wait_seconds.unwrap_or(0) as u64)
+                .saturating_add(Duration::from_secs(5)),
             SidebandRequest::DeliverMessage { .. } => Duration::from_secs(10),
             SidebandRequest::SendInput { .. } => Duration::from_secs(5),
             SidebandRequest::SendKey { .. } => Duration::from_secs(5),
@@ -124,6 +132,7 @@ pub struct SupervisorConfig {
 }
 
 struct AuditLog {
+    dir: PathBuf,
     path: PathBuf,
 }
 
@@ -133,12 +142,24 @@ impl AuditLog {
         fs::create_dir_all(&audit_dir).context("failed to create audit directory")?;
         let file_name = format!("{}.jsonl", Utc::now().format("%Y-%m-%d"));
         Ok(Self {
+            dir: audit_dir.clone(),
             path: audit_dir.join(file_name),
         })
     }
 
     fn path(&self) -> &Path {
         &self.path
+    }
+
+    fn active_file_name(&self) -> &str {
+        self.path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("audit path must end with a UTF-8 filename")
+    }
+
+    fn resolve_path(&self, audit_file: &str) -> PathBuf {
+        self.dir.join(audit_file)
     }
 
     fn append(&self, event: &RuntimeEvent) -> Result<()> {
@@ -157,6 +178,11 @@ struct RunningSession {
     pty: Option<Box<dyn PtySession>>,
 }
 
+struct QuiesceTimer {
+    generation: SessionGeneration,
+    handle: tokio::task::JoinHandle<()>,
+}
+
 struct SessionSlot {
     definition: SessionDefinition,
     state: LifecycleState,
@@ -166,6 +192,7 @@ struct SessionSlot {
     last_activity_at: Option<String>,
     last_real_output_at: Option<Instant>,
     last_error: Option<String>,
+    quiesce_timer: Option<QuiesceTimer>,
 }
 
 impl SessionSlot {
@@ -199,9 +226,29 @@ struct SupervisorInner {
     peer_slash_commands_allowed: bool,
     pty_spawner: RwLock<Arc<dyn PtySpawner>>,
     mailbox_fs: RwLock<Arc<dyn MailboxFs>>,
+    background_runtime: Arc<tokio::runtime::Runtime>,
+    events_seq: AtomicU64,
+    events_watch: tokio::sync::watch::Sender<u64>,
     stale_event_drop_counts: Mutex<HashMap<(String, SessionGeneration), u64>>,
+    stale_quiesce_drop_counts: Mutex<HashMap<(String, SessionGeneration), u64>>,
     #[cfg(test)]
     last_detached_worker: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EventsSinceResult {
+    events: Vec<RuntimeEvent>,
+    next_cursor: EventCursor,
+    gap_detected: bool,
+    as_of: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuditScan {
+    events: Vec<RuntimeEvent>,
+    next_offset: u64,
+    reached_eof: bool,
+    reached_limit: bool,
 }
 
 #[derive(Clone)]
@@ -213,6 +260,12 @@ impl SupervisorHandle {
     pub fn new(config: SupervisorConfig) -> Result<Self> {
         fs::create_dir_all(&config.runtime_dir).context("failed to create runtime directory")?;
         let audit = AuditLog::new(&config.runtime_dir)?;
+        let background_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_time()
+            .build()
+            .context("failed to create supervisor background runtime")?;
+        let (events_watch, _events_watch_rx) = tokio::sync::watch::channel(0_u64);
         let working_root = config.working_root.to_string_lossy().into_owned();
         let mut slots = HashMap::new();
 
@@ -228,6 +281,7 @@ impl SupervisorHandle {
                 last_activity_at: None,
                 last_real_output_at: None,
                 last_error: None,
+                quiesce_timer: None,
             },
         );
 
@@ -243,6 +297,7 @@ impl SupervisorHandle {
                 last_activity_at: None,
                 last_real_output_at: None,
                 last_error: None,
+                quiesce_timer: None,
             },
         );
 
@@ -258,7 +313,11 @@ impl SupervisorHandle {
                 peer_slash_commands_allowed: config.peer_slash_commands_allowed,
                 pty_spawner: RwLock::new(Arc::new(ConcretePtySpawner)),
                 mailbox_fs: RwLock::new(Arc::new(StdMailboxFs)),
+                background_runtime: Arc::new(background_runtime),
+                events_seq: AtomicU64::new(0),
+                events_watch,
                 stale_event_drop_counts: Mutex::new(HashMap::new()),
+                stale_quiesce_drop_counts: Mutex::new(HashMap::new()),
                 #[cfg(test)]
                 last_detached_worker: Mutex::new(None),
             }),
@@ -273,11 +332,325 @@ impl SupervisorHandle {
         self.inner.audit.path()
     }
 
+    fn active_audit_file_name(&self) -> &str {
+        self.inner.audit.active_file_name()
+    }
+
+    fn audit_path_for(&self, audit_file: &str) -> PathBuf {
+        self.inner.audit.resolve_path(audit_file)
+    }
+
+    fn audit_file_len(&self, audit_file: &str) -> Result<u64> {
+        let path = self.audit_path_for(audit_file);
+        match fs::metadata(&path) {
+            Ok(metadata) => Ok(metadata.len()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(error)
+                .with_context(|| format!("audit read error: failed to stat {}", path.display())),
+        }
+    }
+
+    fn current_eof_cursor(&self) -> Result<EventCursor> {
+        let audit_file = self.active_audit_file_name().to_string();
+        let byte_offset = self.audit_file_len(&audit_file)?;
+        Ok(EventCursor {
+            audit_file,
+            byte_offset,
+        })
+    }
+
+    fn current_active_start_cursor(&self) -> EventCursor {
+        EventCursor {
+            audit_file: self.active_audit_file_name().to_string(),
+            byte_offset: 0,
+        }
+    }
+
+    fn normalize_events_filter(filter: Option<EventFilter>) -> EventFilter {
+        filter.unwrap_or_default()
+    }
+
+    fn validate_events_filter(&self, filter: &EventFilter) -> Result<()> {
+        for kind in &filter.include_kinds {
+            if kind == EventFilter::ALL_KINDS {
+                continue;
+            }
+
+            let known = matches!(
+                kind.as_str(),
+                "session_output"
+                    | "session_state"
+                    | "routed_message"
+                    | "system_log"
+                    | "control_plane_ready"
+                    | "sideband_request_lifecycle"
+            );
+            if !known {
+                return Err(anyhow!("unknown event kind: '{kind}'"));
+            }
+        }
+
+        if !filter.include_sessions.is_empty() {
+            let configured_sessions = {
+                let slots = self.inner.slots.lock();
+                slots.keys().cloned().collect::<Vec<_>>()
+            };
+            for session in &filter.include_sessions {
+                if !configured_sessions
+                    .iter()
+                    .any(|candidate| candidate == session)
+                {
+                    return Err(anyhow!("unknown session: '{session}'"));
+                }
+            }
+        }
+
+        for scope in &filter.include_scopes {
+            let known = matches!(scope.as_str(), "direct" | "room" | "system" | "private");
+            if !known {
+                return Err(anyhow!("unknown routed_message scope: '{scope}'"));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn resolve_events_cursor(&self, cursor: Option<EventCursor>) -> Result<(EventCursor, bool)> {
+        let Some(cursor) = cursor else {
+            return Ok((self.current_eof_cursor()?, false));
+        };
+
+        if !is_valid_audit_filename(&cursor.audit_file) {
+            return Err(anyhow!(
+                "cursor audit_file not recognized: {}",
+                cursor.audit_file
+            ));
+        }
+
+        let path = self.audit_path_for(&cursor.audit_file);
+        if path.exists() {
+            return Ok((cursor, false));
+        }
+
+        Ok((self.current_active_start_cursor(), true))
+    }
+
+    fn events_request_error(
+        &self,
+        message: impl Into<String>,
+        echoed_cursor: serde_json::Value,
+    ) -> SidebandResponse {
+        SidebandResponse {
+            ok: false,
+            message: message.into(),
+            snapshot: Some(self.snapshot()),
+            timed_out: false,
+            payload: Some(SidebandResponsePayload::EventsSinceError { echoed_cursor }),
+        }
+    }
+
+    fn read_events_since(
+        &self,
+        cursor: Option<EventCursor>,
+        filter: &EventFilter,
+        max_events: usize,
+    ) -> Result<EventsSinceResult> {
+        let (resolved_cursor, gap_detected) = self.resolve_events_cursor(cursor)?;
+        let active_file = self.active_audit_file_name().to_string();
+        let current_active_eof = self.current_eof_cursor()?;
+
+        let current_len = self.audit_file_len(&resolved_cursor.audit_file)?;
+        if resolved_cursor.byte_offset > current_len {
+            return Ok(EventsSinceResult {
+                events: Vec::new(),
+                next_cursor: current_active_eof,
+                gap_detected,
+                as_of: now_rfc3339(),
+            });
+        }
+
+        let mut events = Vec::new();
+        let mut current_file = resolved_cursor.audit_file.clone();
+        let mut current_offset = resolved_cursor.byte_offset;
+
+        loop {
+            let remaining = max_events.saturating_sub(events.len());
+            let scan = self.scan_audit_file(&current_file, current_offset, filter, remaining)?;
+            current_offset = scan.next_offset;
+            events.extend(scan.events);
+
+            if scan.reached_limit || events.len() >= max_events {
+                return Ok(EventsSinceResult {
+                    events,
+                    next_cursor: EventCursor {
+                        audit_file: current_file,
+                        byte_offset: current_offset,
+                    },
+                    gap_detected,
+                    as_of: now_rfc3339(),
+                });
+            }
+
+            if scan.reached_eof && current_file != active_file {
+                current_file = active_file.clone();
+                current_offset = 0;
+                continue;
+            }
+
+            return Ok(EventsSinceResult {
+                events,
+                next_cursor: EventCursor {
+                    audit_file: current_file,
+                    byte_offset: current_offset,
+                },
+                gap_detected,
+                as_of: now_rfc3339(),
+            });
+        }
+    }
+
+    async fn wait_for_events(
+        &self,
+        cursor: Option<EventCursor>,
+        filter: EventFilter,
+        max_events: usize,
+        max_wait: Duration,
+    ) -> Result<EventsSinceResult> {
+        let mut receiver = self.inner.events_watch.subscribe();
+        let mut observed_seq = *receiver.borrow_and_update();
+        let mut result = self.read_events_since(cursor, &filter, max_events)?;
+        let mut gap_detected = result.gap_detected;
+
+        if !result.events.is_empty() || max_wait.is_zero() {
+            result.gap_detected = gap_detected;
+            return Ok(result);
+        }
+
+        let deadline = tokio::time::Instant::now() + max_wait;
+        let mut next_cursor = result.next_cursor.clone();
+
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                result.gap_detected = gap_detected;
+                return Ok(result);
+            }
+
+            let remaining = deadline.saturating_duration_since(now);
+            let changed = tokio::time::timeout(remaining, receiver.changed()).await;
+            match changed {
+                Ok(Ok(())) => {
+                    observed_seq = *receiver.borrow_and_update();
+                    result =
+                        self.read_events_since(Some(next_cursor.clone()), &filter, max_events)?;
+                    gap_detected |= result.gap_detected;
+                    result.gap_detected = gap_detected;
+                    next_cursor = result.next_cursor.clone();
+
+                    if !result.events.is_empty() {
+                        return Ok(result);
+                    }
+                }
+                Ok(Err(_)) | Err(_) => {
+                    let current_seq = *receiver.borrow();
+                    if current_seq != observed_seq {
+                        observed_seq = *receiver.borrow_and_update();
+                        result =
+                            self.read_events_since(Some(next_cursor.clone()), &filter, max_events)?;
+                        gap_detected |= result.gap_detected;
+                        result.gap_detected = gap_detected;
+                        next_cursor = result.next_cursor.clone();
+                        if !result.events.is_empty() {
+                            return Ok(result);
+                        }
+                        continue;
+                    }
+
+                    result.gap_detected = gap_detected;
+                    return Ok(result);
+                }
+            }
+        }
+    }
+
+    fn scan_audit_file(
+        &self,
+        audit_file: &str,
+        byte_offset: u64,
+        filter: &EventFilter,
+        max_events: usize,
+    ) -> Result<AuditScan> {
+        if max_events == 0 {
+            return Ok(AuditScan {
+                events: Vec::new(),
+                next_offset: byte_offset,
+                reached_eof: false,
+                reached_limit: true,
+            });
+        }
+
+        let path = self.audit_path_for(audit_file);
+        if !path.exists() {
+            return Ok(AuditScan {
+                events: Vec::new(),
+                next_offset: byte_offset,
+                reached_eof: true,
+                reached_limit: false,
+            });
+        }
+
+        let mut file = File::open(&path)
+            .with_context(|| format!("audit read error: failed to open {}", path.display()))?;
+        file.seek(SeekFrom::Start(byte_offset))
+            .with_context(|| format!("audit read error: failed to seek {}", path.display()))?;
+        let mut reader = StdBufReader::new(file);
+        let mut offset = byte_offset;
+        let mut events = Vec::new();
+        let mut line = Vec::new();
+
+        loop {
+            line.clear();
+            let bytes_read = reader
+                .read_until(b'\n', &mut line)
+                .with_context(|| format!("audit read error: failed to read {}", path.display()))?;
+            if bytes_read == 0 {
+                return Ok(AuditScan {
+                    events,
+                    next_offset: offset,
+                    reached_eof: true,
+                    reached_limit: false,
+                });
+            }
+
+            offset += bytes_read as u64;
+            let line_text = String::from_utf8(line.clone()).with_context(|| {
+                format!("audit read error: invalid UTF-8 in {}", path.display())
+            })?;
+            let event: RuntimeEvent = serde_json::from_str(
+                line_text.trim_end_matches(['\r', '\n']),
+            )
+            .with_context(|| format!("audit read error: invalid JSON in {}", path.display()))?;
+            if event_matches_filter(&event, filter) {
+                events.push(event);
+            }
+
+            if events.len() >= max_events {
+                return Ok(AuditScan {
+                    events,
+                    next_offset: offset,
+                    reached_eof: false,
+                    reached_limit: true,
+                });
+            }
+        }
+    }
+
     fn bump_session_generation(&self, name: &str) -> Result<SessionGeneration> {
         let mut slots = self.inner.slots.lock();
         let slot = slots
             .get_mut(name)
             .with_context(|| format!("unknown session '{name}'"))?;
+        cancel_quiesce_timer_locked(slot);
         slot.generation = slot.generation.wrapping_add(1);
         Ok(slot.generation)
     }
@@ -314,6 +687,107 @@ impl SupervisorHandle {
             elapsed_ms: elapsed.as_millis() as u64,
             timestamp: now_rfc3339(),
         });
+    }
+
+    fn arm_quiesce_timer(
+        &self,
+        session_name: &str,
+        driver: DriverKind,
+        generation: SessionGeneration,
+        armed_at: Instant,
+    ) {
+        let Some(threshold) = quiesce_threshold(driver) else {
+            return;
+        };
+
+        let handle = self.clone();
+        let session_name_owned = session_name.to_string();
+        let task = self.inner.background_runtime.spawn(async move {
+            tokio::time::sleep(threshold).await;
+            handle.fire_quiesce_timer(session_name_owned, generation, armed_at, threshold);
+        });
+
+        let mut slots = self.inner.slots.lock();
+        if let Some(slot) = slots.get_mut(session_name) {
+            cancel_quiesce_timer_locked(slot);
+            slot.quiesce_timer = Some(QuiesceTimer {
+                generation,
+                handle: task,
+            });
+        } else {
+            task.abort();
+        }
+    }
+
+    fn fire_quiesce_timer(
+        &self,
+        session_name: String,
+        armed_generation: SessionGeneration,
+        armed_at: Instant,
+        threshold: Duration,
+    ) {
+        let (maybe_event, stale_drop) = {
+            let mut slots = self.inner.slots.lock();
+            let Some(slot) = slots.get_mut(&session_name) else {
+                return;
+            };
+            let timer = slot.quiesce_timer.take();
+            match timer {
+                Some(timer) if timer.generation == armed_generation => {
+                    if slot.generation == armed_generation
+                        && slot.state == LifecycleState::Ready
+                        && slot.last_real_output_at == Some(armed_at)
+                    {
+                        slot.state = LifecycleState::Idle;
+                        slot.last_activity_at = Some(now_rfc3339());
+                        (
+                            Some(RuntimeEvent::SessionState {
+                                session: session_name.clone(),
+                                state: LifecycleState::Idle,
+                                reason: format!("quiesce timeout {}s", threshold.as_secs()),
+                                timestamp: now_rfc3339(),
+                            }),
+                            false,
+                        )
+                    } else {
+                        (None, true)
+                    }
+                }
+                Some(timer) => {
+                    slot.quiesce_timer = Some(timer);
+                    (None, true)
+                }
+                None => (None, true),
+            }
+        };
+
+        if stale_drop {
+            self.note_stale_quiesce_drop(&session_name, armed_generation);
+        }
+        if let Some(event) = maybe_event {
+            self.emit(event);
+        }
+    }
+
+    fn note_stale_quiesce_drop(&self, session_name: &str, generation: SessionGeneration) {
+        let counter = {
+            let mut counts = self.inner.stale_quiesce_drop_counts.lock();
+            let count = counts
+                .entry((session_name.to_string(), generation))
+                .or_insert(0);
+            *count += 1;
+            *count
+        };
+
+        if counter == 1 || counter % 10 == 0 {
+            self.emit(RuntimeEvent::SystemLog {
+                level: LogLevel::Info,
+                message: format!(
+                    "Dropped stale quiesce timer for session '{session_name}' generation {generation} (count={counter})"
+                ),
+                timestamp: now_rfc3339(),
+            });
+        }
     }
 
     #[cfg(test)]
@@ -371,6 +845,7 @@ impl SupervisorHandle {
             if slot.running.is_some() {
                 return Ok(slot.snapshot());
             }
+            cancel_quiesce_timer_locked(slot);
             slot.generation = slot.generation.wrapping_add(1);
             slot.generation
         };
@@ -402,6 +877,7 @@ impl SupervisorHandle {
                 ));
             }
 
+            cancel_quiesce_timer_locked(slot);
             slot.state = LifecycleState::Closed;
             slot.process_id = None;
             slot.last_activity_at = Some(now_rfc3339());
@@ -466,6 +942,7 @@ impl SupervisorHandle {
                 return Ok(slot.snapshot());
             }
 
+            cancel_quiesce_timer_locked(slot);
             slot.state = LifecycleState::Starting;
             slot.last_error = None;
             slot.last_activity_at = Some(now_rfc3339());
@@ -572,6 +1049,7 @@ impl SupervisorHandle {
                     slot.generation
                 ));
             }
+            cancel_quiesce_timer_locked(slot);
             slot.state = LifecycleState::Restarting;
             slot.last_activity_at = Some(now_rfc3339());
             let snapshot = slot.snapshot();
@@ -605,6 +1083,7 @@ impl SupervisorHandle {
                 .as_ref()
                 .ok_or_else(|| anyhow!("session '{}' transport is not available", request.name))?
                 .send_input(&request.input)?;
+            cancel_quiesce_timer_locked(slot);
             slot.state = LifecycleState::Busy;
             slot.last_activity_at = Some(now_rfc3339());
             slot.snapshot()
@@ -664,10 +1143,28 @@ impl SupervisorHandle {
     }
 
     pub fn deliver_message(&self, request: DeliverMessageRequest) -> Result<SessionSnapshot> {
-        let (snapshot, submit_behavior, payloads) =
+        let (_, submit_behavior, payloads) =
             self.prepare_delivery_for_session(&request.name, &request.content)?;
 
         self.deliver_prepared_payloads(&request.name, &payloads, submit_behavior)?;
+        let snapshot = {
+            let mut slots = self.inner.slots.lock();
+            let slot = slots
+                .get_mut(&request.name)
+                .with_context(|| format!("unknown session '{}'", request.name))?;
+            cancel_quiesce_timer_locked(slot);
+            slot.state = LifecycleState::Busy;
+            slot.last_activity_at = Some(now_rfc3339());
+            slot.snapshot()
+        };
+
+        self.emit(RuntimeEvent::SessionState {
+            session: snapshot.name.clone(),
+            state: snapshot.lifecycle_state,
+            reason: "message delivered".into(),
+            timestamp: now_rfc3339(),
+        });
+
         Ok(snapshot)
     }
 
@@ -791,6 +1288,7 @@ impl SupervisorHandle {
                 slot.state = LifecycleState::Closed;
                 slot.last_activity_at = Some(timestamp.clone());
                 slot.last_error = None;
+                cancel_quiesce_timer_locked(slot);
 
                 log_events.push(RuntimeEvent::SystemLog {
                     level: LogLevel::Warn,
@@ -854,7 +1352,8 @@ impl SupervisorHandle {
         match event {
             PtyEvent::Output(chunk) => {
                 let has_real_content = chunk_has_real_content(&chunk);
-                let transitioned_to_ready = {
+                let real_output_at = has_real_content.then(Instant::now);
+                let (transitioned_to_ready, quiesce_arm) = {
                     let mut slots = self.inner.slots.lock();
                     if let Some(slot) = slots.get_mut(session_name) {
                         let transitioned = slot.state != LifecycleState::Ready;
@@ -862,14 +1361,20 @@ impl SupervisorHandle {
                             slot.state = LifecycleState::Ready;
                             slot.last_activity_at = Some(now_rfc3339());
                         }
-                        if has_real_content {
-                            slot.last_real_output_at = Some(Instant::now());
-                        }
-                        transitioned
+                        let quiesce_arm = real_output_at.map(|armed_at| {
+                            slot.last_real_output_at = Some(armed_at);
+                            cancel_quiesce_timer_locked(slot);
+                            (slot.definition.driver, slot.generation, armed_at)
+                        });
+                        (transitioned, quiesce_arm)
                     } else {
-                        false
+                        (false, None)
                     }
                 };
+
+                if let Some((driver, generation, armed_at)) = quiesce_arm {
+                    self.arm_quiesce_timer(session_name, driver, generation, armed_at);
+                }
 
                 if transitioned_to_ready {
                     self.emit(RuntimeEvent::SessionState {
@@ -896,6 +1401,7 @@ impl SupervisorHandle {
                         slot.state = LifecycleState::Closed;
                         slot.last_activity_at = Some(now_rfc3339());
                         slot.last_real_output_at = None;
+                        cancel_quiesce_timer_locked(slot);
                     }
                 }
                 self.emit(RuntimeEvent::SessionState {
@@ -915,6 +1421,7 @@ impl SupervisorHandle {
                         slot.process_id = None;
                         slot.last_activity_at = Some(now_rfc3339());
                         slot.last_real_output_at = None;
+                        cancel_quiesce_timer_locked(slot);
                     }
                 }
                 self.emit(RuntimeEvent::SystemLog {
@@ -1029,6 +1536,62 @@ impl SupervisorHandle {
                         timeout_seconds,
                     })
                     .await;
+            }
+            SidebandRequest::EventsSince {
+                cursor,
+                max_events,
+                max_wait_seconds,
+                filter,
+                ..
+            } => {
+                let filter = Self::normalize_events_filter(filter);
+                let echoed_cursor = cursor
+                    .as_ref()
+                    .map(|value| serde_json::to_value(value).unwrap_or(serde_json::Value::Null))
+                    .unwrap_or(serde_json::Value::Null);
+                if let Err(error) = self.validate_events_filter(&filter) {
+                    return self.events_request_error(error.to_string(), echoed_cursor);
+                }
+
+                let max_events = max_events.unwrap_or(500).clamp(1, 5000) as usize;
+                let max_wait_seconds = max_wait_seconds.unwrap_or(0);
+                if max_wait_seconds > 60 {
+                    return self.events_request_error(
+                        "max_wait_seconds > 60 not supported in V1",
+                        echoed_cursor,
+                    );
+                }
+
+                return match self
+                    .wait_for_events(
+                        cursor,
+                        filter,
+                        max_events,
+                        Duration::from_secs(max_wait_seconds as u64),
+                    )
+                    .await
+                {
+                    Ok(result) => SidebandResponse {
+                        ok: true,
+                        message: format!("returned {} events", result.events.len()),
+                        snapshot: Some(self.snapshot()),
+                        timed_out: false,
+                        payload: Some(SidebandResponsePayload::EventsSince {
+                            events: result.events,
+                            next_cursor: result.next_cursor,
+                            gap_detected: result.gap_detected,
+                            as_of: result.as_of,
+                        }),
+                    },
+                    Err(error) => {
+                        let message = if error.to_string().starts_with("audit read error:") {
+                            error.to_string()
+                        } else {
+                            format!("audit read error: {error}")
+                        };
+                        self.events_request_error(message, echoed_cursor)
+                    }
+                };
             }
             SidebandRequest::DeliverMessage {
                 token,
@@ -1284,8 +1847,17 @@ impl SupervisorHandle {
     }
 
     fn emit(&self, event: RuntimeEvent) {
-        if let Err(error) = self.inner.audit.append(&event) {
-            eprintln!("audit log failure: {error}");
+        let appended = match self.inner.audit.append(&event) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("audit log failure: {error}");
+                false
+            }
+        };
+
+        if appended {
+            let next = self.inner.events_seq.fetch_add(1, Ordering::SeqCst) + 1;
+            self.inner.events_watch.send_replace(next);
         }
 
         if let Some(sink) = self.inner.event_sink.read().as_ref() {
@@ -1968,6 +2540,96 @@ fn scope_label(scope: MessageScope) -> &'static str {
     }
 }
 
+fn cancel_quiesce_timer_locked(slot: &mut SessionSlot) {
+    if let Some(timer) = slot.quiesce_timer.take() {
+        timer.handle.abort();
+    }
+}
+
+fn quiesce_threshold(driver: DriverKind) -> Option<Duration> {
+    let threshold = match driver {
+        DriverKind::Claude => Duration::from_secs(3),
+        DriverKind::Codex => Duration::from_secs(2),
+        DriverKind::GenericTerminal => Duration::from_secs(5),
+    };
+
+    (threshold >= Duration::from_secs(1) && threshold <= Duration::from_secs(30))
+        .then_some(threshold)
+}
+
+fn event_kind(event: &RuntimeEvent) -> &'static str {
+    match event {
+        RuntimeEvent::SessionOutput { .. } => "session_output",
+        RuntimeEvent::SessionState { .. } => "session_state",
+        RuntimeEvent::RoutedMessage { .. } => "routed_message",
+        RuntimeEvent::SystemLog { .. } => "system_log",
+        RuntimeEvent::ControlPlaneReady { .. } => "control_plane_ready",
+        RuntimeEvent::SidebandRequestLifecycle { .. } => "sideband_request_lifecycle",
+    }
+}
+
+fn event_matches_filter(event: &RuntimeEvent, filter: &EventFilter) -> bool {
+    if !filter.includes_kind(event_kind(event)) {
+        return false;
+    }
+
+    if !filter.include_sessions.is_empty() {
+        let session_match = match event {
+            RuntimeEvent::SessionOutput { session, .. }
+            | RuntimeEvent::SessionState { session, .. } => filter
+                .include_sessions
+                .iter()
+                .any(|candidate| candidate == session),
+            RuntimeEvent::RoutedMessage { from, to, .. } => filter
+                .include_sessions
+                .iter()
+                .any(|candidate| candidate == from || candidate == to),
+            RuntimeEvent::SidebandRequestLifecycle { session, .. } => session
+                .as_ref()
+                .map(|value| {
+                    filter
+                        .include_sessions
+                        .iter()
+                        .any(|candidate| candidate == value)
+                })
+                .unwrap_or(false),
+            RuntimeEvent::SystemLog { .. } | RuntimeEvent::ControlPlaneReady { .. } => false,
+        };
+
+        if !session_match {
+            return false;
+        }
+    }
+
+    match event {
+        RuntimeEvent::RoutedMessage { scope, .. } if !filter.include_scopes.is_empty() => filter
+            .include_scopes
+            .iter()
+            .any(|candidate| candidate == message_scope_name(*scope)),
+        _ => true,
+    }
+}
+
+fn message_scope_name(scope: MessageScope) -> &'static str {
+    match scope {
+        MessageScope::Direct => "direct",
+        MessageScope::Room => "room",
+        MessageScope::System => "system",
+        MessageScope::Private => "private",
+    }
+}
+
+fn is_valid_audit_filename(name: &str) -> bool {
+    name.len() == 16
+        && name.ends_with(".jsonl")
+        && name.bytes().enumerate().all(|(index, byte)| match index {
+            4 | 7 => byte == b'-',
+            10..=15 => true,
+            _ => byte.is_ascii_digit(),
+        })
+        && name.as_bytes()[10..] == *b".jsonl"
+}
+
 fn action_label_for(request: &SidebandRequest) -> &'static str {
     match request {
         SidebandRequest::Ping { .. } => "ping",
@@ -1977,6 +2639,7 @@ fn action_label_for(request: &SidebandRequest) -> &'static str {
         SidebandRequest::RestartSession { .. } => "restart_session",
         SidebandRequest::DeliverMessage { .. } => "deliver_message",
         SidebandRequest::WaitQuiet { .. } => "wait_quiet",
+        SidebandRequest::EventsSince { .. } => "events_since",
         SidebandRequest::SendInput { .. } => "send_input",
         SidebandRequest::SendKey { .. } => "send_key",
         SidebandRequest::RouteMessage { .. } => "route_message",
@@ -1993,7 +2656,9 @@ fn session_name_of(request: &SidebandRequest) -> Option<&str> {
         | SidebandRequest::SendInput { name, .. }
         | SidebandRequest::SendKey { name, .. } => Some(name.as_str()),
         SidebandRequest::RouteMessage { request, .. } => Some(request.to.as_str()),
-        SidebandRequest::Ping { .. } | SidebandRequest::ListSessions { .. } => None,
+        SidebandRequest::Ping { .. }
+        | SidebandRequest::ListSessions { .. }
+        | SidebandRequest::EventsSince { .. } => None,
     }
 }
 
@@ -2713,6 +3378,44 @@ mod tests {
             .token
     }
 
+    fn current_audit_file(supervisor: &SupervisorHandle) -> String {
+        supervisor.active_audit_file_name().to_string()
+    }
+
+    fn append_audit_event(
+        supervisor: &SupervisorHandle,
+        audit_file: &str,
+        event: &RuntimeEvent,
+    ) -> PathBuf {
+        let path = supervisor.runtime_dir().join("audit").join(audit_file);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, "{}", serde_json::to_string(event).unwrap()).unwrap();
+        path
+    }
+
+    fn unwrap_events_since(
+        response: SidebandResponse,
+    ) -> (Vec<RuntimeEvent>, EventCursor, bool, String) {
+        assert!(
+            response.ok,
+            "events_since response failed: {}",
+            response.message
+        );
+        match response.payload {
+            Some(SidebandResponsePayload::EventsSince {
+                events,
+                next_cursor,
+                gap_detected,
+                as_of,
+            }) => (events, next_cursor, gap_detected, as_of),
+            other => panic!("unexpected events_since payload: {other:?}"),
+        }
+    }
+
     #[test]
     fn snapshot_contains_default_sessions() {
         let supervisor = test_supervisor();
@@ -3323,6 +4026,386 @@ mod tests {
             routed_message_submit_behavior(DriverKind::Codex)
         );
         assert_eq!(payloads, vec!["line one line two".to_string()]);
+    }
+
+    #[test]
+    fn events_since_returns_emitted_events() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let cursor = supervisor.current_eof_cursor().unwrap();
+
+        supervisor.emit(RuntimeEvent::SystemLog {
+            level: LogLevel::Info,
+            message: "first".into(),
+            timestamp: now_rfc3339(),
+        });
+        supervisor.emit(RuntimeEvent::SessionState {
+            session: "claude".into(),
+            state: LifecycleState::Ready,
+            reason: "ready".into(),
+            timestamp: now_rfc3339(),
+        });
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::EventsSince {
+            token: status.token,
+            cursor: Some(cursor),
+            max_events: Some(10),
+            max_wait_seconds: Some(0),
+            filter: Some(EventFilter {
+                include_kinds: vec!["system_log".into(), "session_state".into()],
+                include_sessions: Vec::new(),
+                include_scopes: Vec::new(),
+            }),
+        });
+
+        let (events, next_cursor, gap_detected, _) = unwrap_events_since(response);
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(event_kind(&events[0]), "system_log");
+        assert_eq!(event_kind(&events[1]), "session_state");
+        assert_eq!(next_cursor.audit_file, current_audit_file(&supervisor));
+        assert!(next_cursor.byte_offset > 0);
+        assert!(!gap_detected);
+    }
+
+    #[test]
+    fn events_since_respects_max_events() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let cursor = supervisor.current_eof_cursor().unwrap();
+
+        for index in 0..25 {
+            supervisor.emit(RuntimeEvent::SystemLog {
+                level: LogLevel::Info,
+                message: format!("event-{index}"),
+                timestamp: now_rfc3339(),
+            });
+        }
+
+        let filter = EventFilter {
+            include_kinds: vec!["system_log".into()],
+            include_sessions: Vec::new(),
+            include_scopes: Vec::new(),
+        };
+
+        let first = supervisor.apply_sideband_request(SidebandRequest::EventsSince {
+            token: status.token.clone(),
+            cursor: Some(cursor),
+            max_events: Some(10),
+            max_wait_seconds: Some(0),
+            filter: Some(filter.clone()),
+        });
+        let (first_events, next_cursor, _, _) = unwrap_events_since(first);
+        assert_eq!(first_events.len(), 10);
+
+        let second = supervisor.apply_sideband_request(SidebandRequest::EventsSince {
+            token: status.token,
+            cursor: Some(next_cursor),
+            max_events: Some(10),
+            max_wait_seconds: Some(0),
+            filter: Some(filter),
+        });
+        let (second_events, _, _, _) = unwrap_events_since(second);
+        assert_eq!(second_events.len(), 10);
+    }
+
+    #[test]
+    fn events_since_long_poll_wakes_on_emit() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let cursor = supervisor.current_eof_cursor().unwrap();
+        let filter = EventFilter {
+            include_kinds: vec!["system_log".into()],
+            include_sessions: Vec::new(),
+            include_scopes: Vec::new(),
+        };
+        let handle = supervisor.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        thread::spawn(move || {
+            let started = Instant::now();
+            let response = handle.apply_sideband_request(SidebandRequest::EventsSince {
+                token: status.token,
+                cursor: Some(cursor),
+                max_events: Some(10),
+                max_wait_seconds: Some(5),
+                filter: Some(filter),
+            });
+            tx.send((started.elapsed(), response)).unwrap();
+        });
+
+        thread::sleep(Duration::from_millis(1000));
+        supervisor.emit(RuntimeEvent::SystemLog {
+            level: LogLevel::Info,
+            message: "wake".into(),
+            timestamp: now_rfc3339(),
+        });
+
+        let (elapsed, response) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (events, _, _, _) = unwrap_events_since(response);
+
+        assert!(elapsed >= Duration::from_millis(900));
+        assert!(elapsed < Duration::from_secs(3));
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            RuntimeEvent::SystemLog { message, .. } if message == "wake"
+        ));
+    }
+
+    #[test]
+    fn events_since_handles_cross_restart_file_advance() {
+        let supervisor = test_supervisor();
+        let active_file = current_audit_file(&supervisor);
+        let prior_file = if active_file == "2026-04-18.jsonl" {
+            "2026-04-17.jsonl".to_string()
+        } else {
+            "2026-04-18.jsonl".to_string()
+        };
+        let filter = EventFilter {
+            include_kinds: vec!["system_log".into()],
+            include_sessions: Vec::new(),
+            include_scopes: Vec::new(),
+        };
+
+        append_audit_event(
+            &supervisor,
+            &prior_file,
+            &RuntimeEvent::SystemLog {
+                level: LogLevel::Info,
+                message: "old-1".into(),
+                timestamp: now_rfc3339(),
+            },
+        );
+        let old_path = append_audit_event(
+            &supervisor,
+            &prior_file,
+            &RuntimeEvent::SystemLog {
+                level: LogLevel::Info,
+                message: "old-2".into(),
+                timestamp: now_rfc3339(),
+            },
+        );
+        append_audit_event(
+            &supervisor,
+            &active_file,
+            &RuntimeEvent::SystemLog {
+                level: LogLevel::Info,
+                message: "new-1".into(),
+                timestamp: now_rfc3339(),
+            },
+        );
+
+        let full = supervisor
+            .read_events_since(
+                Some(EventCursor {
+                    audit_file: prior_file.clone(),
+                    byte_offset: 0,
+                }),
+                &filter,
+                10,
+            )
+            .unwrap();
+
+        let messages = full
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::SystemLog { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(messages, vec!["old-1", "old-2", "new-1"]);
+        assert_eq!(full.next_cursor.audit_file, active_file);
+
+        let limited = supervisor
+            .read_events_since(
+                Some(EventCursor {
+                    audit_file: prior_file.clone(),
+                    byte_offset: 0,
+                }),
+                &filter,
+                1,
+            )
+            .unwrap();
+
+        assert_eq!(limited.events.len(), 1);
+        assert_eq!(limited.next_cursor.audit_file, prior_file);
+        assert!(limited.next_cursor.byte_offset < fs::metadata(old_path).unwrap().len());
+    }
+
+    #[test]
+    fn events_since_gap_detected() {
+        let supervisor = test_supervisor();
+        let active_file = current_audit_file(&supervisor);
+        let filter = EventFilter {
+            include_kinds: vec!["system_log".into()],
+            include_sessions: Vec::new(),
+            include_scopes: Vec::new(),
+        };
+
+        append_audit_event(
+            &supervisor,
+            &active_file,
+            &RuntimeEvent::SystemLog {
+                level: LogLevel::Info,
+                message: "current".into(),
+                timestamp: now_rfc3339(),
+            },
+        );
+
+        let result = supervisor
+            .read_events_since(
+                Some(EventCursor {
+                    audit_file: "2026-04-01.jsonl".into(),
+                    byte_offset: 0,
+                }),
+                &filter,
+                10,
+            )
+            .unwrap();
+
+        assert!(result.gap_detected);
+        assert_eq!(result.next_cursor.audit_file, active_file);
+        assert!(matches!(
+            &result.events[0],
+            RuntimeEvent::SystemLog { message, .. } if message == "current"
+        ));
+    }
+
+    #[test]
+    fn events_since_error_payload_echoes_cursor() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let cursor = EventCursor {
+            audit_file: current_audit_file(&supervisor),
+            byte_offset: 0,
+        };
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::EventsSince {
+            token: status.token,
+            cursor: Some(cursor.clone()),
+            max_events: Some(10),
+            max_wait_seconds: Some(0),
+            filter: Some(EventFilter {
+                include_kinds: vec!["bogus".into()],
+                include_sessions: Vec::new(),
+                include_scopes: Vec::new(),
+            }),
+        });
+
+        assert!(!response.ok);
+        match response.payload {
+            Some(SidebandResponsePayload::EventsSinceError { echoed_cursor }) => {
+                assert_eq!(echoed_cursor, serde_json::to_value(cursor).unwrap());
+            }
+            other => panic!("unexpected error payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn idle_emitted_after_quiesce_threshold() {
+        let supervisor = test_supervisor();
+        install_synthetic_running_session(&supervisor, "codex", DriverKind::Codex);
+        let events = Arc::new(Mutex::new(Vec::<RuntimeEvent>::new()));
+        let captured = events.clone();
+        supervisor.set_event_sink(move |event| {
+            captured.lock().push(event);
+        });
+
+        supervisor.handle_pty_event("codex", 0, PtyEvent::Output("Working".into()));
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if events.lock().iter().any(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::SessionState { session, state, .. }
+                        if session == "codex" && *state == LifecycleState::Idle
+                )
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "idle event was not emitted in time"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn idle_cancelled_on_new_output() {
+        let supervisor = test_supervisor();
+        install_synthetic_running_session(&supervisor, "codex", DriverKind::Codex);
+        let events = Arc::new(Mutex::new(Vec::<RuntimeEvent>::new()));
+        let captured = events.clone();
+        supervisor.set_event_sink(move |event| {
+            captured.lock().push(event);
+        });
+
+        supervisor.handle_pty_event("codex", 0, PtyEvent::Output("Working".into()));
+        thread::sleep(Duration::from_millis(1200));
+        supervisor.handle_pty_event("codex", 0, PtyEvent::Output("Still working".into()));
+        thread::sleep(Duration::from_millis(1300));
+
+        assert!(
+            !events.lock().iter().any(|event| matches!(
+                event,
+                RuntimeEvent::SessionState { session, state, .. }
+                    if session == "codex" && *state == LifecycleState::Idle
+            )),
+            "idle fired before the reset timer elapsed"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if events.lock().iter().any(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::SessionState { session, state, .. }
+                        if session == "codex" && *state == LifecycleState::Idle
+                )
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "idle event was not emitted after reset"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn idle_suppressed_on_stale_generation() {
+        let supervisor = test_supervisor();
+        install_synthetic_running_session(&supervisor, "codex", DriverKind::Codex);
+        let events = Arc::new(Mutex::new(Vec::<RuntimeEvent>::new()));
+        let captured = events.clone();
+        supervisor.set_event_sink(move |event| {
+            captured.lock().push(event);
+        });
+
+        supervisor.handle_pty_event("codex", 0, PtyEvent::Output("Working".into()));
+        let armed_at = {
+            let slots = supervisor.inner.slots.lock();
+            slots.get("codex").unwrap().last_real_output_at.unwrap()
+        };
+        supervisor.bump_session_generation("codex").unwrap();
+        supervisor.fire_quiesce_timer("codex".into(), 0, armed_at, Duration::from_secs(2));
+        thread::sleep(Duration::from_millis(50));
+
+        assert!(!events.lock().iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SessionState { session, state, .. }
+                if session == "codex" && *state == LifecycleState::Idle
+        )));
+        assert!(events.lock().iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SystemLog { message, .. }
+                if message.contains("Dropped stale quiesce timer")
+        )));
     }
 
     #[test]

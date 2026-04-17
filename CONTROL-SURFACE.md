@@ -71,6 +71,7 @@ Supported actions:
 - `input`
 - `deliver`
 - `wait_quiet`
+- `events_since`
 - `key`
 - `route`
 
@@ -83,6 +84,7 @@ powershell -Command "& '.\scripts\control-plane.ps1' -Action input -Session code
 powershell -Command "& '.\scripts\control-plane.ps1' -Action input -Session claude -ContentFile 'D:\tmp\compact.txt'"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action deliver -Session claude -Content 'hello from victor'"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action wait_quiet -Session claude -QuietSec 2 -TimeoutSec 10"
+powershell -Command "& '.\scripts\control-plane.ps1' -Action events_since -CursorFile '.runtime\cursors\outside-supervisor.json' -MaxEvents 200 -MaxWaitSeconds 15 -IncludeKinds 'routed_message','session_state','system_log','sideband_request_lifecycle' -OutCursorFile '.runtime\cursors\outside-supervisor.json'"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action key -Session claude -Key enter"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action route -From victor -To room -Scope room -Content 'status ping'"
 ```
@@ -106,8 +108,29 @@ Behavior:
   - `-ContentFile '<path to UTF-8 text file>'`
 - `-Action wait_quiet` waits for no real session content for `-QuietSec` seconds, up to `-TimeoutSec`
 - `wait_quiet` is **not** turn-completion detection; long-think phases may go quiet while the assistant is still in flight
+- `events_since` returns structured JSON only; it does **not** honor `-Quiet`
+- `events_since` reads from a caller-managed cursor file/object and returns:
+  - `events`
+  - `next_cursor`
+  - `gap_detected`
+  - `as_of`
+- `events_since` defaults to the signal-only filter:
+  - `session_state`
+  - `routed_message`
+  - `system_log`
+  - `control_plane_ready`
+  - `sideband_request_lifecycle`
+- `events_since` accepts:
+  - `-Cursor` or `-CursorFile`
+  - `-MaxEvents`
+  - `-MaxWaitSeconds`
+  - `-IncludeKinds`
+  - `-IncludeSessions`
+  - `-IncludeScopes`
+  - `-OutCursorFile`
 - mailbox fallback still defaults to a 10-second response window for ordinary actions
 - `deliver` and `wait_quiet` now pass their explicit `-TimeoutSec` through to the mailbox fallback when provided
+- `events_since` extends both the mailbox fallback window and the pipe read timeout to `MaxWaitSeconds + 5`
 - `-Content` and `-ContentFile` are mutually exclusive
 - `-ContentFile` is only supported for `-Action input` or `-Action deliver`
 - if you need a typed prompt to execute, follow `-Action input` with `-Action key -Key enter`
@@ -126,6 +149,7 @@ Per-action supervisor budgets:
 - `stop`: 10 s
 - `route`: 15 s
 - `wait_quiet`: requested timeout + 5 s supervisor budget
+- `events_since`: requested `max_wait_seconds` + 5 s supervisor budget
 - `start`: 60 s
 - `restart`: 70 s
 
@@ -209,6 +233,27 @@ Helper for slash commands where the command name is stable but the arguments may
 ```bash
 powershell -Command "& '.\scripts\agent-slash.ps1' -Session claude -Slash compact -ArgsFile 'D:\tmp\compact-args.txt'"
 powershell -Command "& '.\scripts\agent-key.ps1' -Session claude -Key enter"
+```
+
+### `scripts/agent-events.ps1`
+
+Outside-supervisor convenience wrapper over `control-plane.ps1 -Action events_since`.
+
+Defaults:
+
+- consumer cursor file: `.runtime/cursors/outside-supervisor.json`
+- kinds: `routed_message`, `session_state`, `system_log`, `sideband_request_lifecycle`
+- `-MaxWaitSeconds 15`
+- `-MaxEvents 200`
+
+Behavior:
+
+- creates the cursor file with JSON `null` on first run so the first poll starts from "now"
+- writes the returned `next_cursor` back to the same file atomically
+- prints each returned event as one compressed JSON line
+
+```bash
+powershell -Command "& '.\scripts\agent-events.ps1' -Consumer outside-supervisor"
 ```
 
 ### `scripts/new-smoke-token.ps1`
@@ -353,3 +398,15 @@ For desktop-only visuals, the current screenshot capture path is:
 
 - no OS-dialog control outside the PTY
 - no external connector yet for Telegram or remote clients
+
+## 10. Pull-Based Events
+
+`events_since` is the wrapper's pull-based event API over the audit log. Use it when you need durable cross-restart consumption, cursor-managed polling, or the generation-aware `Idle` signal that supplements `wait_quiet`.
+
+Recommended outside-supervisor pattern:
+
+- raw API: `scripts/control-plane.ps1 -Action events_since ...`
+- human/operator wrapper: `scripts/agent-events.ps1`
+- cursor file: `.runtime/cursors/<consumer>.json`
+
+`wait_quiet` remains a synchronous "no real output for N seconds" helper. `session_state: idle` from `events_since` is the better "probably done" signal for ongoing supervision because it is emitted into the audit log and guarded by session generation.

@@ -1,6 +1,6 @@
 param(
   [Parameter(Mandatory = $true)]
-  [ValidateSet("ping", "list", "start", "stop", "restart", "input", "deliver", "wait_quiet", "key", "route")]
+  [ValidateSet("ping", "list", "start", "stop", "restart", "input", "deliver", "wait_quiet", "events_since", "key", "route")]
   [string]$Action,
 
   [string]$Session,
@@ -12,6 +12,14 @@ param(
   [string]$Scope = "direct",
   [string]$Content,
   [string]$ContentFile,
+  [string]$Cursor,
+  [string]$CursorFile,
+  [int]$MaxEvents = 0,
+  [int]$MaxWaitSeconds = 0,
+  [string[]]$IncludeKinds,
+  [string[]]$IncludeSessions,
+  [string[]]$IncludeScopes,
+  [string]$OutCursorFile,
   [int]$QuietSec,
   [int]$TimeoutSec,
   [string]$InfoFile,
@@ -84,10 +92,86 @@ function Resolve-MessageContent {
   }
 }
 
+function Resolve-JsonInput {
+  param(
+    [string]$InlineJson,
+    [string]$JsonFilePath
+  )
+
+  if ($InlineJson -and $JsonFilePath) {
+    throw "cursor accepts either -Cursor or -CursorFile, not both"
+  }
+
+  if (-not $InlineJson -and -not $JsonFilePath) {
+    return $null
+  }
+
+  $raw = $InlineJson
+  if ($JsonFilePath) {
+    $resolvedPath = $null
+    try {
+      $resolvedPath = (Resolve-Path -LiteralPath $JsonFilePath -ErrorAction Stop).Path
+    } catch {
+      throw "failed to resolve cursor file '$JsonFilePath'"
+    }
+
+    try {
+      $raw = Get-Content -LiteralPath $resolvedPath -Raw -ErrorAction Stop
+    } catch {
+      throw "failed to read cursor file '$resolvedPath': $($_.Exception.Message)"
+    }
+  } elseif (Test-Path -LiteralPath $InlineJson) {
+    $resolvedPath = (Resolve-Path -LiteralPath $InlineJson -ErrorAction Stop).Path
+    $raw = Get-Content -LiteralPath $resolvedPath -Raw -ErrorAction Stop
+  }
+
+  if ([string]::IsNullOrWhiteSpace($raw)) {
+    throw "cursor JSON was empty"
+  }
+
+  try {
+    return $raw | ConvertFrom-Json -ErrorAction Stop
+  } catch {
+    throw "invalid cursor format: $($_.Exception.Message)"
+  }
+}
+
+function Write-AtomicText {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Path,
+
+    [Parameter(Mandatory = $true)]
+    [string]$Content
+  )
+
+  $parent = Split-Path -Parent $Path
+  if ($parent) {
+    New-Item -ItemType Directory -Force -Path $parent | Out-Null
+  }
+
+  $tmpPath = "$Path.tmp"
+  $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+  [System.IO.File]::WriteAllText($tmpPath, $Content, $utf8NoBom)
+  Move-Item -LiteralPath $tmpPath -Destination $Path -Force
+}
+
 if ($Action -in @("input", "deliver")) {
   $Content = Resolve-MessageContent -ActionName $Action -InlineContent $Content -ContentFilePath $ContentFile
 } elseif ($ContentFile) {
   throw "-ContentFile is only supported for -Action input or -Action deliver"
+}
+
+if ($Action -eq "events_since" -and $Quiet) {
+  throw "events_since always emits structured JSON and does not support -Quiet"
+}
+
+if ($MaxEvents -lt 0) {
+  throw "-MaxEvents must be >= 0"
+}
+
+if ($MaxWaitSeconds -lt 0) {
+  throw "-MaxWaitSeconds must be >= 0"
 }
 
 if (-not $InfoFile -and $env:PRIM1_PANE_CREDENTIALS -and (Test-Path -LiteralPath $env:PRIM1_PANE_CREDENTIALS)) {
@@ -152,6 +236,26 @@ $payload = switch ($Action) {
       timeout_seconds = $TimeoutSec
     }
   }
+  "events_since" {
+    $cursorValue = Resolve-JsonInput -InlineJson $Cursor -JsonFilePath $CursorFile
+    $filter = $null
+    if ($IncludeKinds -or $IncludeSessions -or $IncludeScopes) {
+      $filter = @{
+        include_kinds = @($IncludeKinds)
+        include_sessions = @($IncludeSessions)
+        include_scopes = @($IncludeScopes)
+      }
+    }
+
+    @{
+      kind = "events_since"
+      token = $info.token
+      cursor = $cursorValue
+      max_events = $(if ($MaxEvents -gt 0) { $MaxEvents } else { $null })
+      max_wait_seconds = $(if ($MaxWaitSeconds -gt 0) { $MaxWaitSeconds } else { $null })
+      filter = $filter
+    }
+  }
   "key" {
     if (-not $Session) { throw "key requires -Session" }
     if (-not $Key) { throw "key requires -Key" }
@@ -177,15 +281,22 @@ $json = $payload | ConvertTo-Json -Depth 8 -Compress
 $runtimeDir = Split-Path -Parent $resolvedInfoFile
 $response = $null
 $mailboxTimeoutSec = 10
+$pipeReadTimeoutSec = 5
 
 if ($TimeoutSec -gt 0 -and $Action -in @("deliver", "wait_quiet")) {
   $mailboxTimeoutSec = $TimeoutSec
+}
+
+if ($Action -eq "events_since" -and $MaxWaitSeconds -gt 0) {
+  $mailboxTimeoutSec = $MaxWaitSeconds + 5
+  $pipeReadTimeoutSec = $MaxWaitSeconds + 5
 }
 
 try {
   $pipe = [System.IO.Pipes.NamedPipeClientStream]::new(".", $pipeName, [System.IO.Pipes.PipeDirection]::InOut)
   try {
     $pipe.Connect(5000)
+    $pipe.ReadTimeout = $pipeReadTimeoutSec * 1000
     $writer = [System.IO.StreamWriter]::new($pipe)
     $writer.AutoFlush = $true
     $reader = [System.IO.StreamReader]::new($pipe)
@@ -206,6 +317,41 @@ if (-not $response) {
 }
 
 $parsed = $response | ConvertFrom-Json
+
+if ($Action -eq "events_since") {
+  if ($parsed.ok) {
+    if (-not $parsed.payload -or $parsed.payload.kind -ne "events_since") {
+      throw "events_since response missing events_since payload"
+    }
+
+    $output = [ordered]@{
+      ok = $true
+      events = $parsed.payload.events
+      next_cursor = $parsed.payload.next_cursor
+      gap_detected = $parsed.payload.gap_detected
+      as_of = $parsed.payload.as_of
+    }
+
+    if ($OutCursorFile) {
+      Write-AtomicText -Path $OutCursorFile -Content (($parsed.payload.next_cursor | ConvertTo-Json -Depth 8 -Compress))
+    }
+
+    $output | ConvertTo-Json -Depth 12 -Compress
+    exit 0
+  }
+
+  $errorOutput = [ordered]@{
+    ok = $false
+    message = $parsed.message
+  }
+  if ($parsed.payload) {
+    $errorOutput.payload = $parsed.payload
+  }
+
+  Write-Error $parsed.message
+  $errorOutput | ConvertTo-Json -Depth 12 -Compress
+  exit 1
+}
 
 if ($Quiet) {
   if ($parsed.timed_out) {

@@ -27,6 +27,7 @@ Scripts should wrap the control plane, not bypass the supervisor.
     - inline `-Content`
     - file-based `-ContentFile`
   - `wait_quiet`
+  - `events_since`
   - `key`
   - `route`
   - optional `-Quiet` mode for agent-friendly success/error output
@@ -38,12 +39,15 @@ Example:
 .\scripts\control-plane.ps1 -Action input -Session claude -ContentFile ".runtime\compact-prompts\compact-full.txt"
 .\scripts\control-plane.ps1 -Action deliver -Session claude -Content "Multi-line`nmessage body"
 .\scripts\control-plane.ps1 -Action wait_quiet -Session claude -QuietSec 2 -TimeoutSec 10
+.\scripts\control-plane.ps1 -Action events_since -CursorFile ".runtime\cursors\outside-supervisor.json" -MaxEvents 200 -MaxWaitSeconds 15 -IncludeKinds "routed_message","session_state","system_log","sideband_request_lifecycle" -OutCursorFile ".runtime\cursors\outside-supervisor.json"
 ```
 
 Notes:
 
 - mailbox fallback keeps a 10-second response window by default
 - `deliver` and `wait_quiet` honor `-TimeoutSec` for longer mailbox-backed waits when needed
+- `events_since` always emits structured JSON and never routes through `-Quiet`
+- `events_since` extends pipe/mailbox waits to `MaxWaitSeconds + 5`
 - timeout responses now print `TIMED OUT: <message>` and exit `124`
 - ordinary non-timeout failures still exit `1`
 
@@ -91,6 +95,15 @@ Example:
 ```powershell
 .\scripts\agent-slash.ps1 -Session claude -Slash compact -ArgsFile ".runtime\compact-prompts\compact-args.txt"
 .\scripts\agent-key.ps1 -Session claude -Key enter
+```
+
+- `agent-events.ps1`
+  Outside-supervisor convenience wrapper over `control-plane.ps1 -Action events_since`. Uses `.runtime/cursors/<consumer>.json`, starts from `null` on first run, writes `next_cursor` back atomically, and prints one compressed JSON line per event.
+
+Example:
+
+```powershell
+.\scripts\agent-events.ps1 -Consumer outside-supervisor
 ```
 
 - `new-smoke-token.ps1`
