@@ -19,15 +19,15 @@ pub fn launch_spec(definition: &SessionDefinition) -> LaunchSpec {
     let wrapper_root = wrapper_root_for_session(&definition.working_dir);
 
     let (program, mut args) = if cfg!(windows) {
-        // On Windows, claude is installed as a .cmd shim via npm.
-        // portable_pty's CommandBuilder can't resolve .cmd files directly,
-        // so we launch via cmd.exe (same pattern as the Codex driver).
+        // On Windows, portable_pty can't resolve .cmd shims directly.
+        // Using cmd.exe /c claude (no extension) finds either claude.exe
+        // (native installer) or claude.cmd (npm) via PATHEXT.
         (
             "cmd.exe".to_string(),
             vec![
                 "/d".into(),
                 "/c".into(),
-                "claude.cmd".into(),
+                "claude".into(),
                 "-n".into(),
                 definition.name.clone(),
                 "--dangerously-skip-permissions".into(),
