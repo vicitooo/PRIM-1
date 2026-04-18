@@ -24,22 +24,24 @@ if (!(app instanceof HTMLDivElement)) {
 
 app.innerHTML = `
   <div class="app-shell">
-    <header class="topbar">
+    <header class="topbar panel">
+      <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
       <div class="topbar-brand">
         <p class="eyebrow">Victor / Claude / Codex</p>
         <h1>PRIM-001</h1>
       </div>
       <div class="topbar-status">
-        <span class="status-dot" id="status-dot"></span>
-        <span class="mono" id="control-endpoint">starting...</span>
-        <span class="status-sep">&middot;</span>
-        <span class="mono" id="audit-path">loading...</span>
+        <span class="state-pill" data-session-state="global">ready</span>
+        <span class="activity-pill">idle</span>
       </div>
       <button class="theme-toggle" id="theme-toggle" aria-label="Toggle theme" title="Toggle theme"></button>
+      <span class="mono" id="control-endpoint" hidden>starting...</span>
+      <span class="mono" id="audit-path" hidden>loading...</span>
     </header>
 
     <section class="workspace-grid">
-      <article class="terminal-card" data-session-card="claude">
+      <article class="terminal-card panel" data-session-card="claude">
+        <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
         <div class="card-head">
           <div>
             <p class="card-kicker">Agent pane</p>
@@ -58,7 +60,8 @@ app.innerHTML = `
         <div class="terminal-host" data-terminal="claude"></div>
       </article>
 
-      <article class="terminal-card" data-session-card="codex">
+      <article class="terminal-card panel" data-session-card="codex">
+        <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
         <div class="card-head">
           <div>
             <p class="card-kicker">Agent pane</p>
@@ -79,7 +82,8 @@ app.innerHTML = `
     </section>
 
     <section class="bottom-grid">
-      <article class="system-card">
+      <article class="system-card panel">
+        <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
         <div class="card-head">
           <div>
             <p class="card-kicker">Supervisor</p>
@@ -90,7 +94,8 @@ app.innerHTML = `
         <div class="system-terminal" id="system-terminal"></div>
       </article>
 
-      <article class="router-card">
+      <article class="router-card panel">
+        <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
         <div class="card-head">
           <div>
             <p class="card-kicker">Sideband</p>
@@ -205,7 +210,7 @@ class SessionTerminal {
 
   banner(): void {
     this.terminal.reset();
-    this.terminal.writeln(`\x1b[38;5;167m${SESSION_LABELS[this.name]} pane ready.\x1b[0m`);
+    this.terminal.writeln(`\x1b[38;5;137m${SESSION_LABELS[this.name]} pane ready.\x1b[0m`);
     this.terminal.writeln("Launch the session from the header or send routed messages below.");
     this.terminal.writeln("");
   }
@@ -318,66 +323,66 @@ let activeCopySurface: CopySurface = null;
 const TERMINAL_THEMES = {
   dark: {
     session: {
-      background: "#100f0e",
-      foreground: "#dedede",
-      cursor: "#D4736A",
-      cursorAccent: "#100f0e",
-      selectionBackground: "rgba(212, 115, 106, 0.18)",
-      black: "#100f0e", brightBlack: "#555350",
-      red: "#D4736A", brightRed: "#E8A598",
-      green: "#8cc265", brightGreen: "#a5d97a",
-      yellow: "#e6b44f", brightYellow: "#f2cc72",
-      blue: "#7aa2f7", brightBlue: "#93b5ff",
-      magenta: "#c97eb8", brightMagenta: "#dfa0d2",
-      cyan: "#59c0c8", brightCyan: "#7ee1e7",
-      white: "#c8c5c0", brightWhite: "#dedede",
+      background: "#151311",
+      foreground: "#b5aea5",
+      cursor: "#a0655e",
+      cursorAccent: "#151311",
+      selectionBackground: "rgba(160, 100, 60, 0.18)",
+      black: "#151311", brightBlack: "#5e5850",
+      red: "#8a4a42", brightRed: "#a0655e",
+      green: "#6a8a50", brightGreen: "#7ea062",
+      yellow: "#9a8040", brightYellow: "#b09555",
+      blue: "#5a7aaa", brightBlue: "#7090c0",
+      magenta: "#7a5a80", brightMagenta: "#907098",
+      cyan: "#4a7a7a", brightCyan: "#608e8e",
+      white: "#8a8278", brightWhite: "#b5aea5",
     },
     system: {
-      background: "#1a1917",
-      foreground: "#dedede",
-      cursor: "#E8A598",
-      cursorAccent: "#1a1917",
-      selectionBackground: "rgba(212, 115, 106, 0.15)",
-      black: "#1a1917", brightBlack: "#555350",
-      red: "#D4736A", brightRed: "#E8A598",
-      green: "#8cc265", brightGreen: "#a5d97a",
-      yellow: "#e6b44f", brightYellow: "#f2cc72",
-      blue: "#88aefc", brightBlue: "#9fc0ff",
-      magenta: "#c97eb8", brightMagenta: "#dfa0d2",
-      cyan: "#73d1d6", brightCyan: "#8de7ec",
-      white: "#c8c5c0", brightWhite: "#dedede",
+      background: "#1a1715",
+      foreground: "#b5aea5",
+      cursor: "#8a6e55",
+      cursorAccent: "#1a1715",
+      selectionBackground: "rgba(138, 110, 85, 0.15)",
+      black: "#1a1715", brightBlack: "#5e5850",
+      red: "#8a4a42", brightRed: "#a0655e",
+      green: "#6a8a50", brightGreen: "#7ea062",
+      yellow: "#9a8040", brightYellow: "#b09555",
+      blue: "#5a7aaa", brightBlue: "#7090c0",
+      magenta: "#7a5a80", brightMagenta: "#907098",
+      cyan: "#4a7a7a", brightCyan: "#608e8e",
+      white: "#8a8278", brightWhite: "#b5aea5",
     },
   },
   light: {
     session: {
-      background: "#f5f2ed",
-      foreground: "#1a1816",
-      cursor: "#D4736A",
-      cursorAccent: "#f5f2ed",
-      selectionBackground: "rgba(212, 115, 106, 0.18)",
-      black: "#1a1816", brightBlack: "#7a7570",
-      red: "#c5524a", brightRed: "#B85D55",
-      green: "#3a8c28", brightGreen: "#4ea03a",
-      yellow: "#9a7020", brightYellow: "#b8862e",
-      blue: "#3568d4", brightBlue: "#4a7ae0",
-      magenta: "#9c50a8", brightMagenta: "#b068ba",
-      cyan: "#1a8a8a", brightCyan: "#2a9e9e",
-      white: "#d8d5d0", brightWhite: "#f5f2ed",
+      background: "#e8e4df",
+      foreground: "#2a2520",
+      cursor: "#8a5550",
+      cursorAccent: "#e8e4df",
+      selectionBackground: "rgba(138, 85, 80, 0.18)",
+      black: "#2a2520", brightBlack: "#6a6458",
+      red: "#7a3a32", brightRed: "#8a4a42",
+      green: "#3a6a28", brightGreen: "#4a7a38",
+      yellow: "#7a6020", brightYellow: "#8a7030",
+      blue: "#3a5a8a", brightBlue: "#4a6a9a",
+      magenta: "#6a4a70", brightMagenta: "#7a5a80",
+      cyan: "#2a5a5a", brightCyan: "#3a6a6a",
+      white: "#b5aea5", brightWhite: "#e8e4df",
     },
     system: {
-      background: "#eae7e2",
-      foreground: "#1a1816",
-      cursor: "#B85D55",
-      cursorAccent: "#eae7e2",
-      selectionBackground: "rgba(212, 115, 106, 0.15)",
-      black: "#1a1816", brightBlack: "#7a7570",
-      red: "#c5524a", brightRed: "#B85D55",
-      green: "#3a8c28", brightGreen: "#4ea03a",
-      yellow: "#9a7020", brightYellow: "#b8862e",
-      blue: "#3568d4", brightBlue: "#4a7ae0",
-      magenta: "#9c50a8", brightMagenta: "#b068ba",
-      cyan: "#1a8a8a", brightCyan: "#2a9e9e",
-      white: "#d8d5d0", brightWhite: "#eae7e2",
+      background: "#ddd9d4",
+      foreground: "#2a2520",
+      cursor: "#7a6048",
+      cursorAccent: "#ddd9d4",
+      selectionBackground: "rgba(122, 96, 72, 0.15)",
+      black: "#2a2520", brightBlack: "#6a6458",
+      red: "#7a3a32", brightRed: "#8a4a42",
+      green: "#3a6a28", brightGreen: "#4a7a38",
+      yellow: "#7a6020", brightYellow: "#8a7030",
+      blue: "#3a5a8a", brightBlue: "#4a6a9a",
+      magenta: "#6a4a70", brightMagenta: "#7a5a80",
+      cyan: "#2a5a5a", brightCyan: "#3a6a6a",
+      white: "#b5aea5", brightWhite: "#ddd9d4",
     },
   },
 } as const;
