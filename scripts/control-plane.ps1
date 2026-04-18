@@ -241,9 +241,9 @@ $payload = switch ($Action) {
     $filter = $null
     if ($IncludeKinds -or $IncludeSessions -or $IncludeScopes) {
       $filter = @{
-        include_kinds = @($IncludeKinds)
-        include_sessions = @($IncludeSessions)
-        include_scopes = @($IncludeScopes)
+        include_kinds    = @(@($IncludeKinds)    | Where-Object { $_ })
+        include_sessions = @(@($IncludeSessions) | Where-Object { $_ })
+        include_scopes   = @(@($IncludeScopes)   | Where-Object { $_ })
       }
     }
 
