@@ -1,10 +1,58 @@
+/* ═══════════════════════════════════════════════════════════════
+   PRIM-001 — COPPER ROSE DESKTOP DESIGN SYSTEM
+   Desktop-grade tokens. Tight spacing, small type, solid surfaces.
+
+   Accent: Copper Rose (#D4736A) — used sparingly on interactive
+   elements, cursors, focus rings. Chrome stays neutral.
+
+   Terminal ANSI palettes: main.ts (kept in sync with accent).
+   ═══════════════════════════════════════════════════════════════ */
+
 :root {
-  color: #f4ede5;
-  background:
-    radial-gradient(circle at top left, rgba(197, 148, 89, 0.24), transparent 28%),
-    radial-gradient(circle at bottom right, rgba(53, 134, 132, 0.22), transparent 24%),
-    linear-gradient(135deg, #0b0908 0%, #17120e 45%, #1f1812 100%);
-  font-family: "Segoe UI", "Space Grotesk", sans-serif;
+  /* ── Background Layers (warm neutral, ~3% steps) ── */
+  --bg-base:       #100f0e;
+  --bg-surface:    #1a1917;
+  --bg-elevated:   #201f1d;
+  --bg-overlay:    #282725;
+  --bg-hover:      #302f2d;
+  --bg-active:     #3a3937;
+
+  /* ── Accent — Copper Rose (interactive only) ── */
+  --accent:        #D4736A;
+  --accent-hover:  #B85D55;
+  --accent-subtle: rgba(212, 115, 106, 0.10);
+  --accent-text:   #E8A598;
+
+  /* ── Semantic ── */
+  --green:         #22c55e;
+  --red:           #ef4444;
+
+  /* ── Text (opacity-based hierarchy) ── */
+  --text-primary:   rgba(255, 255, 255, 0.87);
+  --text-secondary: rgba(255, 255, 255, 0.60);
+  --text-tertiary:  rgba(255, 255, 255, 0.38);
+
+  /* ── Borders ── */
+  --border-subtle:  rgba(255, 255, 255, 0.06);
+  --border-default: rgba(255, 255, 255, 0.10);
+  --border-strong:  rgba(255, 255, 255, 0.16);
+
+  /* ── Radii (platform-native scale) ── */
+  --radius-sm:   2px;
+  --radius-md:   4px;
+  --radius-lg:   6px;
+  --radius-xl:   8px;
+
+  /* ── Motion ── */
+  --duration-instant: 100ms;
+  --duration-fast:    150ms;
+  --easing:           cubic-bezier(0.16, 1, 0.3, 1);
+
+  /* ── Derived ── */
+  color: var(--text-primary);
+  background: var(--bg-base);
+  font-family: "Montserrat", "Segoe UI", system-ui, sans-serif;
+  font-size: 13px;
   line-height: 1.4;
   font-weight: 400;
   text-rendering: optimizeLegibility;
@@ -37,38 +85,56 @@ textarea {
 }
 
 button {
-  border: 1px solid rgba(253, 234, 213, 0.12);
-  background: rgba(255, 249, 242, 0.08);
-  color: inherit;
-  border-radius: 999px;
-  padding: 0.55rem 1rem;
-  cursor: pointer;
+  border: 1px solid var(--border-default);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  border-radius: var(--radius-md);
+  padding: 0.35rem 0.75rem;
+  cursor: default;
+  user-select: none;
   transition:
-    transform 120ms ease,
-    border-color 120ms ease,
-    background 120ms ease;
+    background var(--duration-instant) ease,
+    border-color var(--duration-instant) ease;
 }
 
 button:hover {
-  transform: translateY(-1px);
-  border-color: rgba(241, 191, 120, 0.48);
-  background: rgba(241, 191, 120, 0.14);
+  background: var(--bg-hover);
+  border-color: var(--border-strong);
+}
+
+button:active {
+  background: var(--bg-active);
+}
+
+button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 
 button.primary {
-  background: linear-gradient(120deg, rgba(241, 191, 120, 0.88), rgba(213, 120, 68, 0.88));
-  color: #16110d;
-  border-color: rgba(255, 216, 168, 0.42);
+  background: var(--accent);
+  color: #ffffff;
+  border-color: transparent;
+}
+
+button.primary:hover {
+  background: var(--accent-hover);
 }
 
 select,
 textarea {
   width: 100%;
-  border: 1px solid rgba(253, 234, 213, 0.12);
-  border-radius: 18px;
-  background: rgba(8, 8, 8, 0.4);
-  color: inherit;
-  padding: 0.85rem 1rem;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--bg-base);
+  color: var(--text-primary);
+  padding: 0.4rem 0.6rem;
+}
+
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 
 textarea {
@@ -84,30 +150,32 @@ textarea {
 .app-shell {
   height: 100vh;
   max-height: 100vh;
-  padding: 1.25rem;
+  padding: 0.5rem;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) minmax(240px, 0.38fr);
-  gap: 1rem;
+  grid-template-rows: auto minmax(0, 1fr) minmax(200px, 0.38fr);
+  gap: 0.5rem;
   overflow: hidden;
 }
+
+/* ── Structural cards: solid backgrounds, no glass ── */
 
 .topbar,
 .terminal-card,
 .system-card,
 .router-card {
-  border: 1px solid rgba(255, 244, 230, 0.1);
-  background: rgba(18, 14, 11, 0.72);
-  backdrop-filter: blur(18px);
-  box-shadow: 0 18px 80px rgba(0, 0, 0, 0.28);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+  box-shadow: none;
 }
 
 .topbar {
-  border-radius: 28px;
-  padding: 1rem 1.25rem;
+  border-radius: var(--radius-lg);
+  padding: 0.4rem 0.75rem;
   display: flex;
   justify-content: space-between;
-  align-items: flex-end;
-  gap: 1rem;
+  align-items: center;
+  gap: 0.75rem;
+  user-select: none;
 }
 
 .eyebrow,
@@ -115,36 +183,47 @@ textarea {
 .meta-label {
   margin: 0;
   text-transform: uppercase;
-  letter-spacing: 0.16em;
-  font-size: 0.72rem;
-  color: #c0ae9b;
+  letter-spacing: 0.08em;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-tertiary);
 }
 
-.topbar h1,
+.topbar h1 {
+  margin: 0.1rem 0 0;
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+}
+
 .card-head h2 {
-  margin: 0.2rem 0 0;
-  font-size: clamp(1.6rem, 2vw, 2.3rem);
-  line-height: 1.05;
+  margin: 0.1rem 0 0;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: -0.015em;
 }
 
 .meta-strip {
   display: grid;
-  grid-template-columns: repeat(2, minmax(220px, 1fr));
-  gap: 0.75rem;
+  grid-template-columns: repeat(2, minmax(180px, 1fr));
+  gap: 0.4rem;
 }
 
 .meta-card {
-  border-radius: 20px;
-  padding: 0.85rem 1rem;
-  background: rgba(255, 248, 239, 0.05);
+  border-radius: var(--radius-md);
+  padding: 0.35rem 0.6rem;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
 }
 
 .meta-card strong,
 .mono {
   display: block;
   font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
-  font-size: 0.82rem;
-  color: #f9e7d2;
+  font-size: 11px;
+  color: var(--text-secondary);
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -153,14 +232,14 @@ textarea {
   min-height: 0;
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 1rem;
+  gap: 0.5rem;
 }
 
 .terminal-card,
 .system-card,
 .router-card {
-  border-radius: 30px;
-  padding: 1rem;
+  border-radius: var(--radius-lg);
+  padding: 0.5rem;
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -170,43 +249,45 @@ textarea {
 .card-head {
   display: flex;
   justify-content: space-between;
-  gap: 1rem;
+  gap: 0.5rem;
   align-items: flex-start;
+  user-select: none;
 }
 
 .session-meta {
   display: flex;
-  gap: 0.5rem;
+  gap: 0.35rem;
   flex-wrap: wrap;
   justify-content: flex-end;
 }
 
 .state-pill,
 .activity-pill {
-  border-radius: 999px;
-  padding: 0.35rem 0.7rem;
+  border-radius: var(--radius-sm);
+  padding: 0.15rem 0.45rem;
   font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
-  font-size: 0.76rem;
-  background: rgba(255, 248, 239, 0.08);
-  color: #ecdcc7;
+  font-size: 10px;
+  background: var(--bg-elevated);
+  color: var(--text-tertiary);
+  user-select: none;
 }
 
 .state-pill[data-state="ready"],
 .state-pill[data-state="busy"] {
-  background: rgba(93, 192, 117, 0.16);
-  color: #cce9ca;
+  background: rgba(34, 197, 94, 0.12);
+  color: #86efac;
 }
 
 .state-pill[data-state="failed"] {
-  background: rgba(240, 127, 90, 0.16);
-  color: #ffc3af;
+  background: rgba(239, 68, 68, 0.12);
+  color: #fca5a5;
 }
 
 .terminal-actions,
 .router-actions {
   display: flex;
-  gap: 0.65rem;
-  margin: 0.9rem 0 0.75rem;
+  gap: 0.35rem;
+  margin: 0.4rem 0 0.35rem;
   flex-wrap: wrap;
   flex-shrink: 0;
 }
@@ -215,23 +296,23 @@ textarea {
 .system-terminal {
   min-height: 0;
   flex: 1;
-  border-radius: 22px;
+  border-radius: var(--radius-md);
   overflow: hidden;
-  border: 1px solid rgba(255, 244, 230, 0.08);
+  border: 1px solid var(--border-subtle);
 }
 
 .bottom-grid {
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(0, 1.3fr) minmax(360px, 0.9fr);
-  gap: 1rem;
+  grid-template-columns: minmax(0, 1.3fr) minmax(300px, 0.9fr);
+  gap: 0.5rem;
 }
 
 .router-form {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0.85rem;
-  margin-top: 0.85rem;
+  gap: 0.4rem;
+  margin-top: 0.4rem;
   min-height: 0;
   align-content: start;
   overflow: hidden;
@@ -239,12 +320,13 @@ textarea {
 
 .router-form label {
   display: grid;
-  gap: 0.45rem;
+  gap: 0.2rem;
 }
 
 .router-form span {
-  color: #d8c4ad;
-  font-size: 0.84rem;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 500;
 }
 
 .message-field {
@@ -255,43 +337,49 @@ textarea {
 }
 
 .message-field textarea {
-  min-height: 8rem;
-  max-height: min(18rem, 100%);
+  min-height: 6rem;
+  max-height: min(14rem, 100%);
   flex: 1 1 auto;
 }
 
 .control-flyout {
   position: fixed;
-  right: 1.35rem;
-  bottom: 1.35rem;
+  right: 0.75rem;
+  bottom: 0.75rem;
   display: flex;
   align-items: flex-end;
-  gap: 0.65rem;
+  gap: 0.4rem;
 }
 
 .control-toggle {
-  width: 64px;
-  height: 64px;
-  border-radius: 999px;
-  background: rgba(245, 225, 201, 0.14);
-  backdrop-filter: blur(18px);
-  letter-spacing: 0.08em;
-  font-weight: 700;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-lg);
+  background: var(--bg-elevated);
+  border-color: var(--border-default);
+  letter-spacing: 0.04em;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.control-toggle:hover {
+  background: var(--bg-hover);
+  border-color: var(--accent);
 }
 
 .control-menu {
   opacity: 0;
   pointer-events: none;
-  transform: translateY(12px);
+  transform: translateY(6px);
   transition:
-    opacity 150ms ease,
-    transform 150ms ease;
+    opacity var(--duration-fast) ease,
+    transform var(--duration-fast) var(--easing);
   display: grid;
-  gap: 0.55rem;
-  padding: 0.85rem;
-  border-radius: 22px;
-  border: 1px solid rgba(255, 244, 230, 0.12);
-  background: rgba(16, 12, 10, 0.82);
+  gap: 0.25rem;
+  padding: 0.35rem;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border-default);
+  background: var(--bg-overlay);
 }
 
 .control-flyout:hover .control-menu,
@@ -301,9 +389,30 @@ textarea {
   transform: translateY(0);
 }
 
+/* ── Scrollbar ── */
+::-webkit-scrollbar {
+  width: 5px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.10);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--accent);
+}
+
+/* ── Selection ── */
+::selection {
+  background: var(--accent);
+  color: #ffffff;
+}
+
 @media (max-width: 1280px) {
   .app-shell {
-    grid-template-rows: auto minmax(0, 1fr) minmax(260px, auto);
+    grid-template-rows: auto minmax(0, 1fr) minmax(220px, auto);
   }
 
   .workspace-grid,
