@@ -17,6 +17,11 @@ import type {
   SessionSnapshot,
 } from "./types";
 
+interface PaneGroup {
+  name: string;
+  paneNames: string[];
+}
+
 const app = document.querySelector("#app");
 if (!(app instanceof HTMLDivElement)) {
   throw new Error("Missing #app root element");
@@ -30,6 +35,10 @@ app.innerHTML = `
         <p class="eyebrow">Victor / Claude / Codex</p>
         <h1>PRIM-001</h1>
       </div>
+      <div class="topbar-active">
+        <p class="eyebrow">Active pair</p>
+        <span class="active-group-label" id="active-group-label">main</span>
+      </div>
       <div class="topbar-status">
         <span class="state-pill" data-session-state="global">ready</span>
         <span class="activity-pill">idle</span>
@@ -39,7 +48,21 @@ app.innerHTML = `
       <span class="mono" id="audit-path" hidden>loading...</span>
     </header>
 
-    <section class="workspace-grid" id="workspace-grid"></section>
+    <section class="workspace-shell">
+      <aside class="group-picker panel">
+        <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
+        <div class="card-head">
+          <div>
+            <p class="card-kicker">Pair picker</p>
+            <h2>Active pair</h2>
+          </div>
+          <span class="mono" id="group-count">0 groups</span>
+        </div>
+        <ul class="group-list" id="group-list"></ul>
+      </aside>
+
+      <section class="workspace-grid" id="workspace-grid"></section>
+    </section>
 
     <section class="bottom-grid">
       <article class="system-card panel">
@@ -207,9 +230,11 @@ class SessionTerminal {
       this.banner();
     }
 
-    this.fitAddon.fit();
+    if (isPaneVisible(this.name)) {
+      this.fitAddon.fit();
+      void resizeSession(this.name, this.terminal.cols, this.terminal.rows);
+    }
     this.hookInput();
-    void resizeSession(this.name, this.terminal.cols, this.terminal.rows);
   }
 
   write(chunk: string): void {
@@ -217,6 +242,9 @@ class SessionTerminal {
   }
 
   fit(): void {
+    if (!isPaneVisible(this.name)) {
+      return;
+    }
     this.fitAddon.fit();
     void resizeSession(this.name, this.terminal.cols, this.terminal.rows);
   }
@@ -268,14 +296,18 @@ systemTerminalHost.addEventListener("mousedown", () => {
 });
 
 const workspaceGrid = must<HTMLDivElement>("#workspace-grid");
+const groupList = must<HTMLUListElement>("#group-list");
+const groupCount = must<HTMLElement>("#group-count");
 const snapshotByName = new Map<string, SessionSnapshot>();
 const paneMap = new Map<string, SessionTerminal>();
 const controlEndpoint = must<HTMLElement>("#control-endpoint");
 const auditPath = must<HTMLElement>("#audit-path");
 const runtimePath = must<HTMLElement>("#runtime-path");
+const activeGroupLabel = must<HTMLElement>("#active-group-label");
 let renderedSessionSignature: string | null = null;
 let activeTerminalName: string | null = null;
 let activeCopySurface: CopySurface = null;
+let currentGroups: PaneGroup[] = [];
 
 /* ── Theme system ── */
 
@@ -469,6 +501,9 @@ function syncPaneInventory(sessions: SessionSnapshot[]): void {
     paneMap.set(session.name, new SessionTerminal(session.name, session.title));
   }
 
+  currentGroups = groupSessions(sessions);
+  renderGroupPicker(currentGroups);
+
   if (activeTerminalName && !paneMap.has(activeTerminalName)) {
     activeTerminalName = null;
   }
@@ -478,10 +513,11 @@ function syncPaneInventory(sessions: SessionSnapshot[]): void {
 
   applyTheme(currentThemeName());
   wireButtons();
+  wirePicker();
+  setActiveGroup(resolveInitialGroup(currentGroups));
 }
 
 function renderSessionCards(sessions: SessionSnapshot[]): void {
-  workspaceGrid.style.gridTemplateColumns = "1fr";
   const fragment = document.createDocumentFragment();
   for (const session of sessions) {
     fragment.appendChild(buildSessionCard(session));
@@ -493,6 +529,8 @@ function buildSessionCard(session: SessionSnapshot): HTMLElement {
   const article = document.createElement("article");
   article.className = "terminal-card panel";
   article.dataset.sessionCard = session.name;
+  article.dataset.group = groupNameForSession(session.name);
+  article.dataset.groupActive = "true";
 
   article.innerHTML = `
     <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
@@ -521,6 +559,144 @@ function buildSessionCard(session: SessionSnapshot): HTMLElement {
   title.textContent = session.title;
 
   return article;
+}
+
+function groupSessions(sessions: SessionSnapshot[]): PaneGroup[] {
+  const groups = new Map<string, string[]>();
+  for (const session of sessions) {
+    const groupName = groupNameForSession(session.name);
+    const paneNames = groups.get(groupName) ?? [];
+    paneNames.push(session.name);
+    groups.set(groupName, paneNames);
+  }
+
+  return Array.from(groups.entries())
+    .sort(([left], [right]) => compareGroupNames(left, right))
+    .map(([name, paneNames]) => ({
+      name,
+      paneNames: paneNames.sort(comparePaneNamesWithinGroup),
+    }));
+}
+
+function groupNameForSession(name: string): string {
+  if (name === "claude" || name === "codex") {
+    return "main";
+  }
+
+  const match = name.match(/^(.+)-(claude|codex)$/);
+  return match ? match[1] : "other";
+}
+
+function compareGroupNames(left: string, right: string): number {
+  if (left === right) {
+    return 0;
+  }
+  if (left === "main") {
+    return -1;
+  }
+  if (right === "main") {
+    return 1;
+  }
+  if (left === "other") {
+    return 1;
+  }
+  if (right === "other") {
+    return -1;
+  }
+  return left.localeCompare(right);
+}
+
+function comparePaneNamesWithinGroup(left: string, right: string): number {
+  const leftRank = paneRoleRank(left);
+  const rightRank = paneRoleRank(right);
+  if (leftRank !== rightRank) {
+    return leftRank - rightRank;
+  }
+  return left.localeCompare(right);
+}
+
+function paneRoleRank(name: string): number {
+  if (name === "claude" || name.endsWith("-claude")) {
+    return 0;
+  }
+  if (name === "codex" || name.endsWith("-codex")) {
+    return 1;
+  }
+  return 2;
+}
+
+function renderGroupPicker(groups: PaneGroup[]): void {
+  groupCount.textContent = `${groups.length} ${groups.length === 1 ? "group" : "groups"}`;
+  const fragment = document.createDocumentFragment();
+  for (const group of groups) {
+    const item = document.createElement("li");
+    const button = document.createElement("button");
+    button.className = "group-chip";
+    button.dataset.group = group.name;
+    button.dataset.active = "false";
+    button.textContent = group.name;
+    item.appendChild(button);
+    fragment.appendChild(item);
+  }
+  groupList.replaceChildren(fragment);
+}
+
+function wirePicker(): void {
+  for (const chip of document.querySelectorAll<HTMLButtonElement>(".group-chip")) {
+    chip.addEventListener("click", () => {
+      const name = chip.dataset.group;
+      if (!name) {
+        return;
+      }
+      setActiveGroup(name);
+    });
+  }
+}
+
+function resolveInitialGroup(groups: PaneGroup[]): string {
+  const saved = localStorage.getItem("prim1-active-group");
+  if (saved && groups.some((group) => group.name === saved)) {
+    return saved;
+  }
+  if (groups.some((group) => group.name === "main")) {
+    return "main";
+  }
+  return groups[0]?.name ?? "main";
+}
+
+function setActiveGroup(name: string): void {
+  const resolved =
+    currentGroups.find((group) => group.name === name)?.name
+    ?? resolveInitialGroup(currentGroups);
+
+  localStorage.setItem("prim1-active-group", resolved);
+  activeGroupLabel.textContent = resolved;
+
+  for (const group of currentGroups) {
+    const isActive = group.name === resolved;
+    for (const paneName of group.paneNames) {
+      const card = document.querySelector<HTMLElement>(`[data-session-card="${paneName}"]`);
+      if (!card) {
+        continue;
+      }
+      card.dataset.groupActive = String(isActive);
+    }
+  }
+
+  for (const chip of document.querySelectorAll<HTMLButtonElement>(".group-chip")) {
+    chip.dataset.active = String(chip.dataset.group === resolved);
+  }
+
+  requestAnimationFrame(() => {
+    for (const paneName of currentGroups.find((group) => group.name === resolved)?.paneNames ?? []) {
+      paneMap.get(paneName)?.fit();
+    }
+  });
+}
+
+function isPaneVisible(name: string): boolean {
+  const card = document.querySelector<HTMLElement>(`[data-session-card="${name}"]`);
+  return !card || card.dataset.groupActive !== "false";
 }
 
 function populateRouterOptions(sessions: SessionSnapshot[]): void {
@@ -641,7 +817,8 @@ function wireControls(): void {
           break;
         }
         case "mark-main-menu":
-          writeSystem("warn", "main menu is reserved for the next UI slice.");
+          setActiveGroup("main");
+          writeSystem("info", "active pair switched to main");
           break;
         case "show-control-file":
           writeSystem("info", `control plane info: ${controlEndpoint.textContent}`);
@@ -653,19 +830,23 @@ function wireControls(): void {
 
 function wireResize(): void {
   const observer = new ResizeObserver(() => {
-    for (const pane of paneMap.values()) {
-      pane.fit();
-    }
+    fitVisiblePanes();
     systemFit.fit();
   });
 
   observer.observe(document.body);
   window.addEventListener("resize", () => {
-    for (const pane of paneMap.values()) {
-      pane.fit();
-    }
+    fitVisiblePanes();
     systemFit.fit();
   });
+}
+
+function fitVisiblePanes(): void {
+  for (const pane of paneMap.values()) {
+    if (isPaneVisible(pane.name)) {
+      pane.fit();
+    }
+  }
 }
 
 function wireTerminalShortcuts(): void {
