@@ -499,6 +499,7 @@ button.primary:hover {
   min-height: 0;
   display: grid;
   grid-template-columns: minmax(180px, 220px) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   gap: 0.5rem;
   overflow: hidden;
 }
