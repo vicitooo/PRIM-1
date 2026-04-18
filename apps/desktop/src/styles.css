@@ -573,6 +573,153 @@ textarea {
   color: #ffffff;
 }
 
+/* ═══════════════════════════════════════════════════════════════
+   LIGHT THEME
+   Warm paper backgrounds, white cards, visible shadows.
+   Copper Rose accent stays consistent across themes.
+   ═══════════════════════════════════════════════════════════════ */
+
+[data-theme="light"] {
+  --bg-base:       #f2efeb;
+  --bg-surface:    #ffffff;
+  --bg-elevated:   #eae7e2;
+  --bg-overlay:    #e2dfda;
+  --bg-hover:      #dad7d2;
+  --bg-active:     #d0cdc8;
+
+  --accent-subtle: rgba(212, 115, 106, 0.06);
+  --accent-muted:  rgba(180, 80, 72, 0.70);
+
+  --text-primary:   #1a1816;
+  --text-secondary: rgba(0, 0, 0, 0.55);
+  --text-tertiary:  rgba(0, 0, 0, 0.35);
+
+  --border-subtle:  rgba(0, 0, 0, 0.06);
+  --border-default: rgba(0, 0, 0, 0.10);
+  --border-strong:  rgba(0, 0, 0, 0.18);
+}
+
+/* Light: cards get real shadows (visible on light bg) */
+[data-theme="light"] .topbar,
+[data-theme="light"] .terminal-card,
+[data-theme="light"] .system-card,
+[data-theme="light"] .router-card {
+  background: var(--bg-surface);
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.06),
+    0 3px 8px rgba(0, 0, 0, 0.08);
+}
+
+[data-theme="light"] .terminal-card:hover,
+[data-theme="light"] .system-card:hover,
+[data-theme="light"] .router-card:hover {
+  box-shadow:
+    0 2px 4px rgba(0, 0, 0, 0.08),
+    0 6px 16px rgba(0, 0, 0, 0.10);
+}
+
+[data-theme="light"] .terminal-card:focus-within {
+  box-shadow:
+    0 2px 4px rgba(0, 0, 0, 0.08),
+    0 6px 16px rgba(0, 0, 0, 0.10),
+    0 0 20px rgba(212, 115, 106, 0.08);
+}
+
+/* Light: inputs */
+[data-theme="light"] select,
+[data-theme="light"] textarea {
+  background: var(--bg-elevated);
+}
+
+/* Light: terminal wells inset */
+[data-theme="light"] .terminal-host,
+[data-theme="light"] .system-terminal {
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+
+/* Light: meta cards */
+[data-theme="light"] .meta-card {
+  background: rgba(212, 115, 106, 0.05);
+  border-color: rgba(212, 115, 106, 0.08);
+}
+
+/* Light: state pills */
+[data-theme="light"] .state-pill[data-state="ready"],
+[data-theme="light"] .state-pill[data-state="busy"] {
+  background: rgba(34, 197, 94, 0.10);
+  color: #15803d;
+}
+
+[data-theme="light"] .state-pill[data-state="failed"] {
+  background: rgba(212, 115, 106, 0.10);
+  color: #B85D55;
+}
+
+/* Light: breathing glow more subtle */
+[data-theme="light"] body::before {
+  background: radial-gradient(ellipse, rgba(212, 115, 106, 0.04), transparent 70%);
+}
+
+/* Light: noise overlay — softer blend */
+[data-theme="light"] body::after {
+  mix-blend-mode: multiply;
+  opacity: 0.008;
+}
+
+/* Light: sweep more visible */
+[data-theme="light"] .topbar::before {
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(212, 115, 106, 0.08),
+    rgba(232, 165, 152, 0.04),
+    transparent
+  );
+}
+
+/* Light: title shimmer uses darker text */
+[data-theme="light"] .topbar h1 {
+  background: linear-gradient(
+    90deg,
+    var(--text-primary) 0%,
+    var(--accent) 45%,
+    var(--text-primary) 55%,
+    var(--text-primary) 100%
+  );
+  background-size: 300% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+}
+
+/* Light: scrollbar */
+[data-theme="light"] ::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.12);
+}
+
+/* Light: control flyout */
+[data-theme="light"] .control-toggle {
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+}
+
+[data-theme="light"] .control-menu {
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+}
+
+/* ── Theme toggle button ── */
+
+.theme-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  font-size: 14px;
+  border-radius: var(--radius-md);
+  flex-shrink: 0;
+}
+
 @media (max-width: 1280px) {
   .app-shell {
     grid-template-rows: auto minmax(0, 1fr) minmax(220px, auto);

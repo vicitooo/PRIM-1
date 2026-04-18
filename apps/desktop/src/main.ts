@@ -29,6 +29,7 @@ app.innerHTML = `
         <p class="eyebrow">Victor / Claude / Codex</p>
         <h1>PRIM-001</h1>
       </div>
+      <button class="theme-toggle" id="theme-toggle" aria-label="Toggle theme" title="Toggle theme"></button>
       <div class="meta-strip">
         <div class="meta-card">
           <span class="meta-label">Control plane</span>
@@ -316,11 +317,111 @@ const runtimePath = must<HTMLElement>("#runtime-path");
 let activeTerminalName: (typeof SESSION_NAMES)[number] | null = null;
 let activeCopySurface: CopySurface = null;
 
+/* ── Theme system ── */
+
+const TERMINAL_THEMES = {
+  dark: {
+    session: {
+      background: "#100f0e",
+      foreground: "#dedede",
+      cursor: "#D4736A",
+      cursorAccent: "#100f0e",
+      selectionBackground: "rgba(212, 115, 106, 0.18)",
+      black: "#100f0e", brightBlack: "#555350",
+      red: "#D4736A", brightRed: "#E8A598",
+      green: "#8cc265", brightGreen: "#a5d97a",
+      yellow: "#e6b44f", brightYellow: "#f2cc72",
+      blue: "#7aa2f7", brightBlue: "#93b5ff",
+      magenta: "#c97eb8", brightMagenta: "#dfa0d2",
+      cyan: "#59c0c8", brightCyan: "#7ee1e7",
+      white: "#c8c5c0", brightWhite: "#dedede",
+    },
+    system: {
+      background: "#1a1917",
+      foreground: "#dedede",
+      cursor: "#E8A598",
+      cursorAccent: "#1a1917",
+      selectionBackground: "rgba(212, 115, 106, 0.15)",
+      black: "#1a1917", brightBlack: "#555350",
+      red: "#D4736A", brightRed: "#E8A598",
+      green: "#8cc265", brightGreen: "#a5d97a",
+      yellow: "#e6b44f", brightYellow: "#f2cc72",
+      blue: "#88aefc", brightBlue: "#9fc0ff",
+      magenta: "#c97eb8", brightMagenta: "#dfa0d2",
+      cyan: "#73d1d6", brightCyan: "#8de7ec",
+      white: "#c8c5c0", brightWhite: "#dedede",
+    },
+  },
+  light: {
+    session: {
+      background: "#f5f2ed",
+      foreground: "#1a1816",
+      cursor: "#D4736A",
+      cursorAccent: "#f5f2ed",
+      selectionBackground: "rgba(212, 115, 106, 0.18)",
+      black: "#1a1816", brightBlack: "#7a7570",
+      red: "#c5524a", brightRed: "#B85D55",
+      green: "#3a8c28", brightGreen: "#4ea03a",
+      yellow: "#9a7020", brightYellow: "#b8862e",
+      blue: "#3568d4", brightBlue: "#4a7ae0",
+      magenta: "#9c50a8", brightMagenta: "#b068ba",
+      cyan: "#1a8a8a", brightCyan: "#2a9e9e",
+      white: "#d8d5d0", brightWhite: "#f5f2ed",
+    },
+    system: {
+      background: "#eae7e2",
+      foreground: "#1a1816",
+      cursor: "#B85D55",
+      cursorAccent: "#eae7e2",
+      selectionBackground: "rgba(212, 115, 106, 0.15)",
+      black: "#1a1816", brightBlack: "#7a7570",
+      red: "#c5524a", brightRed: "#B85D55",
+      green: "#3a8c28", brightGreen: "#4ea03a",
+      yellow: "#9a7020", brightYellow: "#b8862e",
+      blue: "#3568d4", brightBlue: "#4a7ae0",
+      magenta: "#9c50a8", brightMagenta: "#b068ba",
+      cyan: "#1a8a8a", brightCyan: "#2a9e9e",
+      white: "#d8d5d0", brightWhite: "#eae7e2",
+    },
+  },
+} as const;
+
+type ThemeName = keyof typeof TERMINAL_THEMES;
+
+function applyTheme(name: ThemeName): void {
+  document.documentElement.dataset.theme = name;
+  localStorage.setItem("prim1-theme", name);
+
+  const themes = TERMINAL_THEMES[name];
+  for (const pane of paneMap.values()) {
+    pane.terminal.options.theme = themes.session;
+  }
+  systemTerminal.options.theme = themes.system;
+
+  const toggleEl = document.getElementById("theme-toggle");
+  if (toggleEl) {
+    toggleEl.textContent = name === "dark" ? "\u2600" : "\u263E";
+    toggleEl.title = name === "dark" ? "Switch to light" : "Switch to dark";
+  }
+}
+
+function wireThemeToggle(): void {
+  const toggleEl = must<HTMLButtonElement>("#theme-toggle");
+  toggleEl.addEventListener("click", () => {
+    const current = (document.documentElement.dataset.theme || "dark") as ThemeName;
+    applyTheme(current === "dark" ? "light" : "dark");
+  });
+}
+
+const savedTheme = (localStorage.getItem("prim1-theme") || "dark") as ThemeName;
+applyTheme(savedTheme);
+
 wireButtons();
 wireRouter();
 wireControls();
 wireResize();
 wireTerminalShortcuts();
+wireThemeToggle();
 
 void listen<RuntimeEvent>("runtime://event", ({ payload }) => {
   handleRuntimeEvent(payload);
