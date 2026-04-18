@@ -261,14 +261,13 @@ textarea {
     0 0 20px rgba(212, 115, 106, 0.06);
 }
 
-/* ── Topbar: command center header ── */
+/* ── Topbar: clean command bar ── */
 
 .topbar {
   position: relative;
   border-radius: var(--radius-lg);
-  padding: 0.45rem 0.85rem;
+  padding: 0.4rem 0.75rem;
   display: flex;
-  justify-content: space-between;
   align-items: center;
   gap: 0.75rem;
   user-select: none;
@@ -302,6 +301,38 @@ textarea {
   100% { left: -60%; }
 }
 
+.topbar-brand {
+  flex-shrink: 0;
+}
+
+.topbar-status {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  justify-content: flex-end;
+  overflow: hidden;
+}
+
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex-shrink: 0;
+  animation: dotPulse 3s ease-in-out infinite;
+}
+
+@keyframes dotPulse {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 1; }
+}
+
+.status-sep {
+  color: var(--text-tertiary);
+  font-size: 10px;
+}
+
 .eyebrow {
   margin: 0;
   text-transform: uppercase;
@@ -311,8 +342,7 @@ textarea {
   color: var(--accent-muted);
 }
 
-.card-kicker,
-.meta-label {
+.card-kicker {
   margin: 0;
   text-transform: uppercase;
   letter-spacing: 0.08em;
@@ -355,27 +385,13 @@ textarea {
   letter-spacing: -0.015em;
 }
 
-.meta-strip {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(180px, 1fr));
-  gap: 0.4rem;
-}
-
-.meta-card {
-  border-radius: var(--radius-md);
-  padding: 0.35rem 0.65rem;
-  background: var(--accent-subtle);
-  border: 1px solid rgba(212, 115, 106, 0.06);
-}
-
-.meta-card strong,
 .mono {
-  display: block;
   font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
-  font-size: 11px;
-  color: var(--text-secondary);
+  font-size: 10px;
+  color: var(--text-tertiary);
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ── Workspace ── */
@@ -416,23 +432,80 @@ textarea {
 .state-pill,
 .activity-pill {
   border-radius: var(--radius-sm);
-  padding: 0.15rem 0.45rem;
+  padding: 0.15rem 0.5rem;
   font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
   font-size: 10px;
   background: var(--bg-elevated);
   color: var(--text-tertiary);
   user-select: none;
+  border: 1px solid var(--border-subtle);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
+  transition:
+    background var(--duration-instant) ease,
+    color var(--duration-instant) ease,
+    border-color var(--duration-instant) ease,
+    box-shadow var(--duration-instant) ease;
+  cursor: default;
+}
+
+.state-pill:hover,
+.activity-pill:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-default);
 }
 
 .state-pill[data-state="ready"],
 .state-pill[data-state="busy"] {
   background: rgba(34, 197, 94, 0.12);
   color: #86efac;
+  border-color: rgba(34, 197, 94, 0.15);
+}
+
+.state-pill[data-state="ready"]:hover,
+.state-pill[data-state="busy"]:hover {
+  background: rgba(34, 197, 94, 0.18);
 }
 
 .state-pill[data-state="failed"] {
   background: rgba(212, 115, 106, 0.14);
   color: var(--accent-text);
+  border-color: rgba(212, 115, 106, 0.15);
+}
+
+.state-pill[data-state="failed"]:hover {
+  background: rgba(212, 115, 106, 0.20);
+}
+
+/* ── Semantic action buttons ── */
+
+[data-action="start"] {
+  color: #4ade80;
+  border-color: rgba(74, 222, 128, 0.18);
+}
+[data-action="start"]:hover {
+  background: rgba(74, 222, 128, 0.10);
+  border-color: rgba(74, 222, 128, 0.35);
+  box-shadow: 0 0 10px rgba(74, 222, 128, 0.08);
+}
+
+[data-action="restart"] {
+  color: #fbbf24;
+  border-color: rgba(251, 191, 36, 0.18);
+}
+[data-action="restart"]:hover {
+  background: rgba(251, 191, 36, 0.10);
+  border-color: rgba(251, 191, 36, 0.35);
+  box-shadow: 0 0 10px rgba(251, 191, 36, 0.08);
+}
+
+[data-action="stop"] {
+  color: #f87171;
+  border-color: rgba(248, 113, 113, 0.18);
+}
+[data-action="stop"]:hover {
+  background: rgba(248, 113, 113, 0.10);
+  border-color: rgba(248, 113, 113, 0.35);
+  box-shadow: 0 0 10px rgba(248, 113, 113, 0.08);
 }
 
 .terminal-actions,
@@ -459,7 +532,7 @@ textarea {
 .bottom-grid {
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(0, 1.3fr) minmax(300px, 0.9fr);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0.5rem;
 }
 
@@ -509,23 +582,26 @@ textarea {
 }
 
 .control-toggle {
-  width: 44px;
-  height: 44px;
+  width: 36px;
+  height: 36px;
   border-radius: var(--radius-lg);
   background: var(--bg-surface);
-  border-color: var(--border-default);
+  border: 1px solid var(--border-default);
   letter-spacing: 0.04em;
-  font-size: 10px;
+  font-size: 9px;
   font-weight: 600;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  box-shadow:
+    0 2px 6px rgba(0, 0, 0, 0.25),
+    inset 0 1px 0 rgba(255, 255, 255, 0.04);
 }
 
 .control-toggle:hover {
   background: var(--bg-hover);
   border-color: var(--accent);
   box-shadow:
-    0 2px 8px rgba(0, 0, 0, 0.3),
-    0 0 12px rgba(212, 115, 106, 0.12);
+    0 2px 6px rgba(0, 0, 0, 0.25),
+    0 0 16px rgba(212, 115, 106, 0.15),
+    inset 0 1px 0 rgba(255, 255, 255, 0.04);
 }
 
 .control-menu {
@@ -689,6 +765,43 @@ textarea {
   background-size: 300% 100%;
   -webkit-background-clip: text;
   background-clip: text;
+}
+
+/* Light: semantic buttons */
+[data-theme="light"] [data-action="start"] {
+  color: #16a34a;
+  border-color: rgba(22, 163, 74, 0.20);
+}
+[data-theme="light"] [data-action="start"]:hover {
+  background: rgba(22, 163, 74, 0.08);
+  border-color: rgba(22, 163, 74, 0.35);
+}
+[data-theme="light"] [data-action="restart"] {
+  color: #d97706;
+  border-color: rgba(217, 119, 6, 0.20);
+}
+[data-theme="light"] [data-action="restart"]:hover {
+  background: rgba(217, 119, 6, 0.08);
+  border-color: rgba(217, 119, 6, 0.35);
+}
+[data-theme="light"] [data-action="stop"] {
+  color: #dc2626;
+  border-color: rgba(220, 38, 38, 0.20);
+}
+[data-theme="light"] [data-action="stop"]:hover {
+  background: rgba(220, 38, 38, 0.08);
+  border-color: rgba(220, 38, 38, 0.35);
+}
+
+/* Light: pills */
+[data-theme="light"] .state-pill[data-state="ready"],
+[data-theme="light"] .state-pill[data-state="busy"] {
+  color: #15803d;
+  border-color: rgba(22, 163, 74, 0.15);
+}
+[data-theme="light"] .state-pill[data-state="failed"] {
+  color: #B85D55;
+  border-color: rgba(212, 115, 106, 0.15);
 }
 
 /* Light: scrollbar */

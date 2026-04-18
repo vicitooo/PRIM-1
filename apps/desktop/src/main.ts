@@ -25,21 +25,17 @@ if (!(app instanceof HTMLDivElement)) {
 app.innerHTML = `
   <div class="app-shell">
     <header class="topbar">
-      <div>
+      <div class="topbar-brand">
         <p class="eyebrow">Victor / Claude / Codex</p>
         <h1>PRIM-001</h1>
       </div>
-      <button class="theme-toggle" id="theme-toggle" aria-label="Toggle theme" title="Toggle theme"></button>
-      <div class="meta-strip">
-        <div class="meta-card">
-          <span class="meta-label">Control plane</span>
-          <strong id="control-endpoint">starting...</strong>
-        </div>
-        <div class="meta-card">
-          <span class="meta-label">Audit log</span>
-          <strong id="audit-path">loading...</strong>
-        </div>
+      <div class="topbar-status">
+        <span class="status-dot" id="status-dot"></span>
+        <span class="mono" id="control-endpoint">starting...</span>
+        <span class="status-sep">&middot;</span>
+        <span class="mono" id="audit-path">loading...</span>
       </div>
+      <button class="theme-toggle" id="theme-toggle" aria-label="Toggle theme" title="Toggle theme"></button>
     </header>
 
     <section class="workspace-grid">
