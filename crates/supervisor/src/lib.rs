@@ -215,6 +215,47 @@ impl SessionSlot {
     }
 }
 
+fn named_claude_session(name: &str, title: &str, working_dir: &str) -> SessionDefinition {
+    let mut definition = driver_claude::default_session(working_dir);
+    definition.name = name.into();
+    definition.title = title.into();
+    definition
+}
+
+fn named_codex_session(name: &str, title: &str, working_dir: &str) -> SessionDefinition {
+    let mut definition = driver_codex::default_session(working_dir);
+    definition.name = name.into();
+    definition.title = title.into();
+    definition
+}
+
+fn default_session_definitions(working_dir: &str) -> Vec<SessionDefinition> {
+    vec![
+        driver_claude::default_session(working_dir),
+        driver_codex::default_session(working_dir),
+        named_claude_session("build-claude", "Build · Claude", working_dir),
+        named_codex_session("build-codex", "Build · Codex", working_dir),
+        named_claude_session("consumer-claude", "Consumer · Claude", working_dir),
+        named_codex_session("consumer-codex", "Consumer · Codex", working_dir),
+        named_claude_session("admin-claude", "Admin · Claude", working_dir),
+        named_codex_session("admin-codex", "Admin · Codex", working_dir),
+    ]
+}
+
+fn closed_session_slot(definition: SessionDefinition) -> SessionSlot {
+    SessionSlot {
+        definition,
+        state: LifecycleState::Closed,
+        running: None,
+        generation: 0,
+        process_id: None,
+        last_activity_at: None,
+        last_real_output_at: None,
+        last_error: None,
+        quiesce_timer: None,
+    }
+}
+
 struct SupervisorInner {
     runtime_dir: PathBuf,
     audit: AuditLog,
@@ -268,38 +309,9 @@ impl SupervisorHandle {
         let (events_watch, _events_watch_rx) = tokio::sync::watch::channel(0_u64);
         let working_root = config.working_root.to_string_lossy().into_owned();
         let mut slots = HashMap::new();
-
-        let claude = driver_claude::default_session(&working_root);
-        slots.insert(
-            claude.name.clone(),
-            SessionSlot {
-                definition: claude,
-                state: LifecycleState::Closed,
-                running: None,
-                generation: 0,
-                process_id: None,
-                last_activity_at: None,
-                last_real_output_at: None,
-                last_error: None,
-                quiesce_timer: None,
-            },
-        );
-
-        let codex = driver_codex::default_session(&working_root);
-        slots.insert(
-            codex.name.clone(),
-            SessionSlot {
-                definition: codex,
-                state: LifecycleState::Closed,
-                running: None,
-                generation: 0,
-                process_id: None,
-                last_activity_at: None,
-                last_real_output_at: None,
-                last_error: None,
-                quiesce_timer: None,
-            },
-        );
+        for definition in default_session_definitions(&working_root) {
+            slots.insert(definition.name.clone(), closed_session_slot(definition));
+        }
 
         Ok(Self {
             inner: Arc::new(SupervisorInner {
@@ -3427,7 +3439,19 @@ mod tests {
             .map(|session| session.name.clone())
             .collect::<Vec<_>>();
 
-        assert_eq!(names, vec!["claude".to_string(), "codex".to_string()]);
+        assert_eq!(
+            names,
+            vec![
+                "admin-claude".to_string(),
+                "admin-codex".to_string(),
+                "build-claude".to_string(),
+                "build-codex".to_string(),
+                "claude".to_string(),
+                "codex".to_string(),
+                "consumer-claude".to_string(),
+                "consumer-codex".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -4818,7 +4842,7 @@ mod tests {
 
         assert!(response.ok);
         assert_eq!(response.message, "sessions listed");
-        assert_eq!(response.snapshot.unwrap().sessions.len(), 2);
+        assert_eq!(response.snapshot.unwrap().sessions.len(), 8);
     }
 
     #[test]
