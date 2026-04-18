@@ -191,30 +191,31 @@ button, input, select, textarea { font: inherit; }
   overflow: hidden;
 }
 
-/* Light sweep */
+/* Light sweep — slower, more visible, more frequent */
 .topbar::after {
   content: '';
   position: absolute;
   top: 0;
-  left: -60%;
-  width: 40%;
+  left: -80%;
+  width: 60%;
   height: 100%;
   background: linear-gradient(
     90deg,
-    transparent,
-    rgba(160, 100, 60, 0.06),
-    rgba(138, 110, 85, 0.03),
-    transparent
+    transparent 0%,
+    rgba(160, 100, 60, 0.10) 20%,
+    rgba(180, 130, 80, 0.16) 45%,
+    rgba(200, 160, 100, 0.08) 55%,
+    rgba(160, 100, 60, 0.10) 80%,
+    transparent 100%
   );
   pointer-events: none;
-  animation: sweep 10s ease-in-out infinite 2s;
+  animation: sweep 6s ease-in-out infinite;
   z-index: 1;
 }
 
 @keyframes sweep {
-  0% { left: -60%; }
-  50% { left: 100%; }
-  100% { left: -60%; }
+  0% { left: -80%; }
+  100% { left: 120%; }
 }
 
 .topbar-brand { flex-shrink: 0; z-index: 1; }
