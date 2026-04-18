@@ -4,10 +4,6 @@ import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 
-import {
-  resolveCopySelection,
-  type CopySurface,
-} from "./copy-selection";
 import "./styles.css";
 import type {
   RouteMessageRequest,
@@ -39,47 +35,7 @@ app.innerHTML = `
       <span class="mono" id="audit-path" hidden>loading...</span>
     </header>
 
-    <section class="workspace-grid">
-      <article class="terminal-card panel" data-session-card="claude">
-        <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
-        <div class="card-head">
-          <div>
-            <p class="card-kicker">Agent pane</p>
-            <h2>Claude</h2>
-          </div>
-          <div class="session-meta">
-            <span class="state-pill" data-session-state="claude">closed</span>
-            <span class="activity-pill" data-session-activity="claude">idle</span>
-          </div>
-        </div>
-        <div class="terminal-actions">
-          <button data-action="start" data-session="claude">Launch</button>
-          <button data-action="restart" data-session="claude">Restart</button>
-          <button data-action="stop" data-session="claude">Stop</button>
-        </div>
-        <div class="terminal-host" data-terminal="claude"></div>
-      </article>
-
-      <article class="terminal-card panel" data-session-card="codex">
-        <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
-        <div class="card-head">
-          <div>
-            <p class="card-kicker">Agent pane</p>
-            <h2>Codex</h2>
-          </div>
-          <div class="session-meta">
-            <span class="state-pill" data-session-state="codex">closed</span>
-            <span class="activity-pill" data-session-activity="codex">idle</span>
-          </div>
-        </div>
-        <div class="terminal-actions">
-          <button data-action="start" data-session="codex">Launch</button>
-          <button data-action="restart" data-session="codex">Restart</button>
-          <button data-action="stop" data-session="codex">Stop</button>
-        </div>
-        <div class="terminal-host" data-terminal="codex"></div>
-      </article>
-    </section>
+    <section class="workspace-grid" id="workspace-grid"></section>
 
     <section class="bottom-grid">
       <article class="system-card panel">
@@ -143,14 +99,11 @@ app.innerHTML = `
   </div>
 `;
 
-const SESSION_NAMES = ["claude", "codex"] as const;
-const SESSION_LABELS: Record<(typeof SESSION_NAMES)[number], string> = {
-  claude: "Claude",
-  codex: "Codex",
-};
+type CopySurface = string | "system" | null;
 
 class SessionTerminal {
-  readonly name: (typeof SESSION_NAMES)[number];
+  readonly name: string;
+  title: string;
   readonly terminal: Terminal;
   readonly fitAddon: FitAddon;
   readonly host: HTMLDivElement;
@@ -159,8 +112,9 @@ class SessionTerminal {
   private hooked = false;
   private snapshot: SessionSnapshot | null = null;
 
-  constructor(name: (typeof SESSION_NAMES)[number]) {
+  constructor(name: string, title: string) {
     this.name = name;
+    this.title = title;
     this.host = must<HTMLDivElement>(`[data-terminal="${name}"]`);
     this.stateEl = must<HTMLSpanElement>(`[data-session-state="${name}"]`);
     this.activityEl = must<HTMLSpanElement>(`[data-session-activity="${name}"]`);
@@ -210,7 +164,7 @@ class SessionTerminal {
 
   banner(): void {
     this.terminal.reset();
-    this.terminal.writeln(`\x1b[38;5;137m${SESSION_LABELS[this.name]} pane ready.\x1b[0m`);
+    this.terminal.writeln(`\x1b[38;5;137m${this.title} pane ready.\x1b[0m`);
     this.terminal.writeln("Launch the session from the header or send routed messages below.");
     this.terminal.writeln("");
   }
@@ -231,11 +185,12 @@ class SessionTerminal {
           name: this.name,
           input,
         } satisfies SendInputRequest,
-      }).catch((error) => writeSystem("error", `${SESSION_LABELS[this.name]} input failed: ${error}`));
+      }).catch((error) => writeSystem("error", `${this.title} input failed: ${error}`));
     });
   }
 
   applySnapshot(snapshot: SessionSnapshot): void {
+    this.title = snapshot.title;
     this.snapshot = snapshot;
     this.stateEl.textContent = snapshot.lifecycle_state;
     this.stateEl.dataset.state = snapshot.lifecycle_state;
@@ -263,11 +218,10 @@ class SessionTerminal {
     this.fitAddon.fit();
     void resizeSession(this.name, this.terminal.cols, this.terminal.rows);
   }
-}
 
-const paneMap = new Map<(typeof SESSION_NAMES)[number], SessionTerminal>();
-for (const sessionName of SESSION_NAMES) {
-  paneMap.set(sessionName, new SessionTerminal(sessionName));
+  dispose(): void {
+    this.terminal.dispose();
+  }
 }
 
 const systemTerminal = new Terminal({
@@ -311,11 +265,14 @@ systemTerminalHost.addEventListener("mousedown", () => {
   activeCopySurface = "system";
 });
 
+const workspaceGrid = must<HTMLDivElement>("#workspace-grid");
 const snapshotByName = new Map<string, SessionSnapshot>();
+const paneMap = new Map<string, SessionTerminal>();
 const controlEndpoint = must<HTMLElement>("#control-endpoint");
 const auditPath = must<HTMLElement>("#audit-path");
 const runtimePath = must<HTMLElement>("#runtime-path");
-let activeTerminalName: (typeof SESSION_NAMES)[number] | null = null;
+let renderedSessionSignature: string | null = null;
+let activeTerminalName: string | null = null;
 let activeCopySurface: CopySurface = null;
 
 /* ── Theme system ── */
@@ -406,6 +363,10 @@ function applyTheme(name: ThemeName): void {
   }
 }
 
+function currentThemeName(): ThemeName {
+  return (document.documentElement.dataset.theme || "dark") as ThemeName;
+}
+
 function wireThemeToggle(): void {
   const toggleEl = must<HTMLButtonElement>("#theme-toggle");
   toggleEl.addEventListener("click", () => {
@@ -417,7 +378,6 @@ function wireThemeToggle(): void {
 const savedTheme = (localStorage.getItem("prim1-theme") || "dark") as ThemeName;
 applyTheme(savedTheme);
 
-wireButtons();
 wireRouter();
 wireControls();
 wireResize();
@@ -437,22 +397,22 @@ async function bootstrap(): Promise<void> {
 }
 
 function applySnapshot(snapshot: RuntimeSnapshot): void {
+  syncPaneInventory(snapshot.sessions);
+  populateRouterOptions(snapshot.sessions);
   controlEndpoint.textContent = snapshot.control_plane?.endpoint ?? "starting...";
   auditPath.textContent = snapshot.audit_log_path;
   runtimePath.textContent = snapshot.runtime_dir;
 
   for (const session of snapshot.sessions) {
     snapshotByName.set(session.name, session);
-    if (session.name === "claude" || session.name === "codex") {
-      paneMap.get(session.name)?.applySnapshot(session);
-    }
+    paneMap.get(session.name)?.applySnapshot(session);
   }
 }
 
 function handleRuntimeEvent(event: RuntimeEvent): void {
   switch (event.event) {
     case "session_output":
-      paneMap.get(event.session as (typeof SESSION_NAMES)[number])?.write(event.chunk);
+      paneMap.get(event.session)?.write(event.chunk);
       break;
     case "session_state": {
       const previous = snapshotByName.get(event.session);
@@ -466,9 +426,7 @@ function handleRuntimeEvent(event: RuntimeEvent): void {
             event.state === "failed" ? event.reason : previous.last_error,
         };
         snapshotByName.set(event.session, next);
-        if (event.session === "claude" || event.session === "codex") {
-          paneMap.get(event.session)?.applySnapshot(next);
-        }
+        paneMap.get(event.session)?.applySnapshot(next);
       }
       writeSystem("info", `${event.session} -> ${event.state} (${event.reason})`);
       break;
@@ -489,6 +447,112 @@ function handleRuntimeEvent(event: RuntimeEvent): void {
   }
 }
 
+function syncPaneInventory(sessions: SessionSnapshot[]): void {
+  const signature = sessions
+    .map((session) => `${session.name}:${session.title}`)
+    .join("|");
+  if (signature === renderedSessionSignature) {
+    return;
+  }
+
+  renderedSessionSignature = signature;
+  snapshotByName.clear();
+  for (const pane of paneMap.values()) {
+    pane.dispose();
+  }
+  paneMap.clear();
+  renderSessionCards(sessions);
+
+  for (const session of sessions) {
+    paneMap.set(session.name, new SessionTerminal(session.name, session.title));
+  }
+
+  if (activeTerminalName && !paneMap.has(activeTerminalName)) {
+    activeTerminalName = null;
+  }
+  if (activeCopySurface && activeCopySurface !== "system" && !paneMap.has(activeCopySurface)) {
+    activeCopySurface = null;
+  }
+
+  applyTheme(currentThemeName());
+  wireButtons();
+}
+
+function renderSessionCards(sessions: SessionSnapshot[]): void {
+  workspaceGrid.style.gridTemplateColumns = "1fr";
+  const fragment = document.createDocumentFragment();
+  for (const session of sessions) {
+    fragment.appendChild(buildSessionCard(session));
+  }
+  workspaceGrid.replaceChildren(fragment);
+}
+
+function buildSessionCard(session: SessionSnapshot): HTMLElement {
+  const article = document.createElement("article");
+  article.className = "terminal-card panel";
+  article.dataset.sessionCard = session.name;
+
+  article.innerHTML = `
+    <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
+    <div class="card-head">
+      <div>
+        <p class="card-kicker">Agent pane</p>
+        <h2></h2>
+      </div>
+      <div class="session-meta">
+        <span class="state-pill" data-session-state="${session.name}">closed</span>
+        <span class="activity-pill" data-session-activity="${session.name}">idle</span>
+      </div>
+    </div>
+    <div class="terminal-actions">
+      <button data-action="start" data-session="${session.name}">Launch</button>
+      <button data-action="restart" data-session="${session.name}">Restart</button>
+      <button data-action="stop" data-session="${session.name}">Stop</button>
+    </div>
+    <div class="terminal-host" data-terminal="${session.name}"></div>
+  `;
+
+  const title = article.querySelector("h2");
+  if (!(title instanceof HTMLHeadingElement)) {
+    throw new Error(`Missing title heading for ${session.name}`);
+  }
+  title.textContent = session.title;
+
+  return article;
+}
+
+function populateRouterOptions(sessions: SessionSnapshot[]): void {
+  const from = must<HTMLSelectElement>("#route-from");
+  const to = must<HTMLSelectElement>("#route-to");
+  const previousFrom = from.value;
+  const previousTo = to.value;
+  const sessionNames = sessions.map((session) => session.name);
+
+  from.replaceChildren(optionElement("victor", "Victor"));
+  for (const sessionName of sessionNames) {
+    from.appendChild(optionElement(sessionName, sessionName));
+  }
+  from.value = previousFrom === "victor" || sessionNames.includes(previousFrom)
+    ? previousFrom
+    : "victor";
+
+  to.replaceChildren();
+  for (const sessionName of sessionNames) {
+    to.appendChild(optionElement(sessionName, sessionName));
+  }
+  to.appendChild(optionElement("room", "Room"));
+  to.value = previousTo === "room" || sessionNames.includes(previousTo)
+    ? previousTo
+    : "room";
+}
+
+function optionElement(value: string, label: string): HTMLOptionElement {
+  const option = document.createElement("option");
+  option.value = value;
+  option.textContent = label;
+  return option;
+}
+
 function wireButtons(): void {
   for (const button of document.querySelectorAll<HTMLButtonElement>("[data-action]")) {
     button.addEventListener("click", async () => {
@@ -504,9 +568,7 @@ function wireButtons(): void {
             request: { name: session },
           });
           snapshotByName.set(snapshot.name, snapshot);
-          if (snapshot.name === "claude" || snapshot.name === "codex") {
-            paneMap.get(snapshot.name)?.applySnapshot(snapshot);
-          }
+          paneMap.get(snapshot.name)?.applySnapshot(snapshot);
         }
 
         if (action === "restart") {
@@ -514,9 +576,7 @@ function wireButtons(): void {
             request: { name: session },
           });
           snapshotByName.set(snapshot.name, snapshot);
-          if (snapshot.name === "claude" || snapshot.name === "codex") {
-            paneMap.get(snapshot.name)?.applySnapshot(snapshot);
-          }
+          paneMap.get(snapshot.name)?.applySnapshot(snapshot);
         }
 
         if (action === "stop") {
@@ -524,9 +584,7 @@ function wireButtons(): void {
             request: { name: session },
           });
           snapshotByName.set(snapshot.name, snapshot);
-          if (snapshot.name === "claude" || snapshot.name === "codex") {
-            paneMap.get(snapshot.name)?.applySnapshot(snapshot);
-          }
+          paneMap.get(snapshot.name)?.applySnapshot(snapshot);
         }
       } catch (error) {
         writeSystem("error", `${action} ${session} failed: ${String(error)}`);
@@ -633,33 +691,25 @@ function wireTerminalShortcuts(): void {
       return;
     }
 
-    const key = event.key.toLowerCase();
-    if (key === "c") {
-      const selection = resolveCopySelection({
-        domSelection: activeNonTerminalDomSelectionText(),
-        activeSurface: activeCopySurface,
-        terminalSelections: {
-          claude: paneMap.get("claude")?.terminal.getSelection() ?? null,
-          codex: paneMap.get("codex")?.terminal.getSelection() ?? null,
-        },
-        systemSelection: systemTerminal.getSelection(),
-      });
-      if (!selection) {
-        return;
-      }
+      const key = event.key.toLowerCase();
+      if (key === "c") {
+        const selection = resolveDynamicCopySelection();
+        if (!selection) {
+          return;
+        }
 
       event.preventDefault();
       void navigator.clipboard
         .writeText(selection.text)
         .then(() =>
-          writeSystem(
-            "info",
-            selection.kind === "dom"
-              ? "DOM selection copied"
-              : selection.kind === "system"
-                ? "System log selection copied"
-              : `${SESSION_LABELS[selection.session]} selection copied`,
-          ),
+            writeSystem(
+              "info",
+              selection.kind === "dom"
+                ? "DOM selection copied"
+                : selection.kind === "system"
+                  ? "System log selection copied"
+                  : `${paneLabel(selection.session)} selection copied`,
+            ),
         )
         .catch((error) =>
           writeSystem(
@@ -668,7 +718,7 @@ function wireTerminalShortcuts(): void {
               ? `copy failed for DOM selection: ${String(error)}`
               : selection.kind === "system"
                 ? `copy failed for System log: ${String(error)}`
-              : `copy failed for ${SESSION_LABELS[selection.session]}: ${String(error)}`,
+                : `copy failed for ${paneLabel(selection.session)}: ${String(error)}`,
           ),
         );
       return;
@@ -689,9 +739,50 @@ function wireTerminalShortcuts(): void {
   });
 }
 
+function resolveDynamicCopySelection():
+  | { kind: "dom"; text: string }
+  | { kind: "system"; text: string }
+  | { kind: "session"; session: string; text: string }
+  | null {
+  const domSelection = activeNonTerminalDomSelectionText();
+  if (domSelection) {
+    return {
+      kind: "dom",
+      text: domSelection,
+    };
+  }
+
+  if (activeCopySurface === "system") {
+    const systemSelection = systemTerminal.getSelection();
+    if (!systemSelection) {
+      return null;
+    }
+
+    return {
+      kind: "system",
+      text: systemSelection,
+    };
+  }
+
+  if (!activeCopySurface) {
+    return null;
+  }
+
+  const terminalSelection = paneMap.get(activeCopySurface)?.terminal.getSelection();
+  if (!terminalSelection) {
+    return null;
+  }
+
+  return {
+    kind: "session",
+    session: activeCopySurface,
+    text: terminalSelection,
+  };
+}
+
 async function pasteClipboardIntoTerminal(pane: SessionTerminal): Promise<void> {
   if (!snapshotByName.get(pane.name)?.running) {
-    writeSystem("warn", `${SESSION_LABELS[pane.name]} is not running; paste skipped`);
+    writeSystem("warn", `${pane.title} is not running; paste skipped`);
     return;
   }
 
@@ -707,14 +798,18 @@ async function pasteClipboardIntoTerminal(pane: SessionTerminal): Promise<void> 
         input: clipboard,
       } satisfies SendInputRequest,
     });
-    writeSystem("info", `${SESSION_LABELS[pane.name]} pasted ${clipboard.length} chars`);
+    writeSystem("info", `${pane.title} pasted ${clipboard.length} chars`);
   } catch (error) {
-    writeSystem("error", `paste failed for ${SESSION_LABELS[pane.name]}: ${String(error)}`);
+    writeSystem("error", `paste failed for ${pane.title}: ${String(error)}`);
   }
 }
 
 function activeTerminal(): SessionTerminal | null {
   return activeTerminalName ? paneMap.get(activeTerminalName) ?? null : null;
+}
+
+function paneLabel(name: string): string {
+  return paneMap.get(name)?.title ?? snapshotByName.get(name)?.title ?? name;
 }
 
 function activeNonTerminalDomSelectionText(): string | null {
