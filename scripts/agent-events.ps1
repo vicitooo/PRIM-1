@@ -40,16 +40,18 @@ if (-not (Test-Path -LiteralPath $CursorFile)) {
   Write-AtomicText -Path $CursorFile -Content "null"
 }
 
-$output = & $controlPlaneScript `
-  -Action events_since `
-  -CursorFile $CursorFile `
-  -MaxEvents $MaxEvents `
-  -MaxWaitSeconds $MaxWaitSeconds `
-  -IncludeKinds $IncludeKinds `
-  -IncludeSessions $IncludeSessions `
-  -IncludeScopes $IncludeScopes `
-  -OutCursorFile $CursorFile `
-  -InfoFile $InfoFile
+$ceArgs = @{
+  Action         = 'events_since'
+  CursorFile     = $CursorFile
+  MaxEvents      = $MaxEvents
+  MaxWaitSeconds = $MaxWaitSeconds
+  IncludeKinds   = $IncludeKinds
+  OutCursorFile  = $CursorFile
+  InfoFile       = $InfoFile
+}
+if ($IncludeSessions) { $ceArgs.IncludeSessions = $IncludeSessions }
+if ($IncludeScopes)   { $ceArgs.IncludeScopes   = $IncludeScopes }
+$output = & $controlPlaneScript @ceArgs
 $exitCode = $LASTEXITCODE
 
 if ($exitCode -ne 0) {
