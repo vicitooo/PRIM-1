@@ -1,10 +1,52 @@
+/* ═══════════════════════════════════════════════════════════════
+   PRIM-001 — COPPER ROSE DESIGN SYSTEM
+   Centralized design tokens sourced from example.com.
+
+   Change values here → cascades to entire desktop app.
+   Terminal ANSI palettes live in main.ts (kept in sync).
+   ═══════════════════════════════════════════════════════════════ */
+
 :root {
-  color: #f4ede5;
+  /* ── Background Layers (warm charcoal, 3% lightness steps) ── */
+  --bg: #0e0c0b;
+  --bg-surface: #141210;
+  --bg-elevated: #1a1816;
+  --bg-hover: #21201e;
+
+  /* ── Primary Accent — Copper Rose ── */
+  --primary: #D4736A;
+  --primary-light: #E8A598;
+  --primary-dark: #B85D55;
+  --primary-faint: rgba(212, 115, 106, 0.08);
+
+  /* ── Semantic Colors ── */
+  --green: #22c55e;
+  --red: #ef4444;
+
+  /* ── Gradients ── */
+  --gradient-start: #D4736A;
+  --gradient-end: #E8A598;
+
+  /* ── Text Hierarchy ── */
+  --text: #E8E2D9;
+  --text-muted: #9a918a;
+  --text-subtle: #6b6259;
+
+  /* ── Borders ── */
+  --border: rgba(255, 255, 255, 0.07);
+  --border-strong: rgba(255, 255, 255, 0.12);
+
+  /* ── Surface Effects ── */
+  --surface-translucent: rgba(255, 255, 255, 0.03);
+  --surface-hover: rgba(255, 255, 255, 0.06);
+
+  /* ── Derived ── */
+  color: var(--text);
   background:
-    radial-gradient(circle at top left, rgba(197, 148, 89, 0.24), transparent 28%),
-    radial-gradient(circle at bottom right, rgba(53, 134, 132, 0.22), transparent 24%),
-    linear-gradient(135deg, #0b0908 0%, #17120e 45%, #1f1812 100%);
-  font-family: "Segoe UI", "Space Grotesk", sans-serif;
+    radial-gradient(circle at top left, rgba(212, 115, 106, 0.12), transparent 28%),
+    radial-gradient(circle at bottom right, rgba(232, 165, 152, 0.06), transparent 24%),
+    linear-gradient(135deg, var(--bg) 0%, var(--bg-surface) 45%, var(--bg-elevated) 100%);
+  font-family: "Montserrat", "Segoe UI", sans-serif;
   line-height: 1.4;
   font-weight: 400;
   text-rendering: optimizeLegibility;
@@ -29,6 +71,18 @@ body {
   overflow: hidden;
 }
 
+/* Noise texture overlay */
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  opacity: 0.018;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  pointer-events: none;
+  z-index: 9999;
+  mix-blend-mode: soft-light;
+}
+
 button,
 input,
 select,
@@ -37,8 +91,8 @@ textarea {
 }
 
 button {
-  border: 1px solid rgba(253, 234, 213, 0.12);
-  background: rgba(255, 249, 242, 0.08);
+  border: 1px solid var(--border-strong);
+  background: var(--surface-hover);
   color: inherit;
   border-radius: 999px;
   padding: 0.55rem 1rem;
@@ -51,24 +105,39 @@ button {
 
 button:hover {
   transform: translateY(-1px);
-  border-color: rgba(241, 191, 120, 0.48);
-  background: rgba(241, 191, 120, 0.14);
+  border-color: rgba(212, 115, 106, 0.48);
+  background: rgba(212, 115, 106, 0.14);
+}
+
+button:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
 }
 
 button.primary {
-  background: linear-gradient(120deg, rgba(241, 191, 120, 0.88), rgba(213, 120, 68, 0.88));
-  color: #16110d;
-  border-color: rgba(255, 216, 168, 0.42);
+  background: linear-gradient(120deg, var(--primary), var(--primary-dark));
+  color: #ffffff;
+  border-color: rgba(232, 165, 152, 0.42);
+}
+
+button.primary:hover {
+  background: linear-gradient(120deg, var(--primary-dark), #9e4f48);
 }
 
 select,
 textarea {
   width: 100%;
-  border: 1px solid rgba(253, 234, 213, 0.12);
+  border: 1px solid var(--border-strong);
   border-radius: 18px;
   background: rgba(8, 8, 8, 0.4);
   color: inherit;
   padding: 0.85rem 1rem;
+}
+
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
 }
 
 textarea {
@@ -95,8 +164,8 @@ textarea {
 .terminal-card,
 .system-card,
 .router-card {
-  border: 1px solid rgba(255, 244, 230, 0.1);
-  background: rgba(18, 14, 11, 0.72);
+  border: 1px solid var(--border);
+  background: rgba(20, 18, 16, 0.72);
   backdrop-filter: blur(18px);
   box-shadow: 0 18px 80px rgba(0, 0, 0, 0.28);
 }
@@ -117,7 +186,7 @@ textarea {
   text-transform: uppercase;
   letter-spacing: 0.16em;
   font-size: 0.72rem;
-  color: #c0ae9b;
+  color: var(--primary);
 }
 
 .topbar h1,
@@ -125,6 +194,7 @@ textarea {
   margin: 0.2rem 0 0;
   font-size: clamp(1.6rem, 2vw, 2.3rem);
   line-height: 1.05;
+  letter-spacing: -0.025em;
 }
 
 .meta-strip {
@@ -136,7 +206,7 @@ textarea {
 .meta-card {
   border-radius: 20px;
   padding: 0.85rem 1rem;
-  background: rgba(255, 248, 239, 0.05);
+  background: var(--primary-faint);
 }
 
 .meta-card strong,
@@ -144,7 +214,7 @@ textarea {
   display: block;
   font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
   font-size: 0.82rem;
-  color: #f9e7d2;
+  color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -187,19 +257,19 @@ textarea {
   padding: 0.35rem 0.7rem;
   font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
   font-size: 0.76rem;
-  background: rgba(255, 248, 239, 0.08);
-  color: #ecdcc7;
+  background: var(--surface-hover);
+  color: var(--text-muted);
 }
 
 .state-pill[data-state="ready"],
 .state-pill[data-state="busy"] {
-  background: rgba(93, 192, 117, 0.16);
-  color: #cce9ca;
+  background: rgba(34, 197, 94, 0.14);
+  color: #86efac;
 }
 
 .state-pill[data-state="failed"] {
-  background: rgba(240, 127, 90, 0.16);
-  color: #ffc3af;
+  background: rgba(212, 115, 106, 0.16);
+  color: var(--primary-light);
 }
 
 .terminal-actions,
@@ -217,7 +287,7 @@ textarea {
   flex: 1;
   border-radius: 22px;
   overflow: hidden;
-  border: 1px solid rgba(255, 244, 230, 0.08);
+  border: 1px solid var(--border);
 }
 
 .bottom-grid {
@@ -243,7 +313,7 @@ textarea {
 }
 
 .router-form span {
-  color: #d8c4ad;
+  color: var(--text-muted);
   font-size: 0.84rem;
 }
 
@@ -273,7 +343,7 @@ textarea {
   width: 64px;
   height: 64px;
   border-radius: 999px;
-  background: rgba(245, 225, 201, 0.14);
+  background: rgba(212, 115, 106, 0.14);
   backdrop-filter: blur(18px);
   letter-spacing: 0.08em;
   font-weight: 700;
@@ -290,8 +360,8 @@ textarea {
   gap: 0.55rem;
   padding: 0.85rem;
   border-radius: 22px;
-  border: 1px solid rgba(255, 244, 230, 0.12);
-  background: rgba(16, 12, 10, 0.82);
+  border: 1px solid var(--border-strong);
+  background: rgba(14, 12, 11, 0.92);
 }
 
 .control-flyout:hover .control-menu,
@@ -299,6 +369,27 @@ textarea {
   opacity: 1;
   pointer-events: auto;
   transform: translateY(0);
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg);
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--primary);
+}
+
+/* ── Selection ── */
+::selection {
+  background: var(--primary);
+  color: #ffffff;
 }
 
 @media (max-width: 1280px) {
