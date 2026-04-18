@@ -4,6 +4,10 @@ import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 
+import {
+  resolveCopySelection,
+  type CopySurface,
+} from "./copy-selection";
 import "./styles.css";
 import type {
   RouteMessageRequest,
@@ -98,8 +102,6 @@ app.innerHTML = `
     </div>
   </div>
 `;
-
-type CopySurface = string | "system" | null;
 
 class SessionTerminal {
   readonly name: string;
@@ -691,25 +693,35 @@ function wireTerminalShortcuts(): void {
       return;
     }
 
-      const key = event.key.toLowerCase();
-      if (key === "c") {
-        const selection = resolveDynamicCopySelection();
-        if (!selection) {
-          return;
-        }
+    const key = event.key.toLowerCase();
+    if (key === "c") {
+      const selection = resolveCopySelection({
+        domSelection: activeNonTerminalDomSelectionText(),
+        activeSurface: activeCopySurface,
+        terminalSelections: Object.fromEntries(
+          Array.from(paneMap.entries()).map(([name, pane]) => [
+            name,
+            pane.terminal.getSelection(),
+          ]),
+        ),
+        systemSelection: systemTerminal.getSelection(),
+      });
+      if (!selection) {
+        return;
+      }
 
       event.preventDefault();
       void navigator.clipboard
         .writeText(selection.text)
         .then(() =>
-            writeSystem(
-              "info",
-              selection.kind === "dom"
-                ? "DOM selection copied"
-                : selection.kind === "system"
-                  ? "System log selection copied"
-                  : `${paneLabel(selection.session)} selection copied`,
-            ),
+          writeSystem(
+            "info",
+            selection.kind === "dom"
+              ? "DOM selection copied"
+              : selection.kind === "system"
+                ? "System log selection copied"
+                : `${paneLabel(selection.session)} selection copied`,
+          ),
         )
         .catch((error) =>
           writeSystem(
@@ -737,47 +749,6 @@ function wireTerminalShortcuts(): void {
       void pasteClipboardIntoTerminal(activePane);
     }
   });
-}
-
-function resolveDynamicCopySelection():
-  | { kind: "dom"; text: string }
-  | { kind: "system"; text: string }
-  | { kind: "session"; session: string; text: string }
-  | null {
-  const domSelection = activeNonTerminalDomSelectionText();
-  if (domSelection) {
-    return {
-      kind: "dom",
-      text: domSelection,
-    };
-  }
-
-  if (activeCopySurface === "system") {
-    const systemSelection = systemTerminal.getSelection();
-    if (!systemSelection) {
-      return null;
-    }
-
-    return {
-      kind: "system",
-      text: systemSelection,
-    };
-  }
-
-  if (!activeCopySurface) {
-    return null;
-  }
-
-  const terminalSelection = paneMap.get(activeCopySurface)?.terminal.getSelection();
-  if (!terminalSelection) {
-    return null;
-  }
-
-  return {
-    kind: "session",
-    session: activeCopySurface,
-    text: terminalSelection,
-  };
 }
 
 async function pasteClipboardIntoTerminal(pane: SessionTerminal): Promise<void> {

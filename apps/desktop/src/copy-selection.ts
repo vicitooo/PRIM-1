@@ -1,4 +1,4 @@
-export type SessionName = "claude" | "codex";
+export type SessionName = string;
 export type CopySurface = SessionName | "system" | null;
 
 export type CopySelectionResult =
@@ -19,7 +19,7 @@ export type CopySelectionResult =
 export interface ResolveCopySelectionInput {
   domSelection: string | null;
   activeSurface: CopySurface;
-  terminalSelections: Record<SessionName, string | null>;
+  terminalSelections: Record<string, string | null>;
   systemSelection: string | null;
 }
 
@@ -46,22 +46,22 @@ export function resolveCopySelection(
     };
   }
 
-  if (input.activeSurface === "claude" || input.activeSurface === "codex") {
-    const terminalSelection = normalizeSelectionText(
-      input.terminalSelections[input.activeSurface],
-    );
-    if (!terminalSelection) {
-      return null;
-    }
-
-    return {
-      kind: "session",
-      session: input.activeSurface,
-      text: terminalSelection,
-    };
+  if (!input.activeSurface) {
+    return null;
   }
 
-  return null;
+  const terminalSelection = normalizeSelectionText(
+    input.terminalSelections[input.activeSurface],
+  );
+  if (!terminalSelection) {
+    return null;
+  }
+
+  return {
+    kind: "session",
+    session: input.activeSurface,
+    text: terminalSelection,
+  };
 }
 
 function normalizeSelectionText(text: string | null | undefined): string | null {
