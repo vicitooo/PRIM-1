@@ -51,9 +51,7 @@
 
   /* ── Derived ── */
   color: var(--text-primary);
-  background:
-    radial-gradient(ellipse at top, rgba(212, 115, 106, 0.05), transparent 50%),
-    var(--bg-base);
+  background: var(--bg-base);
   font-family: "Montserrat", "Segoe UI", system-ui, sans-serif;
   font-size: 13px;
   line-height: 1.4;
@@ -78,6 +76,25 @@ body {
 body {
   min-height: 100vh;
   overflow: hidden;
+}
+
+/* ── Breathing ambient glow ── */
+body::before {
+  content: '';
+  position: fixed;
+  top: -20%;
+  left: 25%;
+  width: 50%;
+  height: 45%;
+  background: radial-gradient(ellipse, rgba(212, 115, 106, 0.07), transparent 70%);
+  pointer-events: none;
+  z-index: 0;
+  animation: breathe 6s ease-in-out infinite;
+}
+
+@keyframes breathe {
+  0%, 100% { opacity: 0.6; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.05); }
 }
 
 /* Subtle noise — organic texture, barely visible */
@@ -131,11 +148,18 @@ button.primary {
   background: var(--accent);
   color: #ffffff;
   border-color: rgba(232, 165, 152, 0.25);
+  animation: btnBreathe 4s ease-in-out infinite;
 }
 
 button.primary:hover {
   background: var(--accent-hover);
-  box-shadow: 0 0 12px rgba(212, 115, 106, 0.2);
+  box-shadow: 0 0 16px rgba(212, 115, 106, 0.3);
+  animation: none;
+}
+
+@keyframes btnBreathe {
+  0%, 100% { box-shadow: 0 0 0 rgba(212, 115, 106, 0); }
+  50% { box-shadow: 0 0 12px rgba(212, 115, 106, 0.15); }
 }
 
 select,
@@ -187,11 +211,60 @@ textarea {
   box-shadow:
     0 1px 3px rgba(0, 0, 0, 0.25),
     0 4px 12px rgba(0, 0, 0, 0.15);
+  animation: cardBoot 0.5s var(--easing) both;
+}
+
+/* Staggered boot sequence */
+.topbar              { animation-delay: 0s; }
+.terminal-card:nth-of-type(1) { animation-delay: 0.08s; }
+.terminal-card:nth-of-type(2) { animation-delay: 0.16s; }
+.system-card          { animation-delay: 0.24s; }
+.router-card          { animation-delay: 0.32s; }
+
+@keyframes cardBoot {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Hover lift */
+.terminal-card,
+.system-card,
+.router-card {
+  transition:
+    transform var(--duration-smooth) var(--easing),
+    box-shadow var(--duration-smooth) var(--easing),
+    border-color var(--duration-smooth) ease;
+}
+
+.terminal-card:hover,
+.system-card:hover,
+.router-card:hover {
+  transform: translateY(-1px);
+  box-shadow:
+    0 2px 6px rgba(0, 0, 0, 0.3),
+    0 8px 20px rgba(0, 0, 0, 0.2);
+  border-color: var(--border-default);
+}
+
+/* Active terminal glow — when pane has focus */
+.terminal-card:focus-within {
+  border-color: rgba(212, 115, 106, 0.25);
+  box-shadow:
+    0 2px 6px rgba(0, 0, 0, 0.3),
+    0 8px 20px rgba(0, 0, 0, 0.2),
+    0 0 20px rgba(212, 115, 106, 0.06);
 }
 
 /* ── Topbar: command center header ── */
 
 .topbar {
+  position: relative;
   border-radius: var(--radius-lg);
   padding: 0.45rem 0.85rem;
   display: flex;
@@ -200,6 +273,33 @@ textarea {
   gap: 0.75rem;
   user-select: none;
   border-bottom-color: rgba(212, 115, 106, 0.12);
+  overflow: hidden;
+}
+
+/* Light sweep — slow monitoring pulse */
+.topbar::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -60%;
+  width: 40%;
+  height: 100%;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(212, 115, 106, 0.06),
+    rgba(232, 165, 152, 0.03),
+    transparent
+  );
+  pointer-events: none;
+  animation: sweep 10s ease-in-out infinite;
+  animation-delay: 2s;
+}
+
+@keyframes sweep {
+  0% { left: -60%; }
+  50% { left: 100%; }
+  100% { left: -60%; }
 }
 
 .eyebrow {
@@ -227,6 +327,24 @@ textarea {
   font-weight: 700;
   line-height: 1.1;
   letter-spacing: -0.025em;
+  background: linear-gradient(
+    90deg,
+    var(--text-primary) 0%,
+    var(--accent-text) 45%,
+    var(--text-primary) 55%,
+    var(--text-primary) 100%
+  );
+  background-size: 300% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: shimmer 8s ease-in-out infinite;
+  animation-delay: 3s;
+}
+
+@keyframes shimmer {
+  0%, 100% { background-position: 100% 50%; }
+  50% { background-position: 0% 50%; }
 }
 
 .card-head h2 {
