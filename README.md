@@ -36,6 +36,7 @@ Current pair model:
 - wrapper boot now seeds only the protected `main` pair (`claude` + `codex`)
 - extra pairs are created dynamically in the sidebar and remain ephemeral for the lifetime of the wrapper process
 - audit history is append-only, so rename/delete changes do not rewrite prior events under old pair names
+- pair CRUD preserves already-running pane terminals during structural updates, and create/rename flows can keep the intended pair active instead of snapping the UI back to a blank-looking `main`
 
 Current verified commands:
 

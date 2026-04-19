@@ -457,14 +457,14 @@ async function bootstrap(): Promise<void> {
   writeSystem("info", "UI attached to supervisor.");
 }
 
-async function refreshSnapshot(): Promise<RuntimeSnapshot> {
+async function refreshSnapshot(preferredActiveGroup?: string): Promise<RuntimeSnapshot> {
   const snapshot = await command<RuntimeSnapshot>("bootstrap");
-  applySnapshot(snapshot);
+  applySnapshot(snapshot, preferredActiveGroup);
   return snapshot;
 }
 
-function applySnapshot(snapshot: RuntimeSnapshot): void {
-  syncPaneInventory(snapshot.sessions);
+function applySnapshot(snapshot: RuntimeSnapshot, preferredActiveGroup?: string): void {
+  syncPaneInventory(snapshot.sessions, preferredActiveGroup);
   populateRouterOptions(snapshot.sessions);
   controlEndpoint.textContent = snapshot.control_plane?.endpoint ?? "starting...";
   auditPath.textContent = snapshot.audit_log_path;
@@ -478,6 +478,22 @@ function applySnapshot(snapshot: RuntimeSnapshot): void {
 
 function currentActiveGroupName(): string {
   return activeGroupLabel.textContent?.trim() || resolveInitialGroup(currentGroups);
+}
+
+function resolveActiveGroupPreference(
+  groups: PaneGroup[],
+  preferredGroup?: string,
+): string {
+  if (preferredGroup && groups.some((group) => group.name === preferredGroup)) {
+    return preferredGroup;
+  }
+
+  const current = activeGroupLabel.textContent?.trim();
+  if (current && groups.some((group) => group.name === current)) {
+    return current;
+  }
+
+  return resolveInitialGroup(groups);
 }
 
 function canManagePairGroup(name: string): boolean {
@@ -570,7 +586,7 @@ function startCreatePair(): void {
 }
 
 function cancelCreatePair(): void {
-  if (pairCrudPending) {
+  if (pairCrudPending || !createPairMode) {
     return;
   }
   createPairMode = false;
@@ -593,7 +609,7 @@ function startRenamePair(name: string): void {
 }
 
 function cancelRenamePair(): void {
-  if (pairCrudPending) {
+  if (pairCrudPending || !renamePairTarget) {
     return;
   }
   renamePairTarget = null;
@@ -664,7 +680,10 @@ function handleRuntimeEvent(event: RuntimeEvent): void {
   }
 }
 
-function syncPaneInventory(sessions: SessionSnapshot[]): void {
+function syncPaneInventory(
+  sessions: SessionSnapshot[],
+  preferredActiveGroup?: string,
+): void {
   const signature = sessions
     .map((session) => `${session.name}:${session.title}`)
     .join("|");
@@ -673,20 +692,41 @@ function syncPaneInventory(sessions: SessionSnapshot[]): void {
   }
 
   renderedSessionSignature = signature;
-  snapshotByName.clear();
-  for (const pane of paneMap.values()) {
-    pane.dispose();
-  }
-  paneMap.clear();
-  renderSessionCards(sessions);
+  const nextNames = new Set(sessions.map((session) => session.name));
+  const fragment = document.createDocumentFragment();
 
   for (const session of sessions) {
-    paneMap.set(session.name, new SessionTerminal(session.name, session.title));
+    const existingCard = document.querySelector<HTMLElement>(
+      `[data-session-card="${session.name}"]`,
+    );
+    const card = existingCard ?? buildSessionCard(session);
+    card.dataset.group = groupNameForSession(session.name);
+    const title = card.querySelector("h2");
+    if (title instanceof HTMLHeadingElement) {
+      title.textContent = session.title;
+    }
+    fragment.appendChild(card);
+  }
+
+  workspaceGrid.replaceChildren(fragment);
+
+  for (const [name, pane] of Array.from(paneMap.entries())) {
+    if (!nextNames.has(name)) {
+      pane.dispose();
+      paneMap.delete(name);
+      snapshotByName.delete(name);
+    }
+  }
+
+  for (const session of sessions) {
+    if (!paneMap.has(session.name)) {
+      paneMap.set(session.name, new SessionTerminal(session.name, session.title));
+    }
   }
 
   currentGroups = groupSessions(sessions);
   syncPairCrudStateToGroups();
-  refreshPairPicker(resolveInitialGroup(currentGroups));
+  refreshPairPicker(resolveActiveGroupPreference(currentGroups, preferredActiveGroup));
 
   if (activeTerminalName && !paneMap.has(activeTerminalName)) {
     activeTerminalName = null;
@@ -697,14 +737,6 @@ function syncPaneInventory(sessions: SessionSnapshot[]): void {
 
   applyTheme(currentThemeName());
   wireButtons();
-}
-
-function renderSessionCards(sessions: SessionSnapshot[]): void {
-  const fragment = document.createDocumentFragment();
-  for (const session of sessions) {
-    fragment.appendChild(buildSessionCard(session));
-  }
-  workspaceGrid.replaceChildren(fragment);
 }
 
 function buildSessionCard(session: SessionSnapshot): HTMLElement {
@@ -727,9 +759,9 @@ function buildSessionCard(session: SessionSnapshot): HTMLElement {
       </div>
     </div>
     <div class="terminal-actions">
-      <button data-action="start" data-session="${session.name}">Launch</button>
-      <button data-action="restart" data-session="${session.name}">Restart</button>
-      <button data-action="stop" data-session="${session.name}">Stop</button>
+      <button type="button" data-action="start" data-session="${session.name}">Launch</button>
+      <button type="button" data-action="restart" data-session="${session.name}">Restart</button>
+      <button type="button" data-action="stop" data-session="${session.name}">Stop</button>
     </div>
     <div class="terminal-host" data-terminal="${session.name}"></div>
   `;
@@ -838,6 +870,7 @@ function renderGroupPicker(groups: PaneGroup[]): void {
       }
     } else {
       const button = document.createElement("button");
+      button.type = "button";
       button.className = "group-chip";
       button.dataset.group = group.name;
       button.dataset.active = String(group.name === activeGroup);
@@ -991,8 +1024,7 @@ async function submitCreatePair(): Promise<void> {
     createPairMode = false;
     createPairDraft = "";
     pairCrudPending = false;
-    await refreshSnapshot();
-    setActiveGroup(name);
+    await refreshSnapshot(name);
   } catch (error) {
     pairCrudPending = false;
     createPairError = String(error);
@@ -1026,10 +1058,7 @@ async function submitRenamePair(): Promise<void> {
     renamePairTarget = null;
     renamePairDraft = "";
     pairCrudPending = false;
-    await refreshSnapshot();
-    if (wasActive) {
-      setActiveGroup(newName);
-    }
+    await refreshSnapshot(wasActive ? newName : undefined);
   } catch (error) {
     pairCrudPending = false;
     renamePairError = String(error);
@@ -1052,10 +1081,7 @@ async function confirmDeletePair(): Promise<void> {
     });
     deletePairTarget = null;
     pairCrudPending = false;
-    await refreshSnapshot();
-    if (wasActive) {
-      setActiveGroup("main");
-    }
+    await refreshSnapshot(wasActive ? "main" : undefined);
   } catch (error) {
     pairCrudPending = false;
     writeSystem("error", `delete ${name} failed: ${String(error)}`);
@@ -1325,6 +1351,11 @@ function wireButtons(): void {
     const action = button.dataset.action;
     const session = button.dataset.session;
     if (!action || !session) {
+      return;
+    }
+
+    if (action === "start" && snapshotByName.get(session)?.running) {
+      writeSystem("info", `${paneLabel(session)} is already running`);
       return;
     }
 
