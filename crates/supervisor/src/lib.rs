@@ -1631,9 +1631,17 @@ impl SupervisorHandle {
                     .and_then(|_| self.send_control_key(&name, key))
                     .map(|_| format!("key {:?} sent", key))
             }
-            SidebandRequest::RouteMessage { request, .. } => {
+            SidebandRequest::RouteMessage { token, mut request } => {
                 tokio::task::yield_now().await;
-                self.route_message(request).map(|_| "message routed".into())
+                self.resolve_route_sender_identity(&token)
+                    .map(|bound| {
+                        if let Some(name) = bound {
+                            request.from = name;
+                        }
+                        request
+                    })
+                    .and_then(|req| self.route_message(req))
+                    .map(|_| "message routed".into())
             }
             lifecycle => {
                 return SidebandResponse {
@@ -1968,6 +1976,18 @@ impl SupervisorHandle {
         }
 
         Ok(())
+    }
+
+    fn resolve_route_sender_identity(&self, token: &str) -> Result<Option<String>> {
+        let binding = self
+            .inner
+            .token_bindings
+            .lock()
+            .get(token)
+            .cloned()
+            .ok_or_else(|| anyhow!("invalid control plane token"))?;
+
+        Ok(binding)
     }
 
     fn validate_deliver_message_token(&self, token: &str, target_session: &str) -> Result<()> {
@@ -4914,6 +4934,106 @@ mod tests {
         assert!(response.ok);
         assert_eq!(response.message, "sessions listed");
         assert_eq!(response.snapshot.unwrap().sessions.len(), 8);
+    }
+
+    #[test]
+    fn route_message_overrides_from_with_bound_session_identity() {
+        let supervisor = test_supervisor();
+        let claude_token = session_token(&supervisor, "claude");
+        let cursor = supervisor.current_eof_cursor().unwrap();
+        let (claude_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        let (codex_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "claude", DriverKind::Claude, claude_pty);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, codex_pty);
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::RouteMessage {
+            token: claude_token.clone(),
+            request: RouteMessageRequest {
+                from: "spoofed-name".into(),
+                to: "codex".into(),
+                scope: MessageScope::Direct,
+                content: "hi".into(),
+            },
+        });
+
+        assert!(response.ok, "got: {}", response.message);
+
+        let routed = supervisor.apply_sideband_request(SidebandRequest::EventsSince {
+            token: claude_token,
+            cursor: Some(cursor),
+            max_events: Some(10),
+            max_wait_seconds: Some(0),
+            filter: Some(EventFilter {
+                include_kinds: vec!["routed_message".into()],
+                include_sessions: Vec::new(),
+                include_scopes: Vec::new(),
+            }),
+        });
+        let (events, _, _, _) = unwrap_events_since(routed);
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            RuntimeEvent::RoutedMessage {
+                from,
+                to,
+                scope,
+                content,
+                ..
+            } if from == "claude"
+                && to == "codex"
+                && *scope == MessageScope::Direct
+                && content == "hi"
+        ));
+    }
+
+    #[test]
+    fn route_message_preserves_user_from_for_root_token() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let cursor = supervisor.current_eof_cursor().unwrap();
+        let (claude_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "claude", DriverKind::Claude, claude_pty);
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::RouteMessage {
+            token: status.token.clone(),
+            request: RouteMessageRequest {
+                from: "victor".into(),
+                to: "claude".into(),
+                scope: MessageScope::Direct,
+                content: "hi".into(),
+            },
+        });
+
+        assert!(response.ok, "got: {}", response.message);
+
+        let routed = supervisor.apply_sideband_request(SidebandRequest::EventsSince {
+            token: status.token,
+            cursor: Some(cursor),
+            max_events: Some(10),
+            max_wait_seconds: Some(0),
+            filter: Some(EventFilter {
+                include_kinds: vec!["routed_message".into()],
+                include_sessions: Vec::new(),
+                include_scopes: Vec::new(),
+            }),
+        });
+        let (events, _, _, _) = unwrap_events_since(routed);
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            RuntimeEvent::RoutedMessage {
+                from,
+                to,
+                scope,
+                content,
+                ..
+            } if from == "victor"
+                && to == "claude"
+                && *scope == MessageScope::Direct
+                && content == "hi"
+        ));
     }
 
     #[test]
