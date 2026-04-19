@@ -334,6 +334,8 @@ let deletePairTarget: string | null = null;
 let pairCrudPending = false;
 let pendingPairFocus: PairFocusTarget = null;
 let pairPickerDismissWired = false;
+let pairPickerActionsWired = false;
+let paneButtonsWired = false;
 
 /* ── Theme system ── */
 
@@ -1109,12 +1111,68 @@ function wirePairPickerDismiss(): void {
   });
 }
 
-function wirePicker(): void {
-  wirePairPickerDismiss();
+function wirePairPickerActions(): void {
+  if (pairPickerActionsWired) {
+    return;
+  }
+  pairPickerActionsWired = true;
 
-  document.querySelector<HTMLButtonElement>("#new-pair-button")?.addEventListener("click", () => {
-    startCreatePair();
+  document.addEventListener("click", (event) => {
+    if (!(event.target instanceof Element)) {
+      return;
+    }
+
+    const actionButton = event.target.closest<HTMLButtonElement>("[data-pair-menu-action]");
+    if (actionButton) {
+      if (actionButton.disabled) {
+        return;
+      }
+      const name = actionButton.dataset.group;
+      const pairAction = actionButton.dataset.pairMenuAction;
+      if (!name || !pairAction) {
+        return;
+      }
+      if (pairAction === "rename") {
+        startRenamePair(name);
+      } else if (pairAction === "delete") {
+        openDeletePairDialog(name);
+      }
+      return;
+    }
+
+    const toggle = event.target.closest<HTMLButtonElement>("[data-group-menu-toggle]");
+    if (toggle) {
+      const name = toggle.dataset.groupMenuToggle;
+      if (!name) {
+        return;
+      }
+      openPairMenu = openPairMenu === name ? null : name;
+      refreshPairPicker();
+      return;
+    }
+
+    const chip = event.target.closest<HTMLButtonElement>(".group-chip");
+    if (chip) {
+      const name = chip.dataset.group;
+      if (!name) {
+        return;
+      }
+      openPairMenu = null;
+      refreshPairPicker(name);
+      return;
+    }
+
+    const newPair = event.target.closest<HTMLButtonElement>("#new-pair-button");
+    if (newPair) {
+      startCreatePair();
+      return;
+    }
   });
+}
+
+function wirePicker(): void {
+  wirePairPickerActions();
+  wirePairPickerDismiss();
 
   document
     .querySelector<HTMLInputElement>("[data-pair-create-input]")
@@ -1139,49 +1197,6 @@ function wirePicker(): void {
     ?.addEventListener("blur", () => {
       cancelCreatePair();
     });
-
-  for (const chip of document.querySelectorAll<HTMLButtonElement>(".group-chip")) {
-    chip.addEventListener("click", () => {
-      const name = chip.dataset.group;
-      if (!name) {
-        return;
-      }
-      openPairMenu = null;
-      refreshPairPicker(name);
-    });
-  }
-
-  for (const toggle of document.querySelectorAll<HTMLButtonElement>("[data-group-menu-toggle]")) {
-    toggle.addEventListener("click", (event) => {
-      event.stopPropagation();
-      const name = toggle.dataset.groupMenuToggle;
-      if (!name) {
-        return;
-      }
-      openPairMenu = openPairMenu === name ? null : name;
-      refreshPairPicker();
-    });
-  }
-
-  for (const action of document.querySelectorAll<HTMLButtonElement>("[data-pair-menu-action]")) {
-    action.addEventListener("click", (event) => {
-      event.stopPropagation();
-      if (action.disabled) {
-        return;
-      }
-      const name = action.dataset.group;
-      const pairAction = action.dataset.pairMenuAction;
-      if (!name || !pairAction) {
-        return;
-      }
-      if (pairAction === "rename") {
-        startRenamePair(name);
-      }
-      if (pairAction === "delete") {
-        openDeletePairDialog(name);
-      }
-    });
-  }
 
   for (const input of document.querySelectorAll<HTMLInputElement>("[data-pair-rename-input]")) {
     input.addEventListener("input", (event) => {
@@ -1294,43 +1309,49 @@ function optionElement(value: string, label: string): HTMLOptionElement {
 }
 
 function wireButtons(): void {
-  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-action]")) {
-    button.addEventListener("click", async () => {
-      const action = button.dataset.action;
-      const session = button.dataset.session;
-      if (!action || !session) {
-        return;
-      }
-
-      try {
-        if (action === "start") {
-          const snapshot = await command<SessionSnapshot>("start_session", {
-            request: { name: session },
-          });
-          snapshotByName.set(snapshot.name, snapshot);
-          paneMap.get(snapshot.name)?.applySnapshot(snapshot);
-        }
-
-        if (action === "restart") {
-          const snapshot = await command<SessionSnapshot>("restart_session", {
-            request: { name: session },
-          });
-          snapshotByName.set(snapshot.name, snapshot);
-          paneMap.get(snapshot.name)?.applySnapshot(snapshot);
-        }
-
-        if (action === "stop") {
-          const snapshot = await command<SessionSnapshot>("stop_session", {
-            request: { name: session },
-          });
-          snapshotByName.set(snapshot.name, snapshot);
-          paneMap.get(snapshot.name)?.applySnapshot(snapshot);
-        }
-      } catch (error) {
-        writeSystem("error", `${action} ${session} failed: ${String(error)}`);
-      }
-    });
+  if (paneButtonsWired) {
+    return;
   }
+  paneButtonsWired = true;
+
+  document.addEventListener("click", async (event) => {
+    if (!(event.target instanceof Element)) {
+      return;
+    }
+    const button = event.target.closest<HTMLButtonElement>("[data-action]");
+    if (!button) {
+      return;
+    }
+    const action = button.dataset.action;
+    const session = button.dataset.session;
+    if (!action || !session) {
+      return;
+    }
+
+    try {
+      if (action === "start") {
+        const snapshot = await command<SessionSnapshot>("start_session", {
+          request: { name: session },
+        });
+        snapshotByName.set(snapshot.name, snapshot);
+        paneMap.get(snapshot.name)?.applySnapshot(snapshot);
+      } else if (action === "restart") {
+        const snapshot = await command<SessionSnapshot>("restart_session", {
+          request: { name: session },
+        });
+        snapshotByName.set(snapshot.name, snapshot);
+        paneMap.get(snapshot.name)?.applySnapshot(snapshot);
+      } else if (action === "stop") {
+        const snapshot = await command<SessionSnapshot>("stop_session", {
+          request: { name: session },
+        });
+        snapshotByName.set(snapshot.name, snapshot);
+        paneMap.get(snapshot.name)?.applySnapshot(snapshot);
+      }
+    } catch (error) {
+      writeSystem("error", `${action} ${session} failed: ${String(error)}`);
+    }
+  });
 }
 
 function wireRouter(): void {
