@@ -10,6 +10,9 @@ import {
 } from "./copy-selection";
 import "./styles.css";
 import type {
+  CreatePairRequest,
+  DeletePairRequest,
+  RenamePairRequest,
   RouteMessageRequest,
   RuntimeEvent,
   RuntimeSnapshot,
@@ -21,6 +24,12 @@ interface PaneGroup {
   name: string;
   paneNames: string[];
 }
+
+type PairFocusTarget = "create" | "delete" | `rename:${string}` | null;
+
+const RESERVED_PAIR_NAMES = new Set(["main", "claude", "codex", "room", "victor"]);
+const PAIR_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
+const PAIR_NAME_MAX_LEN = 48;
 
 const app = document.querySelector("#app");
 if (!(app instanceof HTMLDivElement)) {
@@ -56,9 +65,13 @@ app.innerHTML = `
             <p class="card-kicker">Pair picker</p>
             <h2>Active pair</h2>
           </div>
-          <span class="mono" id="group-count">0 groups</span>
+          <div class="group-picker-tools">
+            <span class="mono" id="group-count">0 groups</span>
+            <div id="pair-create-slot"></div>
+          </div>
         </div>
         <ul class="group-list" id="group-list"></ul>
+        <div id="pair-dialog-slot"></div>
       </aside>
 
       <section class="workspace-grid" id="workspace-grid"></section>
@@ -298,6 +311,8 @@ systemTerminalHost.addEventListener("mousedown", () => {
 const workspaceGrid = must<HTMLDivElement>("#workspace-grid");
 const groupList = must<HTMLUListElement>("#group-list");
 const groupCount = must<HTMLElement>("#group-count");
+const pairCreateSlot = must<HTMLDivElement>("#pair-create-slot");
+const pairDialogSlot = must<HTMLDivElement>("#pair-dialog-slot");
 const snapshotByName = new Map<string, SessionSnapshot>();
 const paneMap = new Map<string, SessionTerminal>();
 const controlEndpoint = must<HTMLElement>("#control-endpoint");
@@ -308,6 +323,17 @@ let renderedSessionSignature: string | null = null;
 let activeTerminalName: string | null = null;
 let activeCopySurface: CopySurface = null;
 let currentGroups: PaneGroup[] = [];
+let createPairMode = false;
+let createPairDraft = "";
+let createPairError: string | null = null;
+let renamePairTarget: string | null = null;
+let renamePairDraft = "";
+let renamePairError: string | null = null;
+let openPairMenu: string | null = null;
+let deletePairTarget: string | null = null;
+let pairCrudPending = false;
+let pendingPairFocus: PairFocusTarget = null;
+let pairPickerDismissWired = false;
 
 /* ── Theme system ── */
 
@@ -425,9 +451,14 @@ void listen<RuntimeEvent>("runtime://event", ({ payload }) => {
 void bootstrap();
 
 async function bootstrap(): Promise<void> {
+  await refreshSnapshot();
+  writeSystem("info", "UI attached to supervisor.");
+}
+
+async function refreshSnapshot(): Promise<RuntimeSnapshot> {
   const snapshot = await command<RuntimeSnapshot>("bootstrap");
   applySnapshot(snapshot);
-  writeSystem("info", "UI attached to supervisor.");
+  return snapshot;
 }
 
 function applySnapshot(snapshot: RuntimeSnapshot): void {
@@ -441,6 +472,147 @@ function applySnapshot(snapshot: RuntimeSnapshot): void {
     snapshotByName.set(session.name, session);
     paneMap.get(session.name)?.applySnapshot(session);
   }
+}
+
+function currentActiveGroupName(): string {
+  return activeGroupLabel.textContent?.trim() || resolveInitialGroup(currentGroups);
+}
+
+function canManagePairGroup(name: string): boolean {
+  return name !== "main" && name !== "other";
+}
+
+function isPairRunning(name: string): boolean {
+  const group = currentGroups.find((candidate) => candidate.name === name);
+  return group?.paneNames.some((paneName) => snapshotByName.get(paneName)?.running) ?? false;
+}
+
+function validatePairName(name: string, ignoreName?: string): string | null {
+  const trimmed = name.trim();
+  if (!trimmed) {
+    return "Pair name cannot be empty.";
+  }
+  if (trimmed.length > PAIR_NAME_MAX_LEN) {
+    return `Pair name cannot exceed ${PAIR_NAME_MAX_LEN} characters.`;
+  }
+  if (RESERVED_PAIR_NAMES.has(trimmed)) {
+    return `Pair name "${trimmed}" is reserved.`;
+  }
+  if (!PAIR_NAME_PATTERN.test(trimmed)) {
+    return "Use only letters, numbers, hyphens, and underscores.";
+  }
+  if (currentGroups.some((group) => group.name === trimmed && group.name !== ignoreName)) {
+    return `Pair "${trimmed}" already exists.`;
+  }
+  return null;
+}
+
+function syncPairCrudStateToGroups(): void {
+  const groupNames = new Set(currentGroups.map((group) => group.name));
+  if (renamePairTarget && !groupNames.has(renamePairTarget)) {
+    renamePairTarget = null;
+    renamePairDraft = "";
+    renamePairError = null;
+  }
+  if (openPairMenu && !groupNames.has(openPairMenu)) {
+    openPairMenu = null;
+  }
+  if (deletePairTarget && !groupNames.has(deletePairTarget)) {
+    deletePairTarget = null;
+  }
+}
+
+function focusPendingPairControl(): void {
+  const target = pendingPairFocus;
+  if (!target) {
+    return;
+  }
+
+  pendingPairFocus = null;
+  requestAnimationFrame(() => {
+    if (target === "create") {
+      document.querySelector<HTMLInputElement>("[data-pair-create-input]")?.focus();
+      return;
+    }
+    if (target === "delete") {
+      document.querySelector<HTMLButtonElement>("[data-pair-delete-confirm]")?.focus();
+      return;
+    }
+    if (target.startsWith("rename:")) {
+      const name = target.slice("rename:".length);
+      document
+        .querySelector<HTMLInputElement>(`[data-pair-rename-input="${name}"]`)
+        ?.focus();
+    }
+  });
+}
+
+function refreshPairPicker(activeGroup = currentActiveGroupName()): void {
+  renderGroupPicker(currentGroups);
+  wirePicker();
+  setActiveGroup(activeGroup);
+  focusPendingPairControl();
+}
+
+function startCreatePair(): void {
+  openPairMenu = null;
+  deletePairTarget = null;
+  renamePairTarget = null;
+  renamePairDraft = "";
+  renamePairError = null;
+  createPairMode = true;
+  createPairDraft = "";
+  createPairError = null;
+  pendingPairFocus = "create";
+  refreshPairPicker();
+}
+
+function cancelCreatePair(): void {
+  if (pairCrudPending) {
+    return;
+  }
+  createPairMode = false;
+  createPairDraft = "";
+  createPairError = null;
+  refreshPairPicker();
+}
+
+function startRenamePair(name: string): void {
+  openPairMenu = null;
+  createPairMode = false;
+  createPairDraft = "";
+  createPairError = null;
+  deletePairTarget = null;
+  renamePairTarget = name;
+  renamePairDraft = name;
+  renamePairError = null;
+  pendingPairFocus = `rename:${name}`;
+  refreshPairPicker();
+}
+
+function cancelRenamePair(): void {
+  if (pairCrudPending) {
+    return;
+  }
+  renamePairTarget = null;
+  renamePairDraft = "";
+  renamePairError = null;
+  refreshPairPicker();
+}
+
+function openDeletePairDialog(name: string): void {
+  openPairMenu = null;
+  deletePairTarget = name;
+  pendingPairFocus = "delete";
+  refreshPairPicker();
+}
+
+function closeDeletePairDialog(): void {
+  if (pairCrudPending) {
+    return;
+  }
+  deletePairTarget = null;
+  refreshPairPicker();
 }
 
 function handleRuntimeEvent(event: RuntimeEvent): void {
@@ -465,6 +637,15 @@ function handleRuntimeEvent(event: RuntimeEvent): void {
       writeSystem("info", `${event.session} -> ${event.state} (${event.reason})`);
       break;
     }
+    case "pair_created":
+      writeSystem("info", `pair created: ${event.name}`);
+      break;
+    case "pair_renamed":
+      writeSystem("info", `pair renamed: ${event.old_name} -> ${event.new_name}`);
+      break;
+    case "pair_deleted":
+      writeSystem("info", `pair deleted: ${event.name}`);
+      break;
     case "system_log":
       writeSystem(event.level, event.message);
       break;
@@ -502,7 +683,8 @@ function syncPaneInventory(sessions: SessionSnapshot[]): void {
   }
 
   currentGroups = groupSessions(sessions);
-  renderGroupPicker(currentGroups);
+  syncPairCrudStateToGroups();
+  refreshPairPicker(resolveInitialGroup(currentGroups));
 
   if (activeTerminalName && !paneMap.has(activeTerminalName)) {
     activeTerminalName = null;
@@ -513,8 +695,6 @@ function syncPaneInventory(sessions: SessionSnapshot[]): void {
 
   applyTheme(currentThemeName());
   wireButtons();
-  wirePicker();
-  setActiveGroup(resolveInitialGroup(currentGroups));
 }
 
 function renderSessionCards(sessions: SessionSnapshot[]): void {
@@ -627,30 +807,412 @@ function paneRoleRank(name: string): number {
 
 function renderGroupPicker(groups: PaneGroup[]): void {
   groupCount.textContent = `${groups.length} ${groups.length === 1 ? "group" : "groups"}`;
+  renderPairCreateControl();
+
   const fragment = document.createDocumentFragment();
+  const activeGroup = currentActiveGroupName();
   for (const group of groups) {
     const item = document.createElement("li");
-    const button = document.createElement("button");
-    button.className = "group-chip";
-    button.dataset.group = group.name;
-    button.dataset.active = "false";
-    button.textContent = group.name;
-    item.appendChild(button);
+    const shell = document.createElement("div");
+    shell.className = "group-chip-shell";
+    shell.dataset.groupRoot = group.name;
+    shell.dataset.active = String(group.name === activeGroup);
+
+    if (renamePairTarget === group.name) {
+      const input = document.createElement("input");
+      input.type = "text";
+      input.className = "new-pair-input";
+      input.value = renamePairDraft;
+      input.placeholder = "pair name";
+      input.dataset.pairRenameInput = group.name;
+      input.disabled = pairCrudPending;
+      shell.appendChild(input);
+
+      if (renamePairError) {
+        const error = document.createElement("span");
+        error.className = "pair-error";
+        error.textContent = renamePairError;
+        shell.appendChild(error);
+      }
+    } else {
+      const button = document.createElement("button");
+      button.className = "group-chip";
+      button.dataset.group = group.name;
+      button.dataset.active = String(group.name === activeGroup);
+      button.textContent = group.name;
+      shell.appendChild(button);
+    }
+
+    if (canManagePairGroup(group.name) && renamePairTarget !== group.name) {
+      const menuRoot = document.createElement("div");
+      menuRoot.className = "chip-menu-root";
+      menuRoot.dataset.chipMenuRoot = group.name;
+
+      const menuButton = document.createElement("button");
+      menuButton.type = "button";
+      menuButton.className = "chip-menu-button";
+      menuButton.dataset.groupMenuToggle = group.name;
+      menuButton.setAttribute("aria-label", `Manage ${group.name}`);
+      menuButton.textContent = "⋯";
+      menuRoot.appendChild(menuButton);
+
+      if (openPairMenu === group.name) {
+        const menu = document.createElement("div");
+        menu.className = "chip-menu panel";
+        const pairRunning = isPairRunning(group.name);
+        const actions: Array<["rename" | "delete", string]> = [
+          ["rename", "Rename"],
+          ["delete", "Delete"],
+        ];
+
+        for (const [action, label] of actions) {
+          const actionButton = document.createElement("button");
+          actionButton.type = "button";
+          actionButton.className = "chip-menu-action";
+          actionButton.textContent = label;
+          actionButton.dataset.pairMenuAction = action;
+          actionButton.dataset.group = group.name;
+          actionButton.disabled = pairRunning || pairCrudPending;
+          actionButton.title = pairRunning
+            ? `Stop both panes to ${action}`
+            : "";
+          menu.appendChild(actionButton);
+        }
+
+        menuRoot.appendChild(menu);
+      }
+
+      shell.appendChild(menuRoot);
+    }
+
+    item.appendChild(shell);
     fragment.appendChild(item);
   }
   groupList.replaceChildren(fragment);
+  renderDeletePairDialog();
+}
+
+function renderPairCreateControl(): void {
+  pairCreateSlot.replaceChildren();
+
+  if (!createPairMode) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "new-pair-button";
+    button.id = "new-pair-button";
+    button.textContent = "+ New pair";
+    button.disabled = pairCrudPending;
+    pairCreateSlot.appendChild(button);
+    return;
+  }
+
+  const wrapper = document.createElement("div");
+  wrapper.className = "pair-inline-editor";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "new-pair-input";
+  input.value = createPairDraft;
+  input.placeholder = "pair name";
+  input.dataset.pairCreateInput = "true";
+  input.disabled = pairCrudPending;
+  wrapper.appendChild(input);
+
+  if (createPairError) {
+    const error = document.createElement("span");
+    error.className = "pair-error";
+    error.textContent = createPairError;
+    wrapper.appendChild(error);
+  }
+
+  pairCreateSlot.appendChild(wrapper);
+}
+
+function renderDeletePairDialog(): void {
+  pairDialogSlot.replaceChildren();
+  if (!deletePairTarget) {
+    return;
+  }
+
+  const overlay = document.createElement("div");
+  overlay.className = "pair-dialog-overlay";
+  const dialog = document.createElement("div");
+  dialog.className = "pair-dialog panel";
+  dialog.innerHTML = `
+    <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
+    <p class="card-kicker">Delete pair</p>
+    <h3>Delete pair "${deletePairTarget}"?</h3>
+    <p>Both panes will be stopped and removed. Audit history is preserved.</p>
+  `;
+
+  const actions = document.createElement("div");
+  actions.className = "pair-dialog-actions";
+
+  const cancelButton = document.createElement("button");
+  cancelButton.type = "button";
+  cancelButton.textContent = "Cancel";
+  cancelButton.dataset.pairDeleteCancel = deletePairTarget;
+  cancelButton.disabled = pairCrudPending;
+
+  const deleteButton = document.createElement("button");
+  deleteButton.type = "button";
+  deleteButton.className = "danger";
+  deleteButton.textContent = "Delete";
+  deleteButton.disabled = pairCrudPending;
+  deleteButton.setAttribute("data-pair-delete-confirm", deletePairTarget);
+
+  actions.append(cancelButton, deleteButton);
+  dialog.appendChild(actions);
+  overlay.appendChild(dialog);
+  pairDialogSlot.appendChild(overlay);
+}
+
+async function submitCreatePair(): Promise<void> {
+  if (pairCrudPending) {
+    return;
+  }
+
+  const name = createPairDraft.trim();
+  const validationError = validatePairName(name);
+  if (validationError) {
+    createPairError = validationError;
+    pendingPairFocus = "create";
+    refreshPairPicker();
+    return;
+  }
+
+  pairCrudPending = true;
+  createPairError = null;
+  try {
+    await command<SessionSnapshot[]>("create_pair", {
+      request: { name } satisfies CreatePairRequest,
+    });
+    createPairMode = false;
+    createPairDraft = "";
+    pairCrudPending = false;
+    await refreshSnapshot();
+    setActiveGroup(name);
+  } catch (error) {
+    pairCrudPending = false;
+    createPairError = String(error);
+    pendingPairFocus = "create";
+    refreshPairPicker();
+  }
+}
+
+async function submitRenamePair(): Promise<void> {
+  if (pairCrudPending || !renamePairTarget) {
+    return;
+  }
+
+  const oldName = renamePairTarget;
+  const newName = renamePairDraft.trim();
+  const validationError = validatePairName(newName, oldName);
+  if (validationError) {
+    renamePairError = validationError;
+    pendingPairFocus = `rename:${oldName}`;
+    refreshPairPicker();
+    return;
+  }
+
+  const wasActive = currentActiveGroupName() === oldName;
+  pairCrudPending = true;
+  renamePairError = null;
+  try {
+    await command<SessionSnapshot[]>("rename_pair", {
+      request: { oldName, newName } satisfies RenamePairRequest,
+    });
+    renamePairTarget = null;
+    renamePairDraft = "";
+    pairCrudPending = false;
+    await refreshSnapshot();
+    if (wasActive) {
+      setActiveGroup(newName);
+    }
+  } catch (error) {
+    pairCrudPending = false;
+    renamePairError = String(error);
+    pendingPairFocus = `rename:${oldName}`;
+    refreshPairPicker();
+  }
+}
+
+async function confirmDeletePair(): Promise<void> {
+  if (pairCrudPending || !deletePairTarget) {
+    return;
+  }
+
+  const name = deletePairTarget;
+  const wasActive = currentActiveGroupName() === name;
+  pairCrudPending = true;
+  try {
+    await command<void>("delete_pair", {
+      request: { name } satisfies DeletePairRequest,
+    });
+    deletePairTarget = null;
+    pairCrudPending = false;
+    await refreshSnapshot();
+    if (wasActive) {
+      setActiveGroup("main");
+    }
+  } catch (error) {
+    pairCrudPending = false;
+    writeSystem("error", `delete ${name} failed: ${String(error)}`);
+    refreshPairPicker();
+  }
+}
+
+function wirePairPickerDismiss(): void {
+  if (pairPickerDismissWired) {
+    return;
+  }
+
+  const closePairMenu = (): void => {
+    if (!openPairMenu) {
+      return;
+    }
+    openPairMenu = null;
+    refreshPairPicker();
+  };
+
+  pairPickerDismissWired = true;
+  document.addEventListener("click", (event) => {
+    if (!(event.target instanceof Element)) {
+      return;
+    }
+    if (openPairMenu && !event.target.closest("[data-chip-menu-root]")) {
+      closePairMenu();
+    }
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") {
+      return;
+    }
+    if (deletePairTarget) {
+      event.preventDefault();
+      closeDeletePairDialog();
+      return;
+    }
+    if (renamePairTarget) {
+      event.preventDefault();
+      cancelRenamePair();
+      return;
+    }
+    if (createPairMode) {
+      event.preventDefault();
+      cancelCreatePair();
+      return;
+    }
+    if (openPairMenu) {
+      event.preventDefault();
+      closePairMenu();
+    }
+  });
 }
 
 function wirePicker(): void {
+  wirePairPickerDismiss();
+
+  document.querySelector<HTMLButtonElement>("#new-pair-button")?.addEventListener("click", () => {
+    startCreatePair();
+  });
+
+  document
+    .querySelector<HTMLInputElement>("[data-pair-create-input]")
+    ?.addEventListener("input", (event) => {
+      createPairDraft = (event.currentTarget as HTMLInputElement).value;
+      createPairError = null;
+    });
+  document
+    .querySelector<HTMLInputElement>("[data-pair-create-input]")
+    ?.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        void submitCreatePair();
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        cancelCreatePair();
+      }
+    });
+  document
+    .querySelector<HTMLInputElement>("[data-pair-create-input]")
+    ?.addEventListener("blur", () => {
+      cancelCreatePair();
+    });
+
   for (const chip of document.querySelectorAll<HTMLButtonElement>(".group-chip")) {
     chip.addEventListener("click", () => {
       const name = chip.dataset.group;
       if (!name) {
         return;
       }
-      setActiveGroup(name);
+      openPairMenu = null;
+      refreshPairPicker(name);
     });
   }
+
+  for (const toggle of document.querySelectorAll<HTMLButtonElement>("[data-group-menu-toggle]")) {
+    toggle.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const name = toggle.dataset.groupMenuToggle;
+      if (!name) {
+        return;
+      }
+      openPairMenu = openPairMenu === name ? null : name;
+      refreshPairPicker();
+    });
+  }
+
+  for (const action of document.querySelectorAll<HTMLButtonElement>("[data-pair-menu-action]")) {
+    action.addEventListener("click", (event) => {
+      event.stopPropagation();
+      if (action.disabled) {
+        return;
+      }
+      const name = action.dataset.group;
+      const pairAction = action.dataset.pairMenuAction;
+      if (!name || !pairAction) {
+        return;
+      }
+      if (pairAction === "rename") {
+        startRenamePair(name);
+      }
+      if (pairAction === "delete") {
+        openDeletePairDialog(name);
+      }
+    });
+  }
+
+  for (const input of document.querySelectorAll<HTMLInputElement>("[data-pair-rename-input]")) {
+    input.addEventListener("input", (event) => {
+      renamePairDraft = (event.currentTarget as HTMLInputElement).value;
+      renamePairError = null;
+    });
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        void submitRenamePair();
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        cancelRenamePair();
+      }
+    });
+    input.addEventListener("blur", () => {
+      cancelRenamePair();
+    });
+  }
+
+  document
+    .querySelector<HTMLButtonElement>("[data-pair-delete-cancel]")
+    ?.addEventListener("click", () => {
+      closeDeletePairDialog();
+    });
+  document
+    .querySelector<HTMLButtonElement>("[data-pair-delete-confirm]")
+    ?.addEventListener("click", () => {
+      void confirmDeletePair();
+    });
 }
 
 function resolveInitialGroup(groups: PaneGroup[]): string {
@@ -811,8 +1373,7 @@ function wireControls(): void {
     button.addEventListener("click", async () => {
       switch (button.dataset.control) {
         case "refresh": {
-          const snapshot = await command<RuntimeSnapshot>("bootstrap");
-          applySnapshot(snapshot);
+          await refreshSnapshot();
           writeSystem("info", "snapshot refreshed");
           break;
         }

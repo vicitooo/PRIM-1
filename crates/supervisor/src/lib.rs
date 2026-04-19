@@ -30,6 +30,8 @@ type EventSink = Arc<dyn Fn(RuntimeEvent) + Send + Sync>;
 
 const CONTROL_PLANE_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const CONTROL_PLANE_PROBE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+const PAIR_NAME_MAX_LEN: usize = 48;
+const RESERVED_PAIR_NAMES: [&str; 5] = ["main", "claude", "codex", "room", "victor"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SubmitBehavior {
@@ -237,13 +239,89 @@ fn default_session_definitions(working_dir: &str) -> Vec<SessionDefinition> {
     vec![
         driver_claude::default_session(working_dir),
         driver_codex::default_session(working_dir),
-        named_claude_session("build-claude", "Build · Claude", working_dir),
-        named_codex_session("build-codex", "Build · Codex", working_dir),
-        named_claude_session("consumer-claude", "Consumer · Claude", working_dir),
-        named_codex_session("consumer-codex", "Consumer · Codex", working_dir),
-        named_claude_session("admin-claude", "Admin · Claude", working_dir),
-        named_codex_session("admin-codex", "Admin · Codex", working_dir),
     ]
+}
+
+fn pair_slot_names(name: &str) -> (String, String) {
+    (format!("{name}-claude"), format!("{name}-codex"))
+}
+
+fn pair_title_stem(name: &str) -> String {
+    let parts = name
+        .split(['-', '_'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            let Some(first) = chars.next() else {
+                return String::new();
+            };
+            let mut word = first.to_uppercase().collect::<String>();
+            word.push_str(chars.as_str());
+            word
+        })
+        .collect::<Vec<_>>();
+
+    if parts.is_empty() {
+        name.to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn pair_session_definitions(name: &str, working_dir: &str) -> [SessionDefinition; 2] {
+    let title_stem = pair_title_stem(name);
+    let (claude_name, codex_name) = pair_slot_names(name);
+    [
+        named_claude_session(&claude_name, &format!("{title_stem} · Claude"), working_dir),
+        named_codex_session(&codex_name, &format!("{title_stem} · Codex"), working_dir),
+    ]
+}
+
+fn validate_pair_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(anyhow!("pair name cannot be empty"));
+    }
+    if name.len() > PAIR_NAME_MAX_LEN {
+        return Err(anyhow!(
+            "pair name cannot exceed {PAIR_NAME_MAX_LEN} characters"
+        ));
+    }
+    if RESERVED_PAIR_NAMES.contains(&name) {
+        return Err(anyhow!("pair name '{name}' is reserved"));
+    }
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        return Err(anyhow!(
+            "pair name '{name}' may only contain letters, numbers, hyphens, and underscores"
+        ));
+    }
+
+    Ok(())
+}
+
+fn ensure_pair_name_available(slots: &HashMap<String, SessionSlot>, name: &str) -> Result<()> {
+    let (claude_name, codex_name) = pair_slot_names(name);
+    if slots.contains_key(&claude_name) || slots.contains_key(&codex_name) {
+        return Err(anyhow!("pair '{name}' already exists"));
+    }
+
+    Ok(())
+}
+
+fn renamed_closed_slot(slot: SessionSlot, definition: SessionDefinition) -> SessionSlot {
+    SessionSlot {
+        definition,
+        state: LifecycleState::Closed,
+        running: None,
+        generation: slot.generation,
+        process_id: None,
+        last_activity_at: slot.last_activity_at,
+        last_real_output_at: None,
+        last_error: slot.last_error,
+        quiesce_timer: None,
+    }
 }
 
 fn closed_session_slot(definition: SessionDefinition) -> SessionSlot {
@@ -396,6 +474,9 @@ impl SupervisorHandle {
                 kind.as_str(),
                 "session_output"
                     | "session_state"
+                    | "pair_created"
+                    | "pair_renamed"
+                    | "pair_deleted"
                     | "routed_message"
                     | "system_log"
                     | "control_plane_ready"
@@ -877,6 +958,153 @@ impl SupervisorHandle {
         self.refresh_session_liveness();
         let expected_stop = self.bump_session_generation(name)?;
         self.restart_session_at(name, expected_stop)
+    }
+
+    pub fn create_pair(&self, name: &str) -> Result<Vec<SessionSnapshot>> {
+        let snapshots = {
+            let mut slots = self.inner.slots.lock();
+            validate_pair_name(name)?;
+            ensure_pair_name_available(&slots, name)?;
+
+            let working_dir = slots
+                .get("claude")
+                .or_else(|| slots.get("codex"))
+                .map(|slot| slot.definition.working_dir.clone())
+                .ok_or_else(|| anyhow!("main pair is missing from supervisor state"))?;
+            let [claude_definition, codex_definition] =
+                pair_session_definitions(name, &working_dir);
+
+            let claude_slot = closed_session_slot(claude_definition);
+            let codex_slot = closed_session_slot(codex_definition);
+            let mut snapshots = vec![claude_slot.snapshot(), codex_slot.snapshot()];
+            snapshots.sort_by(|left, right| left.name.cmp(&right.name));
+
+            slots.insert(claude_slot.definition.name.clone(), claude_slot);
+            slots.insert(codex_slot.definition.name.clone(), codex_slot);
+            snapshots
+        };
+
+        self.emit(RuntimeEvent::PairCreated {
+            name: name.to_string(),
+            timestamp: now_rfc3339(),
+        });
+
+        Ok(snapshots)
+    }
+
+    pub fn rename_pair(&self, old_name: &str, new_name: &str) -> Result<Vec<SessionSnapshot>> {
+        self.refresh_session_liveness();
+        if old_name == "main" {
+            return Err(anyhow!("cannot rename the main pair"));
+        }
+
+        let snapshots = {
+            let mut slots = self.inner.slots.lock();
+            validate_pair_name(new_name)?;
+            ensure_pair_name_available(&slots, new_name)?;
+
+            let (old_claude_name, old_codex_name) = pair_slot_names(old_name);
+            let old_claude = slots
+                .get(&old_claude_name)
+                .ok_or_else(|| anyhow!("pair '{old_name}' not found"))?;
+            let old_codex = slots
+                .get(&old_codex_name)
+                .ok_or_else(|| anyhow!("pair '{old_name}' not found"))?;
+
+            if old_claude.state != LifecycleState::Closed
+                || old_claude.running.is_some()
+                || old_codex.state != LifecycleState::Closed
+                || old_codex.running.is_some()
+            {
+                return Err(anyhow!(
+                    "pair '{old_name}' has running sessions; stop both panes first"
+                ));
+            }
+
+            let working_dir = old_claude.definition.working_dir.clone();
+            let [new_claude_definition, new_codex_definition] =
+                pair_session_definitions(new_name, &working_dir);
+
+            let old_claude_slot = slots
+                .remove(&old_claude_name)
+                .expect("validated pair slot disappeared during rename");
+            let old_codex_slot = slots
+                .remove(&old_codex_name)
+                .expect("validated pair slot disappeared during rename");
+
+            let new_claude_slot = renamed_closed_slot(old_claude_slot, new_claude_definition);
+            let new_codex_slot = renamed_closed_slot(old_codex_slot, new_codex_definition);
+            let mut snapshots = vec![new_claude_slot.snapshot(), new_codex_slot.snapshot()];
+            snapshots.sort_by(|left, right| left.name.cmp(&right.name));
+
+            slots.insert(new_claude_slot.definition.name.clone(), new_claude_slot);
+            slots.insert(new_codex_slot.definition.name.clone(), new_codex_slot);
+            snapshots
+        };
+
+        self.emit(RuntimeEvent::PairRenamed {
+            old_name: old_name.to_string(),
+            new_name: new_name.to_string(),
+            timestamp: now_rfc3339(),
+        });
+
+        Ok(snapshots)
+    }
+
+    pub fn delete_pair(&self, name: &str) -> Result<()> {
+        self.refresh_session_liveness();
+        if name == "main" {
+            return Err(anyhow!("cannot delete the main pair"));
+        }
+
+        let (claude_name, codex_name) = pair_slot_names(name);
+        let sessions_to_stop = {
+            let slots = self.inner.slots.lock();
+            let claude_slot = slots
+                .get(&claude_name)
+                .ok_or_else(|| anyhow!("pair '{name}' not found"))?;
+            let codex_slot = slots
+                .get(&codex_name)
+                .ok_or_else(|| anyhow!("pair '{name}' not found"))?;
+
+            let mut sessions = Vec::new();
+            if claude_slot.running.is_some() {
+                sessions.push((claude_name.clone(), claude_slot.generation));
+            }
+            if codex_slot.running.is_some() {
+                sessions.push((codex_name.clone(), codex_slot.generation));
+            }
+            sessions
+        };
+
+        for (session_name, generation) in sessions_to_stop {
+            self.stop_session_at(&session_name, generation)?;
+        }
+
+        {
+            let mut slots = self.inner.slots.lock();
+            let claude_slot = slots
+                .get(&claude_name)
+                .ok_or_else(|| anyhow!("pair '{name}' not found"))?;
+            let codex_slot = slots
+                .get(&codex_name)
+                .ok_or_else(|| anyhow!("pair '{name}' not found"))?;
+            if claude_slot.running.is_some() || codex_slot.running.is_some() {
+                return Err(anyhow!(
+                    "pair '{name}' has running sessions; stop both panes first"
+                ));
+            }
+
+            slots.remove(&claude_name);
+            slots.remove(&codex_name);
+        }
+
+        self.emit(RuntimeEvent::PairDeleted {
+            name: name.to_string(),
+            timestamp: now_rfc3339(),
+        });
+
+        Ok(())
     }
 
     fn stop_session_at(&self, name: &str, expected: SessionGeneration) -> Result<SessionSnapshot> {
@@ -2604,6 +2832,9 @@ fn event_kind(event: &RuntimeEvent) -> &'static str {
     match event {
         RuntimeEvent::SessionOutput { .. } => "session_output",
         RuntimeEvent::SessionState { .. } => "session_state",
+        RuntimeEvent::PairCreated { .. } => "pair_created",
+        RuntimeEvent::PairRenamed { .. } => "pair_renamed",
+        RuntimeEvent::PairDeleted { .. } => "pair_deleted",
         RuntimeEvent::RoutedMessage { .. } => "routed_message",
         RuntimeEvent::SystemLog { .. } => "system_log",
         RuntimeEvent::ControlPlaneReady { .. } => "control_plane_ready",
@@ -2636,7 +2867,11 @@ fn event_matches_filter(event: &RuntimeEvent, filter: &EventFilter) -> bool {
                         .any(|candidate| candidate == value)
                 })
                 .unwrap_or(false),
-            RuntimeEvent::SystemLog { .. } | RuntimeEvent::ControlPlaneReady { .. } => false,
+            RuntimeEvent::PairCreated { .. }
+            | RuntimeEvent::PairRenamed { .. }
+            | RuntimeEvent::PairDeleted { .. }
+            | RuntimeEvent::SystemLog { .. }
+            | RuntimeEvent::ControlPlaneReady { .. } => false,
         };
 
         if !session_match {
@@ -3470,19 +3705,186 @@ mod tests {
             .map(|session| session.name.clone())
             .collect::<Vec<_>>();
 
-        assert_eq!(
-            names,
-            vec![
-                "admin-claude".to_string(),
-                "admin-codex".to_string(),
-                "build-claude".to_string(),
-                "build-codex".to_string(),
-                "claude".to_string(),
-                "codex".to_string(),
-                "consumer-claude".to_string(),
-                "consumer-codex".to_string(),
-            ]
+        assert_eq!(names, vec!["claude".to_string(), "codex".to_string(),]);
+    }
+
+    #[test]
+    fn create_pair_inserts_two_closed_slots_and_emits_audit() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let cursor = supervisor.current_eof_cursor().unwrap();
+
+        let snapshots = supervisor.create_pair("foo").unwrap();
+
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].name, "foo-claude");
+        assert_eq!(snapshots[1].name, "foo-codex");
+        assert!(snapshots.iter().all(|snapshot| {
+            snapshot.lifecycle_state == LifecycleState::Closed && !snapshot.running
+        }));
+
+        let routed = supervisor.apply_sideband_request(SidebandRequest::EventsSince {
+            token: status.token,
+            cursor: Some(cursor),
+            max_events: Some(10),
+            max_wait_seconds: Some(0),
+            filter: Some(EventFilter {
+                include_kinds: vec!["pair_created".into()],
+                include_sessions: Vec::new(),
+                include_scopes: Vec::new(),
+            }),
+        });
+        let (events, _, _, _) = unwrap_events_since(routed);
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            RuntimeEvent::PairCreated { name, .. } if name == "foo"
+        ));
+    }
+
+    #[test]
+    fn create_pair_rejects_name_collision() {
+        let supervisor = test_supervisor();
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            let working_dir = slots.get("claude").unwrap().definition.working_dir.clone();
+            let [foo_claude_definition, _] = pair_session_definitions("foo", &working_dir);
+            slots.insert(
+                foo_claude_definition.name.clone(),
+                closed_session_slot(foo_claude_definition),
+            );
+        }
+        let (foo_claude_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(
+            &supervisor,
+            "foo-claude",
+            DriverKind::Claude,
+            foo_claude_pty,
         );
+        let initial_count = supervisor.snapshot().sessions.len();
+
+        let error = supervisor.create_pair("foo").unwrap_err();
+
+        assert!(error.to_string().contains("pair 'foo' already exists"));
+        assert_eq!(supervisor.snapshot().sessions.len(), initial_count);
+    }
+
+    #[test]
+    fn create_pair_rejects_invalid_names() {
+        let supervisor = test_supervisor();
+        let invalid_names = vec![
+            String::new(),
+            "main".to_string(),
+            "claude".to_string(),
+            "codex".to_string(),
+            "room".to_string(),
+            "victor".to_string(),
+            "with space".to_string(),
+            "with/slash".to_string(),
+            "with.dot".to_string(),
+            "x".repeat(PAIR_NAME_MAX_LEN + 1),
+        ];
+
+        for invalid in invalid_names {
+            let error = supervisor.create_pair(&invalid).unwrap_err();
+            assert!(!error.to_string().is_empty());
+            assert_eq!(supervisor.snapshot().sessions.len(), 2);
+        }
+    }
+
+    #[test]
+    fn rename_pair_refuses_when_running() {
+        let supervisor = test_supervisor();
+        supervisor.create_pair("foo").unwrap();
+        let (foo_claude_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(
+            &supervisor,
+            "foo-claude",
+            DriverKind::Claude,
+            foo_claude_pty,
+        );
+
+        let error = supervisor.rename_pair("foo", "bar").unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("pair 'foo' has running sessions; stop both panes first")
+        );
+        let snapshot_names = supervisor
+            .snapshot()
+            .sessions
+            .into_iter()
+            .map(|session| session.name)
+            .collect::<Vec<_>>();
+        assert!(snapshot_names.contains(&"foo-claude".to_string()));
+        assert!(snapshot_names.contains(&"foo-codex".to_string()));
+        assert!(!snapshot_names.contains(&"bar-claude".to_string()));
+        assert!(!snapshot_names.contains(&"bar-codex".to_string()));
+    }
+
+    #[test]
+    fn rename_pair_moves_both_slots_when_stopped() {
+        let supervisor = test_supervisor();
+        supervisor.create_pair("foo").unwrap();
+        let foo_claude_generation = supervisor.bump_session_generation("foo-claude").unwrap();
+        let foo_codex_generation = supervisor.bump_session_generation("foo-codex").unwrap();
+
+        let snapshots = supervisor.rename_pair("foo", "bar").unwrap();
+
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].name, "bar-claude");
+        assert_eq!(snapshots[1].name, "bar-codex");
+        assert_eq!(
+            supervisor.current_generation("bar-claude"),
+            Some(foo_claude_generation)
+        );
+        assert_eq!(
+            supervisor.current_generation("bar-codex"),
+            Some(foo_codex_generation)
+        );
+        assert_eq!(supervisor.current_generation("foo-claude"), None);
+        assert_eq!(supervisor.current_generation("foo-codex"), None);
+    }
+
+    #[test]
+    fn delete_pair_stops_running_panes_and_removes_slots() {
+        let supervisor = test_supervisor();
+        supervisor.create_pair("foo").unwrap();
+        let (foo_claude_pty, _, foo_claude_kill_count) =
+            mock_pty_session(None, MockKillBehavior::Immediate);
+        let (foo_codex_pty, _, foo_codex_kill_count) =
+            mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(
+            &supervisor,
+            "foo-claude",
+            DriverKind::Claude,
+            foo_claude_pty,
+        );
+        install_mock_running_session(&supervisor, "foo-codex", DriverKind::Codex, foo_codex_pty);
+
+        supervisor.delete_pair("foo").unwrap();
+
+        assert_eq!(foo_claude_kill_count.load(Ordering::SeqCst), 1);
+        assert_eq!(foo_codex_kill_count.load(Ordering::SeqCst), 1);
+        let snapshot_names = supervisor
+            .snapshot()
+            .sessions
+            .into_iter()
+            .map(|session| session.name)
+            .collect::<Vec<_>>();
+        assert!(!snapshot_names.contains(&"foo-claude".to_string()));
+        assert!(!snapshot_names.contains(&"foo-codex".to_string()));
+    }
+
+    #[test]
+    fn delete_pair_refuses_main() {
+        let supervisor = test_supervisor();
+
+        let error = supervisor.delete_pair("main").unwrap_err();
+
+        assert!(error.to_string().contains("cannot delete the main pair"));
     }
 
     #[test]
@@ -4933,7 +5335,7 @@ mod tests {
 
         assert!(response.ok);
         assert_eq!(response.message, "sessions listed");
-        assert_eq!(response.snapshot.unwrap().sessions.len(), 8);
+        assert_eq!(response.snapshot.unwrap().sessions.len(), 2);
     }
 
     #[test]

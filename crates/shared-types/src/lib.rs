@@ -150,6 +150,25 @@ pub struct RestartSessionRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatePairRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RenamePairRequest {
+    pub old_name: String,
+    pub new_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletePairRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeliverMessageRequest {
     pub name: String,
     pub content: String,
@@ -181,8 +200,11 @@ pub struct EventFilter {
 
 impl EventFilter {
     pub const ALL_KINDS: &'static str = "all";
-    pub const DEFAULT_INCLUDE_KINDS: [&'static str; 5] = [
+    pub const DEFAULT_INCLUDE_KINDS: [&'static str; 8] = [
         "session_state",
+        "pair_created",
+        "pair_renamed",
+        "pair_deleted",
         "routed_message",
         "system_log",
         "control_plane_ready",
@@ -219,6 +241,19 @@ pub enum RuntimeEvent {
         session: String,
         state: LifecycleState,
         reason: String,
+        timestamp: String,
+    },
+    PairCreated {
+        name: String,
+        timestamp: String,
+    },
+    PairRenamed {
+        old_name: String,
+        new_name: String,
+        timestamp: String,
+    },
+    PairDeleted {
+        name: String,
         timestamp: String,
     },
     RoutedMessage {

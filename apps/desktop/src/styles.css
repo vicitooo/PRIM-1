@@ -509,6 +509,18 @@ button.primary:hover {
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
+  position: relative;
+}
+
+.group-picker-tools {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-left: auto;
+}
+
+#pair-create-slot {
+  min-width: 0;
 }
 
 .group-list {
@@ -524,11 +536,22 @@ button.primary:hover {
   min-width: 0;
 }
 
+.pair-inline-editor {
+  display: grid;
+  gap: 0.3rem;
+}
+
+.group-chip-shell {
+  position: relative;
+  display: grid;
+  gap: 0.3rem;
+}
+
 .group-chip {
   width: 100%;
   justify-content: flex-start;
   text-align: left;
-  padding: 0.55rem 0.8rem;
+  padding: 0.55rem 2rem 0.55rem 0.8rem;
   position: relative;
 }
 
@@ -559,6 +582,110 @@ button.primary:hover {
 .group-chip[data-active="true"]::before {
   background: var(--copper-hot);
   box-shadow: 0 0 10px rgba(160, 100, 60, 0.35);
+}
+
+.new-pair-button {
+  white-space: nowrap;
+  padding: 0.4rem 0.7rem;
+  font-size: 11px;
+  letter-spacing: 0.05em;
+}
+
+.new-pair-input {
+  width: 100%;
+  border: 1px solid var(--frame);
+  border-radius: var(--radius-md);
+  background: var(--bg-inset);
+  color: var(--text-primary);
+  padding: 0.4rem 0.65rem;
+  text-transform: none;
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.2);
+}
+
+.new-pair-input:focus-visible {
+  outline: 2px solid var(--copper-hot);
+  outline-offset: 1px;
+}
+
+.chip-menu-root {
+  position: absolute;
+  top: 0.3rem;
+  right: 0.3rem;
+}
+
+.chip-menu-button {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.chip-menu {
+  position: absolute;
+  top: calc(100% + 0.25rem);
+  right: 0;
+  display: grid;
+  gap: 0.25rem;
+  min-width: 132px;
+  padding: 0.35rem;
+  z-index: 4;
+}
+
+.chip-menu-action {
+  width: 100%;
+  justify-content: flex-start;
+  text-align: left;
+  padding: 0.4rem 0.55rem;
+}
+
+.chip-menu-action:disabled {
+  cursor: not-allowed;
+  color: var(--text-tertiary);
+}
+
+.pair-dialog-overlay {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 0.75rem;
+  background: rgba(0, 0, 0, 0.55);
+  z-index: 6;
+}
+
+.pair-dialog {
+  width: min(100%, 280px);
+  padding: 0.9rem;
+  display: grid;
+  gap: 0.5rem;
+}
+
+.pair-dialog h3,
+.pair-dialog p {
+  margin: 0;
+}
+
+.pair-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.35rem;
+}
+
+button.danger {
+  color: #f0b0a8;
+  border-color: rgba(138, 74, 66, 0.65);
+}
+
+.pair-error {
+  color: #e3a59c;
+  font-size: 11px;
+  line-height: 1.3;
 }
 
 .workspace-grid {
@@ -802,6 +929,8 @@ textarea { resize: none; overflow: auto; text-transform: none; }
 [data-theme="light"] .state-pill[data-state="failed"] { color: #7a3a32; }
 [data-theme="light"] .active-group-label { color: #8a5550; }
 [data-theme="light"] .group-chip[data-active="true"] { color: #8a5550; }
+[data-theme="light"] .pair-dialog-overlay { background: rgba(42, 37, 32, 0.18); }
+[data-theme="light"] .pair-error { color: #8a4a42; }
 
 [data-theme="light"] ::-webkit-scrollbar-thumb { background: rgba(100, 80, 60, 0.2); }
 

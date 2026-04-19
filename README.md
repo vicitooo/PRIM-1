@@ -29,6 +29,13 @@ The project is no longer docs-only. The first version now exists and includes:
 - PowerShell helpers under `scripts/`
 - an explicit control-surface reference at `CONTROL-SURFACE.md`
 - release outputs under `target/release/`
+- a pair-picker that now supports in-panel create / rename / delete for ephemeral Claude+Codex pair groups
+
+Current pair model:
+
+- wrapper boot now seeds only the protected `main` pair (`claude` + `codex`)
+- extra pairs are created dynamically in the sidebar and remain ephemeral for the lifetime of the wrapper process
+- audit history is append-only, so rename/delete changes do not rewrite prior events under old pair names
 
 Current verified commands:
 

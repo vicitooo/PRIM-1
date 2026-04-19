@@ -11,8 +11,9 @@ use std::{
 };
 
 use shared_types::{
-    RestartSessionRequest, RouteMessageRequest, RuntimeSnapshot, SendInputRequest, SessionSnapshot,
-    StartSessionRequest, StopSessionRequest,
+    CreatePairRequest, DeletePairRequest, RenamePairRequest, RestartSessionRequest,
+    RouteMessageRequest, RuntimeSnapshot, SendInputRequest, SessionSnapshot, StartSessionRequest,
+    StopSessionRequest,
 };
 use supervisor::{SupervisorConfig, SupervisorHandle};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
@@ -132,6 +133,68 @@ fn restart_session(
             state.diagnostics.log(
                 "error",
                 "restart_session_failed",
+                format!("{}: {}", request.name, error),
+            );
+            error.to_string()
+        })
+}
+
+#[tauri::command]
+fn create_pair(
+    state: State<'_, DesktopState>,
+    request: CreatePairRequest,
+) -> Result<Vec<SessionSnapshot>, String> {
+    state
+        .diagnostics
+        .log("info", "create_pair", format!("requested {}", request.name));
+    state
+        .supervisor
+        .create_pair(&request.name)
+        .map_err(|error| {
+            state.diagnostics.log(
+                "error",
+                "create_pair_failed",
+                format!("{}: {}", request.name, error),
+            );
+            error.to_string()
+        })
+}
+
+#[tauri::command]
+fn rename_pair(
+    state: State<'_, DesktopState>,
+    request: RenamePairRequest,
+) -> Result<Vec<SessionSnapshot>, String> {
+    state.diagnostics.log(
+        "info",
+        "rename_pair",
+        format!("requested {} -> {}", request.old_name, request.new_name),
+    );
+    state
+        .supervisor
+        .rename_pair(&request.old_name, &request.new_name)
+        .map_err(|error| {
+            state.diagnostics.log(
+                "error",
+                "rename_pair_failed",
+                format!("{} -> {}: {}", request.old_name, request.new_name, error),
+            );
+            error.to_string()
+        })
+}
+
+#[tauri::command]
+fn delete_pair(state: State<'_, DesktopState>, request: DeletePairRequest) -> Result<(), String> {
+    state
+        .diagnostics
+        .log("info", "delete_pair", format!("requested {}", request.name));
+    state
+        .supervisor
+        .delete_pair(&request.name)
+        .map_err(|error| {
+            state.diagnostics.log(
+                "error",
+                "delete_pair_failed",
                 format!("{}: {}", request.name, error),
             );
             error.to_string()
@@ -461,6 +524,9 @@ pub fn run() {
             start_session,
             stop_session,
             restart_session,
+            create_pair,
+            rename_pair,
+            delete_pair,
             send_input,
             route_message,
             resize_session,

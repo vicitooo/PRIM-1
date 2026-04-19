@@ -50,6 +50,19 @@ export interface RestartSessionRequest {
   name: string;
 }
 
+export interface CreatePairRequest {
+  name: string;
+}
+
+export interface RenamePairRequest {
+  oldName: string;
+  newName: string;
+}
+
+export interface DeletePairRequest {
+  name: string;
+}
+
 export interface SendInputRequest {
   name: string;
   input: string;
@@ -75,6 +88,22 @@ export type RuntimeEvent =
       session: string;
       state: LifecycleState;
       reason: string;
+      timestamp: string;
+    }
+  | {
+      event: "pair_created";
+      name: string;
+      timestamp: string;
+    }
+  | {
+      event: "pair_renamed";
+      old_name: string;
+      new_name: string;
+      timestamp: string;
+    }
+  | {
+      event: "pair_deleted";
+      name: string;
       timestamp: string;
     }
   | {
