@@ -123,6 +123,10 @@ impl MailboxFs for StdMailboxFs {
 // still held the full routed_message payload. Keeping each Claude-targeted
 // routed input below a conservative size is the least invasive mitigation.
 const CLAUDE_ROUTED_MESSAGE_MAX_CHARS: usize = 500;
+// Codex starts staging large payloads as "[Pasted Content N chars]" once the
+// flattened routed input crosses its paste-detection threshold, so keep routed
+// and deliver payloads comfortably below that boundary.
+const CODEX_ROUTED_MESSAGE_MAX_CHARS: usize = 800;
 
 #[derive(Debug, Clone)]
 pub struct SupervisorConfig {
@@ -2007,7 +2011,14 @@ impl SupervisorHandle {
         }
 
         let submit_behavior = routed_message_submit_behavior(slot.definition.driver);
-        let payloads = prepare_direct_message(slot.definition.driver, content);
+        let prepared = prepare_direct_message(slot.definition.driver, content);
+        let single_payload = prepared.into_iter().next().unwrap_or_default();
+        let chunks = split_routed_message_content(&single_payload, submit_behavior.max_chunk_chars);
+        let payloads = if chunks.is_empty() {
+            vec![String::new()]
+        } else {
+            chunks
+        };
         Ok((slot.snapshot(), submit_behavior, payloads))
     }
 
@@ -2722,7 +2733,7 @@ fn routed_message_submit_behavior(driver: DriverKind) -> SubmitBehavior {
             sequence: "\r",
             delay: Duration::from_millis(500),
             flatten_payload: true,
-            max_chunk_chars: None,
+            max_chunk_chars: Some(CODEX_ROUTED_MESSAGE_MAX_CHARS),
         },
         DriverKind::Claude => SubmitBehavior {
             sequence: "\r",
@@ -3640,6 +3651,40 @@ mod tests {
     }
 
     #[test]
+    fn long_codex_payloads_are_chunked_with_part_headers() {
+        let long_content = (0..120)
+            .map(|index| format!("segment-{index:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let payloads = routed_message_payloads(
+            &RouteMessageRequest {
+                from: "codex".into(),
+                to: "codex".into(),
+                scope: MessageScope::Room,
+                content: long_content.clone(),
+            },
+            routed_message_submit_behavior(DriverKind::Codex),
+        );
+
+        assert!(payloads.len() > 1);
+        assert!(payloads[0].starts_with("[Room message from codex | part 1/"));
+        assert!(payloads.last().unwrap().contains("| part "));
+        assert!(payloads.iter().all(|payload| !payload.contains('\n')));
+        let reassembled = payloads
+            .iter()
+            .map(|payload| {
+                payload
+                    .split_once("] ")
+                    .map(|(_, content)| content)
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(collapse_inline_content(&reassembled), long_content);
+    }
+
+    #[test]
     fn codex_payload_keeps_flattened_provenance_marker() {
         let payload = routed_message_payload(
             &RouteMessageRequest {
@@ -3703,7 +3748,7 @@ mod tests {
                 sequence: "\r",
                 delay: Duration::from_millis(500),
                 flatten_payload: true,
-                max_chunk_chars: None,
+                max_chunk_chars: Some(CODEX_ROUTED_MESSAGE_MAX_CHARS),
             }
         );
     }
@@ -4050,6 +4095,32 @@ mod tests {
             routed_message_submit_behavior(DriverKind::Codex)
         );
         assert_eq!(payloads, vec!["line one line two".to_string()]);
+    }
+
+    #[test]
+    fn deliver_message_codex_chunks_large_flattened_content() {
+        let supervisor = test_supervisor();
+        install_synthetic_running_session(&supervisor, "codex", DriverKind::Codex);
+        let long_content = (0..120)
+            .map(|index| format!("segment-{index:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let (_, submit_behavior, payloads) = supervisor
+            .prepare_delivery_for_session("codex", &long_content)
+            .unwrap();
+
+        assert_eq!(
+            submit_behavior,
+            routed_message_submit_behavior(DriverKind::Codex)
+        );
+        assert!(payloads.len() > 1);
+        assert!(
+            payloads
+                .iter()
+                .all(|payload| payload.chars().count() <= CODEX_ROUTED_MESSAGE_MAX_CHARS)
+        );
+        assert_eq!(payloads.join(" "), long_content);
     }
 
     #[test]

@@ -106,6 +106,7 @@ Behavior:
 - `-Action deliver` accepts either:
   - `-Content '<inline text>'`
   - `-ContentFile '<path to UTF-8 text file>'`
+- large Codex-targeted `deliver` payloads are flattened and chunked below the paste-staging threshold before each Enter submit
 - `-Action wait_quiet` waits for no real session content for `-QuietSec` seconds, up to `-TimeoutSec`
 - `wait_quiet` is **not** turn-completion detection; long-think phases may go quiet while the assistant is still in flight
 - `events_since` returns structured JSON only; it does **not** honor `-Quiet`
@@ -331,7 +332,7 @@ From inside Claude/Codex, an agent can call the helper scripts to:
 Routed-message delivery shape:
 
 - Claude receives multiline routed input with `[Direct|Room message from <sender>]` headers
-- Codex receives flattened single-line routed input, but it now also keeps the same provenance header instead of dropping it
+- Codex receives flattened single-line routed input, keeps the same provenance header instead of dropping it, and chunks long routed payloads into part-labeled submits to avoid `[Pasted Content N chars]` staging
 - long routed messages destined for Claude are split into part-labeled routed inputs to avoid the queued-message truncation found in exploration
 
 Peer slash-command policy:

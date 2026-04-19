@@ -78,6 +78,7 @@ mod tests {
                 audit_log_path: "audit".into(),
                 generated_at: "2026-04-15T00:00:00Z".into(),
             }),
+            timed_out: false,
             payload: None,
         })
         .unwrap();
