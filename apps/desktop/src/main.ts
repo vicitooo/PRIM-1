@@ -314,7 +314,15 @@ const groupCount = must<HTMLElement>("#group-count");
 const pairCreateSlot = must<HTMLDivElement>("#pair-create-slot");
 const pairDialogSlot = must<HTMLDivElement>("#pair-dialog-slot");
 const snapshotByName = new Map<string, SessionSnapshot>();
+
+interface PendingBuffer {
+  chunks: string[];
+  dropped: number;
+}
+
 const paneMap = new Map<string, SessionTerminal>();
+const pendingOutput = new Map<string, PendingBuffer>();
+const MAX_PENDING_CHUNKS_PER_SESSION = 256;
 const controlEndpoint = must<HTMLElement>("#control-endpoint");
 const auditPath = must<HTMLElement>("#audit-path");
 const runtimePath = must<HTMLElement>("#runtime-path");
@@ -633,11 +641,47 @@ function closeDeletePairDialog(): void {
   refreshPairPicker();
 }
 
+function refreshSnapshotFromEvent(preferredGroup?: string): void {
+  void refreshSnapshot(preferredGroup).catch((error) => {
+    writeSystem(
+      "error",
+      `snapshot refresh failed after runtime event: ${String(error)}`,
+    );
+  });
+}
+
 function handleRuntimeEvent(event: RuntimeEvent): void {
   switch (event.event) {
-    case "session_output":
-      paneMap.get(event.session)?.write(event.chunk);
+    case "session_output": {
+      const pane = paneMap.get(event.session);
+      if (pane) {
+        pane.write(event.chunk);
+        break;
+      }
+
+      let entry = pendingOutput.get(event.session);
+      if (!entry) {
+        entry = { chunks: [], dropped: 0 };
+        pendingOutput.set(event.session, entry);
+        writeSystem(
+          "warn",
+          `session_output buffered: pane ${event.session} not attached yet`,
+        );
+      }
+
+      entry.chunks.push(event.chunk);
+      if (entry.chunks.length > MAX_PENDING_CHUNKS_PER_SESSION) {
+        entry.chunks.shift();
+        entry.dropped += 1;
+        if (entry.dropped === 1 || entry.dropped % 64 === 0) {
+          writeSystem(
+            "warn",
+            `session_output buffer pressure: ${event.session} shed ${entry.dropped} oldest chunks`,
+          );
+        }
+      }
       break;
+    }
     case "session_state": {
       const previous = snapshotByName.get(event.session);
       if (previous) {
@@ -657,12 +701,15 @@ function handleRuntimeEvent(event: RuntimeEvent): void {
     }
     case "pair_created":
       writeSystem("info", `pair created: ${event.name}`);
+      refreshSnapshotFromEvent(event.name);
       break;
     case "pair_renamed":
       writeSystem("info", `pair renamed: ${event.old_name} -> ${event.new_name}`);
+      refreshSnapshotFromEvent(event.new_name);
       break;
     case "pair_deleted":
       writeSystem("info", `pair deleted: ${event.name}`);
+      refreshSnapshotFromEvent();
       break;
     case "system_log":
       writeSystem(event.level, event.message);
@@ -684,6 +731,20 @@ function syncPaneInventory(
   sessions: SessionSnapshot[],
   preferredActiveGroup?: string,
 ): void {
+  const nextNames = new Set(sessions.map((session) => session.name));
+  for (const buffered of Array.from(pendingOutput.keys())) {
+    if (!nextNames.has(buffered)) {
+      const entry = pendingOutput.get(buffered);
+      pendingOutput.delete(buffered);
+      if (entry && (entry.chunks.length > 0 || entry.dropped > 0)) {
+        writeSystem(
+          "info",
+          `pendingOutput dropped: ${buffered} (${entry.chunks.length} queued + ${entry.dropped} previously shed, session no longer in snapshot)`,
+        );
+      }
+    }
+  }
+
   const signature = sessions
     .map((session) => `${session.name}:${session.title}`)
     .join("|");
@@ -692,7 +753,6 @@ function syncPaneInventory(
   }
 
   renderedSessionSignature = signature;
-  const nextNames = new Set(sessions.map((session) => session.name));
   const fragment = document.createDocumentFragment();
 
   for (const session of sessions) {
@@ -720,7 +780,25 @@ function syncPaneInventory(
 
   for (const session of sessions) {
     if (!paneMap.has(session.name)) {
-      paneMap.set(session.name, new SessionTerminal(session.name, session.title));
+      const pane = new SessionTerminal(session.name, session.title);
+      paneMap.set(session.name, pane);
+      const pending = pendingOutput.get(session.name);
+      if (pending) {
+        for (const chunk of pending.chunks) {
+          pane.write(chunk);
+        }
+        pendingOutput.delete(session.name);
+        if (pending.chunks.length > 0 || pending.dropped > 0) {
+          const suffix =
+            pending.dropped > 0
+              ? ` (${pending.dropped} older chunks dropped due to cap)`
+              : "";
+          writeSystem(
+            "info",
+            `session_output flushed: ${pending.chunks.length} chunks into ${session.name}${suffix}`,
+          );
+        }
+      }
     }
   }
 
