@@ -10,6 +10,7 @@ control-plane = { path = "../control-plane" }
 driver-claude = { path = "../driver-claude" }
 driver-codex = { path = "../driver-codex" }
 driver-generic-terminal = { path = "../driver-generic-terminal" }
+flate2.workspace = true
 libc.workspace = true
 parking_lot.workspace = true
 pty-host = { path = "../pty-host" }
@@ -19,3 +20,6 @@ shared-types = { path = "../shared-types" }
 tokio.workspace = true
 uuid.workspace = true
 windows-sys.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

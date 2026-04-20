@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader as StdBufReader, Seek, SeekFrom, Write},
+    io::{BufRead, BufReader as StdBufReader, Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -12,7 +12,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use chrono::Utc;
+use chrono::{DateTime, NaiveDate, Utc};
 use control_plane::{DEFAULT_ENDPOINT, decode_request, encode_request, encode_response};
 use parking_lot::{Mutex, RwLock};
 use pty_host::{ConcretePtySession, PtyEvent, PtyEventHandler, PtySession};
@@ -137,46 +137,252 @@ pub struct SupervisorConfig {
     pub peer_slash_commands_allowed: bool,
 }
 
+struct AuditInner {
+    path: PathBuf,
+    active_date: NaiveDate,
+}
+
+struct AuditReadBatch {
+    lines: Vec<AuditLine>,
+    next_offset: u64,
+    reached_eof: bool,
+}
+
+struct AuditLine {
+    text: String,
+    next_offset: u64,
+}
+
 struct AuditLog {
     dir: PathBuf,
-    path: PathBuf,
+    inner: Mutex<AuditInner>,
 }
 
 impl AuditLog {
     fn new(runtime_dir: &Path) -> Result<Self> {
+        Self::new_at(runtime_dir, Utc::now())
+    }
+
+    fn new_at(runtime_dir: &Path, now: DateTime<Utc>) -> Result<Self> {
         let audit_dir = runtime_dir.join("audit");
         fs::create_dir_all(&audit_dir).context("failed to create audit directory")?;
-        let file_name = format!("{}.jsonl", Utc::now().format("%Y-%m-%d"));
+        let active_date = now.date_naive();
         Ok(Self {
             dir: audit_dir.clone(),
-            path: audit_dir.join(file_name),
+            inner: Mutex::new(AuditInner {
+                path: audit_dir.join(audit_file_name(active_date)),
+                active_date,
+            }),
         })
     }
 
-    fn path(&self) -> &Path {
-        &self.path
+    fn path(&self) -> PathBuf {
+        self.inner.lock().path.clone()
     }
 
-    fn active_file_name(&self) -> &str {
-        self.path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .expect("audit path must end with a UTF-8 filename")
+    fn active_file_name(&self) -> String {
+        audit_file_name(self.inner.lock().active_date)
     }
 
     fn resolve_path(&self, audit_file: &str) -> PathBuf {
         self.dir.join(audit_file)
     }
 
+    fn source_exists(&self, audit_file: &str) -> bool {
+        self.resolve_path(audit_file).exists() || self.gzip_path_for(audit_file).exists()
+    }
+
+    fn open_reader(&self, audit_file: &str) -> Result<Option<Box<dyn Read + Send>>> {
+        let plain = self.resolve_path(audit_file);
+        if plain.exists() {
+            let file = File::open(&plain)
+                .with_context(|| format!("audit read error: failed to open {}", plain.display()))?;
+            return Ok(Some(Box::new(file)));
+        }
+
+        let gz = self.gzip_path_for(audit_file);
+        if gz.exists() {
+            let file = File::open(&gz)
+                .with_context(|| format!("audit read error: failed to open {}", gz.display()))?;
+            return Ok(Some(Box::new(flate2::read::GzDecoder::new(file))));
+        }
+
+        Ok(None)
+    }
+
+    fn uncompressed_len(&self, audit_file: &str) -> Result<u64> {
+        let plain = self.resolve_path(audit_file);
+        match fs::metadata(&plain) {
+            Ok(metadata) => return Ok(metadata.len()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("audit read error: failed to stat {}", plain.display())
+                });
+            }
+        }
+
+        let gz = self.gzip_path_for(audit_file);
+        if !gz.exists() {
+            return Ok(0);
+        }
+
+        let file = File::open(&gz)
+            .with_context(|| format!("audit read error: failed to open {}", gz.display()))?;
+        let mut decoder = flate2::read::GzDecoder::new(file);
+        let mut sink = std::io::sink();
+        std::io::copy(&mut decoder, &mut sink)
+            .with_context(|| format!("audit read error: gz decode failed for {}", gz.display()))
+    }
+
+    fn read_lines_since(
+        &self,
+        audit_file: &str,
+        byte_offset: u64,
+        max_lines: usize,
+    ) -> Result<AuditReadBatch> {
+        if max_lines == 0 {
+            return Ok(AuditReadBatch {
+                lines: Vec::new(),
+                next_offset: byte_offset,
+                reached_eof: false,
+            });
+        }
+
+        let Some(mut reader) = self.open_reader(audit_file)? else {
+            return Ok(AuditReadBatch {
+                lines: Vec::new(),
+                next_offset: byte_offset,
+                reached_eof: true,
+            });
+        };
+
+        // Offsets are measured in the uncompressed JSONL stream. Gzip archives
+        // cannot seek, so replay from a non-zero cursor decodes and discards.
+        let mut remaining = byte_offset;
+        let mut skipped = 0_u64;
+        let mut discard = [0_u8; 8192];
+        while remaining > 0 {
+            let take = remaining.min(discard.len() as u64) as usize;
+            let read = reader
+                .read(&mut discard[..take])
+                .with_context(|| format!("audit read error: failed to seek into {audit_file}"))?;
+            if read == 0 {
+                return Ok(AuditReadBatch {
+                    lines: Vec::new(),
+                    next_offset: skipped,
+                    reached_eof: true,
+                });
+            }
+            remaining -= read as u64;
+            skipped += read as u64;
+        }
+
+        let mut reader = StdBufReader::new(reader);
+        let mut offset = byte_offset;
+        let mut lines = Vec::new();
+        let mut line = Vec::new();
+
+        loop {
+            line.clear();
+            let read = reader
+                .read_until(b'\n', &mut line)
+                .with_context(|| format!("audit read error: failed to read {audit_file}"))?;
+            if read == 0 {
+                return Ok(AuditReadBatch {
+                    lines,
+                    next_offset: offset,
+                    reached_eof: true,
+                });
+            }
+
+            offset += read as u64;
+            let line_text = String::from_utf8(line.clone())
+                .with_context(|| format!("audit read error: invalid UTF-8 in {audit_file}"))?;
+            lines.push(AuditLine {
+                text: line_text.trim_end_matches(['\r', '\n']).to_string(),
+                next_offset: offset,
+            });
+
+            if lines.len() >= max_lines {
+                return Ok(AuditReadBatch {
+                    lines,
+                    next_offset: offset,
+                    reached_eof: false,
+                });
+            }
+        }
+    }
+
     fn append(&self, event: &RuntimeEvent) -> Result<()> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .with_context(|| format!("failed to open audit log at {}", self.path.display()))?;
-        let payload = serde_json::to_string(event).context("failed to serialize audit event")?;
-        writeln!(file, "{payload}").context("failed to append audit event")?;
+        self.append_at(event, Utc::now())
+    }
+
+    fn append_at(&self, event: &RuntimeEvent, now: DateTime<Utc>) -> Result<()> {
+        let today = now.date_naive();
+        let rotated = {
+            let mut inner = self.inner.lock();
+            let rotated = if today != inner.active_date {
+                inner.active_date = today;
+                inner.path = self.dir.join(audit_file_name(today));
+                true
+            } else {
+                false
+            };
+
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&inner.path)
+                .with_context(|| format!("failed to open audit log at {}", inner.path.display()))?;
+            let payload =
+                serde_json::to_string(event).context("failed to serialize audit event")?;
+            writeln!(file, "{payload}").context("failed to append audit event")?;
+            rotated
+        };
+
+        if rotated {
+            self.sweep_and_gzip_stale(today);
+        }
+
         Ok(())
+    }
+
+    fn sweep_and_gzip_stale(&self, active_date: NaiveDate) {
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                eprintln!(
+                    "audit rotation: failed to scan stale logs in {}: {error}",
+                    self.dir.display()
+                );
+                return;
+            }
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(date) = parse_audit_file_date(file_name) else {
+                continue;
+            };
+            if date >= active_date {
+                continue;
+            }
+
+            if let Err(error) = gzip_and_remove(&path) {
+                eprintln!(
+                    "audit rotation: gzip failed for {} - leaving plain file in place: {error:#}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    fn gzip_path_for(&self, audit_file: &str) -> PathBuf {
+        self.dir.join(format!("{audit_file}.gz"))
     }
 }
 
@@ -422,30 +628,20 @@ impl SupervisorHandle {
         &self.inner.runtime_dir
     }
 
-    pub fn audit_log_path(&self) -> &Path {
+    pub fn audit_log_path(&self) -> PathBuf {
         self.inner.audit.path()
     }
 
-    fn active_audit_file_name(&self) -> &str {
+    fn active_audit_file_name(&self) -> String {
         self.inner.audit.active_file_name()
     }
 
-    fn audit_path_for(&self, audit_file: &str) -> PathBuf {
-        self.inner.audit.resolve_path(audit_file)
-    }
-
     fn audit_file_len(&self, audit_file: &str) -> Result<u64> {
-        let path = self.audit_path_for(audit_file);
-        match fs::metadata(&path) {
-            Ok(metadata) => Ok(metadata.len()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
-            Err(error) => Err(error)
-                .with_context(|| format!("audit read error: failed to stat {}", path.display())),
-        }
+        self.inner.audit.uncompressed_len(audit_file)
     }
 
     fn current_eof_cursor(&self) -> Result<EventCursor> {
-        let audit_file = self.active_audit_file_name().to_string();
+        let audit_file = self.active_audit_file_name();
         let byte_offset = self.audit_file_len(&audit_file)?;
         Ok(EventCursor {
             audit_file,
@@ -455,7 +651,7 @@ impl SupervisorHandle {
 
     fn current_active_start_cursor(&self) -> EventCursor {
         EventCursor {
-            audit_file: self.active_audit_file_name().to_string(),
+            audit_file: self.active_audit_file_name(),
             byte_offset: 0,
         }
     }
@@ -524,8 +720,7 @@ impl SupervisorHandle {
             ));
         }
 
-        let path = self.audit_path_for(&cursor.audit_file);
-        if path.exists() {
+        if self.inner.audit.source_exists(&cursor.audit_file) {
             return Ok((cursor, false));
         }
 
@@ -553,7 +748,7 @@ impl SupervisorHandle {
         max_events: usize,
     ) -> Result<EventsSinceResult> {
         let (resolved_cursor, gap_detected) = self.resolve_events_cursor(cursor)?;
-        let active_file = self.active_audit_file_name().to_string();
+        let active_file = self.active_audit_file_name();
         let current_active_eof = self.current_eof_cursor()?;
 
         let current_len = self.audit_file_len(&resolved_cursor.audit_file)?;
@@ -686,57 +881,48 @@ impl SupervisorHandle {
             });
         }
 
-        let path = self.audit_path_for(audit_file);
-        if !path.exists() {
-            return Ok(AuditScan {
-                events: Vec::new(),
-                next_offset: byte_offset,
-                reached_eof: true,
-                reached_limit: false,
-            });
-        }
-
-        let mut file = File::open(&path)
-            .with_context(|| format!("audit read error: failed to open {}", path.display()))?;
-        file.seek(SeekFrom::Start(byte_offset))
-            .with_context(|| format!("audit read error: failed to seek {}", path.display()))?;
-        let mut reader = StdBufReader::new(file);
-        let mut offset = byte_offset;
         let mut events = Vec::new();
-        let mut line = Vec::new();
+        let mut next_offset = byte_offset;
 
         loop {
-            line.clear();
-            let bytes_read = reader
-                .read_until(b'\n', &mut line)
-                .with_context(|| format!("audit read error: failed to read {}", path.display()))?;
-            if bytes_read == 0 {
+            let batch = self
+                .inner
+                .audit
+                .read_lines_since(audit_file, next_offset, 1024)?;
+            if batch.lines.is_empty() {
                 return Ok(AuditScan {
                     events,
-                    next_offset: offset,
-                    reached_eof: true,
+                    next_offset: batch.next_offset,
+                    reached_eof: batch.reached_eof,
                     reached_limit: false,
                 });
             }
 
-            offset += bytes_read as u64;
-            let line_text = String::from_utf8(line.clone()).with_context(|| {
-                format!("audit read error: invalid UTF-8 in {}", path.display())
-            })?;
-            let event: RuntimeEvent = serde_json::from_str(
-                line_text.trim_end_matches(['\r', '\n']),
-            )
-            .with_context(|| format!("audit read error: invalid JSON in {}", path.display()))?;
-            if event_matches_filter(&event, filter) {
-                events.push(event);
+            for line in batch.lines {
+                let event: RuntimeEvent = serde_json::from_str(&line.text)
+                    .with_context(|| format!("audit read error: invalid JSON in {audit_file}"))?;
+                next_offset = line.next_offset;
+                if event_matches_filter(&event, filter) {
+                    events.push(event);
+                }
+
+                if events.len() >= max_events {
+                    return Ok(AuditScan {
+                        events,
+                        next_offset,
+                        reached_eof: false,
+                        reached_limit: true,
+                    });
+                }
             }
 
-            if events.len() >= max_events {
+            next_offset = batch.next_offset;
+            if batch.reached_eof {
                 return Ok(AuditScan {
                     events,
-                    next_offset: offset,
-                    reached_eof: false,
-                    reached_limit: true,
+                    next_offset,
+                    reached_eof: true,
+                    reached_limit: false,
                 });
             }
         }
@@ -1436,13 +1622,13 @@ impl SupervisorHandle {
         }
 
         let info_path = self.runtime_dir().join("control-plane.json");
-        if let Some(existing_status) = load_existing_control_plane_status(&info_path)? {
-            if probe_control_plane_owner(&existing_status, CONTROL_PLANE_PROBE_TIMEOUT)? {
-                return Err(anyhow!(
-                    "another wrapper instance is already holding the control plane at {}. Close the other instance before starting a new one.",
-                    existing_status.endpoint
-                ));
-            }
+        if let Some(existing_status) = load_existing_control_plane_status(&info_path)?
+            && probe_control_plane_owner(&existing_status, CONTROL_PLANE_PROBE_TIMEOUT)?
+        {
+            return Err(anyhow!(
+                "another wrapper instance is already holding the control plane at {}. Close the other instance before starting a new one.",
+                existing_status.endpoint
+            ));
         }
 
         let endpoint = control_plane_endpoint();
@@ -1484,9 +1670,8 @@ impl SupervisorHandle {
         match scope {
             MessageScope::Room => slots
                 .iter()
-                .filter_map(|(name, slot)| {
-                    (slot.running.is_some() && Some(name.as_str()) != sender).then(|| name.clone())
-                })
+                .filter(|(name, slot)| slot.running.is_some() && Some(name.as_str()) != sender)
+                .map(|(name, _)| name.clone())
                 .collect(),
             _ => slots
                 .get(to)
@@ -2195,12 +2380,12 @@ impl SupervisorHandle {
             return Ok(());
         }
 
-        if let Some(bound_session) = binding {
-            if bound_session != target_session {
-                return Err(anyhow!(
-                    "peer slash commands are disabled by this wrapper's policy (PRIM1_PEER_SLASH_COMMANDS_ALLOWED=0)"
-                ));
-            }
+        if let Some(bound_session) = binding
+            && bound_session != target_session
+        {
+            return Err(anyhow!(
+                "peer slash commands are disabled by this wrapper's policy (PRIM1_PEER_SLASH_COMMANDS_ALLOWED=0)"
+            ));
         }
 
         Ok(())
@@ -2227,12 +2412,12 @@ impl SupervisorHandle {
             .cloned()
             .ok_or_else(|| anyhow!("invalid control plane token"))?;
 
-        if let Some(bound_session) = binding {
-            if bound_session != target_session {
-                return Err(anyhow!(
-                    "deliver_message: pane-bound token cannot target other sessions; use route_message instead"
-                ));
-            }
+        if let Some(bound_session) = binding
+            && bound_session != target_session
+        {
+            return Err(anyhow!(
+                "deliver_message: pane-bound token cannot target other sessions; use route_message instead"
+            ));
         }
 
         Ok(())
@@ -2897,6 +3082,52 @@ fn message_scope_name(scope: MessageScope) -> &'static str {
     }
 }
 
+fn audit_file_name(date: NaiveDate) -> String {
+    format!("{date}.jsonl")
+}
+
+fn parse_audit_file_date(name: &str) -> Option<NaiveDate> {
+    if !is_valid_audit_filename(name) {
+        return None;
+    }
+
+    NaiveDate::parse_from_str(&name[..10], "%Y-%m-%d").ok()
+}
+
+fn gzip_path_for(path: &Path) -> Result<PathBuf> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            anyhow!(
+                "audit rotate: path has no UTF-8 filename: {}",
+                path.display()
+            )
+        })?;
+    Ok(path.with_file_name(format!("{file_name}.gz")))
+}
+
+fn gzip_and_remove(path: &Path) -> Result<()> {
+    use flate2::{Compression, write::GzEncoder};
+
+    let gz_path = gzip_path_for(path)?;
+    let mut input = StdBufReader::new(
+        File::open(path)
+            .with_context(|| format!("audit rotate: failed to open {}", path.display()))?,
+    );
+    let output = File::create(&gz_path)
+        .with_context(|| format!("audit rotate: failed to create {}", gz_path.display()))?;
+    let mut encoder = GzEncoder::new(output, Compression::default());
+    std::io::copy(&mut input, &mut encoder)
+        .with_context(|| format!("audit rotate: failed to gzip {}", path.display()))?;
+    encoder
+        .finish()
+        .with_context(|| format!("audit rotate: failed to finish {}", gz_path.display()))?;
+    fs::remove_file(path)
+        .with_context(|| format!("audit rotate: failed to remove {}", path.display()))?;
+    Ok(())
+}
+
 fn is_valid_audit_filename(name: &str) -> bool {
     name.len() == 16
         && name.ends_with(".jsonl")
@@ -3206,16 +3437,13 @@ fn split_routed_message_content(content: &str, max_chunk_chars: Option<usize>) -
 
 fn split_point_within_limit(content: &str, max_chunk_chars: usize) -> usize {
     let mut last_whitespace_index = None;
-    let mut char_count = 0;
-
-    for (index, ch) in content.char_indices() {
+    for (char_count, (index, ch)) in content.char_indices().enumerate() {
         if char_count == max_chunk_chars {
             break;
         }
         if ch.is_whitespace() {
             last_whitespace_index = Some(index);
         }
-        char_count += 1;
     }
 
     if let Some(index) = last_whitespace_index {
@@ -3657,7 +3885,7 @@ mod tests {
     }
 
     fn current_audit_file(supervisor: &SupervisorHandle) -> String {
-        supervisor.active_audit_file_name().to_string()
+        supervisor.active_audit_file_name()
     }
 
     fn append_audit_event(
@@ -3673,6 +3901,14 @@ mod tests {
             .unwrap();
         writeln!(file, "{}", serde_json::to_string(event).unwrap()).unwrap();
         path
+    }
+
+    fn make_test_event(label: &str) -> RuntimeEvent {
+        RuntimeEvent::SystemLog {
+            level: LogLevel::Info,
+            message: label.into(),
+            timestamp: "2026-04-20T00:00:00Z".into(),
+        }
     }
 
     fn unwrap_events_since(
@@ -3691,6 +3927,197 @@ mod tests {
                 as_of,
             }) => (events, next_cursor, gap_detected, as_of),
             other => panic!("unexpected events_since payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn audit_log_rotates_at_utc_midnight_with_gzip() {
+        use chrono::TimeZone;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let day_one = Utc.with_ymd_and_hms(2026, 4, 19, 23, 59, 30).unwrap();
+        let day_two = Utc.with_ymd_and_hms(2026, 4, 20, 0, 0, 30).unwrap();
+        let audit = AuditLog::new_at(temp_dir.path(), day_one).expect("new audit");
+
+        audit
+            .append_at(&make_test_event("pre-midnight"), day_one)
+            .expect("append pre");
+        audit
+            .append_at(&make_test_event("post-midnight"), day_two)
+            .expect("append post");
+
+        let audit_dir = temp_dir.path().join("audit");
+        let gz = audit_dir.join("2026-04-19.jsonl.gz");
+        let plain_today = audit_dir.join("2026-04-20.jsonl");
+        let plain_yesterday = audit_dir.join("2026-04-19.jsonl");
+
+        assert!(gz.exists(), "rotated archive should exist");
+        assert!(plain_today.exists(), "today's file should exist");
+        assert!(
+            !plain_yesterday.exists(),
+            "yesterday's plain file should be removed after gzip"
+        );
+
+        let file = File::open(gz).expect("open gz");
+        let mut decoder = flate2::read::GzDecoder::new(file);
+        let mut text = String::new();
+        decoder.read_to_string(&mut text).expect("decode gz");
+        assert!(text.contains("pre-midnight"));
+        assert!(!text.contains("post-midnight"));
+    }
+
+    #[test]
+    fn audit_rotation_keeps_existing_archive_when_plain_file_is_absent() {
+        use chrono::TimeZone;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let day_one = Utc.with_ymd_and_hms(2026, 4, 19, 23, 59, 30).unwrap();
+        let day_two = Utc.with_ymd_and_hms(2026, 4, 20, 0, 0, 30).unwrap();
+        let audit = AuditLog::new_at(temp_dir.path(), day_one).expect("new audit");
+        let audit_dir = temp_dir.path().join("audit");
+        fs::create_dir_all(&audit_dir).unwrap();
+
+        let gz = audit_dir.join("2026-04-19.jsonl.gz");
+        fs::write(&gz, b"existing archive").unwrap();
+
+        audit
+            .append_at(&make_test_event("post-midnight"), day_two)
+            .expect("append post");
+
+        assert_eq!(fs::read(&gz).unwrap(), b"existing archive");
+        assert!(audit_dir.join("2026-04-20.jsonl").exists());
+    }
+
+    #[test]
+    fn audit_sweep_cleans_up_accumulated_stale_plain_files() {
+        use chrono::TimeZone;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let day_nineteen = Utc.with_ymd_and_hms(2026, 4, 19, 12, 0, 0).unwrap();
+        let day_twenty = Utc.with_ymd_and_hms(2026, 4, 20, 0, 0, 30).unwrap();
+        let audit = AuditLog::new_at(temp_dir.path(), day_nineteen).expect("new audit");
+        let audit_dir = temp_dir.path().join("audit");
+
+        for day in ["2026-04-17", "2026-04-18", "2026-04-19"] {
+            fs::write(
+                audit_dir.join(format!("{day}.jsonl")),
+                format!(
+                    "{}\n",
+                    serde_json::to_string(&make_test_event(day)).unwrap()
+                ),
+            )
+            .unwrap();
+        }
+
+        audit
+            .append_at(&make_test_event("post-midnight"), day_twenty)
+            .expect("append post");
+
+        for day in ["2026-04-17", "2026-04-18", "2026-04-19"] {
+            assert!(
+                audit_dir.join(format!("{day}.jsonl.gz")).exists(),
+                "{day} archive missing"
+            );
+            assert!(
+                !audit_dir.join(format!("{day}.jsonl")).exists(),
+                "{day} plain file should have been removed"
+            );
+        }
+        assert!(audit_dir.join("2026-04-20.jsonl").exists());
+    }
+
+    #[test]
+    fn events_since_spans_rotated_archive_and_active_file() {
+        use chrono::TimeZone;
+
+        let day_one = Utc.with_ymd_and_hms(2026, 4, 19, 12, 0, 0).unwrap();
+        let day_two = Utc.with_ymd_and_hms(2026, 4, 20, 0, 0, 30).unwrap();
+        let supervisor = test_supervisor();
+        {
+            let mut inner = supervisor.inner.audit.inner.lock();
+            inner.active_date = day_one.date_naive();
+            inner.path = supervisor
+                .runtime_dir()
+                .join("audit")
+                .join(audit_file_name(day_one.date_naive()));
+        }
+
+        let event_a = make_test_event("A");
+        let event_b = make_test_event("B");
+        let event_c = make_test_event("C");
+        let event_d = make_test_event("D");
+        let event_e = make_test_event("E");
+        supervisor.inner.audit.append_at(&event_a, day_one).unwrap();
+        supervisor.inner.audit.append_at(&event_b, day_one).unwrap();
+        supervisor.inner.audit.append_at(&event_c, day_one).unwrap();
+        let cursor_after_a = serde_json::to_string(&event_a).unwrap().len() as u64 + 1;
+
+        supervisor.inner.audit.append_at(&event_d, day_two).unwrap();
+        supervisor.inner.audit.append_at(&event_e, day_two).unwrap();
+
+        let result = supervisor
+            .read_events_since(
+                Some(EventCursor {
+                    audit_file: audit_file_name(day_one.date_naive()),
+                    byte_offset: cursor_after_a,
+                }),
+                &EventFilter {
+                    include_kinds: vec!["system_log".into()],
+                    include_sessions: Vec::new(),
+                    include_scopes: Vec::new(),
+                },
+                10,
+            )
+            .unwrap();
+        let messages = result
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::SystemLog { message, .. } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(messages, vec!["B", "C", "D", "E"]);
+        assert_eq!(
+            result.next_cursor.audit_file,
+            audit_file_name(day_two.date_naive())
+        );
+        assert!(!result.gap_detected);
+    }
+
+    #[test]
+    fn audit_append_is_single_writer_under_concurrent_load() {
+        use chrono::TimeZone;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let now = Utc.with_ymd_and_hms(2026, 4, 20, 12, 0, 0).unwrap();
+        let audit = Arc::new(AuditLog::new_at(temp_dir.path(), now).expect("new audit"));
+        let thread_count = 16_usize;
+        let events_per_thread = 100_usize;
+        let mut handles = Vec::new();
+
+        for thread_index in 0..thread_count {
+            let audit = Arc::clone(&audit);
+            handles.push(thread::spawn(move || {
+                for event_index in 0..events_per_thread {
+                    let label = format!("t{thread_index}-e{event_index}");
+                    audit
+                        .append_at(&make_test_event(&label), now)
+                        .expect("append");
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("join");
+        }
+
+        let content = fs::read_to_string(audit.path()).expect("read active file");
+        let lines = content.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), thread_count * events_per_thread);
+        for line in lines {
+            serde_json::from_str::<RuntimeEvent>(line)
+                .unwrap_or_else(|error| panic!("line did not parse: {error}\n{line}"));
         }
     }
 
