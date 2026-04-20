@@ -1146,6 +1146,39 @@ impl SupervisorHandle {
         self.restart_session_at(name, expected_stop)
     }
 
+    pub fn shutdown(&self) -> Result<()> {
+        let ptys = {
+            let mut slots = self.inner.slots.lock();
+            let mut ptys = Vec::new();
+            for (name, slot) in slots.iter_mut() {
+                cancel_quiesce_timer_locked(slot);
+                slot.state = LifecycleState::Closed;
+                slot.process_id = None;
+                slot.last_activity_at = Some(now_rfc3339());
+                slot.last_real_output_at = None;
+                if let Some(mut running) = slot.running.take()
+                    && let Some(pty) = running.pty.take()
+                {
+                    ptys.push((name.clone(), pty));
+                }
+            }
+            ptys
+        };
+
+        for (name, pty) in ptys {
+            if let Err(error) = pty.kill() {
+                self.emit(RuntimeEvent::SystemLog {
+                    level: LogLevel::Warn,
+                    message: format!("shutdown: failed to kill session '{name}': {error:#}"),
+                    timestamp: now_rfc3339(),
+                });
+            }
+            drop(pty);
+        }
+
+        Ok(())
+    }
+
     pub fn create_pair(&self, name: &str) -> Result<Vec<SessionSnapshot>> {
         let snapshots = {
             let mut slots = self.inner.slots.lock();
@@ -4312,6 +4345,59 @@ mod tests {
         let error = supervisor.delete_pair("main").unwrap_err();
 
         assert!(error.to_string().contains("cannot delete the main pair"));
+    }
+
+    #[test]
+    fn shutdown_kills_and_clears_all_running_sessions() {
+        let supervisor = test_supervisor();
+        let (claude_pty, _, claude_kill_count) =
+            mock_pty_session(None, MockKillBehavior::Immediate);
+        let (codex_pty, _, codex_kill_count) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "claude", DriverKind::Claude, claude_pty);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, codex_pty);
+
+        supervisor.shutdown().unwrap();
+
+        assert_eq!(claude_kill_count.load(Ordering::SeqCst), 1);
+        assert_eq!(codex_kill_count.load(Ordering::SeqCst), 1);
+        let snapshot = supervisor.snapshot();
+        for session in snapshot.sessions {
+            assert!(
+                !session.running,
+                "{} must not be running after shutdown",
+                session.name
+            );
+            assert_eq!(session.lifecycle_state, LifecycleState::Closed);
+            assert_eq!(session.process_id, None);
+        }
+    }
+
+    #[test]
+    fn shutdown_releases_slots_lock_before_slow_kills() {
+        let supervisor = test_supervisor();
+        let (slow_pty, _, kill_count) =
+            mock_pty_session(None, MockKillBehavior::Sleep(Duration::from_millis(500)));
+        install_mock_running_session(&supervisor, "claude", DriverKind::Claude, slow_pty);
+
+        let shutdown_supervisor = supervisor.clone();
+        let shutdown_thread = thread::spawn(move || shutdown_supervisor.shutdown().unwrap());
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while kill_count.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(kill_count.load(Ordering::SeqCst), 1);
+
+        let lock_started_at = Instant::now();
+        let slots = supervisor.inner.slots.lock();
+        let elapsed = lock_started_at.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "slots lock was held across slow kill for {elapsed:?}"
+        );
+        drop(slots);
+
+        shutdown_thread.join().unwrap();
     }
 
     #[test]

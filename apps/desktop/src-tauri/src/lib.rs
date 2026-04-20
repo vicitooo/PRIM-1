@@ -501,11 +501,8 @@ pub fn run() {
     tauri::Builder::default()
         .setup(move |app| {
             setup_diagnostics.log("info", "tauri_setup", "starting setup");
-            let supervisor = init_supervisor(
-                &app.handle(),
-                setup_project_root.clone(),
-                &setup_diagnostics,
-            )?;
+            let supervisor =
+                init_supervisor(app.handle(), setup_project_root.clone(), &setup_diagnostics)?;
             app.manage(DesktopState {
                 supervisor,
                 diagnostics: setup_diagnostics.clone(),
@@ -518,6 +515,27 @@ pub fn run() {
                 .map_err(|error| error.to_string())?;
             setup_diagnostics.log("info", "window_ready", "main window fullscreen applied");
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                let state = window.app_handle().state::<DesktopState>();
+                state.diagnostics.log(
+                    "info",
+                    "window_close",
+                    "shutting down supervisor before close",
+                );
+                if let Err(error) = state.supervisor.shutdown() {
+                    state
+                        .diagnostics
+                        .log("error", "shutdown_failed", format!("{error:#}"));
+                }
+                state
+                    .diagnostics
+                    .log("info", "window_close", "supervisor shutdown complete");
+            }
         })
         .invoke_handler(tauri::generate_handler![
             bootstrap,
@@ -551,7 +569,9 @@ mod tests {
         normalize_path_for_child_processes, peer_slash_commands_allowed_from_env,
         resolve_agent_working_root, sanitize_terminal_output_for_ui, strip_osc_sequences,
     };
-    use std::path::PathBuf;
+    use std::{path::PathBuf, sync::Mutex};
+
+    static PEER_SLASH_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn strip_osc_sequences_removes_bell_terminated_title_updates() {
@@ -609,6 +629,7 @@ mod tests {
 
     #[test]
     fn peer_slash_commands_allowed_defaults_to_false() {
+        let _guard = PEER_SLASH_ENV_LOCK.lock().unwrap();
         let previous = std::env::var_os("PRIM1_PEER_SLASH_COMMANDS_ALLOWED");
         unsafe {
             std::env::remove_var("PRIM1_PEER_SLASH_COMMANDS_ALLOWED");
@@ -625,6 +646,7 @@ mod tests {
 
     #[test]
     fn peer_slash_commands_allowed_accepts_one_and_true() {
+        let _guard = PEER_SLASH_ENV_LOCK.lock().unwrap();
         let previous = std::env::var_os("PRIM1_PEER_SLASH_COMMANDS_ALLOWED");
 
         unsafe {

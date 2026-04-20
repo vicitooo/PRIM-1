@@ -98,7 +98,7 @@ mod tests {
             vec![
                 "/d".to_string(),
                 "/c".to_string(),
-                "claude.cmd".to_string(),
+                "claude".to_string(),
                 "-n".to_string(),
                 "claude".to_string(),
                 "--dangerously-skip-permissions".to_string(),
