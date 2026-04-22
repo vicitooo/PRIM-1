@@ -453,6 +453,25 @@ fn emit_runtime_event(
     }
 }
 
+/// Emit a boot-time diagnostic naming the exact frontend asset this release EXE has
+/// bundled. Makes deployment skew (stale embedded dist vs on-disk dist) visible in
+/// desktop-events.jsonl without needing to attach CDP. Rule: when WebView behavior
+/// contradicts on-disk source, first check which bundle the live page actually loaded.
+fn log_frontend_bundle_id(diagnostics: &DesktopDiagnostics) {
+    const INDEX_HTML: &str = include_str!("../../dist/index.html");
+    let main_script = INDEX_HTML
+        .split("<script")
+        .filter_map(|s| s.split("src=\"").nth(1))
+        .filter_map(|s| s.split('"').next())
+        .find(|s| s.ends_with(".js"))
+        .unwrap_or("<no js script found in index.html>");
+    diagnostics.log(
+        "info",
+        "frontend_bundle",
+        format!("main_script={main_script}"),
+    );
+}
+
 fn sanitize_terminal_output_for_ui(chunk: &str) -> String {
     strip_osc_sequences(chunk)
 }
@@ -501,6 +520,7 @@ pub fn run() {
     tauri::Builder::default()
         .setup(move |app| {
             setup_diagnostics.log("info", "tauri_setup", "starting setup");
+            log_frontend_bundle_id(&setup_diagnostics);
             let supervisor =
                 init_supervisor(app.handle(), setup_project_root.clone(), &setup_diagnostics)?;
             app.manage(DesktopState {
