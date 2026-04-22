@@ -26,7 +26,10 @@ The project is no longer docs-only. The first version now exists and includes:
 - a named-pipe control plane on Windows
 - JSONL audit logging under `.runtime/audit/`
 - desktop crash/startup diagnostics in `.runtime/desktop-events.jsonl`
-- PowerShell helpers under `scripts/`
+- PowerShell helpers under `scripts/` plus Python supervisor utilities
+  (`supervisor-heartbeat.py`, `supervisor-last-pane-activity.py`,
+  `supervisor-detect-stream-errors.py`, `supervisor-routed-events.py`,
+  `verify-build-report.py`)
 - an explicit control-surface reference at `CONTROL-SURFACE.md`
 - release outputs under `target/release/`
 - a pair-picker that now supports in-panel create / rename / delete for ephemeral Claude+Codex pair groups
