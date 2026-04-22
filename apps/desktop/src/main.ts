@@ -8,6 +8,11 @@ import {
   resolveCopySelection,
   type CopySurface,
 } from "./copy-selection";
+import {
+  handleRuntimeEvent,
+  type PendingBuffer,
+  type RuntimeEventContext,
+} from "./runtime-events";
 import "./styles.css";
 import type {
   CreatePairRequest,
@@ -315,14 +320,8 @@ const pairCreateSlot = must<HTMLDivElement>("#pair-create-slot");
 const pairDialogSlot = must<HTMLDivElement>("#pair-dialog-slot");
 const snapshotByName = new Map<string, SessionSnapshot>();
 
-interface PendingBuffer {
-  chunks: string[];
-  dropped: number;
-}
-
 const paneMap = new Map<string, SessionTerminal>();
 const pendingOutput = new Map<string, PendingBuffer>();
-const MAX_PENDING_CHUNKS_PER_SESSION = 256;
 const controlEndpoint = must<HTMLElement>("#control-endpoint");
 const auditPath = must<HTMLElement>("#audit-path");
 const runtimePath = must<HTMLElement>("#runtime-path");
@@ -454,8 +453,29 @@ wireResize();
 wireTerminalShortcuts();
 wireThemeToggle();
 
+const runtimeEventContext: RuntimeEventContext = {
+  writeSystem,
+  refreshSnapshotFromEvent,
+  snapshotByName,
+  pendingOutput,
+  writeToPane(session, chunk) {
+    const pane = paneMap.get(session);
+    if (pane) {
+      pane.write(chunk);
+      return true;
+    }
+    return false;
+  },
+  applyPaneSnapshot(name, snapshot) {
+    paneMap.get(name)?.applySnapshot(snapshot);
+  },
+  setControlEndpoint(endpoint) {
+    controlEndpoint.textContent = endpoint;
+  },
+};
+
 void listen<RuntimeEvent>("runtime://event", ({ payload }) => {
-  handleRuntimeEvent(payload);
+  handleRuntimeEvent(payload, runtimeEventContext);
 });
 
 void bootstrap();
@@ -648,83 +668,6 @@ function refreshSnapshotFromEvent(preferredGroup?: string): void {
       `snapshot refresh failed after runtime event: ${String(error)}`,
     );
   });
-}
-
-function handleRuntimeEvent(event: RuntimeEvent): void {
-  switch (event.event) {
-    case "session_output": {
-      const pane = paneMap.get(event.session);
-      if (pane) {
-        pane.write(event.chunk);
-        break;
-      }
-
-      let entry = pendingOutput.get(event.session);
-      if (!entry) {
-        entry = { chunks: [], dropped: 0 };
-        pendingOutput.set(event.session, entry);
-        writeSystem(
-          "warn",
-          `session_output buffered: pane ${event.session} not attached yet`,
-        );
-      }
-
-      entry.chunks.push(event.chunk);
-      if (entry.chunks.length > MAX_PENDING_CHUNKS_PER_SESSION) {
-        entry.chunks.shift();
-        entry.dropped += 1;
-        if (entry.dropped === 1 || entry.dropped % 64 === 0) {
-          writeSystem(
-            "warn",
-            `session_output buffer pressure: ${event.session} shed ${entry.dropped} oldest chunks`,
-          );
-        }
-      }
-      break;
-    }
-    case "session_state": {
-      const previous = snapshotByName.get(event.session);
-      if (previous) {
-        const next: SessionSnapshot = {
-          ...previous,
-          lifecycle_state: event.state,
-          running: event.state !== "closed" && event.state !== "failed",
-          last_activity_at: event.timestamp,
-          last_error:
-            event.state === "failed" ? event.reason : previous.last_error,
-        };
-        snapshotByName.set(event.session, next);
-        paneMap.get(event.session)?.applySnapshot(next);
-      }
-      writeSystem("info", `${event.session} -> ${event.state} (${event.reason})`);
-      break;
-    }
-    case "pair_created":
-      writeSystem("info", `pair created: ${event.name}`);
-      refreshSnapshotFromEvent(event.name);
-      break;
-    case "pair_renamed":
-      writeSystem("info", `pair renamed: ${event.old_name} -> ${event.new_name}`);
-      refreshSnapshotFromEvent(event.new_name);
-      break;
-    case "pair_deleted":
-      writeSystem("info", `pair deleted: ${event.name}`);
-      refreshSnapshotFromEvent();
-      break;
-    case "system_log":
-      writeSystem(event.level, event.message);
-      break;
-    case "routed_message":
-      writeSystem(
-        "info",
-        `route ${event.from} -> ${event.to} (${event.scope}): ${event.content}`,
-      );
-      break;
-    case "control_plane_ready":
-      controlEndpoint.textContent = event.endpoint;
-      writeSystem("info", `control plane ready: ${event.endpoint}`);
-      break;
-  }
 }
 
 function syncPaneInventory(

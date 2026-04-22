@@ -127,4 +127,13 @@ export type RuntimeEvent =
       transport: string;
       info_path: string;
       timestamp: string;
+    }
+  | {
+      event: "sideband_request_lifecycle";
+      request_id: string;
+      action: string;
+      session: string | null;
+      phase: "started" | "slow_warning" | "timed_out" | "completed" | "failed";
+      elapsed_ms: number;
+      timestamp: string;
     };
