@@ -304,6 +304,10 @@ pub enum SidebandRequest {
     ListSessions {
         token: String,
     },
+    CreatePair {
+        token: String,
+        name: String,
+    },
     StartSession {
         token: String,
         name: String,
@@ -355,6 +359,7 @@ impl SidebandRequest {
         match self {
             Self::Ping { token }
             | Self::ListSessions { token }
+            | Self::CreatePair { token, .. }
             | Self::StartSession { token, .. }
             | Self::StopSession { token, .. }
             | Self::RestartSession { token, .. }

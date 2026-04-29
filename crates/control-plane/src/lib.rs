@@ -67,6 +67,24 @@ mod tests {
     }
 
     #[test]
+    fn round_trips_create_pair_request_json() {
+        let json = encode_request(&SidebandRequest::CreatePair {
+            token: "abc".into(),
+            name: "frontend-qa".into(),
+        })
+        .unwrap();
+        let decoded = decode_request(&json).unwrap();
+
+        match decoded {
+            SidebandRequest::CreatePair { token, name } => {
+                assert_eq!(token, "abc");
+                assert_eq!(name, "frontend-qa");
+            }
+            _ => panic!("unexpected request variant"),
+        }
+    }
+
+    #[test]
     fn round_trips_response_json() {
         let json = encode_response(&SidebandResponse {
             ok: true,

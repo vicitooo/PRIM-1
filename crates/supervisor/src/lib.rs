@@ -52,6 +52,7 @@ struct SidebandTimeouts;
 impl SidebandTimeouts {
     fn lane(request: &SidebandRequest) -> OpLane {
         match request {
+            SidebandRequest::CreatePair { .. } => OpLane::SideEffect,
             SidebandRequest::StartSession { .. }
             | SidebandRequest::StopSession { .. }
             | SidebandRequest::RestartSession { .. } => OpLane::Lifecycle,
@@ -63,6 +64,7 @@ impl SidebandTimeouts {
         match request {
             SidebandRequest::Ping { .. } => Duration::from_secs(2),
             SidebandRequest::ListSessions { .. } => Duration::from_secs(2),
+            SidebandRequest::CreatePair { .. } => Duration::from_secs(10),
             SidebandRequest::StartSession { .. } => Duration::from_secs(60),
             SidebandRequest::StopSession { .. } => Duration::from_secs(10),
             SidebandRequest::RestartSession { .. } => Duration::from_secs(70),
@@ -2136,6 +2138,12 @@ impl SupervisorHandle {
                     .and_then(|req| self.route_message(req))
                     .map(|_| "message routed".into())
             }
+            SidebandRequest::CreatePair { token, name } => {
+                tokio::task::yield_now().await;
+                self.validate_master_token(&token)
+                    .and_then(|_| self.create_pair(&name))
+                    .map(|snapshots| format!("created pair '{name}' ({} slots)", snapshots.len()))
+            }
             lifecycle => {
                 return SidebandResponse {
                     ok: false,
@@ -2465,6 +2473,24 @@ impl SupervisorHandle {
         {
             return Err(anyhow!(
                 "peer slash commands are disabled by this wrapper's policy (PRIM1_PEER_SLASH_COMMANDS_ALLOWED=0)"
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn validate_master_token(&self, token: &str) -> Result<()> {
+        let binding = self
+            .inner
+            .token_bindings
+            .lock()
+            .get(token)
+            .cloned()
+            .ok_or_else(|| anyhow!("invalid control plane token"))?;
+
+        if binding.is_some() {
+            return Err(anyhow!(
+                "create_pair: pane-bound tokens are not authorised; master token required"
             ));
         }
 
@@ -3223,6 +3249,7 @@ fn action_label_for(request: &SidebandRequest) -> &'static str {
     match request {
         SidebandRequest::Ping { .. } => "ping",
         SidebandRequest::ListSessions { .. } => "list_sessions",
+        SidebandRequest::CreatePair { .. } => "create_pair",
         SidebandRequest::StartSession { .. } => "start_session",
         SidebandRequest::StopSession { .. } => "stop_session",
         SidebandRequest::RestartSession { .. } => "restart_session",
@@ -3247,6 +3274,7 @@ fn session_name_of(request: &SidebandRequest) -> Option<&str> {
         SidebandRequest::RouteMessage { request, .. } => Some(request.to.as_str()),
         SidebandRequest::Ping { .. }
         | SidebandRequest::ListSessions { .. }
+        | SidebandRequest::CreatePair { .. }
         | SidebandRequest::EventsSince { .. } => None,
     }
 }
@@ -5113,6 +5141,91 @@ mod tests {
         supervisor
             .validate_session_action_token(&status.token, "codex")
             .unwrap();
+    }
+
+    #[test]
+    fn create_pair_request_inserts_closed_slots() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::CreatePair {
+            token: status.token.clone(),
+            name: "frontend-qa".into(),
+        });
+
+        assert!(response.ok, "response: {:?}", response);
+        let snapshot = response.snapshot.expect("snapshot present");
+        let by_name: HashMap<&str, &SessionSnapshot> = snapshot
+            .sessions
+            .iter()
+            .map(|session| (session.name.as_str(), session))
+            .collect();
+
+        let new_claude = by_name
+            .get("frontend-qa-claude")
+            .expect("frontend-qa-claude slot inserted");
+        let new_codex = by_name
+            .get("frontend-qa-codex")
+            .expect("frontend-qa-codex slot inserted");
+
+        assert_eq!(new_claude.lifecycle_state, LifecycleState::Closed);
+        assert!(!new_claude.running);
+        assert_eq!(new_codex.lifecycle_state, LifecycleState::Closed);
+        assert!(!new_codex.running);
+        assert!(by_name.contains_key("claude"));
+        assert!(by_name.contains_key("codex"));
+    }
+
+    #[test]
+    fn create_pair_rejects_pane_bound_token() {
+        let supervisor = test_supervisor();
+        let _status = supervisor.start_control_plane().unwrap();
+        let claude_token = session_token(&supervisor, "claude");
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::CreatePair {
+            token: claude_token,
+            name: "frontend-qa".into(),
+        });
+
+        assert!(!response.ok);
+        assert!(
+            response.message.contains("master token required"),
+            "unexpected message: {}",
+            response.message
+        );
+    }
+
+    #[test]
+    fn create_pair_rejects_invalid_token() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::CreatePair {
+            token: format!("{}-wrong", status.token),
+            name: "frontend-qa".into(),
+        });
+
+        assert!(!response.ok);
+        assert_eq!(response.message, "invalid control plane token");
+    }
+
+    #[test]
+    fn create_pair_rejects_reserved_name() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::CreatePair {
+            token: status.token,
+            name: "main".into(),
+        });
+
+        assert!(!response.ok);
+        assert!(
+            response.message.to_lowercase().contains("reserved")
+                || response.message.to_lowercase().contains("name"),
+            "unexpected message: {}",
+            response.message
+        );
     }
 
     #[test]

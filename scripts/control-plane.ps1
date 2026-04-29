@@ -1,9 +1,10 @@
 param(
   [Parameter(Mandatory = $true)]
-  [ValidateSet("ping", "list", "start", "stop", "restart", "input", "deliver", "wait_quiet", "events_since", "key", "route")]
+  [ValidateSet("ping", "list", "start", "stop", "restart", "input", "deliver", "wait_quiet", "events_since", "key", "route", "create-pair")]
   [string]$Action,
 
   [string]$Session,
+  [string]$Name,
   [ValidateSet("enter", "up", "down", "left", "right", "tab", "esc", "ctrl_c")]
   [string]$Key,
   [string]$From = "victor",
@@ -274,6 +275,10 @@ $payload = switch ($Action) {
         content = $Content
       }
     }
+  }
+  "create-pair" {
+    if (-not $Name) { throw "create-pair requires -Name" }
+    @{ kind = "create_pair"; token = $info.token; name = $Name }
   }
 }
 
