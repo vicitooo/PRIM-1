@@ -53,6 +53,13 @@ Examples:
 - `to = "codex:test"`
 - `to = "room"`
 
+Room routing contract:
+
+- `MessageScope::Room` targets running panes in the sender's pair, excluding the sender.
+- `pair_of(session_name)` maps `claude` / `codex` to the protected `main` pair, maps `<prefix>-claude` / `<prefix>-codex` to `<prefix>`, and treats any other session name as a singleton pair.
+- If the sender is unknown, supervisor-originated room messages keep the defensive broadcast-to-running-panes behavior.
+- Setting `PRIM1_CROSS_PAIR_ROOM_BROADCAST=1` before wrapper launch restores the legacy behavior: all running panes receive Room traffic except the sender.
+
 ## 4. Message envelope
 
 All sideband messages should be normalized to one envelope shape.

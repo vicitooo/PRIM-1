@@ -183,7 +183,7 @@ It is a **live three-way coding room** where:
 - Victor speaks to Codex
 - Claude speaks to Codex
 - Codex speaks to Claude
-- room messages are visible to everyone
+- room messages are scoped to the sender's pair by default
 
 The later 24/7 orchestration use cases are built on top of that, not before it.
 
@@ -196,6 +196,13 @@ The later 24/7 orchestration use cases are built on top of that, not before it.
 5. Idle and stuck are different states and must be handled differently.
 6. The runtime must be generic across terminal-first CLIs, not hardcoded to Claude/Codex.
 7. The first milestone is the real-time room, not autonomous orchestration.
+
+## Runtime environment toggles
+
+- `PRIM1_PEER_SLASH_COMMANDS_ALLOWED=1`
+  Re-enables pane-bound `send_input` / `send_key` control over peer panes. Default is off, so pane-bound credentials can only control their own pane. Restart the wrapper after changing it.
+- `PRIM1_CROSS_PAIR_ROOM_BROADCAST=1`
+  Re-enables legacy cross-pair Room fan-out. Default Room behavior is pair-scoped: the protected `main` pair (`claude` + `codex`) is one pair group, and each user-created pair (`<prefix>-claude` + `<prefix>-codex`) is its own group. Restart the wrapper after changing it.
 
 ## Canonical docs
 

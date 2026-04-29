@@ -334,6 +334,7 @@ Routed-message delivery shape:
 - Claude receives multiline routed input with `[Direct|Room message from <sender>]` headers
 - Codex receives flattened single-line routed input, keeps the same provenance header instead of dropping it, and chunks long routed payloads into part-labeled submits to avoid `[Pasted Content N chars]` staging
 - long routed messages destined for Claude are split into part-labeled routed inputs to avoid the queued-message truncation found in exploration
+- direct-scope routed messages are allowed across panes regardless of pair; room-scope routed messages are pair-scoped by default, with the full contract in `RUNTIME-CONTRACTS.md`
 
 Peer slash-command policy:
 

@@ -135,6 +135,7 @@ pub struct SupervisorConfig {
     pub working_root: PathBuf,
     pub runtime_dir: PathBuf,
     pub peer_slash_commands_allowed: bool,
+    pub cross_pair_room_broadcast: bool,
 }
 
 struct AuditInner {
@@ -452,6 +453,30 @@ fn pair_slot_names(name: &str) -> (String, String) {
     (format!("{name}-claude"), format!("{name}-codex"))
 }
 
+/// Group sessions into "pairs" by naming convention.
+///
+/// - `claude` and `codex` (the protected main pair) -> `"main"`
+/// - `<prefix>-claude` and `<prefix>-codex` -> `<prefix>`
+/// - any other name -> the name itself (singleton pair, e.g. `victor`)
+///
+/// `"main"` is collision-safe because it is reserved by `validate_pair_name`.
+fn pair_of(session_name: &str) -> &str {
+    if session_name == "claude" || session_name == "codex" {
+        return "main";
+    }
+    if let Some(stem) = session_name.strip_suffix("-claude")
+        && !stem.is_empty()
+    {
+        return stem;
+    }
+    if let Some(stem) = session_name.strip_suffix("-codex")
+        && !stem.is_empty()
+    {
+        return stem;
+    }
+    session_name
+}
+
 fn pair_title_stem(name: &str) -> String {
     let parts = name
         .split(['-', '_'])
@@ -553,6 +578,7 @@ struct SupervisorInner {
     token_bindings: Mutex<HashMap<String, Option<String>>>,
     session_control_planes: Mutex<HashMap<String, ControlPlaneStatus>>,
     peer_slash_commands_allowed: bool,
+    cross_pair_room_broadcast: bool,
     pty_spawner: RwLock<Arc<dyn PtySpawner>>,
     mailbox_fs: RwLock<Arc<dyn MailboxFs>>,
     background_runtime: Arc<tokio::runtime::Runtime>,
@@ -611,6 +637,7 @@ impl SupervisorHandle {
                 token_bindings: Mutex::new(HashMap::new()),
                 session_control_planes: Mutex::new(HashMap::new()),
                 peer_slash_commands_allowed: config.peer_slash_commands_allowed,
+                cross_pair_room_broadcast: config.cross_pair_room_broadcast,
                 pty_spawner: RwLock::new(Arc::new(ConcretePtySpawner)),
                 mailbox_fs: RwLock::new(Arc::new(StdMailboxFs)),
                 background_runtime: Arc::new(background_runtime),
@@ -1701,11 +1728,31 @@ impl SupervisorHandle {
     ) -> Vec<String> {
         let slots = self.inner.slots.lock();
         match scope {
-            MessageScope::Room => slots
-                .iter()
-                .filter(|(name, slot)| slot.running.is_some() && Some(name.as_str()) != sender)
-                .map(|(name, _)| name.clone())
-                .collect(),
+            MessageScope::Room => {
+                let cross_pair = self.inner.cross_pair_room_broadcast;
+                let sender_pair = sender.map(pair_of);
+                slots
+                    .iter()
+                    .filter(|(name, slot)| {
+                        if slot.running.is_none() {
+                            return false;
+                        }
+                        if Some(name.as_str()) == sender {
+                            return false;
+                        }
+                        if cross_pair {
+                            return true;
+                        }
+                        // Pair-scoped room delivery. Unknown sender keeps the
+                        // old broadcast behavior for supervisor-originated room messages.
+                        match sender_pair {
+                            Some(pair) => pair_of(name) == pair,
+                            None => true,
+                        }
+                    })
+                    .map(|(name, _)| name.clone())
+                    .collect()
+            }
             _ => slots
                 .get(to)
                 .and_then(|slot| {
@@ -3853,6 +3900,7 @@ mod tests {
             working_root: root.clone(),
             runtime_dir: root.join("runtime"),
             peer_slash_commands_allowed: false,
+            cross_pair_room_broadcast: false,
         })
         .unwrap()
     }
@@ -3866,6 +3914,21 @@ mod tests {
             working_root: root.clone(),
             runtime_dir: root.join("runtime"),
             peer_slash_commands_allowed: allowed,
+            cross_pair_room_broadcast: false,
+        })
+        .unwrap()
+    }
+
+    fn test_supervisor_with_cross_pair_room_broadcast(enabled: bool) -> SupervisorHandle {
+        let root = std::env::temp_dir().join(format!(
+            "cli-master-wrapper-cross-pair-test-{}",
+            Uuid::new_v4()
+        ));
+        SupervisorHandle::new(SupervisorConfig {
+            working_root: root.clone(),
+            runtime_dir: root.join("runtime"),
+            peer_slash_commands_allowed: false,
+            cross_pair_room_broadcast: enabled,
         })
         .unwrap()
     }
@@ -4401,6 +4464,53 @@ mod tests {
     }
 
     #[test]
+    fn pair_of_main_pair_panes() {
+        assert_eq!(pair_of("claude"), "main");
+        assert_eq!(pair_of("codex"), "main");
+    }
+
+    #[test]
+    fn pair_of_named_pair_panes() {
+        assert_eq!(pair_of("FrontendQA-claude"), "FrontendQA");
+        assert_eq!(pair_of("FrontendQA-codex"), "FrontendQA");
+        assert_eq!(pair_of("foo-bar-claude"), "foo-bar");
+        assert_eq!(pair_of("foo_bar-codex"), "foo_bar");
+    }
+
+    #[test]
+    fn pair_of_singleton_for_non_convention_names() {
+        assert_eq!(pair_of("victor"), "victor");
+        assert_eq!(pair_of("supervisor"), "supervisor");
+    }
+
+    #[test]
+    fn pair_of_empty_string_is_singleton() {
+        assert_eq!(pair_of(""), "");
+    }
+
+    #[test]
+    fn pair_of_pathological_inputs_do_not_collapse_to_main() {
+        assert_eq!(pair_of("claude-claude"), "claude");
+        assert_eq!(pair_of("claude-codex"), "claude");
+        assert_eq!(pair_of("-claude"), "-claude");
+        assert_eq!(pair_of("-codex"), "-codex");
+    }
+
+    #[test]
+    fn pair_of_main_pair_name_is_reserved_against_user_pairs() {
+        assert_eq!(pair_of("claude"), "main");
+        assert_eq!(pair_of("codex"), "main");
+
+        assert_eq!(pair_of("default-claude"), "default");
+        assert_eq!(pair_of("default-codex"), "default");
+        assert_ne!(pair_of("default-claude"), pair_of("claude"));
+
+        assert!(validate_pair_name("main").is_err());
+        assert_eq!(pair_of("main-claude"), "main");
+        assert_eq!(pair_of("main-codex"), "main");
+    }
+
+    #[test]
     fn room_targets_only_running_sessions() {
         let supervisor = test_supervisor();
 
@@ -4431,6 +4541,74 @@ mod tests {
     }
 
     #[test]
+    fn room_targets_isolate_cross_pair_when_flag_off() {
+        let supervisor = test_supervisor();
+        supervisor.create_pair("FrontendQA").unwrap();
+        install_stale_running_session(&supervisor, "claude");
+        install_stale_running_session(&supervisor, "codex");
+        install_stale_running_session(&supervisor, "FrontendQA-claude");
+        install_stale_running_session(&supervisor, "FrontendQA-codex");
+
+        let recipients =
+            supervisor.resolve_recipients("room", MessageScope::Room, Some("FrontendQA-claude"));
+
+        assert_eq!(recipients, vec!["FrontendQA-codex".to_string()]);
+    }
+
+    #[test]
+    fn room_targets_main_pair_unaffected_by_isolation() {
+        let supervisor = test_supervisor();
+        supervisor.create_pair("FrontendQA").unwrap();
+        install_stale_running_session(&supervisor, "claude");
+        install_stale_running_session(&supervisor, "codex");
+        install_stale_running_session(&supervisor, "FrontendQA-claude");
+        install_stale_running_session(&supervisor, "FrontendQA-codex");
+
+        let recipients = supervisor.resolve_recipients("room", MessageScope::Room, Some("claude"));
+
+        assert_eq!(recipients, vec!["codex".to_string()]);
+    }
+
+    #[test]
+    fn room_targets_broadcast_all_panes_when_flag_on() {
+        let supervisor = test_supervisor_with_cross_pair_room_broadcast(true);
+        supervisor.create_pair("FrontendQA").unwrap();
+        install_stale_running_session(&supervisor, "claude");
+        install_stale_running_session(&supervisor, "codex");
+        install_stale_running_session(&supervisor, "FrontendQA-claude");
+        install_stale_running_session(&supervisor, "FrontendQA-codex");
+
+        let mut recipients =
+            supervisor.resolve_recipients("room", MessageScope::Room, Some("FrontendQA-claude"));
+        recipients.sort();
+
+        assert_eq!(
+            recipients,
+            vec![
+                "FrontendQA-codex".to_string(),
+                "claude".to_string(),
+                "codex".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn room_targets_sender_none_broadcasts_to_all_running() {
+        let supervisor = test_supervisor();
+        supervisor.create_pair("FrontendQA").unwrap();
+        install_stale_running_session(&supervisor, "claude");
+        install_stale_running_session(&supervisor, "FrontendQA-codex");
+
+        let mut recipients = supervisor.resolve_recipients("room", MessageScope::Room, None);
+        recipients.sort();
+
+        assert_eq!(
+            recipients,
+            vec!["FrontendQA-codex".to_string(), "claude".to_string()]
+        );
+    }
+
+    #[test]
     fn direct_targets_ignore_sender_filter() {
         let supervisor = test_supervisor();
         install_stale_running_session(&supervisor, "claude");
@@ -4439,6 +4617,19 @@ mod tests {
             supervisor.resolve_recipients("claude", MessageScope::Direct, Some("claude"));
 
         assert_eq!(recipients, vec!["claude".to_string()]);
+    }
+
+    #[test]
+    fn direct_targets_cross_pair_unchanged_by_flag() {
+        let supervisor = test_supervisor();
+        supervisor.create_pair("FrontendQA").unwrap();
+        install_stale_running_session(&supervisor, "claude");
+        install_stale_running_session(&supervisor, "FrontendQA-codex");
+
+        let recipients =
+            supervisor.resolve_recipients("FrontendQA-codex", MessageScope::Direct, Some("claude"));
+
+        assert_eq!(recipients, vec!["FrontendQA-codex".to_string()]);
     }
 
     #[test]
