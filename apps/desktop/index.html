@@ -4,14 +4,40 @@
     <meta charset="UTF-8" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Montserrat:wght@400;500;600;700&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="/src/styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>PRIM-001</title>
+    <title>Bridge 0.4</title>
     <script type="module" src="/src/main.ts" defer></script>
   </head>
 
   <body>
+    <!-- SVG filter definitions consumed via CSS `filter: url(#id)`.
+         Hidden in layout (width/height 0). Used by [data-theme="blackwall-deep"]
+         to dissolve/glitch certain elements like AIs materializing past the Bridge. -->
+    <svg style="position: absolute; width: 0; height: 0; overflow: hidden;" aria-hidden="true">
+      <defs>
+        <!-- Subtle dissolve: most of the 9s cycle is quiet (scale=0), brief
+             displacement bursts make the element appear to fragment + reform. -->
+        <filter id="blackwall-dissolve">
+          <feTurbulence type="fractalNoise" baseFrequency="0.045" numOctaves="2" seed="2" result="noise">
+            <animate attributeName="seed" values="2;9;16;23;30;37" dur="9s" repeatCount="indefinite" />
+          </feTurbulence>
+          <feDisplacementMap in="SourceGraphic" in2="noise" scale="0" xChannelSelector="R" yChannelSelector="G">
+            <animate attributeName="scale" values="0;0;0;0;6;3;0;0;0" dur="9s" repeatCount="indefinite" />
+          </feDisplacementMap>
+        </filter>
+        <!-- Heavier dissolve for the brand wordmark — slightly stronger peaks. -->
+        <filter id="blackwall-dissolve-strong">
+          <feTurbulence type="fractalNoise" baseFrequency="0.05" numOctaves="2" seed="5" result="noise">
+            <animate attributeName="seed" values="5;13;21;29;37;45" dur="11s" repeatCount="indefinite" />
+          </feTurbulence>
+          <feDisplacementMap in="SourceGraphic" in2="noise" scale="0" xChannelSelector="R" yChannelSelector="G">
+            <animate attributeName="scale" values="0;0;0;0;0;9;4;0;0;0;0" dur="11s" repeatCount="indefinite" />
+          </feDisplacementMap>
+        </filter>
+      </defs>
+    </svg>
     <div id="app"></div>
   </body>
 </html>

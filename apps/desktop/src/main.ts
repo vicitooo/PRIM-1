@@ -32,9 +32,18 @@ interface PaneGroup {
 
 type PairFocusTarget = "create" | "delete" | `rename:${string}` | null;
 
-const RESERVED_PAIR_NAMES = new Set(["main", "claude", "codex", "room", "victor"]);
+const RESERVED_PAIR_NAMES = new Set(["main", "claude", "codex", "room", "victor", "alex"]);
 const PAIR_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
 const PAIR_NAME_MAX_LEN = 48;
+
+/** Display alias for pane titles — theme rebrand.
+    Claude (or {pair}-claude) → ALT (Alt Cunningham)
+    Codex  (or {pair}-codex)  → SO MI (Songbird) */
+function paneDisplayTitle(name: string, original: string): string {
+  if (name === "claude" || name.endsWith("-claude")) return "ALT";
+  if (name === "codex"  || name.endsWith("-codex"))  return "SO MI";
+  return original;
+}
 
 const app = document.querySelector("#app");
 if (!(app instanceof HTMLDivElement)) {
@@ -43,19 +52,71 @@ if (!(app instanceof HTMLDivElement)) {
 
 app.innerHTML = `
   <div class="app-shell">
+    <div class="blackwall-ticker" aria-hidden="true">
+      <div class="blackwall-ticker-track">
+        <span class="blackwall-ticker-cell">INTEGRITY <span class="blackwall-ticker-glyph">&#9635;</span> 98.6%</span>
+        <span class="blackwall-ticker-sep">&#9670;</span>
+        <span class="blackwall-ticker-cell">BLACKWALL <span class="blackwall-ticker-glyph">&#8756;</span> STABLE</span>
+        <span class="blackwall-ticker-sep">&#9670;</span>
+        <span class="blackwall-ticker-cell">CHANNELS: ALT // SO MI</span>
+        <span class="blackwall-ticker-sep">&#9670;</span>
+        <span class="blackwall-ticker-cell">LATENCY: 12.4ms</span>
+        <span class="blackwall-ticker-sep">&#9670;</span>
+        <span class="blackwall-ticker-cell">BREACH ATTEMPTS: 0</span>
+        <span class="blackwall-ticker-sep">&#9670;</span>
+        <span class="blackwall-ticker-cell">ROGUE AI SIGNATURES: NULL</span>
+        <span class="blackwall-ticker-sep">&#9670;</span>
+        <span class="blackwall-ticker-cell">FW VERSION: 2.4.0</span>
+        <span class="blackwall-ticker-sep">&#9670;</span>
+        <span class="blackwall-ticker-cell">NET STATUS: GREEN</span>
+        <span class="blackwall-ticker-sep">&#9670;</span>
+        <span class="blackwall-ticker-cell">NCPD ICE: NEUTRAL</span>
+        <span class="blackwall-ticker-sep">&#9670;</span>
+        <span class="blackwall-ticker-cell">TRAUMA TEAM: STANDBY</span>
+        <span class="blackwall-ticker-sep">&#9670;</span>
+        <span class="blackwall-ticker-cell">BLACKWALL <span class="blackwall-ticker-glyph">&#8756;</span> STABLE</span>
+        <span class="blackwall-ticker-sep">&#9670;</span>
+        <span class="blackwall-ticker-cell">UPLINK: ENCRYPTED</span>
+        <span class="blackwall-ticker-sep">&#9670;</span>
+      </div>
+    </div>
     <header class="topbar panel">
       <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
+      <span class="hud-antenna" aria-hidden="true"></span>
+      <svg class="topbar-hud-strip" viewBox="0 0 2400 30" preserveAspectRatio="none" aria-hidden="true">
+        <path d="M 600 6 L 920 6 M 960 6 L 1280 6 M 1340 6 L 1620 6 M 1680 6 L 2000 6 M 2060 6 L 2320 6"
+              style="stroke: var(--bronze)" stroke-width="1.5" fill="none" stroke-linecap="square" />
+        <path d="M 940 0 L 940 14 M 1310 0 L 1310 14 M 1650 0 L 1650 14 M 2030 0 L 2030 14"
+              style="stroke: var(--bronze)" stroke-width="1.4" fill="none" stroke-linecap="square" />
+        <rect x="930" y="2" width="14" height="6" style="fill: var(--bronze)" opacity="0.55" />
+        <rect x="1300" y="2" width="14" height="6" style="fill: var(--bronze)" opacity="0.55" />
+        <rect x="1640" y="2" width="14" height="6" style="fill: var(--bronze)" opacity="0.55" />
+        <rect x="2020" y="2" width="14" height="6" style="fill: var(--bronze)" opacity="0.55" />
+        <path d="M 1000 16 L 1260 16 M 1700 16 L 1980 16"
+              style="stroke: var(--bronze)" stroke-width="1" fill="none" opacity="0.5" stroke-linecap="square" />
+        <path d="M 600 22 L 700 22 M 1380 22 L 1580 22"
+              style="stroke: var(--copper-hot)" stroke-width="1" fill="none" opacity="0.55" stroke-linecap="square" />
+        <rect x="592" y="20" width="4" height="4" style="fill: var(--copper-hot)" opacity="0.7" />
+        <rect x="1372" y="20" width="4" height="4" style="fill: var(--copper-hot)" opacity="0.7" />
+      </svg>
       <div class="topbar-brand">
-        <p class="eyebrow">Victor / Claude / Codex</p>
-        <h1>PRIM-001</h1>
-      </div>
-      <div class="topbar-active">
-        <p class="eyebrow">Active pair</p>
-        <span class="active-group-label" id="active-group-label">main</span>
+        <div class="brand-logo-frame" aria-hidden="true">
+          <img class="brand-logo" src="/textures/logo.png" alt="" />
+          <svg class="brand-logo-bracket" viewBox="0 0 60 60" aria-hidden="true">
+            <path d="M 0 14 L 0 0 L 14 0" style="stroke: var(--bronze)" stroke-width="2" fill="none" stroke-linecap="square" />
+            <path d="M 46 0 L 60 0 L 60 14" style="stroke: var(--bronze)" stroke-width="2" fill="none" stroke-linecap="square" />
+            <path d="M 60 46 L 60 60 L 46 60" style="stroke: var(--bronze)" stroke-width="2" fill="none" stroke-linecap="square" />
+            <path d="M 14 60 L 0 60 L 0 46" style="stroke: var(--bronze)" stroke-width="2" fill="none" stroke-linecap="square" />
+            <path d="M 0 22 L 0 38" style="stroke: var(--copper-hot)" stroke-width="1.5" fill="none" opacity="0.7" />
+            <path d="M 60 22 L 60 38" style="stroke: var(--copper-hot)" stroke-width="1.5" fill="none" opacity="0.7" />
+          </svg>
+        </div>
+        <h1>Bridge 0.4</h1>
+        <span class="topbar-active-tag">Active pair</span>
       </div>
       <div class="topbar-status">
-        <span class="state-pill" data-session-state="global">ready</span>
-        <span class="activity-pill">idle</span>
+        <span class="state-pill" data-session-state="global" hidden>ready</span>
+        <span class="activity-pill" hidden>idle</span>
       </div>
       <button class="theme-toggle" id="theme-toggle" aria-label="Toggle theme" title="Toggle theme"></button>
       <span class="mono" id="control-endpoint" hidden>starting...</span>
@@ -65,18 +126,36 @@ app.innerHTML = `
     <section class="workspace-shell">
       <aside class="group-picker panel">
         <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
+        <span class="sidebar-accent-stripe" aria-hidden="true"></span>
+        <svg class="sidebar-inner-frame" viewBox="0 0 200 600" preserveAspectRatio="none" aria-hidden="true">
+          <path d="M 14 0 L 14 24 L 4 34 L 4 540 L 14 550 L 14 564 L 28 564 L 38 554 L 162 554 L 172 564 L 186 564 L 186 550 L 196 540 L 196 34 L 186 24 L 186 0"
+                style="stroke: var(--copper-hot)" stroke-width="2.2" fill="none" vector-effect="non-scaling-stroke" stroke-linejoin="miter" stroke-linecap="square"/>
+          <path d="M 4 540 L 14 550 L 14 564 L 28 564 L 38 554 L 162 554 L 172 564 L 186 564 L 186 550 L 196 540"
+                style="stroke: var(--bronze)" stroke-width="2" fill="none" vector-effect="non-scaling-stroke" stroke-linejoin="miter" stroke-linecap="square"/>
+          <rect x="2" y="544" width="14" height="10" style="fill: var(--copper-hot); fill-opacity: 0.22" stroke="none" />
+          <rect x="184" y="544" width="14" height="10" style="fill: var(--copper-hot); fill-opacity: 0.22" stroke="none" />
+        </svg>
         <div class="card-head">
-          <div>
-            <p class="card-kicker">Pair picker</p>
+          <div class="card-title-block">
+            <div class="kicker-row">
+              <p class="card-kicker">Link</p>
+              <span class="online-pill"><span class="online-dot"></span>Online</span>
+            </div>
             <h2>Active pair</h2>
           </div>
           <div class="group-picker-tools">
-            <span class="mono" id="group-count">0 groups</span>
+            <span class="mono" id="group-count" hidden>0 groups</span>
             <div id="pair-create-slot"></div>
           </div>
         </div>
         <ul class="group-list" id="group-list"></ul>
+        <div class="sidebar-grid" aria-hidden="true"></div>
+        <div class="sidebar-footer" aria-hidden="true">
+          <span class="sidebar-version">iSYS v.2.0</span>
+          <div class="sidebar-progress"><span></span></div>
+        </div>
         <div id="pair-dialog-slot"></div>
+        <span class="active-group-label" id="active-group-label" hidden>main</span>
       </aside>
 
       <section class="workspace-grid" id="workspace-grid"></section>
@@ -85,41 +164,57 @@ app.innerHTML = `
     <section class="bottom-grid">
       <article class="system-card panel">
         <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
+        <span class="hud-antenna" aria-hidden="true"></span>
         <div class="card-head">
-          <div>
-            <p class="card-kicker">Supervisor</p>
+          <div class="card-title">
+            <span class="card-icon icon-log" aria-hidden="true"></span>
             <h2>System log</h2>
           </div>
-          <span class="mono" id="runtime-path">runtime pending</span>
+          <svg class="card-head-hud" viewBox="0 0 800 12" preserveAspectRatio="none" aria-hidden="true">
+            <path d="M 0 6 L 180 6 M 220 6 L 420 6 M 460 6 L 700 6 M 740 6 L 800 6"
+                  style="stroke: var(--bronze)" stroke-width="1.2" fill="none" stroke-linecap="square" />
+            <path d="M 200 0 L 200 12 M 440 0 L 440 12 M 720 0 L 720 12"
+                  style="stroke: var(--bronze)" stroke-width="1" fill="none" stroke-linecap="square" />
+            <rect x="195" y="3" width="10" height="6" style="fill: var(--bronze)" opacity="0.55" />
+            <rect x="435" y="3" width="10" height="6" style="fill: var(--copper-hot)" opacity="0.75" />
+            <rect x="715" y="3" width="10" height="6" style="fill: var(--bronze)" opacity="0.55" />
+          </svg>
+          <div class="card-head-meta">
+            <span class="live-pill" hidden><span class="live-dot"></span>Live</span>
+            <span class="mono" id="runtime-path" hidden>runtime pending</span>
+            <span class="log-toggle" aria-hidden="true">&lt; Log &gt;</span>
+          </div>
         </div>
         <div class="system-terminal" id="system-terminal"></div>
+        <span class="card-ctrl-chip" aria-hidden="true">CTRL</span>
       </article>
 
       <article class="router-card panel">
         <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
+        <span class="hud-antenna" aria-hidden="true"></span>
         <div class="card-head">
-          <div>
-            <p class="card-kicker">Sideband</p>
+          <div class="card-title">
+            <span class="card-icon icon-send" aria-hidden="true"></span>
             <h2>Route a message</h2>
           </div>
-          <span class="mono">Visible + logged</span>
+          <svg class="card-head-hud" viewBox="0 0 800 12" preserveAspectRatio="none" aria-hidden="true">
+            <path d="M 0 6 L 220 6 M 260 6 L 460 6 M 500 6 L 800 6"
+                  style="stroke: var(--bronze)" stroke-width="1.2" fill="none" stroke-linecap="square" />
+            <path d="M 240 0 L 240 12 M 480 0 L 480 12"
+                  style="stroke: var(--bronze)" stroke-width="1" fill="none" stroke-linecap="square" />
+            <rect x="235" y="3" width="10" height="6" style="fill: var(--copper-hot)" opacity="0.75" />
+            <rect x="475" y="3" width="10" height="6" style="fill: var(--bronze)" opacity="0.55" />
+          </svg>
+          <span class="mono" hidden>Visible + logged</span>
         </div>
         <form id="router-form" class="router-form">
           <label>
             <span>From</span>
-            <select id="route-from">
-              <option value="victor">Victor</option>
-              <option value="claude">Claude</option>
-              <option value="codex">Codex</option>
-            </select>
+            <div class="combobox-mount" data-combobox="route-from"></div>
           </label>
           <label>
             <span>To</span>
-            <select id="route-to">
-              <option value="claude">Claude</option>
-              <option value="codex">Codex</option>
-              <option value="room">Room</option>
-            </select>
+            <div class="combobox-mount" data-combobox="route-to"></div>
           </label>
           <label class="message-field">
             <span>Content</span>
@@ -130,6 +225,7 @@ app.innerHTML = `
             <button type="button" id="clear-router">Clear</button>
           </div>
         </form>
+        <span class="card-ctrl-chip" aria-hidden="true">CTRL</span>
       </article>
     </section>
 
@@ -144,6 +240,145 @@ app.innerHTML = `
   </div>
 `;
 
+interface ComboboxOption { value: string; label: string; }
+
+class Combobox {
+  readonly el: HTMLDivElement;
+  private readonly trigger: HTMLButtonElement;
+  private readonly triggerLabel: HTMLSpanElement;
+  private readonly listbox: HTMLDivElement;
+  private options: ComboboxOption[] = [];
+  private _value = "";
+  private isOpen = false;
+
+  constructor(mount: HTMLElement, public readonly id: string) {
+    this.el = document.createElement("div");
+    this.el.className = "combobox";
+    this.el.dataset.comboboxId = id;
+
+    this.trigger = document.createElement("button");
+    this.trigger.type = "button";
+    this.trigger.className = "combobox-trigger";
+    this.trigger.setAttribute("aria-haspopup", "listbox");
+    this.trigger.setAttribute("aria-expanded", "false");
+
+    this.triggerLabel = document.createElement("span");
+    this.triggerLabel.className = "combobox-label";
+    this.trigger.appendChild(this.triggerLabel);
+
+    const chevron = document.createElement("span");
+    chevron.className = "combobox-chevron";
+    chevron.setAttribute("aria-hidden", "true");
+    this.trigger.appendChild(chevron);
+
+    this.listbox = document.createElement("div");
+    this.listbox.className = "combobox-listbox";
+    this.listbox.setAttribute("role", "listbox");
+    this.listbox.hidden = true;
+
+    this.el.append(this.trigger, this.listbox);
+    mount.replaceChildren(this.el);
+
+    this.trigger.addEventListener("click", () => this.toggle());
+    this.trigger.addEventListener("keydown", (event) => this.handleKeydown(event));
+    this.listbox.addEventListener("keydown", (event) => this.handleKeydown(event));
+    document.addEventListener("click", (event) => {
+      if (!this.isOpen) return;
+      if (event.target instanceof Node && !this.el.contains(event.target)) {
+        this.close();
+      }
+    });
+  }
+
+  get value(): string { return this._value; }
+  set value(v: string) {
+    if (this.options.some((opt) => opt.value === v)) {
+      this._value = v;
+      this.updateLabel();
+      this.renderListbox();
+    }
+  }
+
+  setOptions(options: ComboboxOption[]): void {
+    this.options = options.slice();
+    if (!this.options.find((opt) => opt.value === this._value)) {
+      this._value = this.options[0]?.value ?? "";
+    }
+    this.updateLabel();
+    this.renderListbox();
+  }
+
+  private updateLabel(): void {
+    const opt = this.options.find((o) => o.value === this._value);
+    this.triggerLabel.textContent = opt?.label ?? "";
+  }
+
+  private renderListbox(): void {
+    this.listbox.replaceChildren();
+    for (const opt of this.options) {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "combobox-option";
+      item.setAttribute("role", "option");
+      item.dataset.value = opt.value;
+      item.textContent = opt.label;
+      if (opt.value === this._value) {
+        item.dataset.selected = "true";
+        item.setAttribute("aria-selected", "true");
+      }
+      item.addEventListener("click", () => {
+        this.value = opt.value;
+        this.el.dispatchEvent(new Event("change", { bubbles: true }));
+        this.close();
+        this.trigger.focus();
+      });
+      this.listbox.appendChild(item);
+    }
+  }
+
+  toggle(): void { this.isOpen ? this.close() : this.open(); }
+
+  open(): void {
+    if (this.isOpen) return;
+    this.isOpen = true;
+    this.listbox.hidden = false;
+    this.trigger.setAttribute("aria-expanded", "true");
+    const selected = this.listbox.querySelector<HTMLButtonElement>('[data-selected="true"]');
+    (selected ?? this.listbox.querySelector<HTMLButtonElement>(".combobox-option"))?.focus();
+  }
+
+  close(): void {
+    if (!this.isOpen) return;
+    this.isOpen = false;
+    this.listbox.hidden = true;
+    this.trigger.setAttribute("aria-expanded", "false");
+  }
+
+  private handleKeydown(event: KeyboardEvent): void {
+    if (event.key === "Escape" && this.isOpen) {
+      event.preventDefault();
+      this.close();
+      this.trigger.focus();
+      return;
+    }
+    if ((event.key === "ArrowDown" || event.key === "Enter" || event.key === " ") && !this.isOpen && event.target === this.trigger) {
+      event.preventDefault();
+      this.open();
+      return;
+    }
+    if (this.isOpen && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
+      event.preventDefault();
+      const items = Array.from(this.listbox.querySelectorAll<HTMLButtonElement>(".combobox-option"));
+      const current = document.activeElement;
+      const idx = current instanceof HTMLButtonElement ? items.indexOf(current) : -1;
+      const next = event.key === "ArrowDown"
+        ? items[(idx + 1) % items.length]
+        : items[(idx - 1 + items.length) % items.length];
+      next?.focus();
+    }
+  }
+}
+
 class SessionTerminal {
   readonly name: string;
   title: string;
@@ -157,7 +392,7 @@ class SessionTerminal {
 
   constructor(name: string, title: string) {
     this.name = name;
-    this.title = title;
+    this.title = paneDisplayTitle(name, title);
     this.host = must<HTMLDivElement>(`[data-terminal="${name}"]`);
     this.stateEl = must<HTMLSpanElement>(`[data-session-state="${name}"]`);
     this.activityEl = must<HTMLSpanElement>(`[data-session-activity="${name}"]`);
@@ -167,27 +402,27 @@ class SessionTerminal {
       fontFamily: '"JetBrains Mono", "Cascadia Code", Consolas, monospace',
       fontSize: 13,
       theme: {
-        background: "#100f0e",
-        foreground: "#dedede",
-        cursor: "#D4736A",
-        cursorAccent: "#100f0e",
-        selectionBackground: "rgba(212, 115, 106, 0.18)",
-        black: "#100f0e",
-        brightBlack: "#555350",
-        red: "#D4736A",
-        brightRed: "#E8A598",
-        green: "#8cc265",
-        brightGreen: "#a5d97a",
-        yellow: "#e6b44f",
-        brightYellow: "#f2cc72",
-        blue: "#7aa2f7",
-        brightBlue: "#93b5ff",
-        magenta: "#c97eb8",
-        brightMagenta: "#dfa0d2",
-        cyan: "#59c0c8",
-        brightCyan: "#7ee1e7",
-        white: "#c8c5c0",
-        brightWhite: "#dedede",
+        background: "#03060a",
+        foreground: "#ff2d8c",
+        cursor: "#5dbabe",
+        cursorAccent: "#03060a",
+        selectionBackground: "rgba(93, 186, 190, 0.22)",
+        black: "#03060a",
+        brightBlack: "#9a2858",
+        red: "#ff2d6f",
+        brightRed: "#ff5a8d",
+        green: "#00ff99",
+        brightGreen: "#5affb8",
+        yellow: "#d8e02a",
+        brightYellow: "#ecf055",
+        blue: "#00aaff",
+        brightBlue: "#5acdff",
+        magenta: "#ff2dd6",
+        brightMagenta: "#ff70e8",
+        cyan: "#5dbabe",
+        brightCyan: "#7dd0d4",
+        white: "#b8e8ff",
+        brightWhite: "#e0f7ff",
       },
     });
     this.fitAddon = new FitAddon();
@@ -207,7 +442,7 @@ class SessionTerminal {
 
   banner(): void {
     this.terminal.reset();
-    this.terminal.writeln(`\x1b[38;5;137m${this.title} pane ready.\x1b[0m`);
+    this.terminal.writeln(`\x1b[38;2;${brandBannerAnsi()}m${this.title} pane ready.\x1b[0m`);
     this.terminal.writeln("Launch the session from the header or send routed messages below.");
     this.terminal.writeln("");
   }
@@ -233,7 +468,7 @@ class SessionTerminal {
   }
 
   applySnapshot(snapshot: SessionSnapshot): void {
-    this.title = snapshot.title;
+    this.title = paneDisplayTitle(snapshot.name, snapshot.title);
     this.snapshot = snapshot;
     this.stateEl.textContent = snapshot.lifecycle_state;
     this.stateEl.dataset.state = snapshot.lifecycle_state;
@@ -278,27 +513,27 @@ const systemTerminal = new Terminal({
   fontFamily: '"JetBrains Mono", "Cascadia Code", Consolas, monospace',
   fontSize: 12,
   theme: {
-    background: "#1a1917",
-    foreground: "#dedede",
-    cursor: "#E8A598",
-    cursorAccent: "#1a1917",
-    selectionBackground: "rgba(212, 115, 106, 0.15)",
-    black: "#1a1917",
-    brightBlack: "#555350",
-    red: "#D4736A",
-    brightRed: "#E8A598",
-    green: "#8cc265",
-    brightGreen: "#a5d97a",
-    yellow: "#e6b44f",
-    brightYellow: "#f2cc72",
-    blue: "#88aefc",
-    brightBlue: "#9fc0ff",
-    magenta: "#c97eb8",
-    brightMagenta: "#dfa0d2",
-    cyan: "#73d1d6",
-    brightCyan: "#8de7ec",
-    white: "#c8c5c0",
-    brightWhite: "#dedede",
+    background: "#03060a",
+    foreground: "#e0f7ff",
+    cursor: "#d8e02a",
+    cursorAccent: "#03060a",
+    selectionBackground: "rgba(216, 224, 42, 0.22)",
+    black: "#03060a",
+    brightBlack: "#2a3a55",
+    red: "#ff2d6f",
+    brightRed: "#ff5a8d",
+    green: "#00ff99",
+    brightGreen: "#5affb8",
+    yellow: "#d8e02a",
+    brightYellow: "#ecf055",
+    blue: "#00aaff",
+    brightBlue: "#5acdff",
+    magenta: "#ff2dd6",
+    brightMagenta: "#ff70e8",
+    cyan: "#5dbabe",
+    brightCyan: "#7dd0d4",
+    white: "#b8e8ff",
+    brightWhite: "#e0f7ff",
   },
 });
 const systemFit = new FitAddon();
@@ -326,6 +561,25 @@ const controlEndpoint = must<HTMLElement>("#control-endpoint");
 const auditPath = must<HTMLElement>("#audit-path");
 const runtimePath = must<HTMLElement>("#runtime-path");
 const activeGroupLabel = must<HTMLElement>("#active-group-label");
+
+const routeFromCombobox = new Combobox(
+  must<HTMLDivElement>('[data-combobox="route-from"]'),
+  "route-from",
+);
+const routeToCombobox = new Combobox(
+  must<HTMLDivElement>('[data-combobox="route-to"]'),
+  "route-to",
+);
+routeFromCombobox.setOptions([
+  { value: "alex", label: "Alex" },
+  { value: "claude", label: paneDisplayTitle("claude", "Claude") },
+  { value: "codex", label: paneDisplayTitle("codex", "Codex") },
+]);
+routeToCombobox.setOptions([
+  { value: "claude", label: paneDisplayTitle("claude", "Claude") },
+  { value: "codex", label: paneDisplayTitle("codex", "Codex") },
+  { value: "room", label: "Room" },
+]);
 let renderedSessionSignature: string | null = null;
 let activeTerminalName: string | null = null;
 let activeCopySurface: CopySurface = null;
@@ -344,39 +598,76 @@ let pairPickerDismissWired = false;
 let pairPickerActionsWired = false;
 let paneButtonsWired = false;
 
-/* ── Theme system ── */
+/* ── Theme system ──
+   Themes are sets of CSS custom properties (defined in styles.css)
+   plus matching xterm.js color objects (defined here). To add a theme:
+   1) Add a [data-theme="<name>"] block in styles.css with palette overrides
+   2) Add a session+system entry in TERMINAL_THEMES below
+   3) Add the name to THEME_CYCLE if you want it in the picker rotation */
 
 const TERMINAL_THEMES = {
-  dark: {
+  blackwall: {
     session: {
-      background: "#151311",
-      foreground: "#b5aea5",
-      cursor: "#a0655e",
-      cursorAccent: "#151311",
-      selectionBackground: "rgba(160, 100, 60, 0.18)",
-      black: "#151311", brightBlack: "#5e5850",
-      red: "#8a4a42", brightRed: "#a0655e",
-      green: "#6a8a50", brightGreen: "#7ea062",
-      yellow: "#9a8040", brightYellow: "#b09555",
-      blue: "#5a7aaa", brightBlue: "#7090c0",
-      magenta: "#7a5a80", brightMagenta: "#907098",
-      cyan: "#4a7a7a", brightCyan: "#608e8e",
-      white: "#8a8278", brightWhite: "#b5aea5",
+      background: "#03060a",
+      foreground: "#ff2d8c",
+      cursor: "#5dbabe",
+      cursorAccent: "#03060a",
+      selectionBackground: "rgba(93, 186, 190, 0.22)",
+      black: "#03060a", brightBlack: "#9a2858",
+      red: "#ff2d6f", brightRed: "#ff5a8d",
+      green: "#00ff99", brightGreen: "#5affb8",
+      yellow: "#d8e02a", brightYellow: "#ecf055",
+      blue: "#00aaff", brightBlue: "#5acdff",
+      magenta: "#ff2dd6", brightMagenta: "#ff70e8",
+      cyan: "#5dbabe", brightCyan: "#7dd0d4",
+      white: "#b8e8ff", brightWhite: "#e0f7ff",
     },
     system: {
-      background: "#1a1715",
-      foreground: "#b5aea5",
-      cursor: "#8a6e55",
-      cursorAccent: "#1a1715",
-      selectionBackground: "rgba(138, 110, 85, 0.15)",
-      black: "#1a1715", brightBlack: "#5e5850",
-      red: "#8a4a42", brightRed: "#a0655e",
-      green: "#6a8a50", brightGreen: "#7ea062",
-      yellow: "#9a8040", brightYellow: "#b09555",
-      blue: "#5a7aaa", brightBlue: "#7090c0",
-      magenta: "#7a5a80", brightMagenta: "#907098",
-      cyan: "#4a7a7a", brightCyan: "#608e8e",
-      white: "#8a8278", brightWhite: "#b5aea5",
+      background: "#03060a",
+      foreground: "#e0f7ff",
+      cursor: "#d8e02a",
+      cursorAccent: "#03060a",
+      selectionBackground: "rgba(216, 224, 42, 0.22)",
+      black: "#03060a", brightBlack: "#2a3a55",
+      red: "#ff2d6f", brightRed: "#ff5a8d",
+      green: "#00ff99", brightGreen: "#5affb8",
+      yellow: "#d8e02a", brightYellow: "#ecf055",
+      blue: "#00aaff", brightBlue: "#5acdff",
+      magenta: "#ff2dd6", brightMagenta: "#ff70e8",
+      cyan: "#5dbabe", brightCyan: "#7dd0d4",
+      white: "#b8e8ff", brightWhite: "#e0f7ff",
+    },
+  },
+  "blackwall-deep": {
+    session: {
+      background: "#000000",
+      foreground: "#ff5cb8",
+      cursor: "#ff70c0",
+      cursorAccent: "#000000",
+      selectionBackground: "rgba(255, 112, 192, 0.28)",
+      black: "#000000", brightBlack: "#6a3850",
+      red: "#e0244a", brightRed: "#ff5a78",
+      green: "#ff70c0", brightGreen: "#ff9ad8",
+      yellow: "#d8389a", brightYellow: "#ff5cb8",
+      blue: "#c8388a", brightBlue: "#e060a8",
+      magenta: "#ff2d8c", brightMagenta: "#ff5cb8",
+      cyan: "#ff70c0", brightCyan: "#ff9ad8",
+      white: "#f0d4e8", brightWhite: "#ffeaf5",
+    },
+    system: {
+      background: "#000000",
+      foreground: "#f0d4e8",
+      cursor: "#d8389a",
+      cursorAccent: "#000000",
+      selectionBackground: "rgba(216, 56, 154, 0.22)",
+      black: "#000000", brightBlack: "#3a2238",
+      red: "#e0244a", brightRed: "#ff5a78",
+      green: "#ff70c0", brightGreen: "#ff9ad8",
+      yellow: "#d8389a", brightYellow: "#ff5cb8",
+      blue: "#c8388a", brightBlue: "#e060a8",
+      magenta: "#ff2d8c", brightMagenta: "#ff5cb8",
+      cyan: "#ff70c0", brightCyan: "#ff9ad8",
+      white: "#f0d4e8", brightWhite: "#ffeaf5",
     },
   },
   light: {
@@ -415,6 +706,16 @@ const TERMINAL_THEMES = {
 
 type ThemeName = keyof typeof TERMINAL_THEMES;
 
+/** Themes the picker cycles through. `light` is intentionally excluded \u2014 kept
+    in TERMINAL_THEMES + styles.css for future repair but not user-exposed. */
+const THEME_CYCLE: ThemeName[] = ["blackwall", "blackwall-deep"];
+
+const THEME_LABELS: Record<ThemeName, { glyph: string; label: string }> = {
+  blackwall:        { glyph: "\u25C7", label: "BLACKWALL" },       // \u25C7 open diamond
+  "blackwall-deep": { glyph: "\u25C6", label: "BLACKWALL DEEP" },  // \u25C6 filled diamond
+  light:            { glyph: "\u25C8", label: "LIGHT" },
+};
+
 function applyTheme(name: ThemeName): void {
   document.documentElement.dataset.theme = name;
   localStorage.setItem("prim1-theme", name);
@@ -427,25 +728,63 @@ function applyTheme(name: ThemeName): void {
 
   const toggleEl = document.getElementById("theme-toggle");
   if (toggleEl) {
-    toggleEl.textContent = name === "dark" ? "\u2600" : "\u263E";
-    toggleEl.title = name === "dark" ? "Switch to light" : "Switch to dark";
+    const meta = THEME_LABELS[name];
+    toggleEl.textContent = meta.glyph;
+    const nextIdx = (THEME_CYCLE.indexOf(name) + 1) % THEME_CYCLE.length;
+    const next = THEME_CYCLE[nextIdx] ?? THEME_CYCLE[0];
+    toggleEl.title = `${meta.label} \u2014 click for ${THEME_LABELS[next].label}`;
+    toggleEl.dataset.activeTheme = name;
   }
 }
 
 function currentThemeName(): ThemeName {
-  return (document.documentElement.dataset.theme || "dark") as ThemeName;
+  const stored = document.documentElement.dataset.theme;
+  if (stored && stored in TERMINAL_THEMES) return stored as ThemeName;
+  return "blackwall";
 }
 
 function wireThemeToggle(): void {
   const toggleEl = must<HTMLButtonElement>("#theme-toggle");
   toggleEl.addEventListener("click", () => {
-    const current = (document.documentElement.dataset.theme || "dark") as ThemeName;
-    applyTheme(current === "dark" ? "light" : "dark");
+    const current = currentThemeName();
+    const cycleIdx = THEME_CYCLE.indexOf(current);
+    // If currently on a non-cycled theme (e.g. legacy light), jump to first cycled theme
+    const nextIdx = cycleIdx === -1 ? 0 : (cycleIdx + 1) % THEME_CYCLE.length;
+    applyTheme(THEME_CYCLE[nextIdx]);
   });
 }
 
-const savedTheme = (localStorage.getItem("prim1-theme") || "dark") as ThemeName;
-applyTheme(savedTheme);
+/** Read the active theme's brand color from CSS and return as ANSI truecolor
+    "R;G;B" so banner text stays in sync with the current theme. */
+function brandBannerAnsi(): string {
+  const raw = getComputedStyle(document.documentElement)
+    .getPropertyValue("--blackwall")
+    .trim();
+  const m = raw.match(/^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i);
+  if (!m) return "255;45;140";
+  return `${parseInt(m[1], 16)};${parseInt(m[2], 16)};${parseInt(m[3], 16)}`;
+}
+
+/** Active theme's secondary color as ANSI truecolor — used for system log info
+    entries so they shift with the theme (cyan in default, pink in deep). */
+function secondaryAnsiRgb(): string {
+  const raw = getComputedStyle(document.documentElement)
+    .getPropertyValue("--copper-hot")
+    .trim();
+  const m = raw.match(/^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i);
+  if (!m) return "93;186;190";
+  return `${parseInt(m[1], 16)};${parseInt(m[2], 16)};${parseInt(m[3], 16)}`;
+}
+
+/** Load saved theme from localStorage, migrating legacy "dark" \u2192 "blackwall" */
+function loadSavedTheme(): ThemeName {
+  const raw = localStorage.getItem("prim1-theme");
+  if (raw === "dark" || raw === null) return "blackwall";
+  if (raw in TERMINAL_THEMES) return raw as ThemeName;
+  return "blackwall";
+}
+
+applyTheme(loadSavedTheme());
 
 wireRouter();
 wireControls();
@@ -706,7 +1045,7 @@ function syncPaneInventory(
     card.dataset.group = groupNameForSession(session.name);
     const title = card.querySelector("h2");
     if (title instanceof HTMLHeadingElement) {
-      title.textContent = session.title;
+      title.textContent = paneDisplayTitle(session.name, session.title);
     }
     fragment.appendChild(card);
   }
@@ -767,22 +1106,30 @@ function buildSessionCard(session: SessionSnapshot): HTMLElement {
   article.dataset.group = groupNameForSession(session.name);
   article.dataset.groupActive = "true";
 
+  const isClaude = session.name === "claude" || session.name.endsWith("-claude");
+  const trailingButton = isClaude
+    ? `<button type="button" class="ghost" data-decor="clear">Clear</button>`
+    : `<button type="button" class="ghost" data-decor="close">Close</button>`;
+
   article.innerHTML = `
     <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
-    <div class="card-head">
-      <div>
-        <p class="card-kicker">Agent pane</p>
-        <h2></h2>
+    <span class="hud-antenna" aria-hidden="true"></span>
+    <span class="hud-side-stripe" aria-hidden="true"></span>
+    <div class="card-head terminal-head">
+      <h2></h2>
+      <div class="terminal-actions">
+        <button type="button" data-action="start" data-session="${session.name}">Launch</button>
+        <button type="button" data-action="restart" data-session="${session.name}">Restart</button>
+        <button type="button" data-action="stop" data-session="${session.name}">Stop</button>
       </div>
-      <div class="session-meta">
+      <div class="terminal-actions terminal-actions-right">
+        ${trailingButton}
+        <button type="button" class="ghost" data-decor="tile">Tile</button>
+      </div>
+      <div class="session-meta" hidden>
         <span class="state-pill" data-session-state="${session.name}">closed</span>
         <span class="activity-pill" data-session-activity="${session.name}">idle</span>
       </div>
-    </div>
-    <div class="terminal-actions">
-      <button type="button" data-action="start" data-session="${session.name}">Launch</button>
-      <button type="button" data-action="restart" data-session="${session.name}">Restart</button>
-      <button type="button" data-action="stop" data-session="${session.name}">Stop</button>
     </div>
     <div class="terminal-host" data-terminal="${session.name}"></div>
   `;
@@ -791,7 +1138,7 @@ function buildSessionCard(session: SessionSnapshot): HTMLElement {
   if (!(title instanceof HTMLHeadingElement)) {
     throw new Error(`Missing title heading for ${session.name}`);
   }
-  title.textContent = session.title;
+  title.textContent = paneDisplayTitle(session.name, session.title);
 
   return article;
 }
@@ -914,7 +1261,7 @@ function renderGroupPicker(groups: PaneGroup[]): void {
 
       if (openPairMenu === group.name) {
         const menu = document.createElement("div");
-        menu.className = "chip-menu panel";
+        menu.className = "chip-menu";
         const pairRunning = isPairRunning(group.name);
         const actions: Array<["rename" | "delete", string]> = [
           ["rename", "Rename"],
@@ -985,19 +1332,28 @@ function renderPairCreateControl(): void {
 
 function renderDeletePairDialog(): void {
   pairDialogSlot.replaceChildren();
+  // Remove any existing dialog from anywhere it might be living
+  document.querySelector(".pair-dialog-overlay")?.remove();
+  document.querySelectorAll(".pair-dialog").forEach((el) => el.remove());
   if (!deletePairTarget) {
     return;
   }
 
-  const overlay = document.createElement("div");
-  overlay.className = "pair-dialog-overlay";
+  // Render inline below the targeted chip-shell so the dialog feels anchored
+  // to the pair it's about to delete.
+  const targetShell = document.querySelector<HTMLElement>(
+    `[data-group-root="${deletePairTarget}"]`,
+  );
+  if (!targetShell) {
+    return;
+  }
+
   const dialog = document.createElement("div");
-  dialog.className = "pair-dialog panel";
+  dialog.className = "pair-dialog";
   dialog.innerHTML = `
-    <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
     <p class="card-kicker">Delete pair</p>
-    <h3>Delete pair "${deletePairTarget}"?</h3>
-    <p>Both panes will be stopped and removed. Audit history is preserved.</p>
+    <h3>Delete "${deletePairTarget}"?</h3>
+    <p>Both panes stop and are removed. Audit log preserved.</p>
   `;
 
   const actions = document.createElement("div");
@@ -1018,8 +1374,7 @@ function renderDeletePairDialog(): void {
 
   actions.append(cancelButton, deleteButton);
   dialog.appendChild(actions);
-  overlay.appendChild(dialog);
-  pairDialogSlot.appendChild(overlay);
+  targetShell.appendChild(dialog);
 }
 
 async function submitCreatePair(): Promise<void> {
@@ -1324,35 +1679,27 @@ function isPaneVisible(name: string): boolean {
 }
 
 function populateRouterOptions(sessions: SessionSnapshot[]): void {
-  const from = must<HTMLSelectElement>("#route-from");
-  const to = must<HTMLSelectElement>("#route-to");
-  const previousFrom = from.value;
-  const previousTo = to.value;
+  const previousFrom = routeFromCombobox.value;
+  const previousTo = routeToCombobox.value;
   const sessionNames = sessions.map((session) => session.name);
 
-  from.replaceChildren(optionElement("victor", "Victor"));
-  for (const sessionName of sessionNames) {
-    from.appendChild(optionElement(sessionName, sessionName));
-  }
-  from.value = previousFrom === "victor" || sessionNames.includes(previousFrom)
+  const fromOptions: ComboboxOption[] = [
+    { value: "alex", label: "Alex" },
+    ...sessions.map((s) => ({ value: s.name, label: paneDisplayTitle(s.name, s.title) })),
+  ];
+  routeFromCombobox.setOptions(fromOptions);
+  routeFromCombobox.value = previousFrom === "alex" || sessionNames.includes(previousFrom)
     ? previousFrom
-    : "victor";
+    : "alex";
 
-  to.replaceChildren();
-  for (const sessionName of sessionNames) {
-    to.appendChild(optionElement(sessionName, sessionName));
-  }
-  to.appendChild(optionElement("room", "Room"));
-  to.value = previousTo === "room" || sessionNames.includes(previousTo)
+  const toOptions: ComboboxOption[] = [
+    ...sessions.map((s) => ({ value: s.name, label: paneDisplayTitle(s.name, s.title) })),
+    { value: "room", label: "Room" },
+  ];
+  routeToCombobox.setOptions(toOptions);
+  routeToCombobox.value = previousTo === "room" || sessionNames.includes(previousTo)
     ? previousTo
     : "room";
-}
-
-function optionElement(value: string, label: string): HTMLOptionElement {
-  const option = document.createElement("option");
-  option.value = value;
-  option.textContent = label;
-  return option;
 }
 
 function wireButtons(): void {
@@ -1408,8 +1755,6 @@ function wireButtons(): void {
 
 function wireRouter(): void {
   const form = must<HTMLFormElement>("#router-form");
-  const from = must<HTMLSelectElement>("#route-from");
-  const to = must<HTMLSelectElement>("#route-to");
   const content = must<HTMLTextAreaElement>("#route-content");
   const clearButton = must<HTMLButtonElement>("#clear-router");
 
@@ -1421,9 +1766,9 @@ function wireRouter(): void {
     }
 
     const request: RouteMessageRequest = {
-      from: from.value,
-      to: to.value,
-      scope: to.value === "room" ? "room" : "direct",
+      from: routeFromCombobox.value,
+      to: routeToCombobox.value,
+      scope: routeToCombobox.value === "room" ? "room" : "direct",
       content: trimmed,
     };
 
@@ -1663,7 +2008,7 @@ function writeSystem(level: "info" | "warn" | "error", message: string): void {
       ? "\x1b[38;5;203m"
       : level === "warn"
         ? "\x1b[38;5;215m"
-        : "\x1b[38;5;110m";
+        : `\x1b[38;2;${secondaryAnsiRgb()}m`;
   systemTerminal.writeln(
     `${color}[${new Date().toLocaleTimeString()}] ${message}\x1b[0m`,
   );

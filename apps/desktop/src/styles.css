@@ -1,134 +1,261 @@
 /* ═══════════════════════════════════════════════════════════════
-   PRIM-001 — FORGED COMMAND INTERFACE
-   Prometheus bridge meets Roman legionnaire.
-   Oxidized bronze frames, brushed gunmetal surfaces,
-   molten copper bleeding through welded seams.
+   OMNIA PRIME — TACTICAL HUD INTERFACE
+   Yellow primary frame, cyan secondary detail, magenta destructive.
+   Pure-black field, sharp angular geometry, fixed-pixel SVG corners
+   so chamfers never distort with aspect ratio.
    ═══════════════════════════════════════════════════════════════ */
 
 :root {
   /* ── Surfaces ── */
-  --bg-base:       #1a1715;
-  --bg-panel:      #22201d;
-  --bg-inset:      #151311;
-  --bg-hover:      #2a2724;
-  --bg-active:     #33302d;
+  --bg-base:       #000000;
+  --bg-panel:      #03060a;
+  --bg-inset:      #02040a;
+  --bg-hover:      #0d1208;
+  --bg-active:     #1a2010;
 
-  /* ── Bronze / Copper ── */
-  --bronze:        #8a6e55;
-  --bronze-light:  #a68868;
-  --bronze-dim:    rgba(138, 110, 85, 0.35);
-  --bronze-glow:   rgba(160, 100, 60, 0.12);
-  --copper-hot:    #a0655e;
+  /* ── Primary (lemon yellow) — frames, brand, dominant chrome ── */
+  --bronze:        #d8e02a;
+  --bronze-light:  #ecf055;
+  --bronze-dim:    rgba(216, 224, 42, 0.40);
+  --bronze-glow:   rgba(216, 224, 42, 0.22);
 
-  /* ── Semantic ── */
-  --green:         #6a8a50;
-  --amber:         #9a8040;
-  --red-muted:     #8a4a42;
+  /* ── Secondary (HUD cyan) — labels, default outlines, icons ── */
+  --copper-hot:    #5dbabe;
+  --cyan-bright:   #7ee7eb;
 
-  /* ── Text (weathered parchment) ── */
-  --text-primary:   #b5aea5;
-  --text-secondary: #8a8278;
-  --text-tertiary:  #5e5850;
+  /* ── Destructive / hot CTA — true red ── */
+  --red:           #e6293a;
+  --red-bright:    #ff4350;
+  --red-deep:      #a8141d;
 
-  /* ── Borders (oxidized metal) ── */
-  --frame:          rgba(138, 110, 85, 0.30);
-  --frame-inner:    rgba(138, 110, 85, 0.15);
-  --frame-dark:     rgba(0, 0, 0, 0.40);
+  /* ── Bridge identity — magenta-pink for BLACKWALL 0.4 brand + ALT / SO MI pane titles ── */
+  --blackwall:        #ff2d8c;
+  --blackwall-deep:   #b22556;
+  --blackwall-glow:   rgba(255, 45, 140, 0.6);
 
-  /* ── Radii ── */
-  --radius-sm:   2px;
-  --radius-md:   3px;
-  --radius-lg:   4px;
+  /* ── Semantic action colors ── */
+  --green:         #5dbabe; /* Launch */
+  --amber:         #d8e02a; /* Restart */
+
+  /* ── Text ── */
+  --text-primary:   #f0f0d8;
+  --text-secondary: #b5b58a;
+  --text-tertiary:  #5a5a40;
+
+  /* ── Borders ── */
+  --frame:          rgba(216, 224, 42, 0.95);
+  --frame-soft:     rgba(216, 224, 42, 0.45);
+  --frame-inner:    rgba(216, 224, 42, 0.22);
+  --frame-dark:     rgba(0, 0, 0, 0.55);
+
+  /* ── Corner overlay sizing ── */
+  --corner: 56px;
+
+  /* ── Radii (cyberpunk = sharp) ── */
+  --radius-sm: 0;
+  --radius-md: 0;
+  --radius-lg: 0;
 
   /* ── Motion ── */
   --duration-fast:    150ms;
-  --duration-smooth:  200ms;
+  --duration-smooth:  220ms;
   --easing:           cubic-bezier(0.16, 1, 0.3, 1);
 
   color: var(--text-primary);
   background: var(--bg-base);
-  font-family: "Montserrat", "Segoe UI", system-ui, sans-serif;
+  font-family: "Rajdhani", "Montserrat", "Segoe UI", system-ui, sans-serif;
   font-size: 13px;
   line-height: 1.4;
-  font-weight: 400;
+  font-weight: 500;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html, body { margin: 0; height: 100%; overflow: hidden; }
 body { min-height: 100vh; overflow: hidden; }
 
-/* ── Body: metal texture + vignette ── */
+/* ── Body: deep field + scanlines ── */
 body {
-  background:
-    url('/textures/metal-grain.png'),
-    var(--bg-base);
-  background-size: 512px;
+  background: var(--bg-base);
+  background-image:
+    repeating-linear-gradient(
+      0deg,
+      color-mix(in srgb, var(--bronze) 2%, transparent) 0px,
+      color-mix(in srgb, var(--bronze) 2%, transparent) 1px,
+      transparent 1px,
+      transparent 3px
+    ),
+    radial-gradient(ellipse at 25% 12%, color-mix(in srgb, var(--bronze) 5%, transparent), transparent 55%),
+    radial-gradient(ellipse at 80% 88%, color-mix(in srgb, var(--copper-hot) 5%, transparent), transparent 55%);
 }
 
-/* Vignette overlay */
 body::before {
   content: '';
   position: fixed;
   inset: 0;
-  background: radial-gradient(
-    ellipse at center,
-    transparent 40%,
-    rgba(0, 0, 0, 0.5) 100%
-  );
+  background: radial-gradient(ellipse at center, transparent 30%, rgba(0,0,0,0.7) 100%);
   pointer-events: none;
   z-index: 0;
 }
 
-/* Warm forge glow at bottom */
 body::after {
   content: '';
   position: fixed;
-  bottom: -10%;
-  left: 20%;
-  width: 60%;
+  bottom: -15%;
+  left: 30%;
+  width: 50%;
   height: 30%;
-  background: radial-gradient(ellipse, rgba(160, 100, 60, 0.06), transparent 70%);
+  background: radial-gradient(ellipse, color-mix(in srgb, var(--bronze) 7%, transparent), transparent 70%);
   pointer-events: none;
   z-index: 0;
-  animation: forgeGlow 5s ease-in-out infinite;
+  animation: forgeGlow 6s ease-in-out infinite;
 }
 
 @keyframes forgeGlow {
   0%, 100% { opacity: 0.5; }
-  50% { opacity: 1; }
+  50%      { opacity: 1; }
 }
 
-/* ── Shared form resets ── */
+/* ── Form resets ── */
 button, input, select, textarea { font: inherit; }
 
 /* ══════════════════════════════════════
-   PANEL SYSTEM — forged metal frames
+   PANEL — HUD bezel
+   Yellow 1px border + fixed-pixel SVG corner overlays
+   so chamfers stay sharp at any aspect ratio.
    ══════════════════════════════════════ */
 
 .panel {
+  --chamfer: 22px;
   position: relative;
-  background:
-    url('/textures/metal-grain.png'),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.02) 0%, transparent 100%),
-    var(--bg-panel);
-  background-size: 512px, auto, auto;
-  border: 2px solid var(--frame);
-  box-shadow:
-    inset 0 0 0 1px var(--frame-inner),
-    0 0 0 1px var(--frame-dark),
-    0 2px 8px rgba(0, 0, 0, 0.4),
-    0 8px 24px rgba(0, 0, 0, 0.25);
+  background: var(--frame);            /* yellow underlay = the visible border */
   animation: cardBoot 0.5s var(--easing) both;
+  filter: drop-shadow(0 0 14px color-mix(in srgb, var(--bronze) 12%, transparent));
+  clip-path: polygon(
+    var(--chamfer) 0,
+    calc(100% - var(--chamfer)) 0,
+    100% var(--chamfer),
+    100% calc(100% - var(--chamfer)),
+    calc(100% - var(--chamfer)) 100%,
+    var(--chamfer) 100%,
+    0 calc(100% - var(--chamfer)),
+    0 var(--chamfer)
+  );
 }
 
+/* Inner dark fill — slightly smaller chamfer = even 1.5px yellow border on every edge */
+.panel::after {
+  content: '';
+  position: absolute;
+  inset: 1.5px;
+  background: var(--bg-panel);
+  box-shadow: inset 0 0 28px color-mix(in srgb, var(--bronze) 4%, transparent);
+  pointer-events: none;
+  z-index: 0;
+  clip-path: polygon(
+    calc(var(--chamfer) - 1.5px) 0,
+    calc(100% - var(--chamfer) + 1.5px) 0,
+    100% calc(var(--chamfer) - 1.5px),
+    100% calc(100% - var(--chamfer) + 1.5px),
+    calc(100% - var(--chamfer) + 1.5px) 100%,
+    calc(var(--chamfer) - 1.5px) 100%,
+    0 calc(100% - var(--chamfer) + 1.5px),
+    0 calc(var(--chamfer) - 1.5px)
+  );
+}
+
+/* All real content sits above the inner fill */
+.panel > * {
+  position: relative;
+  z-index: 2;
+}
+
+/* Corner overlays disabled — clip-path chamfer is the border */
+.panel > .c { display: none; }
+
+/* Inner offset double-line — drawn as inset border */
+.panel::before {
+  content: '';
+  position: absolute;
+  inset: 5px;
+  border: 1px solid color-mix(in srgb, var(--bronze) 18%, transparent);
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* Antenna decoration removed — too noisy on the chamfered bezel */
+.hud-antenna { display: none; }
+
+/* Topbar HUD strip — multi-segment yellow tech line with ticks + parallel sub-line.
+   Drawn on the inner panel surface so the chamfer border stays clean. */
+.topbar-hud-strip {
+  position: absolute;
+  top: 8px;
+  left: 0;
+  right: 0;
+  width: 100%;
+  height: 28px;
+  pointer-events: none;
+  z-index: 4;
+  filter: drop-shadow(0 0 4px color-mix(in srgb, var(--bronze) 40%, transparent));
+}
+
+/* Side stripe accent for terminal cards — masked SVG so color follows the active theme */
+.hud-side-stripe {
+  position: absolute;
+  top: 12%;
+  bottom: 12%;
+  right: 6px;
+  width: 6px;
+  background-color: var(--bronze);
+  -webkit-mask: url('/textures/hud-side-stripe.svg') no-repeat center / 100% 100%;
+          mask: url('/textures/hud-side-stripe.svg') no-repeat center / 100% 100%;
+  -webkit-mask-mode: alpha;
+          mask-mode: alpha;
+  pointer-events: none;
+  z-index: 2;
+  opacity: 0.85;
+}
+
+/* Sidebar border: mostly primary, just a hint of secondary at top + bottom corners */
+.group-picker.panel {
+  background: linear-gradient(
+    180deg,
+    var(--copper-hot) 0%,
+    var(--bronze) 5%,
+    var(--bronze) 95%,
+    var(--copper-hot) 100%
+  );
+}
+
+/* Inner offset U-frame as SVG: cyan U with step-in notches at top, yellow chamfered bottom */
+.sidebar-inner-frame {
+  position: absolute;
+  top: 96px;
+  left: 12px;
+  right: 12px;
+  height: calc(100% - 96px - 60px);
+  pointer-events: none;
+  z-index: 3;
+  display: block;
+  filter: drop-shadow(0 0 6px color-mix(in srgb, var(--copper-hot) 55%, transparent));
+}
+.sidebar-inner-frame svg, svg.sidebar-inner-frame {
+  width: 100%;
+  height: 100%;
+}
+
+/* Sidebar accent stripe replaced by the inner U-frame's right border */
+.sidebar-accent-stripe { display: none; }
+
 /* Staggered boot */
-.topbar               { animation-delay: 0s; }
+.topbar                       { animation-delay: 0s; }
 .terminal-card:nth-of-type(1) { animation-delay: 0.08s; }
 .terminal-card:nth-of-type(2) { animation-delay: 0.16s; }
-.system-card           { animation-delay: 0.24s; }
-.router-card           { animation-delay: 0.32s; }
+.system-card                  { animation-delay: 0.24s; }
+.router-card                  { animation-delay: 0.32s; }
 
 @keyframes cardBoot {
   from { opacity: 0; transform: translateY(6px); }
@@ -138,93 +265,125 @@ button, input, select, textarea { font: inherit; }
 /* Hover lift */
 .terminal-card, .system-card, .router-card, .group-picker {
   transition:
-    transform var(--duration-smooth) var(--easing),
     box-shadow var(--duration-smooth) var(--easing),
     border-color var(--duration-smooth) ease;
 }
 
 .terminal-card:hover, .system-card:hover, .router-card:hover, .group-picker:hover {
-  border-color: rgba(138, 110, 85, 0.45);
+  border-color: var(--bronze);
   box-shadow:
-    inset 0 0 0 1px var(--frame-inner),
+    inset 0 0 0 1px rgba(0, 0, 0, 0.6),
     0 0 0 1px var(--frame-dark),
-    0 4px 12px rgba(0, 0, 0, 0.5),
-    0 0 20px var(--bronze-glow);
+    0 0 28px var(--bronze-glow);
 }
 
-/* Active terminal — copper seam glow */
 .terminal-card:focus-within {
-  border-color: rgba(160, 100, 60, 0.5);
+  border-color: color-mix(in srgb, var(--copper-hot) 70%, transparent);
   box-shadow:
-    inset 0 0 0 1px rgba(160, 100, 60, 0.2),
+    inset 0 0 0 1px color-mix(in srgb, var(--copper-hot) 18%, transparent),
     0 0 0 1px var(--frame-dark),
-    0 4px 12px rgba(0, 0, 0, 0.5),
-    0 0 24px rgba(160, 100, 60, 0.1);
+    0 0 30px color-mix(in srgb, var(--copper-hot) 18%, transparent);
 }
-
-/* ── Corner brackets ── */
-.c {
-  position: absolute;
-  width: 32px;
-  height: 32px;
-  background: url('/textures/corner.png') no-repeat center / contain;
-  pointer-events: none;
-  z-index: 2;
-  font-style: normal;
-}
-.c.tl { top: -3px; left: -3px; }
-.c.tr { top: -3px; right: -3px; transform: scaleX(-1); }
-.c.bl { bottom: -3px; left: -3px; transform: scaleY(-1); }
-.c.br { bottom: -3px; right: -3px; transform: scale(-1); }
 
 /* ══════════════════════════════════════
    TOPBAR
    ══════════════════════════════════════ */
 
 .topbar {
-  border-radius: var(--radius-lg);
-  padding: 0.45rem 0.85rem;
+  padding: 0.85rem 1.4rem 0.85rem 1.1rem;
   display: flex;
   align-items: center;
-  gap: 0.75rem;
+  gap: 1.1rem;
   user-select: none;
   overflow: hidden;
+  min-height: 78px;
 }
 
-/* Light sweep — slower, more visible, more frequent */
-.topbar::after {
+.topbar::before {
   content: '';
   position: absolute;
   top: 0;
   left: -80%;
-  width: 60%;
+  width: 80%;
   height: 100%;
   background: linear-gradient(
     90deg,
     transparent 0%,
-    rgba(160, 100, 60, 0.10) 20%,
-    rgba(180, 130, 80, 0.16) 45%,
-    rgba(200, 160, 100, 0.08) 55%,
-    rgba(160, 100, 60, 0.10) 80%,
+    color-mix(in srgb, var(--bronze) 14%, transparent) 25%,
+    color-mix(in srgb, var(--bronze-light) 22%, transparent) 45%,
+    color-mix(in srgb, var(--bronze) 16%, transparent) 65%,
+    color-mix(in srgb, var(--red) 10%, transparent) 80%,
     transparent 100%
   );
   pointer-events: none;
-  animation: sweep 6s ease-in-out infinite;
+  animation: sweep 7s ease-in-out infinite;
   z-index: 1;
 }
 
 @keyframes sweep {
-  0% { left: -80%; }
+  0%   { left: -80%; }
   100% { left: 120%; }
 }
 
-.topbar-brand { flex-shrink: 0; z-index: 1; }
+.topbar-brand {
+  flex-shrink: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+}
 
-.topbar-active {
-  display: grid;
-  gap: 0.15rem;
-  align-content: center;
-  z-index: 1;
+.brand-logo-frame {
+  position: relative;
+  width: 60px;
+  height: 60px;
+  flex-shrink: 0;
+}
+.brand-logo {
+  width: 48px;
+  height: auto;
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  filter: drop-shadow(0 0 12px color-mix(in srgb, var(--bronze) 60%, transparent));
+  user-select: none;
+  pointer-events: none;
+}
+.brand-logo-bracket {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  filter: drop-shadow(0 0 5px color-mix(in srgb, var(--bronze) 55%, transparent));
+  pointer-events: none;
+}
+
+.topbar h1 {
+  margin: 0;
+  font-family: "Rajdhani", "Montserrat", system-ui, sans-serif;
+  font-size: 38px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--blackwall);
+  text-shadow:
+    0 0 12px rgba(255, 45, 140, 0.7),
+    0 0 28px rgba(255, 45, 140, 0.35),
+    0 0 4px rgba(180, 30, 90, 0.5);
+}
+
+.topbar-active-tag {
+  font-family: "Rajdhani", system-ui, sans-serif;
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--red);
+  text-shadow:
+    0 0 10px rgba(230, 41, 58, 0.6),
+    0 0 22px rgba(230, 41, 58, 0.3);
 }
 
 .topbar-status {
@@ -233,57 +392,24 @@ button, input, select, textarea { font: inherit; }
   align-items: center;
   gap: 0.4rem;
   justify-content: flex-end;
-  z-index: 1;
+  z-index: 2;
 }
 
 .eyebrow {
   margin: 0;
   text-transform: uppercase;
-  letter-spacing: 0.14em;
+  letter-spacing: 0.18em;
   font-size: 9px;
-  font-weight: 500;
-  color: var(--bronze);
-}
-
-.topbar h1 {
-  margin: 0.1rem 0 0;
-  font-size: 17px;
-  font-weight: 700;
-  line-height: 1.1;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--text-primary);
-}
-
-.active-group-label {
-  display: inline-flex;
-  align-items: center;
-  width: fit-content;
-  padding: 0.22rem 0.7rem;
-  border-radius: var(--radius-sm);
-  border: 1px solid rgba(160, 100, 60, 0.35);
-  background:
-    linear-gradient(180deg, rgba(160, 100, 60, 0.12) 0%, rgba(0, 0, 0, 0.12) 100%),
-    var(--bg-inset);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.04),
-    0 0 0 1px rgba(0, 0, 0, 0.18),
-    0 0 14px rgba(160, 100, 60, 0.08);
+  font-weight: 600;
   color: var(--copper-hot);
-  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
-  font-size: 10px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
 }
 
 /* ══════════════════════════════════════
-   CARDS
+   CARDS — generic
    ══════════════════════════════════════ */
 
 .terminal-card, .system-card, .router-card, .group-picker {
-  border-radius: var(--radius-lg);
-  padding: 0.6rem;
+  padding: 0.85rem 1.0rem;
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -293,32 +419,162 @@ button, input, select, textarea { font: inherit; }
 .card-head {
   display: flex;
   justify-content: space-between;
-  gap: 0.5rem;
-  align-items: flex-start;
+  gap: 0.6rem;
+  align-items: center;
   user-select: none;
+  padding-top: 0.15rem;
+  flex-shrink: 0;
 }
 
 .card-kicker {
   margin: 0;
   text-transform: uppercase;
-  letter-spacing: 0.12em;
-  font-size: 9px;
-  font-weight: 600;
-  color: var(--text-tertiary);
+  letter-spacing: 0.18em;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--copper-hot);
+  text-shadow: 0 0 6px color-mix(in srgb, var(--copper-hot) 40%, transparent);
 }
 
 .card-head h2 {
-  margin: 0.1rem 0 0;
-  font-size: 15px;
+  margin: 0.05rem 0 0;
+  font-family: "Rajdhani", "Montserrat", system-ui, sans-serif;
+  font-size: 22px;
   font-weight: 700;
-  line-height: 1.2;
-  letter-spacing: 0.02em;
+  line-height: 1.05;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--text-primary);
 }
 
+/* Terminal pane titles (ALT / SO MI) — blackwall magenta */
+.terminal-card .card-head h2 {
+  color: var(--blackwall);
+  text-shadow:
+    0 0 10px rgba(255, 45, 140, 0.65),
+    0 0 22px rgba(255, 45, 140, 0.25),
+    0 0 3px rgba(180, 30, 90, 0.5);
+  font-size: 24px;
+}
+
+/* System log + Route a message — cyan */
+.system-card .card-head h2,
+.router-card .card-head h2 {
+  color: var(--copper-hot);
+  font-size: 17px;
+  letter-spacing: 0.16em;
+  text-shadow: 0 0 10px color-mix(in srgb, var(--copper-hot) 55%, transparent);
+}
+
+.group-picker .card-head h2 {
+  color: var(--blackwall);
+  font-size: 19px;
+  text-shadow:
+    0 0 10px rgba(255, 45, 140, 0.6),
+    0 0 22px rgba(255, 45, 140, 0.25);
+}
+
+.card-title {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+}
+
+.card-title-block { display: grid; gap: 0.15rem; flex: 1; min-width: 0; }
+
+.kicker-row {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  justify-content: flex-start;
+  width: 100%;
+}
+
+/* Mini HUD strip filling the empty horizontal space inside system-log + router
+   card heads. Matches the topbar HUD strip aesthetic at smaller scale. Themes
+   via var() so it follows the active palette. */
+.card-head-hud {
+  flex: 1 1 auto;
+  height: 12px;
+  margin: 0 1rem;
+  align-self: center;
+  pointer-events: none;
+  filter: drop-shadow(0 0 3px color-mix(in srgb, var(--bronze) 35%, transparent));
+  min-width: 0;
+}
+
+/* Card icons — drawn as inline SVG masks so they pick up currentColor */
+.card-icon {
+  display: inline-block;
+  width: 18px;
+  height: 18px;
+  background-color: var(--copper-hot);
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  mask-position: center;
+  -webkit-mask-size: contain;
+  mask-size: contain;
+  flex-shrink: 0;
+  filter: drop-shadow(0 0 6px color-mix(in srgb, var(--copper-hot) 55%, transparent));
+}
+.card-icon.icon-log {
+  -webkit-mask-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.4' stroke-linecap='square'><path d='M3 6h18M3 12h18M3 18h18'/></svg>");
+          mask-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.4' stroke-linecap='square'><path d='M3 6h18M3 12h18M3 18h18'/></svg>");
+}
+.card-icon.icon-send {
+  -webkit-mask-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round' stroke-linecap='round'><path d='M22 2 L11 13'/><path d='M22 2 L15 22 L11 13 L2 9 Z'/></svg>");
+          mask-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round' stroke-linecap='round'><path d='M22 2 L11 13'/><path d='M22 2 L15 22 L11 13 L2 9 Z'/></svg>");
+}
+
+/* Live pill (kept hidden in target but here for state) */
+.card-head-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  flex-wrap: nowrap;
+}
+
+.live-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.18rem 0.6rem;
+  border: 1px solid var(--copper-hot);
+  color: var(--copper-hot);
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+}
+
+.live-dot {
+  width: 6px; height: 6px;
+  border-radius: 999px;
+  background: var(--copper-hot);
+  box-shadow: 0 0 6px var(--copper-hot);
+  animation: livePulse 1.6s ease-in-out infinite;
+}
+
+@keyframes livePulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.4; }
+}
+
+.log-toggle {
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  color: var(--copper-hot);
+  text-transform: uppercase;
+  text-shadow: 0 0 6px color-mix(in srgb, var(--copper-hot) 40%, transparent);
+  user-select: none;
+}
+
 .mono {
-  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+  font-family: "JetBrains Mono", Consolas, monospace;
   font-size: 10px;
   color: var(--text-tertiary);
   overflow: hidden;
@@ -327,112 +583,124 @@ button, input, select, textarea { font: inherit; }
 }
 
 /* ══════════════════════════════════════
-   BUTTONS — stamped metal
+   BUTTONS — HUD bezels with notched corners
    ══════════════════════════════════════ */
 
 button {
-  border: 1px solid var(--frame);
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.03) 0%, rgba(0, 0, 0, 0.1) 100%),
-    var(--bg-panel);
-  color: var(--text-primary);
-  border-radius: var(--radius-md);
-  padding: 0.35rem 0.85rem;
+  --btn-color: var(--copper-hot);
+  --btn-glow: color-mix(in srgb, var(--copper-hot) 50%, transparent);
+  border: 1px solid var(--btn-color);
+  background: transparent;
+  color: var(--btn-color);
+  border-radius: 0;
+  padding: 0.36rem 0.95rem;
   cursor: default;
   user-select: none;
   text-transform: uppercase;
-  letter-spacing: 0.06em;
-  font-size: 11px;
-  font-weight: 600;
+  letter-spacing: 0.12em;
+  font-family: "Rajdhani", "Montserrat", system-ui, sans-serif;
+  font-size: 12px;
+  font-weight: 700;
+  text-shadow: 0 0 6px var(--btn-glow);
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.04),
-    inset 0 -1px 0 rgba(0, 0, 0, 0.15),
-    0 1px 3px rgba(0, 0, 0, 0.3);
+    inset 0 0 0 1px rgba(0, 0, 0, 0.4),
+    0 0 8px var(--btn-glow);
+  clip-path: polygon(
+    6px 0,
+    calc(100% - 6px) 0,
+    100% 6px,
+    100% calc(100% - 6px),
+    calc(100% - 6px) 100%,
+    6px 100%,
+    0 calc(100% - 6px),
+    0 6px
+  );
   transition:
     background var(--duration-fast) ease,
     border-color var(--duration-fast) ease,
-    box-shadow var(--duration-fast) ease;
+    box-shadow var(--duration-fast) ease,
+    color var(--duration-fast) ease;
 }
 
 button:hover {
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.05) 0%, rgba(0, 0, 0, 0.05) 100%),
-    var(--bg-hover);
-  border-color: var(--bronze-dim);
+  background: color-mix(in srgb, var(--btn-color) 14%, transparent);
+  box-shadow:
+    inset 0 0 0 1px rgba(0, 0, 0, 0.4),
+    0 0 16px var(--btn-glow);
 }
 
 button:active {
-  background: var(--bg-inset);
-  box-shadow:
-    inset 0 2px 4px rgba(0, 0, 0, 0.3),
-    0 0 0 rgba(0, 0, 0, 0);
+  background: color-mix(in srgb, var(--btn-color) 22%, transparent);
 }
 
 button:focus-visible {
-  outline: 2px solid var(--copper-hot);
-  outline-offset: 1px;
+  outline: 1px solid var(--btn-color);
+  outline-offset: 3px;
 }
 
-/* Semantic action buttons */
+/* Semantic actions */
 [data-action="start"] {
-  color: var(--green);
-  border-color: rgba(106, 138, 80, 0.30);
+  --btn-color: var(--copper-hot);
+  --btn-glow: color-mix(in srgb, var(--copper-hot) 55%, transparent);
 }
-[data-action="start"]:hover {
-  border-color: rgba(106, 138, 80, 0.50);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.04),
-    inset 0 -1px 0 rgba(0, 0, 0, 0.15),
-    0 1px 3px rgba(0, 0, 0, 0.3),
-    0 0 10px rgba(106, 138, 80, 0.08);
-}
-
 [data-action="restart"] {
-  color: var(--amber);
-  border-color: rgba(154, 128, 64, 0.30);
+  --btn-color: var(--amber);
+  --btn-glow: color-mix(in srgb, var(--amber) 50%, transparent);
 }
-[data-action="restart"]:hover {
-  border-color: rgba(154, 128, 64, 0.50);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.04),
-    inset 0 -1px 0 rgba(0, 0, 0, 0.15),
-    0 1px 3px rgba(0, 0, 0, 0.3),
-    0 0 10px rgba(154, 128, 64, 0.08);
-}
-
 [data-action="stop"] {
-  color: var(--red-muted);
-  border-color: rgba(138, 74, 66, 0.35);
-  background:
-    linear-gradient(180deg, rgba(138, 74, 66, 0.08) 0%, rgba(138, 74, 66, 0.15) 100%),
-    var(--bg-panel);
+  --btn-color: var(--red);
+  --btn-glow: rgba(230, 41, 58, 0.55);
+  background: transparent;
+  border-color: var(--red);
+  color: var(--red);
+  text-shadow: 0 0 6px rgba(230, 41, 58, 0.6);
+  box-shadow:
+    inset 0 0 0 1px rgba(0, 0, 0, 0.4),
+    0 0 14px rgba(230, 41, 58, 0.4);
 }
 [data-action="stop"]:hover {
-  border-color: rgba(138, 74, 66, 0.55);
+  background: color-mix(in srgb, var(--red) 14%, transparent);
+  border-color: var(--red-bright);
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.04),
-    inset 0 -1px 0 rgba(0, 0, 0, 0.15),
-    0 1px 3px rgba(0, 0, 0, 0.3),
-    0 0 10px rgba(138, 74, 66, 0.10);
+    inset 0 0 0 1px rgba(0, 0, 0, 0.4),
+    0 0 22px rgba(230, 41, 58, 0.65);
+}
+[data-action="stop"]:active {
+  background: color-mix(in srgb, var(--red) 22%, transparent);
 }
 
+/* Decorative right-side buttons (Clear / Tile / Close) */
+button.ghost {
+  --btn-color: var(--copper-hot);
+  --btn-glow: color-mix(in srgb, var(--copper-hot) 40%, transparent);
+}
+
+/* Primary CTA — Send routed message: outlined red, red text (matches STOP styling) */
 button.primary {
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.06) 0%, rgba(0, 0, 0, 0.15) 100%),
-    var(--red-muted);
-  color: var(--text-primary);
-  border-color: rgba(138, 74, 66, 0.50);
+  --btn-color: var(--red);
+  --btn-glow: rgba(230, 41, 58, 0.55);
+  background: transparent;
+  color: var(--red);
+  border-color: var(--red);
+  text-shadow: 0 0 6px rgba(230, 41, 58, 0.6);
+  box-shadow:
+    inset 0 0 0 1px rgba(0, 0, 0, 0.4),
+    0 0 18px rgba(230, 41, 58, 0.45);
+  letter-spacing: 0.12em;
+  padding: 0.5rem 1.1rem;
+  font-size: 12px;
 }
 button.primary:hover {
-  border-color: rgba(160, 100, 60, 0.6);
+  background: color-mix(in srgb, var(--red) 14%, transparent);
+  border-color: var(--red-bright);
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.06),
-    0 1px 3px rgba(0, 0, 0, 0.3),
-    0 0 14px rgba(160, 100, 60, 0.15);
+    inset 0 0 0 1px rgba(0, 0, 0, 0.4),
+    0 0 26px rgba(230, 41, 58, 0.65);
 }
+button.primary:active { background: color-mix(in srgb, var(--red) 22%, transparent); }
 
 /* ══════════════════════════════════════
-   STATE PILLS — instrument readouts
+   STATE PILLS (visually present where shown)
    ══════════════════════════════════════ */
 
 .session-meta {
@@ -443,38 +711,23 @@ button.primary:hover {
 }
 
 .state-pill, .activity-pill {
-  border-radius: var(--radius-sm);
-  padding: 0.15rem 0.5rem;
-  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+  border-radius: 0;
+  padding: 0.15rem 0.55rem;
+  font-family: "JetBrains Mono", Consolas, monospace;
   font-size: 10px;
   text-transform: uppercase;
-  letter-spacing: 0.05em;
-  background: var(--bg-inset);
-  color: var(--text-tertiary);
-  border: 1px solid var(--frame-inner);
-  box-shadow:
-    inset 0 1px 3px rgba(0, 0, 0, 0.25),
-    0 1px 0 rgba(255, 255, 255, 0.02);
+  letter-spacing: 0.12em;
+  background: transparent;
+  color: var(--copper-hot);
+  border: 1px solid var(--copper-hot);
+  text-shadow: 0 0 5px color-mix(in srgb, var(--copper-hot) 40%, transparent);
   user-select: none;
-  transition:
-    background var(--duration-fast) ease,
-    color var(--duration-fast) ease,
-    border-color var(--duration-fast) ease;
-}
-
-.state-pill:hover, .activity-pill:hover {
-  border-color: var(--bronze-dim);
-}
-
-.state-pill[data-state="ready"],
-.state-pill[data-state="busy"] {
-  color: var(--green);
-  border-color: rgba(106, 138, 80, 0.25);
 }
 
 .state-pill[data-state="failed"] {
-  color: var(--red-muted);
-  border-color: rgba(138, 74, 66, 0.25);
+  color: var(--red);
+  border-color: var(--red);
+  text-shadow: 0 0 5px rgba(230, 41, 58, 0.5);
 }
 
 /* ══════════════════════════════════════
@@ -488,28 +741,164 @@ button.primary:hover {
   z-index: 1;
   height: 100vh;
   max-height: 100vh;
-  padding: 0.6rem;
+  padding: 0.7rem;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) minmax(200px, 0.38fr);
-  gap: 0.5rem;
+  grid-template-rows: auto minmax(0, 1fr) minmax(220px, 0.38fr);
+  gap: 0.7rem;
   overflow: hidden;
 }
 
 .workspace-shell {
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(180px, 220px) minmax(0, 1fr);
+  grid-template-columns: minmax(190px, 230px) minmax(0, 1fr);
   grid-template-rows: minmax(0, 1fr);
-  gap: 0.5rem;
+  gap: 0.7rem;
   overflow: hidden;
 }
 
+/* ── Sidebar ── */
 .group-picker {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 0.5rem;
+  gap: 0.55rem;
   position: relative;
+}
+
+.online-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.05rem 0.45rem;
+  border: 1px solid var(--copper-hot);
+  color: var(--copper-hot);
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 8px;
+  letter-spacing: 0.18em;
+  font-weight: 700;
+  text-transform: uppercase;
+  text-shadow: 0 0 4px color-mix(in srgb, var(--copper-hot) 45%, transparent);
+}
+.online-dot {
+  width: 5px; height: 5px;
+  border-radius: 999px;
+  background: var(--copper-hot);
+  box-shadow: 0 0 5px var(--copper-hot);
+  animation: livePulse 1.8s ease-in-out infinite;
+}
+
+.group-picker .card-kicker {
+  font-size: 9px;
+  letter-spacing: 0.22em;
+}
+
+.sidebar-grid {
+  position: absolute;
+  inset: 100px 18px 80px 18px;
+  background-image: radial-gradient(
+    color-mix(in srgb, var(--copper-hot) 65%, transparent) 1.2px,
+    transparent 1.7px
+  );
+  background-size: 11px 11px;
+  background-position: 3px 3px;
+  pointer-events: none;
+  z-index: 1;
+  /* Tight cluster at bottom-right — matches target reference */
+  mask-image: radial-gradient(
+    ellipse 70% 45% at 100% 100%,
+    #000 0%,
+    rgba(0, 0, 0, 0.7) 30%,
+    rgba(0, 0, 0, 0.18) 70%,
+    transparent 100%
+  );
+  -webkit-mask-image: radial-gradient(
+    ellipse 70% 45% at 100% 100%,
+    #000 0%,
+    rgba(0, 0, 0, 0.7) 30%,
+    rgba(0, 0, 0, 0.18) 70%,
+    transparent 100%
+  );
+}
+
+/* Second layer: warm-primary dot tint at bottom-right for color depth */
+.sidebar-grid::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background-image: radial-gradient(
+    color-mix(in srgb, var(--bronze) 50%, transparent) 1.1px,
+    transparent 1.6px
+  );
+  background-size: 11px 11px;
+  background-position: 3px 3px;
+  mask-image: radial-gradient(
+    ellipse 35% 35% at 90% 95%,
+    #000 0%,
+    rgba(0, 0, 0, 0.55) 50%,
+    transparent 100%
+  );
+  -webkit-mask-image: radial-gradient(
+    ellipse 35% 35% at 90% 95%,
+    #000 0%,
+    rgba(0, 0, 0, 0.55) 50%,
+    transparent 100%
+  );
+  pointer-events: none;
+}
+
+.sidebar-footer {
+  margin-top: auto;
+  padding: 0.4rem 0.1rem 0.2rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  z-index: 2;
+}
+.sidebar-version {
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 9px;
+  letter-spacing: 0.2em;
+  color: var(--copper-hot);
+  text-transform: uppercase;
+  text-shadow: 0 0 5px color-mix(in srgb, var(--copper-hot) 40%, transparent);
+}
+/* Loading / health gauge — animated primary-color bar with secondary tick cluster at right end */
+.sidebar-progress {
+  position: relative;
+  height: 7px;
+  background: color-mix(in srgb, var(--bronze) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--bronze) 40%, transparent);
+  overflow: hidden;
+}
+.sidebar-progress > span {
+  display: block;
+  height: 100%;
+  width: 62%;
+  background: linear-gradient(90deg, var(--bronze) 0%, var(--bronze-light) 70%, var(--copper-hot) 100%);
+  box-shadow: 0 0 10px color-mix(in srgb, var(--bronze) 60%, transparent);
+  animation: progressPulse 4s ease-in-out infinite;
+}
+/* Tick cluster pinned to the right edge — uses active theme's secondary color */
+.sidebar-progress::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 0;
+  width: 18px;
+  background: repeating-linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--copper-hot) 85%, transparent) 0,
+    color-mix(in srgb, var(--copper-hot) 85%, transparent) 1.5px,
+    transparent 1.5px,
+    transparent 4px
+  );
+  pointer-events: none;
+}
+@keyframes progressPulse {
+  0%, 100% { width: 58%; }
+  50%      { width: 72%; }
 }
 
 .group-picker-tools {
@@ -517,29 +906,26 @@ button.primary:hover {
   align-items: center;
   gap: 0.5rem;
   margin-left: auto;
+  align-self: flex-end;
+  margin-bottom: 2px;
 }
 
-#pair-create-slot {
-  min-width: 0;
-}
+#pair-create-slot { min-width: 0; }
 
 .group-list {
   list-style: none;
   margin: 0;
-  padding: 0;
+  padding: 0 0.55rem;
   display: grid;
-  gap: 0.35rem;
-  overflow: auto;
+  gap: 0.4rem;
+  overflow: visible;
+  z-index: 2;
+  position: relative;
 }
 
-.group-list li {
-  min-width: 0;
-}
+.group-list li { min-width: 0; }
 
-.pair-inline-editor {
-  display: grid;
-  gap: 0.3rem;
-}
+.pair-inline-editor { display: grid; gap: 0.3rem; }
 
 .group-chip-shell {
   position: relative;
@@ -551,50 +937,59 @@ button.primary:hover {
   width: 100%;
   justify-content: flex-start;
   text-align: left;
-  padding: 0.55rem 2rem 0.55rem 0.8rem;
+  padding: 0.55rem 2rem 0.55rem 0.85rem;
   position: relative;
+  font-size: 13px;
+  letter-spacing: 0.12em;
+  font-weight: 700;
 }
 
 .group-chip::before {
   content: "";
   position: absolute;
-  top: 20%;
-  bottom: 20%;
-  left: 0.45rem;
+  top: 22%;
+  bottom: 22%;
+  left: 0.4rem;
   width: 2px;
-  border-radius: 999px;
   background: transparent;
-  transition: background var(--duration-fast) ease, box-shadow var(--duration-fast) ease;
+  transition: background var(--duration-fast) ease;
 }
 
 .group-chip[data-active="true"] {
-  border-color: rgba(160, 100, 60, 0.48);
-  color: var(--copper-hot);
-  background:
-    linear-gradient(180deg, rgba(160, 100, 60, 0.12) 0%, rgba(0, 0, 0, 0.12) 100%),
-    var(--bg-hover);
+  --btn-color: var(--blackwall);
+  --btn-glow: rgba(255, 45, 140, 0.65);
+  color: var(--blackwall);
+  background: transparent;
+  text-shadow:
+    0 0 8px rgba(255, 45, 140, 0.7),
+    0 0 3px rgba(180, 30, 90, 0.5);
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.04),
-    0 1px 3px rgba(0, 0, 0, 0.3),
-    0 0 16px rgba(160, 100, 60, 0.12);
+    inset 0 0 0 1px rgba(255, 45, 140, 0.30),
+    0 0 18px rgba(255, 45, 140, 0.55);
+}
+
+.group-chip[data-active="true"]:hover {
+  background: rgba(255, 45, 140, 0.08);
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 45, 140, 0.50),
+    0 0 24px rgba(255, 45, 140, 0.65);
 }
 
 .group-chip[data-active="true"]::before {
-  background: var(--copper-hot);
-  box-shadow: 0 0 10px rgba(160, 100, 60, 0.35);
+  background: var(--blackwall);
+  box-shadow: 0 0 8px rgba(255, 45, 140, 0.7);
 }
 
 .new-pair-button {
   white-space: nowrap;
-  padding: 0.4rem 0.7rem;
-  font-size: 11px;
-  letter-spacing: 0.05em;
+  padding: 0.32rem 0.7rem;
+  font-size: 10px;
+  letter-spacing: 0.1em;
 }
 
 .new-pair-input {
   width: 100%;
   border: 1px solid var(--frame);
-  border-radius: var(--radius-md);
   background: var(--bg-inset);
   color: var(--text-primary);
   padding: 0.4rem 0.65rem;
@@ -616,14 +1011,15 @@ button.primary:hover {
 }
 
 .chip-menu-button {
-  width: 18px;
-  height: 18px;
+  width: 20px;
+  height: 20px;
   padding: 0;
   display: grid;
   place-items: center;
   border-radius: 999px;
   font-size: 14px;
   line-height: 1;
+  clip-path: none;
 }
 
 .chip-menu {
@@ -631,9 +1027,12 @@ button.primary:hover {
   top: calc(100% + 0.25rem);
   right: 0;
   display: grid;
-  gap: 0.25rem;
+  gap: 0.3rem;
   min-width: 132px;
-  padding: 0.35rem;
+  padding: 0;
+  background: transparent;
+  border: none;
+  box-shadow: none;
   z-index: 4;
 }
 
@@ -641,35 +1040,91 @@ button.primary:hover {
   width: 100%;
   justify-content: flex-start;
   text-align: left;
-  padding: 0.4rem 0.55rem;
+  padding: 0.4rem 0.6rem;
+  background: var(--bg-panel);
 }
-
 .chip-menu-action:disabled {
   cursor: not-allowed;
   color: var(--text-tertiary);
 }
 
 .pair-dialog-overlay {
-  position: absolute;
-  inset: 0;
-  display: grid;
-  place-items: center;
-  padding: 0.75rem;
-  background: rgba(0, 0, 0, 0.55);
-  z-index: 6;
+  /* Legacy — no longer rendered, kept zeroed in case anything still references it */
+  display: none;
 }
 
+/* Inline confirmation popover — anchored below the chip it targets.
+   Chamfered cyan border on dark fill, no backdrop overlay. */
 .pair-dialog {
-  width: min(100%, 280px);
-  padding: 0.9rem;
+  position: absolute;
+  top: calc(100% + 0.45rem);
+  left: -0.2rem;
+  right: -0.2rem;
+  padding: 0.75rem 0.85rem 0.7rem;
   display: grid;
-  gap: 0.5rem;
+  gap: 0.45rem;
+  background: var(--copper-hot);
+  --dialog-chamfer: 12px;
+  z-index: 12;
+  clip-path: polygon(
+    var(--dialog-chamfer) 0,
+    calc(100% - var(--dialog-chamfer)) 0,
+    100% var(--dialog-chamfer),
+    100% calc(100% - var(--dialog-chamfer)),
+    calc(100% - var(--dialog-chamfer)) 100%,
+    var(--dialog-chamfer) 100%,
+    0 calc(100% - var(--dialog-chamfer)),
+    0 var(--dialog-chamfer)
+  );
+  filter: drop-shadow(0 0 18px color-mix(in srgb, var(--copper-hot) 35%, transparent));
+}
+.pair-dialog::before {
+  content: '';
+  position: absolute;
+  inset: 1.5px;
+  background: var(--bg-panel);
+  clip-path: polygon(
+    calc(var(--dialog-chamfer) - 1.5px) 0,
+    calc(100% - var(--dialog-chamfer) + 1.5px) 0,
+    100% calc(var(--dialog-chamfer) - 1.5px),
+    100% calc(100% - var(--dialog-chamfer) + 1.5px),
+    calc(100% - var(--dialog-chamfer) + 1.5px) 100%,
+    calc(var(--dialog-chamfer) - 1.5px) 100%,
+    0 calc(100% - var(--dialog-chamfer) + 1.5px),
+    0 calc(var(--dialog-chamfer) - 1.5px)
+  );
+  z-index: 0;
+  pointer-events: none;
+}
+.pair-dialog > * {
+  position: relative;
+  z-index: 1;
+}
+.pair-dialog .card-kicker {
+  color: var(--copper-hot);
+  font-size: 10px;
+  letter-spacing: 0.2em;
+}
+.pair-dialog h3 {
+  margin: 0;
+  color: var(--blackwall);
+  font-family: "Rajdhani", "Montserrat", system-ui, sans-serif;
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  line-height: 1.2;
+  text-shadow: 0 0 8px rgba(255, 45, 140, 0.55);
+}
+.pair-dialog p {
+  margin: 0;
+  color: color-mix(in srgb, var(--bronze) 85%, transparent);
+  font-size: 12px;
+  line-height: 1.45;
+  text-shadow: 0 0 5px color-mix(in srgb, var(--bronze) 30%, transparent);
 }
 
 .pair-dialog h3,
-.pair-dialog p {
-  margin: 0;
-}
+.pair-dialog p { margin: 0; }
 
 .pair-dialog-actions {
   display: flex;
@@ -678,94 +1133,270 @@ button.primary:hover {
 }
 
 button.danger {
-  color: #f0b0a8;
-  border-color: rgba(138, 74, 66, 0.65);
+  --btn-color: var(--red);
+  --btn-glow: rgba(230, 41, 58, 0.55);
+  color: var(--red);
+  background: transparent;
+  border-color: var(--red);
+  text-shadow: 0 0 6px rgba(230, 41, 58, 0.6);
+}
+button.danger:hover {
+  background: color-mix(in srgb, var(--red) 14%, transparent);
+  border-color: var(--red-bright);
 }
 
 .pair-error {
-  color: #e3a59c;
+  color: var(--red-bright);
   font-size: 11px;
   line-height: 1.3;
 }
 
+/* ── Workspace + bottom grids ── */
 .workspace-grid {
   min-height: 0;
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   grid-template-rows: minmax(0, 1fr);
-  gap: 0.5rem;
+  gap: 0.7rem;
   overflow: hidden;
 }
 
-.terminal-actions, .router-actions {
+/* Pane card layout */
+.terminal-card {
+  position: relative;
+}
+.terminal-head {
   display: flex;
-  gap: 0.35rem;
-  margin: 0.45rem 0 0.4rem;
+  align-items: center;
+  gap: 0.7rem;
   flex-wrap: wrap;
+}
+.terminal-head h2 {
+  flex-shrink: 0;
+  margin-right: 0.4rem;
+}
+
+.terminal-actions {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+.terminal-actions-right {
+  margin-left: auto;
   flex-shrink: 0;
 }
 
 .terminal-host, .system-terminal {
   min-height: 0;
   flex: 1;
-  border-radius: var(--radius-sm);
   overflow: hidden;
   border: 1px solid var(--frame-inner);
-  box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.35);
+  box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.5);
+  margin-top: 0.55rem;
+  position: relative;
+  z-index: 2;
 }
 
 .bottom-grid {
   min-height: 0;
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0.5rem;
+  gap: 0.7rem;
 }
 
 .terminal-card[data-group-active="false"] {
   display: none;
 }
 
+.system-card, .router-card { position: relative; }
+
+/* CTRL chip — bottom-right of system + router cards */
+.card-ctrl-chip {
+  position: absolute;
+  bottom: 6px;
+  right: 6px;
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 9px;
+  letter-spacing: 0.22em;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: var(--copper-hot);
+  padding: 0.15rem 0.45rem;
+  border: 1px solid color-mix(in srgb, var(--copper-hot) 55%, transparent);
+  background: color-mix(in srgb, var(--copper-hot) 5%, transparent);
+  text-shadow: 0 0 5px color-mix(in srgb, var(--copper-hot) 40%, transparent);
+  z-index: 5;
+  user-select: none;
+}
+
 /* ══════════════════════════════════════
    FORM ELEMENTS
    ══════════════════════════════════════ */
 
-select, textarea {
+textarea {
   width: 100%;
   border: 1px solid var(--frame);
-  border-radius: var(--radius-md);
   background: var(--bg-inset);
   color: var(--text-primary);
-  padding: 0.4rem 0.65rem;
-  text-transform: uppercase;
+  padding: 0.45rem 0.7rem;
   font-size: 11px;
-  letter-spacing: 0.04em;
-  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.2);
+  letter-spacing: 0.06em;
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.3);
+  resize: none;
+  overflow: auto;
 }
 
-select:focus-visible, textarea:focus-visible {
+textarea:focus-visible {
   outline: 2px solid var(--copper-hot);
   outline-offset: 1px;
 }
 
-textarea { resize: none; overflow: auto; text-transform: none; }
+/* ══════════════════════════════════════
+   COMBOBOX — custom dropdown replacing native <select>
+   so we can fully theme the open-list hover state
+   (WebView2 overrides option:hover with native OS highlight).
+   ══════════════════════════════════════ */
+
+.combobox {
+  position: relative;
+  width: 100%;
+}
+
+.combobox-trigger {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  border: 1px solid var(--frame);
+  background: var(--bg-inset);
+  color: var(--copper-hot);
+  padding: 0.45rem 0.7rem;
+  text-transform: uppercase;
+  font-family: "Rajdhani", "Montserrat", system-ui, sans-serif;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-shadow: 0 0 6px color-mix(in srgb, var(--copper-hot) 40%, transparent);
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.3);
+  cursor: pointer;
+  /* Override the global button chamfer — combobox triggers are rectangular */
+  clip-path: none;
+  text-align: left;
+  justify-content: flex-start;
+}
+
+.combobox-label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.combobox-chevron {
+  flex-shrink: 0;
+  width: 11px;
+  height: 7px;
+  background-color: var(--red);
+  -webkit-mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8' fill='none' stroke='black' stroke-width='2' stroke-linecap='square'><path d='M 1 1 L 6 6 L 11 1'/></svg>") no-repeat center / contain;
+          mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8' fill='none' stroke='black' stroke-width='2' stroke-linecap='square'><path d='M 1 1 L 6 6 L 11 1'/></svg>") no-repeat center / contain;
+  -webkit-mask-mode: alpha;
+          mask-mode: alpha;
+  transition: transform var(--duration-fast) var(--easing);
+}
+
+.combobox-trigger[aria-expanded="true"] .combobox-chevron {
+  transform: rotate(180deg);
+}
+
+.combobox-trigger:hover {
+  border-color: var(--copper-hot);
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.3), 0 0 10px color-mix(in srgb, var(--copper-hot) 25%, transparent);
+}
+
+.combobox-trigger:focus-visible {
+  outline: 2px solid var(--copper-hot);
+  outline-offset: 1px;
+}
+
+.combobox-listbox {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  background: var(--bg-panel);
+  border: 1px solid var(--copper-hot);
+  box-shadow:
+    0 0 0 1px var(--frame-dark),
+    0 0 18px color-mix(in srgb, var(--copper-hot) 25%, transparent),
+    0 6px 16px rgba(0, 0, 0, 0.55);
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  padding: 4px;
+  gap: 1px;
+}
+
+.combobox-option {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--copper-hot);
+  padding: 0.45rem 0.7rem;
+  text-transform: uppercase;
+  font-family: "Rajdhani", "Montserrat", system-ui, sans-serif;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  cursor: pointer;
+  /* Override global button chamfer */
+  clip-path: none;
+  box-shadow: none;
+  text-shadow: 0 0 4px color-mix(in srgb, var(--copper-hot) 30%, transparent);
+  transition: background var(--duration-fast) ease, color var(--duration-fast) ease;
+}
+
+.combobox-option:hover,
+.combobox-option:focus-visible {
+  background: color-mix(in srgb, var(--copper-hot) 18%, transparent);
+  color: var(--cyan-bright);
+  border-color: color-mix(in srgb, var(--copper-hot) 40%, transparent);
+  outline: none;
+  box-shadow: 0 0 12px color-mix(in srgb, var(--copper-hot) 35%, transparent);
+  text-shadow: 0 0 6px color-mix(in srgb, var(--copper-hot) 55%, transparent);
+}
+
+.combobox-option[data-selected="true"] {
+  background: color-mix(in srgb, var(--copper-hot) 10%, transparent);
+  color: var(--cyan-bright);
+}
+
+.combobox-option[data-selected="true"]:hover,
+.combobox-option[data-selected="true"]:focus-visible {
+  background: color-mix(in srgb, var(--copper-hot) 22%, transparent);
+}
 
 .router-form {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0.45rem;
-  margin-top: 0.45rem;
+  gap: 0.55rem;
+  margin-top: 0.55rem;
   min-height: 0;
   align-content: start;
   overflow: hidden;
+  position: relative;
+  z-index: 2;
 }
 
-.router-form label { display: grid; gap: 0.2rem; }
+.router-form label { display: grid; gap: 0.25rem; }
 .router-form span {
-  color: var(--text-tertiary);
+  color: var(--copper-hot);
   font-size: 10px;
-  font-weight: 600;
+  font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.18em;
+  text-shadow: 0 0 5px color-mix(in srgb, var(--copper-hot) 35%, transparent);
 }
 
 .message-field {
@@ -781,46 +1412,48 @@ textarea { resize: none; overflow: auto; text-transform: none; }
   flex: 1 1 auto;
 }
 
+.router-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+  margin-top: 0.2rem;
+}
+
 /* ══════════════════════════════════════
-   CONTROL FLYOUT
+   CONTROL FLYOUT  (kept tucked away)
    ══════════════════════════════════════ */
 
 .control-flyout {
   position: fixed;
-  right: 0.75rem;
-  bottom: 0.75rem;
+  right: 0.85rem;
+  bottom: 0.85rem;
   display: flex;
   align-items: flex-end;
   gap: 0.4rem;
   z-index: 10;
+  opacity: 0.0;
+  pointer-events: none;
+}
+.control-flyout:hover, .control-flyout:focus-within {
+  opacity: 1;
+  pointer-events: auto;
 }
 
 .control-toggle {
-  width: 36px;
-  height: 36px;
-  border-radius: var(--radius-lg);
+  width: 38px;
+  height: 38px;
   font-size: 9px;
-}
-
-.control-toggle:hover {
-  border-color: var(--bronze);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.04),
-    0 1px 3px rgba(0, 0, 0, 0.3),
-    0 0 14px var(--bronze-glow);
 }
 
 .control-menu {
   opacity: 0;
   pointer-events: none;
   transform: translateY(6px);
-  transition:
-    opacity var(--duration-fast) ease,
-    transform var(--duration-fast) var(--easing);
+  transition: opacity var(--duration-fast) ease, transform var(--duration-fast) var(--easing);
   display: grid;
   gap: 0.25rem;
   padding: 0.4rem;
-  border-radius: var(--radius-lg);
   border: 1px solid var(--frame);
   background: var(--bg-panel);
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
@@ -833,30 +1466,325 @@ textarea { resize: none; overflow: auto; text-transform: none; }
   transform: translateY(0);
 }
 
-/* ── Theme toggle ── */
+/* Theme toggle (compact, top-right) — glyph + brand-color tint per active theme */
 .theme-toggle {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 30px;
-  height: 30px;
+  width: 34px;
+  height: 34px;
   padding: 0;
-  font-size: 14px;
-  border-radius: var(--radius-md);
+  font-size: 18px;
+  line-height: 1;
   flex-shrink: 0;
-  z-index: 1;
+  z-index: 2;
+  color: var(--blackwall);
+  border-color: var(--blackwall);
+  --btn-color: var(--blackwall);
+  --btn-glow: var(--blackwall-glow);
+  text-shadow: 0 0 6px var(--blackwall-glow);
 }
 
 /* ══════════════════════════════════════
    SCROLLBAR & SELECTION
    ══════════════════════════════════════ */
 
-::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: rgba(138, 110, 85, 0.25); border-radius: 3px; }
+::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--bronze) 30%, transparent); }
 ::-webkit-scrollbar-thumb:hover { background: var(--bronze); }
 
 ::selection { background: var(--copper-hot); color: #ffffff; }
+
+/* ══════════════════════════════════════
+   THEME — BLACKWALL DEEP
+   Lore-flavored: magenta primary (replaces yellow), violet secondary
+   (replaces cyan), deep crimson destructive, pure-black surfaces.
+   Inspired by the in-lore Bridge barrier + Songbird's signature palette.
+   ══════════════════════════════════════ */
+
+[data-theme="blackwall-deep"] {
+  /* Surfaces — pure black, no blue tint */
+  --bg-base:       #000000;
+  --bg-panel:      #000000;
+  --bg-inset:      #050207;
+  --bg-hover:      #150815;
+  --bg-active:     #20102a;
+
+  /* Primary — magenta replaces yellow as the dominant frame color */
+  --bronze:        #d8389a;
+  --bronze-light:  #ff5cb8;
+  --bronze-dim:    rgba(216, 56, 154, 0.40);
+  --bronze-glow:   rgba(216, 56, 154, 0.28);
+
+  /* Secondary — pinkish mauve (no blue undertones) — keeps the whole UI in the pink family */
+  --copper-hot:    #ff70c0;
+  --cyan-bright:   #ff9ad8;
+
+  /* Destructive — deeper crimson */
+  --red:           #c01838;
+  --red-bright:    #e0244a;
+  --red-deep:      #6b0a1d;
+
+  /* Semantic actions */
+  --green:         #9a3acc; /* Launch — violet */
+  --amber:         #d8389a; /* Restart — magenta */
+
+  /* Text — pinkish cream */
+  --text-primary:   #f0d4e8;
+  --text-secondary: #b08aa0;
+  --text-tertiary:  #5a4050;
+
+  /* Frame strokes */
+  --frame:          rgba(216, 56, 154, 0.95);
+  --frame-soft:     rgba(216, 56, 154, 0.45);
+  --frame-inner:    rgba(216, 56, 154, 0.22);
+  --frame-dark:     rgba(0, 0, 0, 0.55);
+
+  /* Brand identity — even more vivid pink, the centerpiece of this theme */
+  --blackwall:        #ff5cb8;
+  --blackwall-deep:   #c8388a;
+  --blackwall-glow:   rgba(255, 92, 184, 0.65);
+}
+
+/* Body: deeper field with violet/magenta wash instead of yellow forge glow */
+[data-theme="blackwall-deep"] body {
+  background-image:
+    repeating-linear-gradient(
+      0deg,
+      rgba(216, 56, 154, 0.022) 0px,
+      rgba(216, 56, 154, 0.022) 1px,
+      transparent 1px,
+      transparent 3px
+    ),
+    radial-gradient(ellipse at 25% 12%, rgba(216, 56, 154, 0.06), transparent 55%),
+    radial-gradient(ellipse at 80% 88%, rgba(154, 58, 204, 0.06), transparent 55%);
+}
+
+[data-theme="blackwall-deep"] body::after {
+  background: radial-gradient(ellipse, rgba(216, 56, 154, 0.08), transparent 70%);
+}
+
+/* Brand wordmark — chromatic aberration / RGB-split glitch text. Sells the
+   "reading through dirty cyberware" Bridge feel without animation. */
+[data-theme="blackwall-deep"] .topbar h1 {
+  color: var(--blackwall);
+  text-shadow:
+    0 0 14px rgba(255, 92, 184, 0.75),
+    0 0 32px rgba(255, 92, 184, 0.4),
+    0 0 6px rgba(192, 24, 56, 0.5),
+    -2px 0 0 rgba(0, 220, 255, 0.45),
+    2px 0 0 rgba(255, 50, 80, 0.55);
+}
+
+/* Pane titles still in brand pink — chromatic split too, lighter so terminal stays readable */
+[data-theme="blackwall-deep"] .terminal-card .card-head h2 {
+  color: var(--blackwall);
+  text-shadow:
+    0 0 12px rgba(255, 92, 184, 0.7),
+    0 0 24px rgba(255, 92, 184, 0.3),
+    -1px 0 0 rgba(0, 220, 255, 0.35),
+    1px 0 0 rgba(255, 50, 80, 0.45);
+}
+
+/* Slow heartbeat pulse on the theme-toggle diamond glyph — signal monitor vibe */
+[data-theme="blackwall-deep"] .theme-toggle {
+  animation: blackwallPulse 2.4s ease-in-out infinite;
+}
+@keyframes blackwallPulse {
+  0%, 100% {
+    text-shadow: 0 0 4px var(--blackwall-glow);
+    filter: brightness(1);
+  }
+  50% {
+    text-shadow:
+      0 0 12px var(--blackwall-glow),
+      0 0 24px var(--blackwall-glow);
+    filter: brightness(1.25);
+  }
+}
+
+/* Status ticker — scrolling netrunner-deck flavor banner above the topbar.
+   Hidden in default theme, scrolls slowly in deep theme. Absolutely positioned
+   so it doesn't steal a grid row from app-shell — the deep-theme app-shell
+   padding-top is bumped to make room for it. */
+.blackwall-ticker {
+  display: none;
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 16px;
+  overflow: hidden;
+}
+
+[data-theme="blackwall-deep"] .app-shell {
+  padding-top: calc(0.7rem + 18px);
+}
+
+[data-theme="blackwall-deep"] .blackwall-ticker {
+  display: flex;
+  align-items: center;
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.2em;
+  color: color-mix(in srgb, var(--blackwall) 60%, transparent);
+  text-shadow: 0 0 4px color-mix(in srgb, var(--blackwall) 35%, transparent);
+  border-top: 1px solid color-mix(in srgb, var(--red) 30%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--blackwall) 18%, transparent);
+  pointer-events: none;
+  user-select: none;
+  z-index: 5;
+}
+
+[data-theme="blackwall-deep"] .blackwall-ticker::before,
+[data-theme="blackwall-deep"] .blackwall-ticker::after {
+  /* fade edges so text doesn't pop in/out abruptly at the viewport boundaries */
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 60px;
+  pointer-events: none;
+  z-index: 1;
+}
+[data-theme="blackwall-deep"] .blackwall-ticker::before {
+  left: 0;
+  background: linear-gradient(90deg, var(--bg-base), transparent);
+}
+[data-theme="blackwall-deep"] .blackwall-ticker::after {
+  right: 0;
+  background: linear-gradient(270deg, var(--bg-base), transparent);
+}
+
+[data-theme="blackwall-deep"] .blackwall-ticker-track {
+  display: inline-flex;
+  align-items: center;
+  gap: 1.4em;
+  white-space: nowrap;
+  padding-left: 100%;
+  animation: blackwallTickerScroll 90s linear infinite;
+}
+
+[data-theme="blackwall-deep"] .blackwall-ticker-cell {
+  flex-shrink: 0;
+}
+
+[data-theme="blackwall-deep"] .blackwall-ticker-glyph {
+  color: color-mix(in srgb, var(--red) 80%, transparent);
+  font-size: 11px;
+  margin: 0 0.2em;
+  vertical-align: -1px;
+}
+
+[data-theme="blackwall-deep"] .blackwall-ticker-sep {
+  color: color-mix(in srgb, var(--blackwall) 40%, transparent);
+  font-size: 8px;
+  flex-shrink: 0;
+}
+
+@keyframes blackwallTickerScroll {
+  0% { transform: translateX(0); }
+  100% { transform: translateX(-100%); }
+}
+
+/* Logo PNG is yellow at the source — shift it to the brand pink via hue-rotate.
+   Preserves depth/highlights in the logo, just rolls the dominant hue around the wheel. */
+[data-theme="blackwall-deep"] .brand-logo {
+  filter:
+    hue-rotate(265deg)
+    saturate(1.15)
+    drop-shadow(0 0 12px color-mix(in srgb, var(--blackwall) 65%, transparent));
+}
+
+/* Crimson corner-bleed on every panel — Songbird red-to-black ombré soaking
+   into the magenta frame. Layered radial gradients on top of the frame fill. */
+[data-theme="blackwall-deep"] .panel {
+  background:
+    radial-gradient(ellipse 35% 25% at 0% 0%, color-mix(in srgb, var(--red-deep) 90%, transparent) 0%, transparent 70%),
+    radial-gradient(ellipse 35% 25% at 100% 100%, color-mix(in srgb, var(--red-deep) 90%, transparent) 0%, transparent 70%),
+    var(--frame);
+}
+
+/* Viewport-edge red bleed — the firewall is right at the perimeter, just out of view.
+   Combines with the vignette already on body::before. */
+[data-theme="blackwall-deep"] body::before {
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--red) 24%, transparent) 0%, transparent 6%),
+    linear-gradient(0deg, color-mix(in srgb, var(--red) 18%, transparent) 0%, transparent 5%),
+    radial-gradient(ellipse at center, transparent 30%, rgba(0,0,0,0.7) 100%);
+}
+
+/* Dissolve effect — applies the SVG turbulence/displacement filter to specific
+   elements so they periodically fragment + reform, like AIs materializing past
+   the Bridge. Filter is always-on but its displacement scale is 0 most of
+   the cycle, so it's quiet between bursts. */
+[data-theme="blackwall-deep"] .topbar h1 {
+  filter: url(#blackwall-dissolve-strong);
+  position: relative;
+}
+
+/* "ICE probe" pierce — thin red scan line sweeps the brand wordmark every
+   ~22s. Dormant most of the cycle, brief glow during the sweep. */
+[data-theme="blackwall-deep"] .topbar h1::after {
+  content: '';
+  position: absolute;
+  left: -8%;
+  right: -8%;
+  height: 1.5px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    color-mix(in srgb, var(--red-bright) 90%, transparent) 30%,
+    color-mix(in srgb, var(--red-bright) 100%, transparent) 50%,
+    color-mix(in srgb, var(--red-bright) 90%, transparent) 70%,
+    transparent 100%
+  );
+  box-shadow: 0 0 10px color-mix(in srgb, var(--red-bright) 80%, transparent);
+  top: 0;
+  opacity: 0;
+  pointer-events: none;
+  animation: blackwallIcePierce 22s linear infinite;
+}
+@keyframes blackwallIcePierce {
+  0%, 96.5% {
+    top: 0%;
+    opacity: 0;
+  }
+  97% {
+    top: 5%;
+    opacity: 0;
+  }
+  97.5% {
+    top: 12%;
+    opacity: 0.9;
+  }
+  98.5% {
+    top: 55%;
+    opacity: 0.85;
+  }
+  99.5% {
+    top: 95%;
+    opacity: 0.4;
+  }
+  100% {
+    top: 100%;
+    opacity: 0;
+  }
+}
+
+[data-theme="blackwall-deep"] .terminal-card .card-head h2 {
+  filter: url(#blackwall-dissolve);
+}
+
+[data-theme="blackwall-deep"] .group-picker .card-head h2 {
+  filter: url(#blackwall-dissolve);
+}
+
+[data-theme="blackwall-deep"] .group-chip[data-active="true"] {
+  filter: url(#blackwall-dissolve);
+}
 
 /* ══════════════════════════════════════
    LIGHT THEME
@@ -866,42 +1794,35 @@ textarea { resize: none; overflow: auto; text-transform: none; }
   --bg-base:       #e8e4df;
   --bg-panel:      #f2efeb;
   --bg-inset:      #ddd9d4;
-  --bg-hover:      #d5d1cc;
-  --bg-active:     #ccc8c3;
 
   --bronze:        #7a6048;
   --bronze-light:  #8a7058;
   --bronze-dim:    rgba(122, 96, 72, 0.35);
-  --bronze-glow:   rgba(122, 96, 72, 0.08);
-  --copper-hot:    #8a5550;
+  --bronze-glow:   rgba(122, 96, 72, 0.10);
+  --copper-hot:    #2a5a5a;
+
+  --red:           #b22552;
+  --red-bright:    #d6294e;
+  --red-deep:      #7a1a3a;
 
   --text-primary:   #2a2520;
   --text-secondary: #5a5448;
   --text-tertiary:  #8a8278;
 
-  --frame:          rgba(100, 80, 60, 0.25);
+  --frame:          rgba(100, 80, 60, 0.35);
+  --frame-soft:     rgba(100, 80, 60, 0.18);
   --frame-inner:    rgba(100, 80, 60, 0.12);
   --frame-dark:     rgba(0, 0, 0, 0.08);
 }
 
-[data-theme="light"] body {
-  background: var(--bg-base);
-  background-image: none;
-}
-
+[data-theme="light"] body { background: var(--bg-base); background-image: none; }
 [data-theme="light"] body::before {
-  background: radial-gradient(
-    ellipse at center,
-    transparent 50%,
-    rgba(0, 0, 0, 0.08) 100%
-  );
+  background: radial-gradient(ellipse at center, transparent 50%, rgba(0,0,0,0.08) 100%);
 }
-
 [data-theme="light"] body::after { opacity: 0; }
 
 [data-theme="light"] .panel {
   background: var(--bg-panel);
-  background-image: none;
   box-shadow:
     inset 0 0 0 1px var(--frame-inner),
     0 1px 2px rgba(0, 0, 0, 0.06),
@@ -913,26 +1834,10 @@ textarea { resize: none; overflow: auto; text-transform: none; }
   box-shadow: inset 0 1px 4px rgba(0, 0, 0, 0.08);
 }
 
-[data-theme="light"] button {
-  background: var(--bg-panel);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.5),
-    0 1px 2px rgba(0, 0, 0, 0.08);
-}
+[data-theme="light"] [data-action="start"]   { --btn-color: #3a6a28; }
+[data-theme="light"] [data-action="restart"] { --btn-color: #7a6020; }
 
-[data-theme="light"] [data-action="start"]   { color: #3a6a28; }
-[data-theme="light"] [data-action="restart"] { color: #7a6020; }
-[data-theme="light"] [data-action="stop"]    { color: #7a3a32; }
-
-[data-theme="light"] .state-pill[data-state="ready"],
-[data-theme="light"] .state-pill[data-state="busy"] { color: #3a6a28; }
-[data-theme="light"] .state-pill[data-state="failed"] { color: #7a3a32; }
-[data-theme="light"] .active-group-label { color: #8a5550; }
-[data-theme="light"] .group-chip[data-active="true"] { color: #8a5550; }
-[data-theme="light"] .pair-dialog-overlay { background: rgba(42, 37, 32, 0.18); }
-[data-theme="light"] .pair-error { color: #8a4a42; }
-
-[data-theme="light"] ::-webkit-scrollbar-thumb { background: rgba(100, 80, 60, 0.2); }
+[data-theme="light"] ::-webkit-scrollbar-thumb { background: rgba(100, 80, 60, 0.20); }
 
 /* ══════════════════════════════════════
    RESPONSIVE
@@ -948,4 +1853,5 @@ textarea { resize: none; overflow: auto; text-transform: none; }
   .router-form {
     grid-template-columns: 1fr;
   }
+  :root { --corner: 44px; }
 }
