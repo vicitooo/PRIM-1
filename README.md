@@ -57,7 +57,7 @@ Current operator shortcut status:
 
 Current autonomous control surface:
 
-- `scripts/control-plane.ps1` exposes `ping`, `list`, `start`, `stop`, `restart`, `input`, `key`, and `route`
+- `scripts/control-plane.ps1` exposes `ping`, `list`, `start` (including per-launch `-ExtraArgs`), `stop`, `restart`, `input`, `key`, and `route`
 - `scripts/agent-route.ps1`, `scripts/agent-ping.ps1`, and `scripts/agent-key.ps1` give agents a quieter wrapper over the control plane
 - `scripts/new-smoke-token.ps1`, `scripts/handshake-route.ps1`, and `scripts/handshake-watchdog.ps1` now harden the handshake protocol against token collisions, malformed dispatches, and silent stalls
 - runtime evidence lives in `.runtime/audit/` and `.runtime/desktop-events.jsonl`

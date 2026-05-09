@@ -80,6 +80,7 @@ Canonical examples:
 ```bash
 powershell -Command "& '.\scripts\control-plane.ps1' -Action list"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action start -Session claude"
+powershell -Command "& '.\scripts\control-plane.ps1' -Action start -Session claude -ExtraArgs '--resume','00000000-0000-0000-0000-000000000000'"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action input -Session codex -Content 'hi'"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action input -Session claude -ContentFile 'D:\tmp\compact.txt'"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action deliver -Session claude -Content 'hello from victor'"
@@ -98,6 +99,7 @@ Behavior:
   - otherwise `PRIM1_PANE_CREDENTIALS` is used when present inside a supervised pane
   - otherwise the helper falls back to `.runtime/control-plane.json`
 - `-Quiet` prints only the success/error message for agent-friendly use
+- `-Action start` accepts `-ExtraArgs <string[]>`; values are appended to the spawned driver's launch args for that invocation only and are recorded on the `start_session` sideband audit event
 - `-Action input` injects raw text only; it does **not** press Enter for you
 - `-Action input` now accepts either:
   - `-Content '<inline text>'`

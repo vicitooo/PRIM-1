@@ -36,6 +36,7 @@ Example:
 
 ```powershell
 .\scripts\control-plane.ps1 -Action route -From victor -To claude -Scope direct -Content "Review the Codex pane."
+.\scripts\control-plane.ps1 -Action start -Session claude -ExtraArgs '--resume', '00000000-0000-0000-0000-000000000000'
 .\scripts\control-plane.ps1 -Action input -Session claude -ContentFile ".runtime\compact-prompts\compact-full.txt"
 .\scripts\control-plane.ps1 -Action deliver -Session claude -Content "Multi-line`nmessage body"
 .\scripts\control-plane.ps1 -Action wait_quiet -Session claude -QuietSec 2 -TimeoutSec 10
@@ -45,6 +46,7 @@ Example:
 Notes:
 
 - mailbox fallback keeps a 10-second response window by default
+- `start` accepts `-ExtraArgs <string[]>` for per-launch CLI arguments such as `--resume <session-id>`; the supervisor appends them to the cloned launch definition and writes them to the `start_session` audit lifecycle entry
 - `deliver` and `wait_quiet` honor `-TimeoutSec` for longer mailbox-backed waits when needed
 - `events_since` always emits structured JSON and never routes through `-Quiet`
 - `events_since` extends pipe/mailbox waits to `MaxWaitSeconds + 5`
