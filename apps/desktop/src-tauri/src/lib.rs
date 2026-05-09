@@ -82,7 +82,7 @@ fn start_session(
     );
     state
         .supervisor
-        .start_session(&request.name)
+        .start_session(&request.name, request.extra_args)
         .map_err(|error| {
             state.diagnostics.log(
                 "error",

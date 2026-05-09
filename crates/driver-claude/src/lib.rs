@@ -136,6 +136,26 @@ mod tests {
     }
 
     #[test]
+    fn launch_spec_appends_session_definition_args_after_base_args() {
+        let working_dir = if cfg!(windows) {
+            r"C:\Projects\workspace"
+        } else {
+            "/home/alice/mywork"
+        };
+        let base = launch_spec(&default_session(working_dir));
+        let mut definition = default_session(working_dir);
+        definition.args = vec!["--resume".into(), "abc-123".into()];
+
+        let spec = launch_spec(&definition);
+
+        assert_eq!(&spec.args[..base.args.len()], base.args.as_slice());
+        assert_eq!(
+            &spec.args[base.args.len()..],
+            &["--resume".to_string(), "abc-123".to_string()]
+        );
+    }
+
+    #[test]
     fn wrapper_root_helper_keeps_existing_wrapper_path() {
         assert_eq!(
             wrapper_root_for_session(r"C:\Projects\workspace\CLI-master-wrapper"),

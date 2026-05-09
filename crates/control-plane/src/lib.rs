@@ -85,6 +85,33 @@ mod tests {
     }
 
     #[test]
+    fn round_trips_start_session_extra_args_request_json() {
+        let json = encode_request(&SidebandRequest::StartSession {
+            token: "abc".into(),
+            name: "claude".into(),
+            extra_args: vec!["--resume".into(), "abc-123".into()],
+        })
+        .unwrap();
+        let decoded = decode_request(&json).unwrap();
+
+        match decoded {
+            SidebandRequest::StartSession {
+                token,
+                name,
+                extra_args,
+            } => {
+                assert_eq!(token, "abc");
+                assert_eq!(name, "claude");
+                assert_eq!(
+                    extra_args,
+                    vec!["--resume".to_string(), "abc-123".to_string()]
+                );
+            }
+            _ => panic!("unexpected request variant"),
+        }
+    }
+
+    #[test]
     fn round_trips_response_json() {
         let json = encode_response(&SidebandResponse {
             ok: true,

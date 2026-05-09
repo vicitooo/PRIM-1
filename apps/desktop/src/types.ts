@@ -40,6 +40,7 @@ export interface RuntimeSnapshot {
 
 export interface StartSessionRequest {
   name: string;
+  extra_args?: string[];
 }
 
 export interface StopSessionRequest {
@@ -133,6 +134,7 @@ export type RuntimeEvent =
       request_id: string;
       action: string;
       session: string | null;
+      extra_args?: string[];
       phase: "started" | "slow_warning" | "timed_out" | "completed" | "failed";
       elapsed_ms: number;
       timestamp: string;

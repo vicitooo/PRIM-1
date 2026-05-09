@@ -988,6 +988,7 @@ impl SupervisorHandle {
         request_id: &str,
         action: &str,
         session: Option<&str>,
+        extra_args: &[String],
         phase: SidebandPhase,
         elapsed: Duration,
     ) {
@@ -995,6 +996,7 @@ impl SupervisorHandle {
             request_id: request_id.to_string(),
             action: action.to_string(),
             session: session.map(ToOwned::to_owned),
+            extra_args: extra_args.to_vec(),
             phase,
             elapsed_ms: elapsed.as_millis() as u64,
             timestamp: now_rfc3339(),
@@ -1147,7 +1149,8 @@ impl SupervisorHandle {
         }
     }
 
-    pub fn start_session(&self, name: &str) -> Result<SessionSnapshot> {
+    pub fn start_session(&self, name: &str, extra_args: Vec<String>) -> Result<SessionSnapshot> {
+        validate_extra_args(&extra_args)?;
         self.refresh_session_liveness();
         let expected = {
             let mut slots = self.inner.slots.lock();
@@ -1161,7 +1164,7 @@ impl SupervisorHandle {
             slot.generation = slot.generation.wrapping_add(1);
             slot.generation
         };
-        self.start_session_at(name, expected)
+        self.start_session_at(name, expected, extra_args)
     }
 
     pub fn stop_session(&self, name: &str) -> Result<SessionSnapshot> {
@@ -1417,7 +1420,13 @@ impl SupervisorHandle {
         Ok(snapshot)
     }
 
-    fn start_session_at(&self, name: &str, expected: SessionGeneration) -> Result<SessionSnapshot> {
+    fn start_session_at(
+        &self,
+        name: &str,
+        expected: SessionGeneration,
+        extra_args: Vec<String>,
+    ) -> Result<SessionSnapshot> {
+        validate_extra_args(&extra_args)?;
         self.refresh_session_liveness();
         let definition = {
             let mut slots = self.inner.slots.lock();
@@ -1440,7 +1449,8 @@ impl SupervisorHandle {
             slot.last_activity_at = Some(now_rfc3339());
             slot.last_real_output_at = None;
             let snapshot = slot.snapshot();
-            let definition = slot.definition.clone();
+            let mut definition = slot.definition.clone();
+            definition.args.extend(extra_args.clone());
             drop(slots);
 
             self.emit(RuntimeEvent::SessionState {
@@ -1556,7 +1566,7 @@ impl SupervisorHandle {
 
         self.stop_session_at(name, expected_stop)?;
         let expected_start = self.bump_session_generation(name)?;
-        self.start_session_at(name, expected_start)
+        self.start_session_at(name, expected_start, Vec::new())
     }
 
     pub fn send_input(&self, request: SendInputRequest) -> Result<SessionSnapshot> {
@@ -2011,8 +2021,13 @@ impl SupervisorHandle {
         }
 
         let outcome = match (request, expected_generation) {
-            (SidebandRequest::StartSession { name, .. }, Some(expected)) => self
-                .start_session_at(&name, expected)
+            (
+                SidebandRequest::StartSession {
+                    name, extra_args, ..
+                },
+                Some(expected),
+            ) => self
+                .start_session_at(&name, expected, extra_args)
                 .map(|_| format!("started {name}")),
             (SidebandRequest::StopSession { name, .. }, Some(expected)) => self
                 .stop_session_at(&name, expected)
@@ -2165,6 +2180,7 @@ impl SupervisorHandle {
         let request_id = Uuid::new_v4().to_string();
         let action = action_label_for(&request).to_string();
         let session = session_name_of(&request).map(str::to_string);
+        let extra_args = start_session_extra_args_of(&request).to_vec();
         let budget = SidebandTimeouts::budget(&request);
         let started = Instant::now();
 
@@ -2172,6 +2188,7 @@ impl SupervisorHandle {
             &request_id,
             &action,
             session.as_deref(),
+            &extra_args,
             SidebandPhase::Started,
             Duration::ZERO,
         );
@@ -2184,6 +2201,7 @@ impl SupervisorHandle {
                     &request_id,
                     &action,
                     session.as_deref(),
+                    &extra_args,
                 )
                 .await
             }
@@ -2194,6 +2212,7 @@ impl SupervisorHandle {
                     &request_id,
                     &action,
                     session.as_deref(),
+                    &extra_args,
                 )
                 .await
             }
@@ -2209,6 +2228,7 @@ impl SupervisorHandle {
                 &request_id,
                 &action,
                 session.as_deref(),
+                &extra_args,
                 phase,
                 started.elapsed(),
             );
@@ -2224,7 +2244,12 @@ impl SupervisorHandle {
         request_id: &str,
         action: &str,
         session: Option<&str>,
+        extra_args: &[String],
     ) -> SidebandResponse {
+        if let Err(error) = validate_extra_args(start_session_extra_args_of(&request)) {
+            return self.sideband_response_from_outcome(Err(error));
+        }
+
         let expected_generation = match session {
             Some(name) => match self.bump_session_generation(name) {
                 Ok(expected) => Some(expected),
@@ -2255,6 +2280,7 @@ impl SupervisorHandle {
                             request_id,
                             action,
                             session,
+                            extra_args,
                             SidebandPhase::SlowWarning,
                             elapsed,
                         );
@@ -2277,6 +2303,7 @@ impl SupervisorHandle {
                         request_id,
                         action,
                         session,
+                        extra_args,
                         SidebandPhase::SlowWarning,
                         started.elapsed(),
                     );
@@ -2287,6 +2314,7 @@ impl SupervisorHandle {
                         request_id,
                         action,
                         session,
+                        extra_args,
                         SidebandPhase::TimedOut,
                         elapsed,
                     );
@@ -2312,6 +2340,7 @@ impl SupervisorHandle {
         request_id: &str,
         action: &str,
         session: Option<&str>,
+        extra_args: &[String],
     ) -> SidebandResponse {
         let slow_warn_at = budget / 2;
         let started = Instant::now();
@@ -2332,6 +2361,7 @@ impl SupervisorHandle {
                             request_id,
                             action,
                             session,
+                            extra_args,
                             SidebandPhase::SlowWarning,
                             elapsed,
                         );
@@ -2344,6 +2374,7 @@ impl SupervisorHandle {
                         request_id,
                         action,
                         session,
+                        extra_args,
                         SidebandPhase::SlowWarning,
                         started.elapsed(),
                     );
@@ -2353,6 +2384,7 @@ impl SupervisorHandle {
                         request_id,
                         action,
                         session,
+                        extra_args,
                         SidebandPhase::TimedOut,
                         budget,
                     );
@@ -2802,6 +2834,7 @@ fn process_sideband_mailbox_file(
     let request_id = Uuid::new_v4().to_string();
     let action = action_label_for(&request);
     let session = session_name_of(&request);
+    let extra_args = start_session_extra_args_of(&request).to_vec();
     let budget = SidebandTimeouts::budget(&request);
     let started = Instant::now();
 
@@ -2809,6 +2842,7 @@ fn process_sideband_mailbox_file(
         &request_id,
         action,
         session,
+        &extra_args,
         SidebandPhase::Started,
         Duration::ZERO,
     );
@@ -2821,6 +2855,7 @@ fn process_sideband_mailbox_file(
             &request_id,
             action,
             session,
+            &extra_args,
         ),
         OpLane::SideEffect => run_inline_with_timeout(
             handle,
@@ -2829,6 +2864,7 @@ fn process_sideband_mailbox_file(
             &request_id,
             action,
             session,
+            &extra_args,
         ),
     };
 
@@ -2838,7 +2874,14 @@ fn process_sideband_mailbox_file(
         } else {
             SidebandPhase::Failed
         };
-        handle.emit_sideband_lifecycle(&request_id, action, session, phase, started.elapsed());
+        handle.emit_sideband_lifecycle(
+            &request_id,
+            action,
+            session,
+            &extra_args,
+            phase,
+            started.elapsed(),
+        );
     }
 
     write_and_archive_response(handle, request_path, outbox_dir, processed_dir, &response)
@@ -2851,7 +2894,12 @@ fn run_detached_with_timeout(
     request_id: &str,
     action: &str,
     session: Option<&str>,
+    extra_args: &[String],
 ) -> SidebandResponse {
+    if let Err(error) = validate_extra_args(start_session_extra_args_of(&request)) {
+        return handle.sideband_response_from_outcome(Err(error));
+    }
+
     let expected_generation = match session {
         Some(name) => match handle.bump_session_generation(name) {
             Ok(expected) => Some(expected),
@@ -2893,6 +2941,7 @@ fn run_detached_with_timeout(
                         request_id,
                         action,
                         session,
+                        extra_args,
                         SidebandPhase::SlowWarning,
                         elapsed,
                     );
@@ -2902,6 +2951,7 @@ fn run_detached_with_timeout(
                         request_id,
                         action,
                         session,
+                        extra_args,
                         SidebandPhase::TimedOut,
                         elapsed,
                     );
@@ -2937,6 +2987,7 @@ fn run_inline_with_timeout(
     request_id: &str,
     action: &str,
     session: Option<&str>,
+    extra_args: &[String],
 ) -> SidebandResponse {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -2960,6 +3011,7 @@ fn run_inline_with_timeout(
             request_id,
             action,
             session,
+            extra_args,
             SidebandPhase::SlowWarning,
             elapsed,
         );
@@ -2972,6 +3024,7 @@ fn run_inline_with_timeout(
                 request_id,
                 action,
                 session,
+                extra_args,
                 SidebandPhase::TimedOut,
                 budget,
             );
@@ -3277,6 +3330,23 @@ fn session_name_of(request: &SidebandRequest) -> Option<&str> {
         | SidebandRequest::CreatePair { .. }
         | SidebandRequest::EventsSince { .. } => None,
     }
+}
+
+fn start_session_extra_args_of(request: &SidebandRequest) -> &[String] {
+    match request {
+        SidebandRequest::StartSession { extra_args, .. } => extra_args.as_slice(),
+        _ => &[],
+    }
+}
+
+fn validate_extra_args(extra_args: &[String]) -> Result<()> {
+    if let Some(index) = extra_args.iter().position(|arg| arg.trim().is_empty()) {
+        return Err(anyhow!(
+            "extra_args[{index}] must not be empty or whitespace-only"
+        ));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3840,6 +3910,38 @@ mod tests {
         }
     }
 
+    struct CapturingPtySpawner {
+        sessions: Mutex<VecDeque<Box<dyn PtySessionTrait>>>,
+        specs: Arc<Mutex<Vec<LaunchSpec>>>,
+    }
+
+    impl CapturingPtySpawner {
+        fn new(sessions: Vec<Box<dyn PtySessionTrait>>) -> (Self, Arc<Mutex<Vec<LaunchSpec>>>) {
+            let specs = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    sessions: Mutex::new(sessions.into()),
+                    specs: specs.clone(),
+                },
+                specs,
+            )
+        }
+    }
+
+    impl PtySpawner for CapturingPtySpawner {
+        fn spawn(
+            &self,
+            spec: &LaunchSpec,
+            _handler: PtyEventHandler,
+        ) -> Result<Box<dyn PtySessionTrait>> {
+            self.specs.lock().push(spec.clone());
+            self.sessions
+                .lock()
+                .pop_front()
+                .ok_or_else(|| anyhow!("no queued PTY sessions"))
+        }
+    }
+
     struct StagedPtySpawner {
         release_gate: Arc<(Mutex<bool>, Condvar)>,
         stage_first_spawn: AtomicBool,
@@ -4319,6 +4421,141 @@ mod tests {
 
         assert!(error.to_string().contains("pair 'foo' already exists"));
         assert_eq!(supervisor.snapshot().sessions.len(), initial_count);
+    }
+
+    #[test]
+    fn start_session_passes_extra_args_to_spawned_launch_spec() {
+        let supervisor = test_supervisor();
+        let (pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        let (spawner, specs) = CapturingPtySpawner::new(vec![pty]);
+        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+
+        let snapshot = supervisor
+            .start_session("claude", vec!["--resume".into(), "abc-123".into()])
+            .unwrap();
+
+        assert_eq!(snapshot.lifecycle_state, LifecycleState::Ready);
+        let specs = specs.lock();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(
+            &specs[0].args[specs[0].args.len() - 2..],
+            &["--resume".to_string(), "abc-123".to_string()]
+        );
+        assert!(
+            supervisor
+                .inner
+                .slots
+                .lock()
+                .get("claude")
+                .unwrap()
+                .definition
+                .args
+                .is_empty(),
+            "registered SessionDefinition must remain pristine"
+        );
+    }
+
+    #[test]
+    fn start_session_without_extra_args_keeps_baseline_launch_spec() {
+        let supervisor = test_supervisor();
+        let baseline_definition = {
+            supervisor
+                .inner
+                .slots
+                .lock()
+                .get("claude")
+                .unwrap()
+                .definition
+                .clone()
+        };
+        let expected = build_launch_spec(&baseline_definition);
+        let (pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        let (spawner, specs) = CapturingPtySpawner::new(vec![pty]);
+        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+
+        let snapshot = supervisor.start_session("claude", Vec::new()).unwrap();
+
+        assert_eq!(snapshot.lifecycle_state, LifecycleState::Ready);
+        let specs = specs.lock();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].program, expected.program);
+        assert_eq!(specs[0].args, expected.args);
+    }
+
+    #[test]
+    fn start_session_rejects_whitespace_only_extra_args() {
+        let supervisor = test_supervisor();
+
+        let error = supervisor
+            .start_session("claude", vec!["--resume".into(), "   ".into()])
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("extra_args[1] must not be empty or whitespace-only")
+        );
+    }
+
+    #[test]
+    fn sideband_start_session_audit_records_extra_args() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let (pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        let (spawner, _) = CapturingPtySpawner::new(vec![pty]);
+        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::StartSession {
+            token: status.token,
+            name: "claude".into(),
+            extra_args: vec!["--resume".into(), "abc-123".into()],
+        });
+
+        assert!(response.ok, "start response failed: {}", response.message);
+        let raw = fs::read_to_string(supervisor.audit_log_path()).unwrap();
+        let started = raw
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| {
+                event["event"] == "sideband_request_lifecycle"
+                    && event["action"] == "start_session"
+                    && event["phase"] == "started"
+            })
+            .expect("start_session lifecycle event not found");
+
+        assert_eq!(
+            started["extra_args"],
+            serde_json::json!(["--resume", "abc-123"])
+        );
+    }
+
+    #[test]
+    fn sideband_start_session_audit_omits_empty_extra_args() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let (pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        let (spawner, _) = CapturingPtySpawner::new(vec![pty]);
+        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::StartSession {
+            token: status.token,
+            name: "claude".into(),
+            extra_args: Vec::new(),
+        });
+
+        assert!(response.ok, "start response failed: {}", response.message);
+        let raw = fs::read_to_string(supervisor.audit_log_path()).unwrap();
+        let started = raw
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| {
+                event["event"] == "sideband_request_lifecycle"
+                    && event["action"] == "start_session"
+                    && event["phase"] == "started"
+            })
+            .expect("start_session lifecycle event not found");
+
+        assert!(started.get("extra_args").is_none());
     }
 
     #[test]
@@ -5997,10 +6234,11 @@ mod tests {
             "req-stop",
             "stop_session",
             Some("claude"),
+            &[],
         );
         assert!(response.timed_out);
 
-        let snapshot = supervisor.start_session("claude").unwrap();
+        let snapshot = supervisor.start_session("claude", Vec::new()).unwrap();
         assert_eq!(snapshot.lifecycle_state, LifecycleState::Ready);
         assert!(supervisor.test_wait_for_last_worker(Duration::from_secs(1)));
         assert_eq!(supervisor.current_generation("claude"), Some(2));
@@ -6029,15 +6267,17 @@ mod tests {
             SidebandRequest::StartSession {
                 token: status.token.clone(),
                 name: "claude".into(),
+                extra_args: Vec::new(),
             },
             Duration::from_millis(50),
             "req-start",
             "start_session",
             Some("claude"),
+            &[],
         );
         assert!(response.timed_out);
 
-        let snapshot = supervisor.start_session("claude").unwrap();
+        let snapshot = supervisor.start_session("claude", Vec::new()).unwrap();
         assert_eq!(snapshot.lifecycle_state, LifecycleState::Ready);
         {
             let (lock, cvar) = &*gate;

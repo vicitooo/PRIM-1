@@ -137,6 +137,8 @@ pub struct SendInputRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StartSessionRequest {
     pub name: String,
+    #[serde(default)]
+    pub extra_args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -279,6 +281,8 @@ pub enum RuntimeEvent {
         request_id: String,
         action: String,
         session: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        extra_args: Vec<String>,
         phase: SidebandPhase,
         elapsed_ms: u64,
         timestamp: String,
@@ -311,6 +315,8 @@ pub enum SidebandRequest {
     StartSession {
         token: String,
         name: String,
+        #[serde(default)]
+        extra_args: Vec<String>,
     },
     StopSession {
         token: String,
@@ -419,6 +425,56 @@ mod tests {
         };
 
         assert_eq!(request.token(), "secret");
+    }
+
+    #[test]
+    fn start_session_request_defaults_extra_args() {
+        let request: StartSessionRequest = serde_json::from_value(json!({
+            "name": "claude"
+        }))
+        .unwrap();
+
+        assert_eq!(request.name, "claude");
+        assert!(request.extra_args.is_empty());
+    }
+
+    #[test]
+    fn sideband_start_session_extra_args_roundtrip_and_legacy_default() {
+        let payload = json!({
+            "kind": "start_session",
+            "token": "abc",
+            "name": "claude",
+            "extra_args": ["--resume", "abc-123"]
+        });
+        let decoded: SidebandRequest = serde_json::from_value(payload.clone()).unwrap();
+
+        match &decoded {
+            SidebandRequest::StartSession {
+                token,
+                name,
+                extra_args,
+            } => {
+                assert_eq!(token, "abc");
+                assert_eq!(name, "claude");
+                assert_eq!(
+                    extra_args,
+                    &vec!["--resume".to_string(), "abc-123".to_string()]
+                );
+            }
+            other => panic!("unexpected request variant: {other:?}"),
+        }
+        assert_eq!(serde_json::to_value(decoded).unwrap(), payload);
+
+        let legacy: SidebandRequest = serde_json::from_value(json!({
+            "kind": "start_session",
+            "token": "abc",
+            "name": "claude"
+        }))
+        .unwrap();
+        match legacy {
+            SidebandRequest::StartSession { extra_args, .. } => assert!(extra_args.is_empty()),
+            other => panic!("unexpected request variant: {other:?}"),
+        }
     }
 
     #[test]
