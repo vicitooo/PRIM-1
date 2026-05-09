@@ -4,6 +4,7 @@ param(
   [string]$Action,
 
   [string]$Session,
+  [string[]]$ExtraArgs,
   [string]$Name,
   [ValidateSet("enter", "up", "down", "left", "right", "tab", "esc", "ctrl_c")]
   [string]$Key,
@@ -163,6 +164,21 @@ if ($Action -in @("input", "deliver")) {
   throw "-ContentFile is only supported for -Action input or -Action deliver"
 }
 
+[string[]]$normalizedExtraArgs = @()
+if ($null -ne $ExtraArgs) {
+  $normalizedExtraArgs = [string[]]@($ExtraArgs)
+}
+
+if ($normalizedExtraArgs.Count -gt 0 -and $Action -ne "start") {
+  throw "-ExtraArgs is only supported for -Action start"
+}
+
+foreach ($arg in $normalizedExtraArgs) {
+  if ($null -eq $arg -or [string]::IsNullOrWhiteSpace($arg)) {
+    throw "-ExtraArgs cannot contain null, empty, or whitespace-only values"
+  }
+}
+
 if ($Action -eq "events_since" -and $Quiet) {
   throw "events_since always emits structured JSON and does not support -Quiet"
 }
@@ -205,7 +221,7 @@ $payload = switch ($Action) {
   }
   "start" {
     if (-not $Session) { throw "start requires -Session" }
-    @{ kind = "start_session"; token = $info.token; name = $Session }
+    @{ kind = "start_session"; token = $info.token; name = $Session; extra_args = [string[]]$normalizedExtraArgs }
   }
   "stop" {
     if (-not $Session) { throw "stop requires -Session" }
