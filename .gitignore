@@ -1,4 +1,54 @@
+# Rust
 /target/
+**/target/
+Cargo.lock.bak
+
+# Runtime state (audit logs, pane credentials, sideband mailbox, dispatch staging)
 /.runtime/
+.runtime/
+
+# Node (Tauri frontend)
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+*.tsbuildinfo
+
+# Python
 __pycache__/
+**/__pycache__/
 *.pyc
+*.pyo
+
+# Logs + ephemeral
+*.log
+*.tmp
+.scratch/
+.runtime-tmp/
+
+# Secrets — never commit
+*.env
+.env*
+!.env.example
+*.credentials*
+credentials.json
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Per-machine local settings
+.claude/
+
+# Tauri build outputs
+src-tauri/target/
+apps/desktop/dist/
+apps/desktop/src-tauri/target/

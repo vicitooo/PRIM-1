@@ -1,4 +1,16 @@
-# CLI-master-wrapper
+# PRIM-1
+
+A local multi-agent runtime for terminal-first AI tools (Claude Code + Codex CLI in supervised PTY panes, with structured peer routing). Built by the company for Victor Valtchev's PRIM-1 ensemble.
+
+**Repo extracted from `./` on 2026-05-17 with subtree-preserved history.** The wrapper's original folder name was `CLI-master-wrapper`; the runtime's codename was always **PRIM-1**. Going forward, this repo is the canonical home for the wrapper code.
+
+**Operational doctrine lives elsewhere:** the inside-pane onboarding (`agents/PRIM-001 SUPERVISOR | CLAUDE | CODEX/README.md`), the case-law memory (`memory/feedback_prim1_* + feedback_codex_* + feedback_supervisor_*`), the project contracts (`projects/prim1-extract-and-reliability/{ANALYSIS,CONTRACT}.md`), and the Section 8 supervisor rules all live in Victor's personal repo next to `CLAUDE.md`. This repo holds only the wrapper itself.
+
+**Current reliability work** is tracked as five umbrella problems (A/B/D/E/F) plus (Problem C — centralized state). The full failure-mode taxonomy and recommended phasing live there.
+
+---
+
+## Original README
 
 **Status:** First MVP implemented
 **Date:** 2026-04-15
