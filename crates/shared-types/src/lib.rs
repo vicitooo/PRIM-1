@@ -202,12 +202,13 @@ pub struct EventFilter {
 
 impl EventFilter {
     pub const ALL_KINDS: &'static str = "all";
-    pub const DEFAULT_INCLUDE_KINDS: [&'static str; 10] = [
+    pub const DEFAULT_INCLUDE_KINDS: [&'static str; 11] = [
         "session_state",
         "pair_created",
         "pair_renamed",
         "pair_deleted",
         "routed_message",
+        "route_delivery",
         "system_log",
         "control_plane_ready",
         "sideband_request_lifecycle",
@@ -268,6 +269,21 @@ pub enum RuntimeEvent {
         content: String,
         timestamp: String,
     },
+    RouteDelivery {
+        request_id: String,
+        route_id: String,
+        from: String,
+        logical_to: String,
+        scope: MessageScope,
+        recipient: Option<String>,
+        recipient_index: u32,
+        recipient_count: u32,
+        payload_part_count: u32,
+        phase: RouteDeliveryPhase,
+        bytes_written: usize,
+        error: Option<String>,
+        timestamp: String,
+    },
     SystemLog {
         level: LogLevel,
         message: String,
@@ -305,6 +321,14 @@ pub enum RuntimeEvent {
         elapsed_ms: u64,
         timestamp: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteDeliveryPhase {
+    Resolved,
+    Written,
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -581,6 +605,49 @@ mod tests {
     }
 
     #[test]
+    fn route_delivery_event_round_trips_via_json() {
+        let event = RuntimeEvent::RouteDelivery {
+            request_id: "req-1".into(),
+            route_id: "route-1".into(),
+            from: "claude".into(),
+            logical_to: "room".into(),
+            scope: MessageScope::Room,
+            recipient: Some("codex".into()),
+            recipient_index: 1,
+            recipient_count: 2,
+            payload_part_count: 3,
+            phase: RouteDeliveryPhase::Written,
+            bytes_written: 42,
+            error: None,
+            timestamp: "2026-05-17T00:00:00Z".into(),
+        };
+
+        let value = serde_json::to_value(event.clone()).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "event": "route_delivery",
+                "request_id": "req-1",
+                "route_id": "route-1",
+                "from": "claude",
+                "logical_to": "room",
+                "scope": "room",
+                "recipient": "codex",
+                "recipient_index": 1,
+                "recipient_count": 2,
+                "payload_part_count": 3,
+                "phase": "written",
+                "bytes_written": 42,
+                "error": null,
+                "timestamp": "2026-05-17T00:00:00Z",
+            })
+        );
+
+        let roundtrip: RuntimeEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(roundtrip, event);
+    }
+
+    #[test]
     fn sideband_lifecycle_event_skips_absent_error() {
         let event = RuntimeEvent::SidebandRequestLifecycle {
             request_id: "req-1".into(),
@@ -700,6 +767,22 @@ mod tests {
     }
 
     #[test]
+    fn route_delivery_phase_uses_snake_case() {
+        assert_eq!(
+            serde_json::to_value(RouteDeliveryPhase::Resolved).unwrap(),
+            json!("resolved")
+        );
+        assert_eq!(
+            serde_json::to_value(RouteDeliveryPhase::Written).unwrap(),
+            json!("written")
+        );
+        assert_eq!(
+            serde_json::to_value(RouteDeliveryPhase::Failed).unwrap(),
+            json!("failed")
+        );
+    }
+
+    #[test]
     fn event_cursor_roundtrips_json() {
         let cursor = EventCursor {
             audit_file: "2026-04-18.jsonl".into(),
@@ -743,6 +826,13 @@ mod tests {
 
         assert!(filter.includes_kind("request_ack"));
         assert!(filter.includes_kind("request_ack_timeout"));
+    }
+
+    #[test]
+    fn filter_default_includes_route_delivery() {
+        let filter = EventFilter::default();
+
+        assert!(filter.includes_kind("route_delivery"));
     }
 
     #[test]

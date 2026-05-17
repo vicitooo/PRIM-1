@@ -18,10 +18,10 @@ use parking_lot::{Mutex, RwLock};
 use pty_host::{ConcretePtySession, PtyEvent, PtyEventHandler, PtySession};
 use shared_types::{
     ControlKey, ControlPlaneStatus, DeliverMessageRequest, DriverKind, EnvVar, EventCursor,
-    EventFilter, LaunchSpec, LifecycleState, LogLevel, MessageScope, RouteMessageRequest,
-    RuntimeEvent, RuntimeSnapshot, SendInputRequest, SessionDefinition, SessionGeneration,
-    SessionSnapshot, SidebandPhase, SidebandRequest, SidebandResponse, SidebandResponsePayload,
-    WaitQuietRequest, now_rfc3339,
+    EventFilter, LaunchSpec, LifecycleState, LogLevel, MessageScope, RouteDeliveryPhase,
+    RouteMessageRequest, RuntimeEvent, RuntimeSnapshot, SendInputRequest, SessionDefinition,
+    SessionGeneration, SessionSnapshot, SidebandPhase, SidebandRequest, SidebandResponse,
+    SidebandResponsePayload, WaitQuietRequest, now_rfc3339,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use uuid::Uuid;
@@ -94,6 +94,27 @@ struct RequestAckContext {
 struct RequestAckWatchdog {
     completed: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeliveryWriteResult {
+    bytes_written: usize,
+    payload_part_count: u32,
+}
+
+struct RouteDeliveryEvent {
+    request_id: String,
+    route_id: String,
+    from: String,
+    logical_to: String,
+    scope: MessageScope,
+    recipient: Option<String>,
+    recipient_index: u32,
+    recipient_count: u32,
+    payload_part_count: u32,
+    phase: RouteDeliveryPhase,
+    bytes_written: usize,
+    error: Option<String>,
 }
 
 impl RequestAckWatchdog {
@@ -729,9 +750,12 @@ impl SupervisorHandle {
                     | "pair_renamed"
                     | "pair_deleted"
                     | "routed_message"
+                    | "route_delivery"
                     | "system_log"
                     | "control_plane_ready"
                     | "sideband_request_lifecycle"
+                    | "request_ack"
+                    | "request_ack_timeout"
             );
             if !known {
                 return Err(anyhow!("unknown event kind: '{kind}'"));
@@ -1067,6 +1091,24 @@ impl SupervisorHandle {
             session: session.to_string(),
             action: context.action.clone(),
             elapsed_ms: elapsed.as_millis() as u64,
+            timestamp: now_rfc3339(),
+        });
+    }
+
+    fn emit_route_delivery(&self, event: RouteDeliveryEvent) {
+        self.emit(RuntimeEvent::RouteDelivery {
+            request_id: event.request_id,
+            route_id: event.route_id,
+            from: event.from,
+            logical_to: event.logical_to,
+            scope: event.scope,
+            recipient: event.recipient,
+            recipient_index: event.recipient_index,
+            recipient_count: event.recipient_count,
+            payload_part_count: event.payload_part_count,
+            phase: event.phase,
+            bytes_written: event.bytes_written,
+            error: event.error,
             timestamp: now_rfc3339(),
         });
     }
@@ -1748,8 +1790,34 @@ impl SupervisorHandle {
         ack_context: Option<&RequestAckContext>,
     ) -> Result<RuntimeSnapshot> {
         self.refresh_session_liveness();
-        let recipients =
-            self.resolve_recipients(&request.to, request.scope, Some(request.from.as_str()));
+        let route_id = Uuid::new_v4();
+        let route_id_string = route_id.to_string();
+        let request_id = ack_context
+            .map(|context| context.request_id.clone())
+            .unwrap_or_else(|| route_id_string.clone());
+        let sender_filter = if request.scope == MessageScope::Room
+            && !self.inner.slots.lock().contains_key(&request.from)
+        {
+            None
+        } else {
+            Some(request.from.as_str())
+        };
+        let recipients = self.resolve_recipients(&request.to, request.scope, sender_filter);
+        let recipient_count = recipients.len() as u32;
+        self.emit_route_delivery(RouteDeliveryEvent {
+            request_id: request_id.clone(),
+            route_id: route_id_string.clone(),
+            from: request.from.clone(),
+            logical_to: request.to.clone(),
+            scope: request.scope,
+            recipient: None,
+            recipient_index: 0,
+            recipient_count,
+            payload_part_count: 0,
+            phase: RouteDeliveryPhase::Resolved,
+            bytes_written: 0,
+            error: None,
+        });
         if recipients.is_empty() {
             return Err(anyhow!(
                 "no running recipients available for '{}'",
@@ -1757,7 +1825,6 @@ impl SupervisorHandle {
             ));
         }
 
-        let route_id = Uuid::new_v4();
         self.emit(RuntimeEvent::RoutedMessage {
             id: route_id,
             from: request.from.clone(),
@@ -1767,17 +1834,88 @@ impl SupervisorHandle {
             timestamp: now_rfc3339(),
         });
 
-        for recipient in recipients {
-            let submit_behavior = self.submit_behavior_for_session(&recipient)?;
+        let mut failures = Vec::new();
+        for (recipient_index, recipient) in recipients.into_iter().enumerate() {
+            let submit_behavior = match self.submit_behavior_for_session(&recipient) {
+                Ok(submit_behavior) => submit_behavior,
+                Err(error) => {
+                    let error = error.to_string();
+                    self.emit_route_delivery(RouteDeliveryEvent {
+                        request_id: request_id.clone(),
+                        route_id: route_id_string.clone(),
+                        from: request.from.clone(),
+                        logical_to: request.to.clone(),
+                        scope: request.scope,
+                        recipient: Some(recipient.clone()),
+                        recipient_index: recipient_index as u32,
+                        recipient_count,
+                        payload_part_count: 0,
+                        phase: RouteDeliveryPhase::Failed,
+                        bytes_written: 0,
+                        error: Some(error.clone()),
+                    });
+                    failures.push((recipient, error));
+                    continue;
+                }
+            };
             let payloads = routed_message_payloads(&request, submit_behavior);
+            let payload_part_count = payloads.len() as u32;
             let watchdog =
                 ack_context.map(|context| self.arm_request_ack_watchdog(context, &recipient));
-            let bytes_written =
-                self.deliver_prepared_payloads(&recipient, &payloads, submit_behavior)?;
-            if let (Some(context), Some(watchdog)) = (ack_context, watchdog.as_ref()) {
-                watchdog.cancel();
-                self.emit_request_ack(context, &recipient, bytes_written);
+            match self.deliver_prepared_payloads(&recipient, &payloads, submit_behavior) {
+                Ok(delivery) => {
+                    if let (Some(context), Some(watchdog)) = (ack_context, watchdog.as_ref()) {
+                        watchdog.cancel();
+                        self.emit_request_ack(context, &recipient, delivery.bytes_written);
+                    }
+                    self.emit_route_delivery(RouteDeliveryEvent {
+                        request_id: request_id.clone(),
+                        route_id: route_id_string.clone(),
+                        from: request.from.clone(),
+                        logical_to: request.to.clone(),
+                        scope: request.scope,
+                        recipient: Some(recipient),
+                        recipient_index: recipient_index as u32,
+                        recipient_count,
+                        payload_part_count: delivery.payload_part_count,
+                        phase: RouteDeliveryPhase::Written,
+                        bytes_written: delivery.bytes_written,
+                        error: None,
+                    });
+                }
+                Err(error) => {
+                    if let Some(watchdog) = watchdog.as_ref() {
+                        watchdog.cancel();
+                    }
+                    let error = error.to_string();
+                    self.emit_route_delivery(RouteDeliveryEvent {
+                        request_id: request_id.clone(),
+                        route_id: route_id_string.clone(),
+                        from: request.from.clone(),
+                        logical_to: request.to.clone(),
+                        scope: request.scope,
+                        recipient: Some(recipient.clone()),
+                        recipient_index: recipient_index as u32,
+                        recipient_count,
+                        payload_part_count,
+                        phase: RouteDeliveryPhase::Failed,
+                        bytes_written: 0,
+                        error: Some(error.clone()),
+                    });
+                    failures.push((recipient, error));
+                }
             }
+        }
+
+        if !failures.is_empty() {
+            let failed_recipients = failures
+                .iter()
+                .map(|(recipient, error)| format!("{recipient}: {error}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(anyhow!(
+                "route delivery failed for recipient(s): {failed_recipients}"
+            ));
         }
 
         self.emit(RuntimeEvent::SystemLog {
@@ -1811,11 +1949,10 @@ impl SupervisorHandle {
 
         let watchdog =
             ack_context.map(|context| self.arm_request_ack_watchdog(context, &request.name));
-        let bytes_written =
-            self.deliver_prepared_payloads(&request.name, &payloads, submit_behavior)?;
+        let delivery = self.deliver_prepared_payloads(&request.name, &payloads, submit_behavior)?;
         if let (Some(context), Some(watchdog)) = (ack_context, watchdog.as_ref()) {
             watchdog.cancel();
-            self.emit_request_ack(context, &request.name, bytes_written);
+            self.emit_request_ack(context, &request.name, delivery.bytes_written);
         }
 
         let snapshot = {
@@ -2878,7 +3015,7 @@ impl SupervisorHandle {
         session_name: &str,
         payloads: &[String],
         submit_behavior: SubmitBehavior,
-    ) -> Result<usize> {
+    ) -> Result<DeliveryWriteResult> {
         let mut total_bytes_written = 0;
         for payload in payloads {
             let (_snapshot, bytes_written) = self.send_input_with_bytes(SendInputRequest {
@@ -2896,7 +3033,10 @@ impl SupervisorHandle {
             total_bytes_written += bytes_written;
         }
 
-        Ok(total_bytes_written)
+        Ok(DeliveryWriteResult {
+            bytes_written: total_bytes_written,
+            payload_part_count: payloads.len() as u32,
+        })
     }
 }
 
@@ -3413,6 +3553,7 @@ fn event_kind(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::PairRenamed { .. } => "pair_renamed",
         RuntimeEvent::PairDeleted { .. } => "pair_deleted",
         RuntimeEvent::RoutedMessage { .. } => "routed_message",
+        RuntimeEvent::RouteDelivery { .. } => "route_delivery",
         RuntimeEvent::SystemLog { .. } => "system_log",
         RuntimeEvent::ControlPlaneReady { .. } => "control_plane_ready",
         RuntimeEvent::SidebandRequestLifecycle { .. } => "sideband_request_lifecycle",
@@ -3437,6 +3578,19 @@ fn event_matches_filter(event: &RuntimeEvent, filter: &EventFilter) -> bool {
                 .include_sessions
                 .iter()
                 .any(|candidate| candidate == from || candidate == to),
+            RuntimeEvent::RouteDelivery {
+                from,
+                logical_to,
+                recipient,
+                ..
+            } => filter.include_sessions.iter().any(|candidate| {
+                candidate == from
+                    || candidate == logical_to
+                    || recipient
+                        .as_ref()
+                        .map(|value| candidate == value)
+                        .unwrap_or(false)
+            }),
             RuntimeEvent::SidebandRequestLifecycle { session, .. } => session
                 .as_ref()
                 .map(|value| {
@@ -3465,6 +3619,10 @@ fn event_matches_filter(event: &RuntimeEvent, filter: &EventFilter) -> bool {
 
     match event {
         RuntimeEvent::RoutedMessage { scope, .. } if !filter.include_scopes.is_empty() => filter
+            .include_scopes
+            .iter()
+            .any(|candidate| candidate == message_scope_name(*scope)),
+        RuntimeEvent::RouteDelivery { scope, .. } if !filter.include_scopes.is_empty() => filter
             .include_scopes
             .iter()
             .any(|candidate| candidate == message_scope_name(*scope)),
@@ -4141,6 +4299,34 @@ mod tests {
         }
     }
 
+    struct FailingPtySession {
+        send_input_count: Arc<AtomicUsize>,
+        error_message: String,
+    }
+
+    impl PtySessionTrait for FailingPtySession {
+        fn send_input(&self, _input: &str) -> Result<usize> {
+            self.send_input_count.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow!(self.error_message.clone()))
+        }
+
+        fn resize(&self, _cols: u16, _rows: u16) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn try_wait(&self) -> Result<Option<pty_host::PtyExitStatus>> {
+            Ok(None)
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+    }
+
     fn mock_pty_session(
         process_id: Option<u32>,
         kill_behavior: MockKillBehavior,
@@ -4156,6 +4342,17 @@ mod tests {
             }) as Box<dyn PtySessionTrait>,
             send_input_count,
             kill_count,
+        )
+    }
+
+    fn failing_pty_session(error_message: &str) -> (Box<dyn PtySessionTrait>, Arc<AtomicUsize>) {
+        let send_input_count = Arc::new(AtomicUsize::new(0));
+        (
+            Box::new(FailingPtySession {
+                send_input_count: send_input_count.clone(),
+                error_message: error_message.into(),
+            }) as Box<dyn PtySessionTrait>,
+            send_input_count,
         )
     }
 
@@ -4373,6 +4570,24 @@ mod tests {
         slot.process_id = None;
         slot.state = LifecycleState::Busy;
         slot.last_real_output_at = None;
+    }
+
+    fn capture_runtime_events(supervisor: &SupervisorHandle) -> Arc<Mutex<Vec<RuntimeEvent>>> {
+        let events = Arc::new(Mutex::new(Vec::<RuntimeEvent>::new()));
+        let captured = events.clone();
+        supervisor.set_event_sink(move |event| {
+            captured.lock().push(event);
+        });
+        events
+    }
+
+    fn route_delivery_events(events: &Arc<Mutex<Vec<RuntimeEvent>>>) -> Vec<RuntimeEvent> {
+        events
+            .lock()
+            .iter()
+            .filter(|event| matches!(event, RuntimeEvent::RouteDelivery { .. }))
+            .cloned()
+            .collect()
     }
 
     fn session_token(supervisor: &SupervisorHandle, name: &str) -> String {
@@ -5948,6 +6163,26 @@ mod tests {
     }
 
     #[test]
+    fn events_filter_accepts_script_default_signal_kinds() {
+        let supervisor = test_supervisor();
+        let filter = EventFilter {
+            include_kinds: vec![
+                "routed_message".into(),
+                "route_delivery".into(),
+                "session_state".into(),
+                "system_log".into(),
+                "sideband_request_lifecycle".into(),
+                "request_ack".into(),
+                "request_ack_timeout".into(),
+            ],
+            include_sessions: Vec::new(),
+            include_scopes: Vec::new(),
+        };
+
+        supervisor.validate_events_filter(&filter).unwrap();
+    }
+
+    #[test]
     fn events_since_respects_max_events() {
         let supervisor = test_supervisor();
         let status = supervisor.start_control_plane().unwrap();
@@ -6854,6 +7089,368 @@ mod tests {
                 && *scope == MessageScope::Direct
                 && content == "hi"
         ));
+    }
+
+    #[test]
+    fn sideband_direct_route_emits_resolved_and_written_delivery() {
+        let supervisor = test_supervisor();
+        let claude_token = session_token(&supervisor, "claude");
+        let events = capture_runtime_events(&supervisor);
+        let (codex_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, codex_pty);
+        let long_content = (0..120)
+            .map(|index| format!("segment-{index:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::RouteMessage {
+            token: claude_token,
+            request: RouteMessageRequest {
+                from: "spoofed".into(),
+                to: "codex".into(),
+                scope: MessageScope::Direct,
+                content: long_content,
+            },
+        });
+
+        assert!(response.ok, "got: {}", response.message);
+        let response_request_id = response.request_id.as_deref().unwrap();
+        let deliveries = route_delivery_events(&events);
+        assert_eq!(deliveries.len(), 2);
+
+        let route_id = match &deliveries[0] {
+            RuntimeEvent::RouteDelivery {
+                request_id,
+                route_id,
+                from,
+                logical_to,
+                scope,
+                recipient,
+                recipient_index,
+                recipient_count,
+                payload_part_count,
+                phase,
+                bytes_written,
+                error,
+                ..
+            } => {
+                assert_eq!(request_id, response_request_id);
+                assert_eq!(from, "claude");
+                assert_eq!(logical_to, "codex");
+                assert_eq!(*scope, MessageScope::Direct);
+                assert_eq!(recipient, &None);
+                assert_eq!(*recipient_index, 0);
+                assert_eq!(*recipient_count, 1);
+                assert_eq!(*payload_part_count, 0);
+                assert_eq!(*phase, RouteDeliveryPhase::Resolved);
+                assert_eq!(*bytes_written, 0);
+                assert_eq!(error, &None);
+                route_id.clone()
+            }
+            other => panic!("unexpected event: {other:?}"),
+        };
+
+        match &deliveries[1] {
+            RuntimeEvent::RouteDelivery {
+                request_id,
+                route_id: written_route_id,
+                from,
+                logical_to,
+                scope,
+                recipient,
+                recipient_index,
+                recipient_count,
+                payload_part_count,
+                phase,
+                bytes_written,
+                error,
+                ..
+            } => {
+                assert_eq!(request_id, response_request_id);
+                assert_eq!(written_route_id, &route_id);
+                assert_eq!(from, "claude");
+                assert_eq!(logical_to, "codex");
+                assert_eq!(*scope, MessageScope::Direct);
+                assert_eq!(recipient.as_deref(), Some("codex"));
+                assert_eq!(*recipient_index, 0);
+                assert_eq!(*recipient_count, 1);
+                assert!(*payload_part_count > 1);
+                assert_eq!(*phase, RouteDeliveryPhase::Written);
+                assert!(*bytes_written > 0);
+                assert_eq!(error, &None);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn operator_room_route_emits_two_pane_delivery_receipts() {
+        let supervisor = test_supervisor();
+        let events = capture_runtime_events(&supervisor);
+        let (claude_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        let (codex_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "claude", DriverKind::Claude, claude_pty);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, codex_pty);
+
+        supervisor
+            .route_message(RouteMessageRequest {
+                from: "operator".into(),
+                to: "room".into(),
+                scope: MessageScope::Room,
+                content: "status".into(),
+            })
+            .unwrap();
+
+        let deliveries = route_delivery_events(&events);
+        assert_eq!(deliveries.len(), 3);
+        assert!(matches!(
+            &deliveries[0],
+            RuntimeEvent::RouteDelivery {
+                phase: RouteDeliveryPhase::Resolved,
+                recipient: None,
+                recipient_count: 2,
+                ..
+            }
+        ));
+
+        let mut written_recipients = deliveries
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::RouteDelivery {
+                    phase: RouteDeliveryPhase::Written,
+                    recipient: Some(recipient),
+                    recipient_count,
+                    payload_part_count,
+                    bytes_written,
+                    error,
+                    ..
+                } => {
+                    assert_eq!(*recipient_count, 2);
+                    assert_eq!(*payload_part_count, 1);
+                    assert!(*bytes_written > 0);
+                    assert_eq!(error, &None);
+                    Some(recipient.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        written_recipients.sort();
+
+        assert_eq!(
+            written_recipients,
+            vec!["claude".to_string(), "codex".to_string()]
+        );
+    }
+
+    #[test]
+    fn cross_pair_room_route_emits_delivery_for_each_resolved_recipient() {
+        let supervisor = test_supervisor_with_cross_pair_room_broadcast(true);
+        supervisor.create_pair("FrontendQA").unwrap();
+        let events = capture_runtime_events(&supervisor);
+        let (claude_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        let (codex_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        let (frontend_claude_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        let (frontend_codex_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "claude", DriverKind::Claude, claude_pty);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, codex_pty);
+        install_mock_running_session(
+            &supervisor,
+            "FrontendQA-claude",
+            DriverKind::Claude,
+            frontend_claude_pty,
+        );
+        install_mock_running_session(
+            &supervisor,
+            "FrontendQA-codex",
+            DriverKind::Codex,
+            frontend_codex_pty,
+        );
+
+        supervisor
+            .route_message(RouteMessageRequest {
+                from: "claude".into(),
+                to: "room".into(),
+                scope: MessageScope::Room,
+                content: "status".into(),
+            })
+            .unwrap();
+
+        let deliveries = route_delivery_events(&events);
+        assert_eq!(deliveries.len(), 4);
+        assert!(matches!(
+            &deliveries[0],
+            RuntimeEvent::RouteDelivery {
+                phase: RouteDeliveryPhase::Resolved,
+                recipient_count: 3,
+                ..
+            }
+        ));
+
+        let mut written_recipients = deliveries
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::RouteDelivery {
+                    phase: RouteDeliveryPhase::Written,
+                    recipient: Some(recipient),
+                    recipient_count,
+                    ..
+                } => {
+                    assert_eq!(*recipient_count, 3);
+                    Some(recipient.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        written_recipients.sort();
+
+        assert_eq!(
+            written_recipients,
+            vec![
+                "FrontendQA-claude".to_string(),
+                "FrontendQA-codex".to_string(),
+                "codex".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_recipient_route_still_emits_resolved_delivery() {
+        let supervisor = test_supervisor();
+        let events = capture_runtime_events(&supervisor);
+
+        let error = supervisor
+            .route_message(RouteMessageRequest {
+                from: "operator".into(),
+                to: "missing".into(),
+                scope: MessageScope::Direct,
+                content: "hello".into(),
+            })
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("no running recipients available for 'missing'")
+        );
+        let deliveries = route_delivery_events(&events);
+        assert_eq!(deliveries.len(), 1);
+        assert!(matches!(
+            &deliveries[0],
+            RuntimeEvent::RouteDelivery {
+                phase: RouteDeliveryPhase::Resolved,
+                recipient: None,
+                recipient_count: 0,
+                payload_part_count: 0,
+                bytes_written: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn one_recipient_write_failure_emits_failed_delivery_and_returns_error() {
+        let supervisor = test_supervisor();
+        let events = capture_runtime_events(&supervisor);
+        let (codex_pty, send_count) = failing_pty_session("synthetic route write failure");
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, codex_pty);
+
+        let error = supervisor
+            .route_message(RouteMessageRequest {
+                from: "claude".into(),
+                to: "codex".into(),
+                scope: MessageScope::Direct,
+                content: "hello".into(),
+            })
+            .unwrap_err();
+
+        assert_eq!(send_count.load(Ordering::SeqCst), 1);
+        let error = error.to_string();
+        assert!(error.contains("codex"));
+        assert!(error.contains("synthetic route write failure"));
+
+        let deliveries = route_delivery_events(&events);
+        assert_eq!(deliveries.len(), 2);
+        assert!(matches!(
+            &deliveries[0],
+            RuntimeEvent::RouteDelivery {
+                phase: RouteDeliveryPhase::Resolved,
+                recipient_count: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &deliveries[1],
+            RuntimeEvent::RouteDelivery {
+                phase: RouteDeliveryPhase::Failed,
+                recipient: Some(recipient),
+                recipient_count: 1,
+                payload_part_count: 1,
+                bytes_written: 0,
+                error: Some(message),
+                ..
+            } if recipient == "codex" && message.contains("synthetic route write failure")
+        ));
+    }
+
+    #[test]
+    fn mixed_room_delivery_failure_preserves_success_receipt_and_returns_error() {
+        let supervisor = test_supervisor();
+        let events = capture_runtime_events(&supervisor);
+        let (claude_pty, claude_send_count, _) =
+            mock_pty_session(None, MockKillBehavior::Immediate);
+        let (codex_pty, codex_send_count) = failing_pty_session("synthetic route write failure");
+        install_mock_running_session(&supervisor, "claude", DriverKind::Claude, claude_pty);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, codex_pty);
+
+        let error = supervisor
+            .route_message(RouteMessageRequest {
+                from: "operator".into(),
+                to: "room".into(),
+                scope: MessageScope::Room,
+                content: "hello".into(),
+            })
+            .unwrap_err();
+
+        assert_eq!(claude_send_count.load(Ordering::SeqCst), 2);
+        assert_eq!(codex_send_count.load(Ordering::SeqCst), 1);
+        let error = error.to_string();
+        assert!(error.contains("codex"));
+        assert!(error.contains("synthetic route write failure"));
+
+        let deliveries = route_delivery_events(&events);
+        assert_eq!(deliveries.len(), 3);
+        assert!(matches!(
+            &deliveries[0],
+            RuntimeEvent::RouteDelivery {
+                phase: RouteDeliveryPhase::Resolved,
+                recipient_count: 2,
+                ..
+            }
+        ));
+        assert!(deliveries.iter().any(|event| {
+            matches!(
+                event,
+                RuntimeEvent::RouteDelivery {
+                    phase: RouteDeliveryPhase::Written,
+                    recipient: Some(recipient),
+                    recipient_count: 2,
+                    ..
+                } if recipient == "claude"
+            )
+        }));
+        assert!(deliveries.iter().any(|event| {
+            matches!(
+                event,
+                RuntimeEvent::RouteDelivery {
+                    phase: RouteDeliveryPhase::Failed,
+                    recipient: Some(recipient),
+                    recipient_count: 2,
+                    bytes_written: 0,
+                    error: Some(message),
+                    ..
+                } if recipient == "codex" && message.contains("synthetic route write failure")
+            )
+        }));
     }
 
     #[test]

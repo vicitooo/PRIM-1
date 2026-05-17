@@ -186,6 +186,13 @@ Pane-bound sideband requests (`send_input`, `send_key`, `deliver_message`, `rout
 - `request_ack` records successful PTY-write completion for the target session, keyed by the same `request_id`; `request_ack_timeout` records a missing PTY-write completion after `PRIM1_REQUEST_ACK_TIMEOUT_SECS` (default 60)
 - failed or timed-out `sideband_request_lifecycle` events include optional `error` text with the same message returned to the caller
 
+Route sideband requests expose a third delivery-truth layer:
+
+- `route_delivery` records the resolved pane fan-out and each per-recipient write outcome, keyed by `request_id` and `route_id`
+- every route emits one `phase: "resolved"` event with `recipient: null`, `recipient_count` set to the resolved pane count, and zero payload/byte counts
+- every resolved pane recipient emits `phase: "written"` with `recipient`, `recipient_index`, `payload_part_count`, and `bytes_written`, or `phase: "failed"` with `error`
+- partial failure is non-transactional: successful recipient writes remain delivered and audited, and the route request returns an error naming the failed recipient(s)
+
 ## 11. Cost telemetry contract
 
 Supervisor must have a hook for:
