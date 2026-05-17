@@ -6,14 +6,15 @@
 .DESCRIPTION
   Runs the following suites in order:
     1. tools/tests/test_watcher.py       (Python unit tests)
-    2. tests/handshake-helpers.ps1       (PowerShell helper tests)
-    3. tests/control-plane-content-file.ps1 (PowerShell content-file harness)
-    4. tests/control-plane-request-id.ps1 (PowerShell request-id helper harness)
-    5. tests/control-plane-deliver-wait.ps1 (PowerShell deliver/wait harness)
-    6. tests/control-plane-timeouts.ps1  (PowerShell timeout harness)
-    7. tests/routing-stress-sequential.ps1  (live transport stress, requires
+    2. tests/agent-events-summary.test.py (Python fixture tests)
+    3. tests/handshake-helpers.ps1       (PowerShell helper tests)
+    4. tests/control-plane-content-file.ps1 (PowerShell content-file harness)
+    5. tests/control-plane-request-id.ps1 (PowerShell request-id helper harness)
+    6. tests/control-plane-deliver-wait.ps1 (PowerShell deliver/wait harness)
+    7. tests/control-plane-timeouts.ps1  (PowerShell timeout harness)
+    8. tests/routing-stress-sequential.ps1  (live transport stress, requires
                                              wrapper + panes running)
-    8. scripts/health-check.ps1          (live runtime state check)
+    9. scripts/health-check.ps1          (live runtime state check)
 
   Uses direct invocation with $LASTEXITCODE capture. Output is only shown on
   failure unless -Verbose is set.
@@ -94,6 +95,10 @@ $start = Get-Date
 
 $results += Invoke-Suite -Name "watcher unit tests" -Block {
   & python tools/tests/test_watcher.py
+}
+
+$results += Invoke-Suite -Name "agent events summary" -Block {
+  & python (Join-Path $scriptRoot "agent-events-summary.test.py")
 }
 
 $results += Invoke-Suite -Name "handshake helpers" -Block {

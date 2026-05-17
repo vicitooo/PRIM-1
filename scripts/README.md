@@ -113,6 +113,18 @@ Example:
 .\scripts\agent-events.ps1 -Consumer outside-supervisor
 ```
 
+- `agent-events-summary.py`
+  Human-readable summary helper for the receipt/signal event families emitted by the control plane. Reads a JSONL audit log directly, or `events_since` JSON from stdin. Groups `route_delivery` phases into one logical route line and summarizes `pane_signal`, `request_ack`, `request_ack_timeout`, and failed/timed-out sideband lifecycle events.
+
+Examples:
+
+```powershell
+python .\scripts\agent-events-summary.py --audit-log ".runtime\audit\2026-05-17.jsonl"
+python .\scripts\agent-events-summary.py --audit-log ".runtime\audit\2026-05-17.jsonl" --task-id smoke-task-418
+python .\scripts\agent-events-summary.py --audit-log ".runtime\audit\2026-05-17.jsonl" --fail-on blocked,failed,timeout
+.\scripts\control-plane.ps1 -Action events_since -MaxEvents 200 | python .\scripts\agent-events-summary.py --events-since-stdin
+```
+
 - `new-smoke-token.ps1`
   Generates a unique `SMOKE-XXXXXXXX` token plus a UTC-timestamped handshake file path.
 
