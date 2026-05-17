@@ -32,6 +32,8 @@ param(
   [int]$TimeoutSec,
   [string]$InfoFile,
   [string]$OutRequestIdFile,
+  [switch]$RequireIdle,
+  [switch]$AllowBusy,
   [switch]$PassThruJson,
   [switch]$Quiet
 )
@@ -222,6 +224,15 @@ if ($Action -eq "events_since" -and $Quiet) {
   throw "events_since always emits structured JSON and does not support -Quiet"
 }
 
+$dispatchActions = @("input", "key", "deliver", "route")
+if ($RequireIdle -and $AllowBusy) {
+  throw "-RequireIdle and -AllowBusy are mutually exclusive"
+}
+
+if (($RequireIdle -or $AllowBusy) -and $Action -notin $dispatchActions) {
+  throw "-RequireIdle and -AllowBusy are only supported for -Action input, key, deliver, or route"
+}
+
 if ($MaxEvents -lt 0) {
   throw "-MaxEvents must be >= 0"
 }
@@ -273,12 +284,16 @@ $payload = switch ($Action) {
   "input" {
     if (-not $Session) { throw "input requires -Session" }
     if ([string]::IsNullOrEmpty($Content)) { throw "input requires -Content or -ContentFile" }
-    @{ kind = "send_input"; token = $info.token; name = $Session; input = $Content }
+    $inputPayload = @{ kind = "send_input"; token = $info.token; name = $Session; input = $Content }
+    if ($RequireIdle) { $inputPayload.require_idle = $true }
+    $inputPayload
   }
   "deliver" {
     if (-not $Session) { throw "deliver requires -Session" }
     if ([string]::IsNullOrEmpty($Content)) { throw "deliver requires -Content or -ContentFile" }
-    @{ kind = "deliver_message"; token = $info.token; name = $Session; content = $Content }
+    $deliverPayload = @{ kind = "deliver_message"; token = $info.token; name = $Session; content = $Content }
+    if ($RequireIdle) { $deliverPayload.require_idle = $true }
+    $deliverPayload
   }
   "wait_quiet" {
     if (-not $Session) { throw "wait_quiet requires -Session" }
@@ -315,12 +330,14 @@ $payload = switch ($Action) {
   "key" {
     if (-not $Session) { throw "key requires -Session" }
     if (-not $Key) { throw "key requires -Key" }
-    @{ kind = "send_key"; token = $info.token; name = $Session; key = $Key }
+    $keyPayload = @{ kind = "send_key"; token = $info.token; name = $Session; key = $Key }
+    if ($RequireIdle) { $keyPayload.require_idle = $true }
+    $keyPayload
   }
   "route" {
     if (-not $To) { throw "route requires -To" }
     if (-not $Content) { throw "route requires -Content" }
-    @{
+    $routePayload = @{
       kind = "route_message"
       token = $info.token
       request = @{
@@ -330,6 +347,8 @@ $payload = switch ($Action) {
         content = $Content
       }
     }
+    if ($RequireIdle) { $routePayload.require_idle = $true }
+    $routePayload
   }
   "signal" {
     if ([string]::IsNullOrWhiteSpace($TaskId)) { throw "signal requires -TaskId" }

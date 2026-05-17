@@ -32,6 +32,7 @@ type EventSink = Arc<dyn Fn(RuntimeEvent) + Send + Sync>;
 const CONTROL_PLANE_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const CONTROL_PLANE_PROBE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const DEFAULT_REQUEST_ACK_TIMEOUT_SECS: u64 = 60;
+const RECENT_ROUTE_OVERLAP_WINDOW: Duration = Duration::from_secs(3);
 const PAIR_NAME_MAX_LEN: usize = 48;
 const RESERVED_PAIR_NAMES: [&str; 5] = ["main", "claude", "codex", "room", "operator"];
 
@@ -117,6 +118,22 @@ struct RouteDeliveryEvent {
     phase: RouteDeliveryPhase,
     bytes_written: usize,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DispatchAttemptDecision {
+    target_lifecycle_state_before: LifecycleState,
+    target_work_state_before: Option<WorkState>,
+    target_last_activity_at: Option<String>,
+    last_route_from_target_at: Option<String>,
+    last_route_from_target_instant: Option<Instant>,
+    reason: Option<&'static str>,
+}
+
+impl DispatchAttemptDecision {
+    fn overlap(&self) -> bool {
+        self.reason.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -469,6 +486,7 @@ struct SessionSlot {
     definition: SessionDefinition,
     state: LifecycleState,
     work_state: WorkState,
+    work_state_observed: bool,
     work_detail: Option<String>,
     work_error_observations: HashMap<String, Vec<Instant>>,
     running: Option<RunningSession>,
@@ -477,6 +495,8 @@ struct SessionSlot {
     process_id: Option<u32>,
     last_activity_at: Option<String>,
     last_real_output_at: Option<Instant>,
+    last_route_from_session_at: Option<String>,
+    last_route_from_session_instant: Option<Instant>,
     last_error: Option<String>,
     quiesce_timer: Option<QuiesceTimer>,
 }
@@ -822,6 +842,7 @@ fn renamed_closed_slot(slot: SessionSlot, definition: SessionDefinition) -> Sess
         definition,
         state: LifecycleState::Closed,
         work_state: WorkState::Idle,
+        work_state_observed: false,
         work_detail: None,
         work_error_observations: HashMap::new(),
         running: None,
@@ -830,6 +851,8 @@ fn renamed_closed_slot(slot: SessionSlot, definition: SessionDefinition) -> Sess
         process_id: None,
         last_activity_at: slot.last_activity_at,
         last_real_output_at: None,
+        last_route_from_session_at: slot.last_route_from_session_at,
+        last_route_from_session_instant: slot.last_route_from_session_instant,
         last_error: slot.last_error,
         quiesce_timer: None,
     }
@@ -840,6 +863,7 @@ fn closed_session_slot(definition: SessionDefinition) -> SessionSlot {
         definition,
         state: LifecycleState::Closed,
         work_state: WorkState::Idle,
+        work_state_observed: false,
         work_detail: None,
         work_error_observations: HashMap::new(),
         running: None,
@@ -848,6 +872,8 @@ fn closed_session_slot(definition: SessionDefinition) -> SessionSlot {
         process_id: None,
         last_activity_at: None,
         last_real_output_at: None,
+        last_route_from_session_at: None,
+        last_route_from_session_instant: None,
         last_error: None,
         quiesce_timer: None,
     }
@@ -988,6 +1014,7 @@ impl SupervisorHandle {
                     | "pair_deleted"
                     | "routed_message"
                     | "route_delivery"
+                    | "dispatch_attempt"
                     | "pane_signal"
                     | "system_log"
                     | "control_plane_ready"
@@ -1349,6 +1376,60 @@ impl SupervisorHandle {
             error: event.error,
             timestamp: now_rfc3339(),
         });
+    }
+
+    fn emit_dispatch_attempt(
+        &self,
+        request_id: &str,
+        action: &str,
+        from: &str,
+        target_session: &str,
+    ) -> Result<DispatchAttemptDecision> {
+        self.refresh_session_liveness();
+        let decision = {
+            let slots = self.inner.slots.lock();
+            let slot = slots
+                .get(target_session)
+                .with_context(|| format!("unknown session '{target_session}'"))?;
+            let target_work_state_before = slot.work_state_observed.then_some(slot.work_state);
+            let last_route_from_target_instant = slot.last_route_from_session_instant;
+            let mut decision = DispatchAttemptDecision {
+                target_lifecycle_state_before: slot.state,
+                target_work_state_before,
+                target_last_activity_at: slot.last_activity_at.clone(),
+                last_route_from_target_at: slot.last_route_from_session_at.clone(),
+                last_route_from_target_instant,
+                reason: None,
+            };
+            decision.reason = dispatch_overlap_reason(&decision);
+            decision
+        };
+
+        self.emit(RuntimeEvent::DispatchAttempt {
+            request_id: request_id.to_string(),
+            action: action.to_string(),
+            from: from.to_string(),
+            target_session: target_session.to_string(),
+            target_lifecycle_state_before: decision.target_lifecycle_state_before,
+            target_work_state_before: decision.target_work_state_before,
+            target_last_activity_at: decision.target_last_activity_at.clone(),
+            last_route_from_target_at: decision.last_route_from_target_at.clone(),
+            overlap: decision.overlap(),
+            reason: decision.reason.map(ToOwned::to_owned),
+            timestamp: now_rfc3339(),
+        });
+
+        Ok(decision)
+    }
+
+    fn record_route_from_session(&self, session: &str) {
+        let timestamp = now_rfc3339();
+        let now = Instant::now();
+        let mut slots = self.inner.slots.lock();
+        if let Some(slot) = slots.get_mut(session) {
+            slot.last_route_from_session_at = Some(timestamp);
+            slot.last_route_from_session_instant = Some(now);
+        }
     }
 
     fn record_pane_signal(
@@ -2110,6 +2191,8 @@ impl SupervisorHandle {
     }
 
     pub fn send_input(&self, request: SendInputRequest) -> Result<SessionSnapshot> {
+        let request_id = Uuid::new_v4().to_string();
+        self.emit_dispatch_attempt(&request_id, "send_input", "operator", &request.name)?;
         self.send_input_with_bytes(request)
             .map(|(snapshot, _bytes_written)| snapshot)
     }
@@ -2118,8 +2201,18 @@ impl SupervisorHandle {
         &self,
         request: SendInputRequest,
         ack_context: &RequestAckContext,
+        from: &str,
+        require_idle: bool,
     ) -> Result<SessionSnapshot> {
         let session_name = request.name.clone();
+        let decision =
+            self.emit_dispatch_attempt(&ack_context.request_id, "send_input", from, &session_name)?;
+        if require_idle && decision.overlap() {
+            return Err(anyhow!(
+                "dispatch aborted: target {}",
+                decision.reason.unwrap_or("overlap")
+            ));
+        }
         let watchdog = self.arm_request_ack_watchdog(ack_context, &session_name);
         let (snapshot, bytes_written) = self.send_input_with_bytes(request)?;
         watchdog.cancel();
@@ -2128,10 +2221,13 @@ impl SupervisorHandle {
     }
 
     pub fn send_control_key(&self, name: &str, key: ControlKey) -> Result<SessionSnapshot> {
-        self.send_input(SendInputRequest {
+        let request_id = Uuid::new_v4().to_string();
+        self.emit_dispatch_attempt(&request_id, "send_key", "operator", name)?;
+        let (snapshot, _bytes_written) = self.send_input_with_bytes(SendInputRequest {
             name: name.into(),
             input: control_key_sequence(key).into(),
-        })
+        })?;
+        Ok(snapshot)
     }
 
     fn send_control_key_with_request_ack(
@@ -2139,32 +2235,45 @@ impl SupervisorHandle {
         name: &str,
         key: ControlKey,
         ack_context: &RequestAckContext,
+        from: &str,
+        require_idle: bool,
     ) -> Result<SessionSnapshot> {
-        self.send_input_with_request_ack(
-            SendInputRequest {
-                name: name.into(),
-                input: control_key_sequence(key).into(),
-            },
-            ack_context,
-        )
+        let decision =
+            self.emit_dispatch_attempt(&ack_context.request_id, "send_key", from, name)?;
+        if require_idle && decision.overlap() {
+            return Err(anyhow!(
+                "dispatch aborted: target {}",
+                decision.reason.unwrap_or("overlap")
+            ));
+        }
+        let watchdog = self.arm_request_ack_watchdog(ack_context, name);
+        let (snapshot, bytes_written) = self.send_input_with_bytes(SendInputRequest {
+            name: name.into(),
+            input: control_key_sequence(key).into(),
+        })?;
+        watchdog.cancel();
+        self.emit_request_ack(ack_context, &snapshot.name, bytes_written);
+        Ok(snapshot)
     }
 
     pub fn route_message(&self, request: RouteMessageRequest) -> Result<RuntimeSnapshot> {
-        self.route_message_inner(request, None)
+        self.route_message_inner(request, None, false)
     }
 
     fn route_message_with_request_ack(
         &self,
         request: RouteMessageRequest,
         ack_context: &RequestAckContext,
+        require_idle: bool,
     ) -> Result<RuntimeSnapshot> {
-        self.route_message_inner(request, Some(ack_context))
+        self.route_message_inner(request, Some(ack_context), require_idle)
     }
 
     fn route_message_inner(
         &self,
         request: RouteMessageRequest,
         ack_context: Option<&RequestAckContext>,
+        require_idle: bool,
     ) -> Result<RuntimeSnapshot> {
         self.refresh_session_liveness();
         let route_id = Uuid::new_v4();
@@ -2181,6 +2290,24 @@ impl SupervisorHandle {
         };
         let recipients = self.resolve_recipients(&request.to, request.scope, sender_filter);
         let recipient_count = recipients.len() as u32;
+        let mut attempts = Vec::new();
+        for recipient in &recipients {
+            let decision =
+                self.emit_dispatch_attempt(&request_id, "route_message", &request.from, recipient)?;
+            attempts.push((recipient.clone(), decision));
+        }
+        if require_idle {
+            if let Some((recipient, decision)) =
+                attempts.iter().find(|(_, decision)| decision.overlap())
+            {
+                return Err(anyhow!(
+                    "dispatch aborted: target {} {}",
+                    recipient,
+                    decision.reason.unwrap_or("overlap")
+                ));
+            }
+        }
+
         self.emit_route_delivery(RouteDeliveryEvent {
             request_id: request_id.clone(),
             route_id: route_id_string.clone(),
@@ -2202,6 +2329,7 @@ impl SupervisorHandle {
             ));
         }
 
+        self.record_route_from_session(&request.from);
         self.emit(RuntimeEvent::RoutedMessage {
             id: route_id,
             from: request.from.clone(),
@@ -2305,22 +2433,38 @@ impl SupervisorHandle {
     }
 
     pub fn deliver_message(&self, request: DeliverMessageRequest) -> Result<SessionSnapshot> {
-        self.deliver_message_inner(request, None)
+        self.deliver_message_inner(request, None, "operator", false)
     }
 
     fn deliver_message_with_request_ack(
         &self,
         request: DeliverMessageRequest,
         ack_context: &RequestAckContext,
+        from: &str,
+        require_idle: bool,
     ) -> Result<SessionSnapshot> {
-        self.deliver_message_inner(request, Some(ack_context))
+        self.deliver_message_inner(request, Some(ack_context), from, require_idle)
     }
 
     fn deliver_message_inner(
         &self,
         request: DeliverMessageRequest,
         ack_context: Option<&RequestAckContext>,
+        from: &str,
+        require_idle: bool,
     ) -> Result<SessionSnapshot> {
+        let request_id = ack_context
+            .map(|context| context.request_id.clone())
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let decision =
+            self.emit_dispatch_attempt(&request_id, "deliver_message", from, &request.name)?;
+        if require_idle && decision.overlap() {
+            return Err(anyhow!(
+                "dispatch aborted: target {}",
+                decision.reason.unwrap_or("overlap")
+            ));
+        }
+
         let (_, submit_behavior, payloads) =
             self.prepare_delivery_for_session(&request.name, &request.content)?;
 
@@ -2885,44 +3029,76 @@ impl SupervisorHandle {
                 token,
                 name,
                 content,
+                require_idle,
             } => {
                 tokio::task::yield_now().await;
                 self.validate_deliver_message_token(&token, &name)
                     .and_then(|_| {
+                        let from = self.dispatch_actor_for_token(&token)?;
                         let request = DeliverMessageRequest { name, content };
                         match ack_context.as_ref() {
-                            Some(context) => {
-                                self.deliver_message_with_request_ack(request, context)
-                            }
-                            None => self.deliver_message(request),
+                            Some(context) => self.deliver_message_with_request_ack(
+                                request,
+                                context,
+                                &from,
+                                require_idle,
+                            ),
+                            None => self.deliver_message_inner(request, None, &from, require_idle),
                         }
                     })
                     .map(|_| "delivered".into())
             }
-            SidebandRequest::SendInput { token, name, input } => {
+            SidebandRequest::SendInput {
+                token,
+                name,
+                input,
+                require_idle,
+            } => {
                 tokio::task::yield_now().await;
                 self.validate_session_action_token(&token, &name)
                     .and_then(|_| {
+                        let from = self.dispatch_actor_for_token(&token)?;
                         let request = SendInputRequest { name, input };
                         match ack_context.as_ref() {
-                            Some(context) => self.send_input_with_request_ack(request, context),
+                            Some(context) => self.send_input_with_request_ack(
+                                request,
+                                context,
+                                &from,
+                                require_idle,
+                            ),
                             None => self.send_input(request),
                         }
                     })
                     .map(|_| "input sent".into())
             }
-            SidebandRequest::SendKey { token, name, key } => {
+            SidebandRequest::SendKey {
+                token,
+                name,
+                key,
+                require_idle,
+            } => {
                 tokio::task::yield_now().await;
                 self.validate_session_action_token(&token, &name)
                     .and_then(|_| match ack_context.as_ref() {
                         Some(context) => {
-                            self.send_control_key_with_request_ack(&name, key, context)
+                            let from = self.dispatch_actor_for_token(&token)?;
+                            self.send_control_key_with_request_ack(
+                                &name,
+                                key,
+                                context,
+                                &from,
+                                require_idle,
+                            )
                         }
                         None => self.send_control_key(&name, key),
                     })
                     .map(|_| format!("key {:?} sent", key))
             }
-            SidebandRequest::RouteMessage { token, mut request } => {
+            SidebandRequest::RouteMessage {
+                token,
+                mut request,
+                require_idle,
+            } => {
                 tokio::task::yield_now().await;
                 self.resolve_route_sender_identity(&token)
                     .map(|bound| {
@@ -2932,8 +3108,10 @@ impl SupervisorHandle {
                         request
                     })
                     .and_then(|req| match ack_context.as_ref() {
-                        Some(context) => self.route_message_with_request_ack(req, context),
-                        None => self.route_message(req),
+                        Some(context) => {
+                            self.route_message_with_request_ack(req, context, require_idle)
+                        }
+                        None => self.route_message_inner(req, None, require_idle),
                     })
                     .map(|_| "message routed".into())
             }
@@ -3375,6 +3553,18 @@ impl SupervisorHandle {
             .ok_or_else(|| anyhow!("invalid control plane token"))?;
 
         Ok(binding)
+    }
+
+    fn dispatch_actor_for_token(&self, token: &str) -> Result<String> {
+        let binding = self
+            .inner
+            .token_bindings
+            .lock()
+            .get(token)
+            .cloned()
+            .ok_or_else(|| anyhow!("invalid control plane token"))?;
+
+        Ok(binding.unwrap_or_else(|| "operator".into()))
     }
 
     fn resolve_pane_signal_session(&self, token: &str) -> Result<String> {
@@ -4034,6 +4224,7 @@ fn cancel_quiesce_timer_locked(slot: &mut SessionSlot) {
 
 fn reset_work_state_locked(slot: &mut SessionSlot) {
     slot.work_state = WorkState::Idle;
+    slot.work_state_observed = false;
     slot.work_detail = None;
     slot.work_error_observations.clear();
 }
@@ -4073,12 +4264,14 @@ fn transition_work_state_locked(
     }
 
     if slot.work_state == state {
+        slot.work_state_observed = true;
         slot.work_detail = detail;
         return None;
     }
 
     let previous_state = Some(slot.work_state);
     slot.work_state = state;
+    slot.work_state_observed = true;
     slot.work_detail = detail.clone();
     Some(RuntimeEvent::SessionWorkState {
         session: session_name.to_string(),
@@ -4087,6 +4280,34 @@ fn transition_work_state_locked(
         previous_state,
         timestamp: now_rfc3339(),
     })
+}
+
+fn dispatch_overlap_reason(decision: &DispatchAttemptDecision) -> Option<&'static str> {
+    let recent_route_from_target = decision
+        .last_route_from_target_instant
+        .map(|last_route| last_route.elapsed() <= RECENT_ROUTE_OVERLAP_WINDOW)
+        .unwrap_or(false);
+
+    if recent_route_from_target
+        && matches!(
+            decision.target_work_state_before,
+            Some(WorkState::Thinking | WorkState::ToolCall)
+        )
+    {
+        return Some("recent_route_from_target");
+    }
+
+    match decision.target_work_state_before {
+        Some(WorkState::Thinking) => Some("target_thinking"),
+        Some(WorkState::ToolCall) => Some("target_tool_call"),
+        Some(WorkState::Blocked) => Some("target_blocked"),
+        Some(WorkState::ErrorLoop) => Some("target_error_loop"),
+        Some(WorkState::Idle) => None,
+        None if decision.target_lifecycle_state_before != LifecycleState::Ready => {
+            Some("target_not_ready")
+        }
+        None => None,
+    }
 }
 
 fn quiesce_threshold(driver: DriverKind) -> Option<Duration> {
@@ -4111,6 +4332,7 @@ fn event_kind(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::PairDeleted { .. } => "pair_deleted",
         RuntimeEvent::RoutedMessage { .. } => "routed_message",
         RuntimeEvent::RouteDelivery { .. } => "route_delivery",
+        RuntimeEvent::DispatchAttempt { .. } => "dispatch_attempt",
         RuntimeEvent::PaneSignal { .. } => "pane_signal",
         RuntimeEvent::SystemLog { .. } => "system_log",
         RuntimeEvent::ControlPlaneReady { .. } => "control_plane_ready",
@@ -4151,6 +4373,14 @@ fn event_matches_filter(event: &RuntimeEvent, filter: &EventFilter) -> bool {
                         .map(|value| candidate == value)
                         .unwrap_or(false)
             }),
+            RuntimeEvent::DispatchAttempt {
+                from,
+                target_session,
+                ..
+            } => filter
+                .include_sessions
+                .iter()
+                .any(|candidate| candidate == from || candidate == target_session),
             RuntimeEvent::SidebandRequestLifecycle { session, .. } => session
                 .as_ref()
                 .map(|value| {
@@ -5278,6 +5508,44 @@ mod tests {
             .filter(|event| matches!(event, RuntimeEvent::RouteDelivery { .. }))
             .cloned()
             .collect()
+    }
+
+    fn dispatch_attempt_events(events: &Arc<Mutex<Vec<RuntimeEvent>>>) -> Vec<RuntimeEvent> {
+        events
+            .lock()
+            .iter()
+            .filter(|event| matches!(event, RuntimeEvent::DispatchAttempt { .. }))
+            .cloned()
+            .collect()
+    }
+
+    fn request_ack_events(events: &Arc<Mutex<Vec<RuntimeEvent>>>) -> Vec<RuntimeEvent> {
+        events
+            .lock()
+            .iter()
+            .filter(|event| matches!(event, RuntimeEvent::RequestAck { .. }))
+            .cloned()
+            .collect()
+    }
+
+    fn set_session_dispatch_state(
+        supervisor: &SupervisorHandle,
+        name: &str,
+        lifecycle_state: LifecycleState,
+        work_state: Option<WorkState>,
+    ) {
+        let mut slots = supervisor.inner.slots.lock();
+        let slot = slots.get_mut(name).unwrap();
+        slot.state = lifecycle_state;
+        slot.work_state = work_state.unwrap_or(WorkState::Idle);
+        slot.work_state_observed = work_state.is_some();
+    }
+
+    fn mark_recent_route_from_session(supervisor: &SupervisorHandle, name: &str) {
+        let mut slots = supervisor.inner.slots.lock();
+        let slot = slots.get_mut(name).unwrap();
+        slot.last_route_from_session_at = Some(now_rfc3339());
+        slot.last_route_from_session_instant = Some(Instant::now());
     }
 
     fn pane_signal_events(events: &Arc<Mutex<Vec<RuntimeEvent>>>) -> Vec<RuntimeEvent> {
@@ -6748,6 +7016,7 @@ mod tests {
             token: claude_token,
             name: "codex".into(),
             content: "status update".into(),
+            require_idle: false,
         });
 
         assert!(!response.ok);
@@ -7004,8 +7273,10 @@ mod tests {
             include_kinds: vec![
                 "routed_message".into(),
                 "route_delivery".into(),
+                "dispatch_attempt".into(),
                 "pane_signal".into(),
                 "session_state".into(),
+                "session_exit".into(),
                 "session_work_state".into(),
                 "system_log".into(),
                 "sideband_request_lifecycle".into(),
@@ -7985,6 +8256,7 @@ mod tests {
             token: status.token,
             name: "codex".into(),
             input: "/fast".into(),
+            require_idle: false,
         });
 
         assert!(response.ok, "got: {}", response.message);
@@ -8020,6 +8292,205 @@ mod tests {
             ack_events[0],
             (response_request_id, "codex", "send_input", 5)
         );
+    }
+
+    #[test]
+    fn dispatch_attempt_idle_ready_proceeds_without_overlap() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let events = capture_runtime_events(&supervisor);
+        let (pty, send_count, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
+        set_session_dispatch_state(
+            &supervisor,
+            "codex",
+            LifecycleState::Ready,
+            Some(WorkState::Idle),
+        );
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::SendInput {
+            token: status.token,
+            name: "codex".into(),
+            input: "hello".into(),
+            require_idle: false,
+        });
+
+        assert!(response.ok, "got: {}", response.message);
+        assert_eq!(send_count.load(Ordering::SeqCst), 1);
+        let attempts = dispatch_attempt_events(&events);
+        assert_eq!(attempts.len(), 1);
+        assert!(matches!(
+            &attempts[0],
+            RuntimeEvent::DispatchAttempt {
+                request_id,
+                action,
+                from,
+                target_session,
+                target_lifecycle_state_before,
+                target_work_state_before,
+                overlap,
+                reason,
+                ..
+            } if request_id == response.request_id.as_deref().unwrap()
+                && action == "send_input"
+                && from == "operator"
+                && target_session == "codex"
+                && *target_lifecycle_state_before == LifecycleState::Ready
+                && *target_work_state_before == Some(WorkState::Idle)
+                && !overlap
+                && reason.is_none()
+        ));
+    }
+
+    #[test]
+    fn dispatch_attempt_require_idle_aborts_thinking_without_ack_or_write() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let events = capture_runtime_events(&supervisor);
+        let (pty, send_count, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
+        set_session_dispatch_state(
+            &supervisor,
+            "codex",
+            LifecycleState::Ready,
+            Some(WorkState::Thinking),
+        );
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::SendInput {
+            token: status.token,
+            name: "codex".into(),
+            input: "hello".into(),
+            require_idle: true,
+        });
+
+        assert!(!response.ok);
+        assert_eq!(response.message, "dispatch aborted: target target_thinking");
+        assert_eq!(send_count.load(Ordering::SeqCst), 0);
+        assert!(request_ack_events(&events).is_empty());
+        let attempts = dispatch_attempt_events(&events);
+        assert_eq!(attempts.len(), 1);
+        assert!(matches!(
+            &attempts[0],
+            RuntimeEvent::DispatchAttempt {
+                overlap: true,
+                reason: Some(reason),
+                target_work_state_before: Some(WorkState::Thinking),
+                ..
+            } if reason == "target_thinking"
+        ));
+    }
+
+    #[test]
+    fn dispatch_attempt_allow_busy_semantics_proceed_when_thinking() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let events = capture_runtime_events(&supervisor);
+        let (pty, send_count, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
+        set_session_dispatch_state(
+            &supervisor,
+            "codex",
+            LifecycleState::Ready,
+            Some(WorkState::Thinking),
+        );
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::SendInput {
+            token: status.token,
+            name: "codex".into(),
+            input: "hello".into(),
+            require_idle: false,
+        });
+
+        assert!(response.ok, "got: {}", response.message);
+        assert_eq!(send_count.load(Ordering::SeqCst), 1);
+        assert_eq!(request_ack_events(&events).len(), 1);
+        let attempts = dispatch_attempt_events(&events);
+        assert_eq!(attempts.len(), 1);
+        assert!(matches!(
+            &attempts[0],
+            RuntimeEvent::DispatchAttempt {
+                overlap: true,
+                reason: Some(reason),
+                ..
+            } if reason == "target_thinking"
+        ));
+    }
+
+    #[test]
+    fn dispatch_attempt_default_mode_proceeds_when_thinking() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let events = capture_runtime_events(&supervisor);
+        let (pty, send_count, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
+        set_session_dispatch_state(
+            &supervisor,
+            "codex",
+            LifecycleState::Ready,
+            Some(WorkState::Thinking),
+        );
+
+        let request_json = serde_json::json!({
+            "kind": "send_input",
+            "token": status.token,
+            "name": "codex",
+            "input": "hello"
+        });
+        let request: SidebandRequest = serde_json::from_value(request_json).unwrap();
+        let response = supervisor.apply_sideband_request(request);
+
+        assert!(response.ok, "got: {}", response.message);
+        assert_eq!(send_count.load(Ordering::SeqCst), 1);
+        assert_eq!(request_ack_events(&events).len(), 1);
+        assert!(matches!(
+            &dispatch_attempt_events(&events)[0],
+            RuntimeEvent::DispatchAttempt {
+                overlap: true,
+                reason: Some(reason),
+                ..
+            } if reason == "target_thinking"
+        ));
+    }
+
+    #[test]
+    fn dispatch_attempt_recent_route_reason_takes_precedence() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let events = capture_runtime_events(&supervisor);
+        let (pty, send_count, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
+        set_session_dispatch_state(
+            &supervisor,
+            "codex",
+            LifecycleState::Ready,
+            Some(WorkState::Thinking),
+        );
+        mark_recent_route_from_session(&supervisor, "codex");
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::SendInput {
+            token: status.token,
+            name: "codex".into(),
+            input: "hello".into(),
+            require_idle: true,
+        });
+
+        assert!(!response.ok);
+        assert_eq!(
+            response.message,
+            "dispatch aborted: target recent_route_from_target"
+        );
+        assert_eq!(send_count.load(Ordering::SeqCst), 0);
+        let attempts = dispatch_attempt_events(&events);
+        assert_eq!(attempts.len(), 1);
+        assert!(matches!(
+            &attempts[0],
+            RuntimeEvent::DispatchAttempt {
+                overlap: true,
+                reason: Some(reason),
+                last_route_from_target_at: Some(_),
+                ..
+            } if reason == "recent_route_from_target"
+        ));
     }
 
     #[test]
@@ -8221,6 +8692,7 @@ mod tests {
                 scope: MessageScope::Direct,
                 content: "hi".into(),
             },
+            require_idle: false,
         });
 
         assert!(response.ok, "got: {}", response.message);
@@ -8270,6 +8742,7 @@ mod tests {
                 scope: MessageScope::Direct,
                 content: "hi".into(),
             },
+            require_idle: false,
         });
 
         assert!(response.ok, "got: {}", response.message);
@@ -8323,6 +8796,7 @@ mod tests {
                 scope: MessageScope::Direct,
                 content: long_content,
             },
+            require_idle: false,
         });
 
         assert!(response.ok, "got: {}", response.message);
@@ -8452,6 +8926,111 @@ mod tests {
             written_recipients,
             vec!["claude".to_string(), "codex".to_string()]
         );
+    }
+
+    #[test]
+    fn route_message_default_emits_dispatch_attempt_per_recipient_and_proceeds() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let events = capture_runtime_events(&supervisor);
+        let (claude_pty, claude_send_count, _) =
+            mock_pty_session(None, MockKillBehavior::Immediate);
+        let (codex_pty, codex_send_count, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "claude", DriverKind::Claude, claude_pty);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, codex_pty);
+        set_session_dispatch_state(
+            &supervisor,
+            "claude",
+            LifecycleState::Ready,
+            Some(WorkState::Idle),
+        );
+        set_session_dispatch_state(
+            &supervisor,
+            "codex",
+            LifecycleState::Ready,
+            Some(WorkState::Thinking),
+        );
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::RouteMessage {
+            token: status.token,
+            request: RouteMessageRequest {
+                from: "operator".into(),
+                to: "room".into(),
+                scope: MessageScope::Room,
+                content: "status".into(),
+            },
+            require_idle: false,
+        });
+
+        assert!(response.ok, "got: {}", response.message);
+        assert!(claude_send_count.load(Ordering::SeqCst) > 0);
+        assert!(codex_send_count.load(Ordering::SeqCst) > 0);
+        let attempts = dispatch_attempt_events(&events);
+        assert_eq!(attempts.len(), 2);
+        assert!(attempts.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::DispatchAttempt {
+                target_session,
+                overlap: false,
+                reason: None,
+                ..
+            } if target_session == "claude"
+        )));
+        assert!(attempts.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::DispatchAttempt {
+                target_session,
+                overlap: true,
+                reason: Some(reason),
+                ..
+            } if target_session == "codex" && reason == "target_thinking"
+        )));
+        let deliveries = route_delivery_events(&events);
+        assert_eq!(deliveries.len(), 3);
+    }
+
+    #[test]
+    fn route_message_require_idle_aborts_entire_route_before_delivery_events_or_writes() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let events = capture_runtime_events(&supervisor);
+        let (claude_pty, claude_send_count, _) =
+            mock_pty_session(None, MockKillBehavior::Immediate);
+        let (codex_pty, codex_send_count, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "claude", DriverKind::Claude, claude_pty);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, codex_pty);
+        set_session_dispatch_state(
+            &supervisor,
+            "claude",
+            LifecycleState::Ready,
+            Some(WorkState::Idle),
+        );
+        set_session_dispatch_state(
+            &supervisor,
+            "codex",
+            LifecycleState::Ready,
+            Some(WorkState::Thinking),
+        );
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::RouteMessage {
+            token: status.token,
+            request: RouteMessageRequest {
+                from: "operator".into(),
+                to: "room".into(),
+                scope: MessageScope::Room,
+                content: "status".into(),
+            },
+            require_idle: true,
+        });
+
+        assert!(!response.ok);
+        assert!(response.message.contains("codex"));
+        assert!(response.message.contains("target_thinking"));
+        assert_eq!(claude_send_count.load(Ordering::SeqCst), 0);
+        assert_eq!(codex_send_count.load(Ordering::SeqCst), 0);
+        assert_eq!(dispatch_attempt_events(&events).len(), 2);
+        assert!(route_delivery_events(&events).is_empty());
+        assert!(request_ack_events(&events).is_empty());
     }
 
     #[test]

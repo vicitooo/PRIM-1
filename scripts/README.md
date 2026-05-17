@@ -41,8 +41,9 @@ Example:
 .\scripts\control-plane.ps1 -Action start -Session claude -ExtraArgs '--resume', '00000000-0000-0000-0000-000000000000'
 .\scripts\control-plane.ps1 -Action input -Session claude -ContentFile ".runtime\compact-prompts\compact-full.txt"
 .\scripts\control-plane.ps1 -Action deliver -Session claude -Content "Multi-line`nmessage body"
+.\scripts\control-plane.ps1 -Action route -From operator -To codex -Content "status ping" -RequireIdle
 .\scripts\control-plane.ps1 -Action wait_quiet -Session claude -QuietSec 2 -TimeoutSec 10
-.\scripts\control-plane.ps1 -Action events_since -CursorFile ".runtime\cursors\outside-supervisor.json" -MaxEvents 200 -MaxWaitSeconds 15 -IncludeKinds "routed_message","session_state","system_log","sideband_request_lifecycle" -OutCursorFile ".runtime\cursors\outside-supervisor.json"
+.\scripts\control-plane.ps1 -Action events_since -CursorFile ".runtime\cursors\outside-supervisor.json" -MaxEvents 200 -MaxWaitSeconds 15 -IncludeKinds "routed_message","route_delivery","dispatch_attempt","session_state","system_log","sideband_request_lifecycle" -OutCursorFile ".runtime\cursors\outside-supervisor.json"
 .\scripts\control-plane.ps1 -Action route -From operator -To claude -Content "status ping" -Quiet -PassThruJson -OutRequestIdFile ".runtime\last-request-id.txt"
 ```
 
@@ -55,11 +56,12 @@ Notes:
 - `events_since` extends pipe/mailbox waits to `MaxWaitSeconds + 5`
 - `-PassThruJson` keeps quiet message output and appends the full sideband response JSON
 - `-OutRequestIdFile` writes the raw `request_id` string when the response carries one
+- `-RequireIdle` and `-AllowBusy` are supported for `input`, `key`, `deliver`, and `route`; default mode matches `-AllowBusy`, while `-RequireIdle` aborts before PTY write when `dispatch_attempt.overlap` is true
 - timeout responses now print `TIMED OUT: <message>` and exit `124`
 - ordinary non-timeout failures still exit `1`
 
 - `agent-route.ps1`
-  Minimal agent-facing wrapper over `control-plane.ps1` for direct or room messages without the verbose JSON snapshot payload. Supports `-PassThruJson` and `-OutRequestIdFile` passthrough for ACK correlation.
+  Minimal agent-facing wrapper over `control-plane.ps1` for direct or room messages without the verbose JSON snapshot payload. Supports `-RequireIdle`, `-AllowBusy`, `-PassThruJson`, and `-OutRequestIdFile` passthrough for dispatch/ACK correlation.
 
 Example:
 
@@ -105,7 +107,7 @@ Example:
 ```
 
 - `agent-events.ps1`
-  Outside-supervisor convenience wrapper over `control-plane.ps1 -Action events_since`. Uses `.runtime/cursors/<consumer>.json`, starts from `null` on first run, writes `next_cursor` back atomically, and prints one compressed JSON line per event. Default signal events include route receipts, pane signals, session lifecycle, session work-state, system logs, sideband lifecycle, and request ACK events.
+  Outside-supervisor convenience wrapper over `control-plane.ps1 -Action events_since`. Uses `.runtime/cursors/<consumer>.json`, starts from `null` on first run, writes `next_cursor` back atomically, and prints one compressed JSON line per event. Default signal events include route receipts, dispatch attempts, pane signals, session lifecycle, session work-state, system logs, sideband lifecycle, and request ACK events.
 
 Example:
 
@@ -114,7 +116,7 @@ Example:
 ```
 
 - `agent-events-summary.py`
-  Human-readable summary helper for the receipt/signal event families emitted by the control plane. Reads a JSONL audit log directly, or `events_since` JSON from stdin. Groups `route_delivery` phases into one logical route line and summarizes `pane_signal`, `session_work_state`, `request_ack`, `request_ack_timeout`, and failed/timed-out sideband lifecycle events.
+  Human-readable summary helper for the receipt/signal event families emitted by the control plane. Reads a JSONL audit log directly, or `events_since` JSON from stdin. Groups `route_delivery` phases into one logical route line and summarizes overlap-only `dispatch_attempt`, `pane_signal`, `session_work_state`, `request_ack`, `request_ack_timeout`, and failed/timed-out sideband lifecycle events.
 
 Examples:
 

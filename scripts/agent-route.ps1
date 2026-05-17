@@ -15,6 +15,10 @@ param(
 
   [string]$OutRequestIdFile,
 
+  [switch]$RequireIdle,
+
+  [switch]$AllowBusy,
+
   [switch]$PassThruJson
 )
 
@@ -31,6 +35,8 @@ $routeArgs = @{
   Quiet    = $true
 }
 if ($OutRequestIdFile) { $routeArgs.OutRequestIdFile = $OutRequestIdFile }
+if ($RequireIdle) { $routeArgs.RequireIdle = $true }
+if ($AllowBusy) { $routeArgs.AllowBusy = $true }
 if ($PassThruJson) { $routeArgs.PassThruJson = $true }
 
 & $controlPlaneScript @routeArgs

@@ -52,15 +52,22 @@ mod tests {
             token: "abc".into(),
             name: "claude".into(),
             key: ControlKey::CtrlC,
+            require_idle: false,
         })
         .unwrap();
         let decoded = decode_request(&json).unwrap();
 
         match decoded {
-            SidebandRequest::SendKey { token, name, key } => {
+            SidebandRequest::SendKey {
+                token,
+                name,
+                key,
+                require_idle,
+            } => {
                 assert_eq!(token, "abc");
                 assert_eq!(name, "claude");
                 assert_eq!(key, ControlKey::CtrlC);
+                assert!(!require_idle);
             }
             _ => panic!("unexpected request variant"),
         }

@@ -21,6 +21,7 @@ SUMMARY_EVENTS = {
     "session_exit",
     "session_work_state",
     "route_delivery",
+    "dispatch_attempt",
     "request_ack",
     "request_ack_timeout",
     "sideband_request_lifecycle",
@@ -275,6 +276,16 @@ def event_to_line(event: dict, sequence: int) -> SummaryLine | None:
             f"{format_time(timestamp)} request_ack      req={short_id(event.get('request_id'))}  "
             f"session={event.get('session') or '?'}  action={event.get('action') or '?'}  "
             f"bytes={event.get('bytes_written') or 0}"
+        )
+        return SummaryLine(timestamp, sequence, line)
+
+    if kind == "dispatch_attempt":
+        if not event.get("overlap"):
+            return None
+        line = (
+            f"{format_time(timestamp)} dispatch_overlap req={short_id(event.get('request_id'))}  "
+            f"from={event.get('from') or '?'}  target={event.get('target_session') or '?'}  "
+            f"action={event.get('action') or '?'}  reason={event.get('reason') or 'overlap'}"
         )
         return SummaryLine(timestamp, sequence, line)
 

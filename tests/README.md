@@ -12,7 +12,7 @@ Expected v1 test mix:
 Current script-level coverage:
 
 - `tests/agent-events-summary.test.py`
-  - validates `scripts/agent-events-summary.py` fixture summaries for `pane_signal`, grouped `route_delivery`, `request_ack`, `request_ack_timeout`, and failed sideband lifecycle events
+  - validates `scripts/agent-events-summary.py` fixture summaries for `pane_signal`, grouped `route_delivery`, overlap-only `dispatch_attempt`, `request_ack`, `request_ack_timeout`, and failed sideband lifecycle events
   - checks `--fail-on`, `--task-id`, `--request-id`, and `--events-since-stdin`
 
 - `tests/control-plane-content-file.ps1`

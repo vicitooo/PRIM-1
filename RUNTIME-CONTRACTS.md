@@ -207,8 +207,26 @@ Minimum fields:
 Pane-bound sideband requests (`send_input`, `send_key`, `deliver_message`, `route_message`) must expose two correlated layers:
 
 - `sideband_request_lifecycle` records supervisor request processing, keyed by `request_id`
+- `dispatch_attempt` records the pre-PTY-write target state for `send_input`, `send_key`, `deliver_message`, and each resolved `route_message` recipient
 - `request_ack` records successful PTY-write completion for the target session, keyed by the same `request_id`; `request_ack_timeout` records a missing PTY-write completion after `PRIM1_REQUEST_ACK_TIMEOUT_SECS` (default 60)
 - failed or timed-out `sideband_request_lifecycle` events include optional `error` text with the same message returned to the caller
+
+Dispatch overlap rules:
+
+- `target_work_state_before: thinking` -> `overlap: true`, `reason: "target_thinking"`
+- `target_work_state_before: tool_call` -> `overlap: true`, `reason: "target_tool_call"`
+- `target_work_state_before: blocked` -> `overlap: true`, `reason: "target_blocked"`
+- `target_work_state_before: error_loop` -> `overlap: true`, `reason: "target_error_loop"`
+- no observed work state and `target_lifecycle_state_before != ready` -> `overlap: true`, `reason: "target_not_ready"`
+- `last_route_from_target_at` within 3 seconds while target work-state is `thinking` or `tool_call` -> `overlap: true`, `reason: "recent_route_from_target"`
+- `recent_route_from_target` takes precedence over the generic `thinking` / `tool_call` reason when both apply
+- otherwise `overlap: false`, `reason: null`
+
+Dispatch gate modes:
+
+- default mode and `-AllowBusy` emit `dispatch_attempt` and proceed with the PTY write
+- `-RequireIdle` emits `dispatch_attempt` and aborts before the PTY write when `overlap: true`
+- aborted `-RequireIdle` route requests emit one `dispatch_attempt` per resolved recipient, then abort the entire route without partial delivery, `request_ack`, or `route_delivery`
 
 Route sideband requests expose a third delivery-truth layer:
 

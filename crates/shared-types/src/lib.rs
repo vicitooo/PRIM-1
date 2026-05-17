@@ -212,7 +212,7 @@ pub struct EventFilter {
 
 impl EventFilter {
     pub const ALL_KINDS: &'static str = "all";
-    pub const DEFAULT_INCLUDE_KINDS: [&'static str; 14] = [
+    pub const DEFAULT_INCLUDE_KINDS: [&'static str; 15] = [
         "session_state",
         "session_exit",
         "session_work_state",
@@ -221,6 +221,7 @@ impl EventFilter {
         "pair_deleted",
         "routed_message",
         "route_delivery",
+        "dispatch_attempt",
         "pane_signal",
         "system_log",
         "control_plane_ready",
@@ -324,6 +325,19 @@ pub enum RuntimeEvent {
         phase: RouteDeliveryPhase,
         bytes_written: usize,
         error: Option<String>,
+        timestamp: String,
+    },
+    DispatchAttempt {
+        request_id: String,
+        action: String,
+        from: String,
+        target_session: String,
+        target_lifecycle_state_before: LifecycleState,
+        target_work_state_before: Option<WorkState>,
+        target_last_activity_at: Option<String>,
+        last_route_from_target_at: Option<String>,
+        overlap: bool,
+        reason: Option<String>,
         timestamp: String,
     },
     PaneSignal {
@@ -436,6 +450,8 @@ pub enum SidebandRequest {
         token: String,
         name: String,
         content: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        require_idle: bool,
     },
     WaitQuiet {
         token: String,
@@ -454,15 +470,21 @@ pub enum SidebandRequest {
         token: String,
         name: String,
         input: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        require_idle: bool,
     },
     SendKey {
         token: String,
         name: String,
         key: ControlKey,
+        #[serde(default, skip_serializing_if = "is_false")]
+        require_idle: bool,
     },
     RouteMessage {
         token: String,
         request: RouteMessageRequest,
+        #[serde(default, skip_serializing_if = "is_false")]
+        require_idle: bool,
     },
     PaneSignal {
         token: String,
@@ -545,6 +567,7 @@ mod tests {
             token: "secret".into(),
             name: "claude".into(),
             key: ControlKey::Enter,
+            require_idle: false,
         };
 
         assert_eq!(request.token(), "secret");
@@ -806,6 +829,77 @@ mod tests {
 
         let roundtrip: RuntimeEvent = serde_json::from_value(value).unwrap();
         assert_eq!(roundtrip, event);
+    }
+
+    #[test]
+    fn dispatch_attempt_event_round_trips_via_json() {
+        let event = RuntimeEvent::DispatchAttempt {
+            request_id: "req-1".into(),
+            action: "send_input".into(),
+            from: "operator".into(),
+            target_session: "codex".into(),
+            target_lifecycle_state_before: LifecycleState::Ready,
+            target_work_state_before: Some(WorkState::Thinking),
+            target_last_activity_at: Some("2026-05-18T00:00:00Z".into()),
+            last_route_from_target_at: Some("2026-05-18T00:00:01Z".into()),
+            overlap: true,
+            reason: Some("target_thinking".into()),
+            timestamp: "2026-05-18T00:00:02Z".into(),
+        };
+
+        let value = serde_json::to_value(event.clone()).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "event": "dispatch_attempt",
+                "request_id": "req-1",
+                "action": "send_input",
+                "from": "operator",
+                "target_session": "codex",
+                "target_lifecycle_state_before": "ready",
+                "target_work_state_before": "thinking",
+                "target_last_activity_at": "2026-05-18T00:00:00Z",
+                "last_route_from_target_at": "2026-05-18T00:00:01Z",
+                "overlap": true,
+                "reason": "target_thinking",
+                "timestamp": "2026-05-18T00:00:02Z",
+            })
+        );
+
+        let roundtrip: RuntimeEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(roundtrip, event);
+    }
+
+    #[test]
+    fn dispatch_attempt_reason_strings_round_trip() {
+        let reasons = [
+            "target_thinking",
+            "target_tool_call",
+            "target_blocked",
+            "target_error_loop",
+            "target_not_ready",
+            "recent_route_from_target",
+        ];
+
+        for reason in reasons {
+            let event = RuntimeEvent::DispatchAttempt {
+                request_id: format!("req-{reason}"),
+                action: "send_input".into(),
+                from: "operator".into(),
+                target_session: "codex".into(),
+                target_lifecycle_state_before: LifecycleState::Ready,
+                target_work_state_before: Some(WorkState::Thinking),
+                target_last_activity_at: None,
+                last_route_from_target_at: None,
+                overlap: true,
+                reason: Some(reason.into()),
+                timestamp: "2026-05-18T00:00:02Z".into(),
+            };
+
+            let roundtrip: RuntimeEvent =
+                serde_json::from_value(serde_json::to_value(event.clone()).unwrap()).unwrap();
+            assert_eq!(roundtrip, event);
+        }
     }
 
     #[test]
@@ -1141,6 +1235,13 @@ mod tests {
         let filter = EventFilter::default();
 
         assert!(filter.includes_kind("route_delivery"));
+    }
+
+    #[test]
+    fn filter_default_includes_dispatch_attempt() {
+        let filter = EventFilter::default();
+
+        assert!(filter.includes_kind("dispatch_attempt"));
     }
 
     #[test]

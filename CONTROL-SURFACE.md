@@ -83,10 +83,11 @@ powershell -Command "& '.\scripts\control-plane.ps1' -Action list"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action start -Session claude"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action start -Session claude -ExtraArgs '--resume','00000000-0000-0000-0000-000000000000'"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action input -Session codex -Content 'hi'"
+powershell -Command "& '.\scripts\control-plane.ps1' -Action input -Session codex -Content 'hi' -RequireIdle"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action input -Session claude -ContentFile 'D:\tmp\compact.txt'"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action deliver -Session claude -Content 'hello from operator'"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action wait_quiet -Session claude -QuietSec 2 -TimeoutSec 10"
-powershell -Command "& '.\scripts\control-plane.ps1' -Action events_since -CursorFile '.runtime\cursors\outside-supervisor.json' -MaxEvents 200 -MaxWaitSeconds 15 -IncludeKinds 'routed_message','route_delivery','session_state','session_exit','system_log','sideband_request_lifecycle' -OutCursorFile '.runtime\cursors\outside-supervisor.json'"
+powershell -Command "& '.\scripts\control-plane.ps1' -Action events_since -CursorFile '.runtime\cursors\outside-supervisor.json' -MaxEvents 200 -MaxWaitSeconds 15 -IncludeKinds 'routed_message','route_delivery','dispatch_attempt','session_state','session_exit','system_log','sideband_request_lifecycle' -OutCursorFile '.runtime\cursors\outside-supervisor.json'"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action key -Session claude -Key enter"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action route -From operator -To room -Scope room -Content 'status ping'"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action signal -TaskId smoke -SignalType done -Summary 'smoke test'"
@@ -108,6 +109,10 @@ Behavior:
 - `-Action input` now accepts either:
   - `-Content '<inline text>'`
   - `-ContentFile '<path to UTF-8 text file>'`
+- `input`, `key`, `deliver`, and `route` accept `-RequireIdle` or `-AllowBusy`
+  - default mode emits `dispatch_attempt` and proceeds even when overlap is detected
+  - `-AllowBusy` is explicit default-mode behavior
+  - `-RequireIdle` aborts before any PTY write when overlap is detected and returns `ok=false`
 - `-Action deliver` delivers a conversational message with driver-aware preprocessing and Enter submission
 - `-Action deliver` accepts either:
   - `-Content '<inline text>'`
@@ -130,6 +135,7 @@ Behavior:
   - `session_exit`
   - `routed_message`
   - `route_delivery`
+  - `dispatch_attempt`
   - `pane_signal`
   - `system_log`
   - `session_work_state`
@@ -175,6 +181,8 @@ What callers see:
 
 - every sideband response includes `request_id` when the request decoded successfully
 - pane-bound `send_input`, `key`, `deliver`, and `route` requests emit `request_ack` after PTY writes complete; if the write path remains incomplete past `PRIM1_REQUEST_ACK_TIMEOUT_SECS` (default 60), they emit `request_ack_timeout`
+- pane-bound `send_input`, `key`, `deliver`, and `route` requests emit `dispatch_attempt` before any PTY write, carrying the target lifecycle/work-state snapshot, recent outbound-route timestamp, overlap boolean, and reason
+- `-RequireIdle` aborts overlapping dispatches before PTY write; aborted `route` requests emit per-recipient `dispatch_attempt` events but no `route_delivery` or `request_ack`
 - `route` requests emit `route_delivery` with one `resolved` event for the resolved pane fan-out and one `written` or `failed` event per pane recipient; each event carries `request_id`, `route_id`, `logical_to`, `recipient_count`, `payload_part_count`, `bytes_written`, and optional `error`
 - process exits emit `session_exit` alongside the existing `session_state`, carrying `generation`, `process_id`, optional `exit_code` / `signal`, `success`, `reason`, and `requested`
 - pane output can emit `session_work_state` on semantic work-state transitions only; events carry `session`, `state`, optional `detail`, `previous_state`, and `timestamp`
@@ -267,7 +275,7 @@ Outside-supervisor convenience wrapper over `control-plane.ps1 -Action events_si
 Defaults:
 
 - consumer cursor file: `.runtime/cursors/outside-supervisor.json`
-- kinds: `routed_message`, `route_delivery`, `pane_signal`, `session_state`, `session_exit`, `session_work_state`, `system_log`, `sideband_request_lifecycle`, `request_ack`, `request_ack_timeout`
+- kinds: `routed_message`, `route_delivery`, `dispatch_attempt`, `pane_signal`, `session_state`, `session_exit`, `session_work_state`, `system_log`, `sideband_request_lifecycle`, `request_ack`, `request_ack_timeout`
 - `-MaxWaitSeconds 15`
 - `-MaxEvents 200`
 
@@ -438,3 +446,5 @@ Recommended outside-supervisor pattern:
 `wait_quiet` remains a synchronous "no real output for N seconds" helper. `session_state: idle` from `events_since` is the better "probably done" signal for ongoing supervision because it is emitted into the audit log and guarded by session generation.
 
 `session_work_state` supplements lifecycle state with semantic pane activity. The supervisor emits it only when a driver's classifier changes state, including quiesce-driven `idle` transitions, so consumers should not expect one event per output chunk. States are `idle`, `thinking`, `tool_call`, `blocked`, and `error_loop`; repeated blocked hints with the same detail can escalate to `error_loop`.
+
+`dispatch_attempt` is the pre-write audit event for pane-bound dispatches. It lets consumers distinguish safe idle sends from overlap sends before looking for `request_ack` or `route_delivery`.

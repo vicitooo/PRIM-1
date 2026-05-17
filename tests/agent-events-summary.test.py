@@ -174,6 +174,34 @@ def write_fixture(path: Path) -> None:
             "timestamp": "2026-05-17T20:00:09+00:00",
         },
         {
+            "event": "dispatch_attempt",
+            "request_id": "req-dispatch-idle",
+            "action": "send_input",
+            "from": "operator",
+            "target_session": "claude",
+            "target_lifecycle_state_before": "ready",
+            "target_work_state_before": "idle",
+            "target_last_activity_at": "2026-05-17T20:00:08+00:00",
+            "last_route_from_target_at": None,
+            "overlap": False,
+            "reason": None,
+            "timestamp": "2026-05-17T20:00:09.200000+00:00",
+        },
+        {
+            "event": "dispatch_attempt",
+            "request_id": "req-dispatch-overlap",
+            "action": "send_input",
+            "from": "operator",
+            "target_session": "codex",
+            "target_lifecycle_state_before": "ready",
+            "target_work_state_before": "thinking",
+            "target_last_activity_at": "2026-05-17T20:00:08+00:00",
+            "last_route_from_target_at": None,
+            "overlap": True,
+            "reason": "target_thinking",
+            "timestamp": "2026-05-17T20:00:09.500000+00:00",
+        },
+        {
             "event": "request_ack_timeout",
             "request_id": "req-timeout-123456",
             "session": "codex",
@@ -225,6 +253,10 @@ def test_fixture_summary_and_fail_on():
         assert "2/2 written, 0 failed" in out
         assert "2/3 written, 1 failed: claude" in out
         assert "request_ack" in out
+        assert "dispatch_overlap" in out
+        assert "target=codex" in out
+        assert "req-disp" in out
+        assert "req-dispatch-idle" not in out
         assert "ack_timeout" in out
         assert "lifecycle_failed" in out
 

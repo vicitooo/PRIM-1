@@ -13,7 +13,7 @@ A local multi-agent runtime for terminal-first AI tools. PRIM-1 hosts CLI agents
 - **Visible terminal UI** — every pane renders live via xterm.js. The operator sees agent output exactly as it happens.
 - **Structured routing** — agents can send each other direct messages (`-To codex -Scope direct`) or post to a shared room (`-To room -Scope room`). The supervisor stamps provenance (`[Direct message from claude]`) and logs each routed message.
 - **Sideband control plane** — a local named pipe (Windows) / Unix socket exposes operator actions: `ping`, `list`, `start`, `stop`, `restart`, `input`, `key`, `route`, `deliver`, `events_since`, `wait_quiet`.
-- **Append-only audit log** at `.runtime/audit/YYYY-MM-DD.jsonl` capturing every event (session_state, session_output, routed_message, sideband_request_lifecycle, request_ack/request_ack_timeout, system_log, pair_created/renamed/deleted).
+- **Append-only audit log** at `.runtime/audit/YYYY-MM-DD.jsonl` capturing every event (session_state, session_output, routed_message, dispatch_attempt, sideband_request_lifecycle, request_ack/request_ack_timeout, system_log, pair_created/renamed/deleted).
 - **Dynamic pair management** — beyond the protected `main` pair (`claude` + `codex`), additional pairs can be created, renamed, and deleted at runtime. Pair-scoped room broadcasts by default.
 
 ## Prerequisites
