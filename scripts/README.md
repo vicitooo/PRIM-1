@@ -107,7 +107,7 @@ Example:
 ```
 
 - `agent-events.ps1`
-  Outside-supervisor convenience wrapper over `control-plane.ps1 -Action events_since`. Uses `.runtime/cursors/<consumer>.json`, starts from `null` on first run, writes `next_cursor` back atomically, and prints one compressed JSON line per event. Default signal events include route receipts, dispatch attempts, pane signals, session lifecycle, session work-state, system logs, sideband lifecycle, and request ACK events.
+  Outside-supervisor convenience wrapper over `control-plane.ps1 -Action events_since`. Uses `.runtime/cursors/<consumer>.json`, starts from `null` on first run, writes `next_cursor` back atomically, and prints one compressed JSON line per event. Default signal events include route receipts, dispatch attempts, dispatch template warnings, pane signals, session lifecycle, session work-state, supervisor heartbeats/alerts, system logs, sideband lifecycle, and request ACK events.
 
 Example:
 
@@ -116,16 +116,22 @@ Example:
 ```
 
 - `agent-events-summary.py`
-  Human-readable summary helper for the receipt/signal event families emitted by the control plane. Reads a JSONL audit log directly, or `events_since` JSON from stdin. Groups `route_delivery` phases into one logical route line and summarizes overlap-only `dispatch_attempt`, `pane_signal`, `session_work_state`, `request_ack`, `request_ack_timeout`, and failed/timed-out sideband lifecycle events.
+  Human-readable summary helper for the receipt/signal event families emitted by the control plane. Reads a JSONL audit log directly, or `events_since` JSON from stdin. Groups `route_delivery` phases into one logical route line and summarizes overlap-only `dispatch_attempt`, `dispatch_template_warning`, `pane_signal`, `session_work_state`, `supervisor_heartbeat`, `supervisor_alert`, `request_ack`, `request_ack_timeout`, and failed/timed-out sideband lifecycle events.
 
 Examples:
 
 ```powershell
 python .\scripts\agent-events-summary.py --audit-log ".runtime\audit\2026-05-17.jsonl"
 python .\scripts\agent-events-summary.py --audit-log ".runtime\audit\2026-05-17.jsonl" --task-id smoke-task-418
-python .\scripts\agent-events-summary.py --audit-log ".runtime\audit\2026-05-17.jsonl" --fail-on blocked,failed,timeout
+python .\scripts\agent-events-summary.py --audit-log ".runtime\audit\2026-05-17.jsonl" --fail-on alert,blocked,failed,timeout
 .\scripts\control-plane.ps1 -Action events_since -MaxEvents 200 | python .\scripts\agent-events-summary.py --events-since-stdin
 ```
+
+Runtime env vars used by the wrapper defaults:
+
+- `PRIM1_HEARTBEAT_INTERVAL_SECS`: supervisor heartbeat interval in seconds; default `1800`
+- `PRIM1_AUTO_RESTART_ON_STALL`: comma-separated session allowlist for stall auto-restart, for example `claude,codex`; default empty/off
+- `PRIM1_AUTO_RESTART_STALL_THRESHOLD_SECS`: blocked/error-loop threshold before auto-restart; default `600`
 
 - `new-smoke-token.ps1`
   Generates a unique `SMOKE-XXXXXXXX` token plus a UTC-timestamped handshake file path.

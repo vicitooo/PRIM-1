@@ -20,6 +20,9 @@ SUMMARY_EVENTS = {
     "pane_signal",
     "session_exit",
     "session_work_state",
+    "supervisor_heartbeat",
+    "supervisor_alert",
+    "dispatch_template_warning",
     "route_delivery",
     "dispatch_attempt",
     "request_ack",
@@ -27,7 +30,7 @@ SUMMARY_EVENTS = {
     "sideband_request_lifecycle",
 }
 
-FAIL_ON_VALUES = {"blocked", "failed", "timeout"}
+FAIL_ON_VALUES = {"alert", "blocked", "failed", "timeout"}
 
 
 @dataclass
@@ -126,7 +129,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument(
         "--fail-on",
         default="",
-        help="Comma-list of conditions that should return nonzero: blocked,failed,timeout.",
+        help="Comma-list of conditions that should return nonzero: alert,blocked,failed,timeout.",
     )
     return ap.parse_args(argv)
 
@@ -270,6 +273,39 @@ def event_to_line(event: dict, sequence: int) -> SummaryLine | None:
             f"signal={event.get('signal')}  requested={str(bool(event.get('requested'))).lower()}"
         )
         return SummaryLine(timestamp, sequence, line, conditions)
+
+    if kind == "supervisor_heartbeat":
+        sessions = event.get("sessions") if isinstance(event.get("sessions"), list) else []
+        active = [
+            item for item in sessions
+            if isinstance(item, dict) and item.get("lifecycle_state") not in {None, "closed"}
+        ]
+        line = (
+            f"{format_time(timestamp)} heartbeat       pid={event.get('wrapper_pid') or '?'}  "
+            f"uptime={event.get('uptime_secs') or 0}s  "
+            f"sessions={len(sessions)} active={len(active)}"
+        )
+        return SummaryLine(timestamp, sequence, line)
+
+    if kind == "supervisor_alert":
+        severity = str(event.get("severity") or "?")
+        alert_type = str(event.get("alert_type") or "?")
+        conditions = {"alert"} if severity == "critical" else set()
+        line = (
+            f"{format_time(timestamp)} supervisor_alert severity={severity}  "
+            f"type={alert_type}  session={event.get('session') or '?'}  "
+            f"action={event.get('action') or '?'}  message={quote_summary(event.get('message'))}"
+        )
+        return SummaryLine(timestamp, sequence, line, conditions)
+
+    if kind == "dispatch_template_warning":
+        missing = ",".join(str(value) for value in event.get("missing_patterns") or [])
+        line = (
+            f"{format_time(timestamp)} template_warning req={short_id(event.get('request_id'))}  "
+            f"session={event.get('session') or '?'}  severity={event.get('severity') or '?'}  "
+            f"missing={quote_summary(missing)}"
+        )
+        return SummaryLine(timestamp, sequence, line)
 
     if kind == "request_ack":
         line = (

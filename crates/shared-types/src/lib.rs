@@ -212,10 +212,13 @@ pub struct EventFilter {
 
 impl EventFilter {
     pub const ALL_KINDS: &'static str = "all";
-    pub const DEFAULT_INCLUDE_KINDS: [&'static str; 15] = [
+    pub const DEFAULT_INCLUDE_KINDS: [&'static str; 18] = [
         "session_state",
         "session_exit",
         "session_work_state",
+        "supervisor_heartbeat",
+        "supervisor_alert",
+        "dispatch_template_warning",
         "pair_created",
         "pair_renamed",
         "pair_deleted",
@@ -245,6 +248,31 @@ impl EventFilter {
 
         self.include_kinds.iter().any(|candidate| candidate == kind)
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HeartbeatSessionSummary {
+    pub name: String,
+    pub lifecycle_state: LifecycleState,
+    pub work_state: Option<WorkState>,
+    pub process_id: Option<u32>,
+    pub last_activity_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorAlertType {
+    AckTimeout,
+    SessionStallDetected,
+    OperatorAttention,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertSeverity {
+    Info,
+    Warn,
+    Critical,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -289,6 +317,31 @@ pub enum RuntimeEvent {
         state: WorkState,
         detail: Option<String>,
         previous_state: Option<WorkState>,
+        timestamp: String,
+    },
+    SupervisorHeartbeat {
+        wrapper_pid: u32,
+        uptime_secs: u64,
+        sessions: Vec<HeartbeatSessionSummary>,
+        timestamp: String,
+    },
+    SupervisorAlert {
+        alert_type: SupervisorAlertType,
+        request_id: Option<String>,
+        session: Option<String>,
+        action: Option<String>,
+        last_work_state: Option<WorkState>,
+        last_session_state: Option<LifecycleState>,
+        message: String,
+        severity: AlertSeverity,
+        timestamp: String,
+    },
+    DispatchTemplateWarning {
+        request_id: String,
+        session: String,
+        detected_patterns: Vec<String>,
+        missing_patterns: Vec<String>,
+        severity: AlertSeverity,
         timestamp: String,
     },
     PairCreated {
@@ -726,6 +779,116 @@ mod tests {
                 "detail": "Working 12s",
                 "previous_state": "idle",
                 "timestamp": "2026-05-17T00:00:00Z",
+            })
+        );
+
+        let roundtrip: RuntimeEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(roundtrip, event);
+    }
+
+    #[test]
+    fn supervisor_heartbeat_event_round_trips_via_json() {
+        let event = RuntimeEvent::SupervisorHeartbeat {
+            wrapper_pid: 4242,
+            uptime_secs: 1800,
+            sessions: vec![HeartbeatSessionSummary {
+                name: "codex".into(),
+                lifecycle_state: LifecycleState::Ready,
+                work_state: Some(WorkState::Thinking),
+                process_id: Some(1234),
+                last_activity_at: Some("2026-05-18T00:00:00Z".into()),
+            }],
+            timestamp: "2026-05-18T00:30:00Z".into(),
+        };
+
+        let value = serde_json::to_value(event.clone()).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "event": "supervisor_heartbeat",
+                "wrapper_pid": 4242,
+                "uptime_secs": 1800,
+                "sessions": [{
+                    "name": "codex",
+                    "lifecycle_state": "ready",
+                    "work_state": "thinking",
+                    "process_id": 1234,
+                    "last_activity_at": "2026-05-18T00:00:00Z",
+                }],
+                "timestamp": "2026-05-18T00:30:00Z",
+            })
+        );
+
+        let roundtrip: RuntimeEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(roundtrip, event);
+    }
+
+    #[test]
+    fn supervisor_alert_event_round_trips_via_json() {
+        let event = RuntimeEvent::SupervisorAlert {
+            alert_type: SupervisorAlertType::AckTimeout,
+            request_id: Some("req-1".into()),
+            session: Some("codex".into()),
+            action: Some("deliver_message".into()),
+            last_work_state: Some(WorkState::Blocked),
+            last_session_state: Some(LifecycleState::Ready),
+            message: "Dispatch deliver_message to codex didn't ACK in 60s; last work_state=blocked"
+                .into(),
+            severity: AlertSeverity::Warn,
+            timestamp: "2026-05-18T00:01:00Z".into(),
+        };
+
+        let value = serde_json::to_value(event.clone()).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "event": "supervisor_alert",
+                "alert_type": "ack_timeout",
+                "request_id": "req-1",
+                "session": "codex",
+                "action": "deliver_message",
+                "last_work_state": "blocked",
+                "last_session_state": "ready",
+                "message": "Dispatch deliver_message to codex didn't ACK in 60s; last work_state=blocked",
+                "severity": "warn",
+                "timestamp": "2026-05-18T00:01:00Z",
+            })
+        );
+
+        let roundtrip: RuntimeEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(roundtrip, event);
+    }
+
+    #[test]
+    fn dispatch_template_warning_event_round_trips_via_json() {
+        let event = RuntimeEvent::DispatchTemplateWarning {
+            request_id: "req-2".into(),
+            session: "claude".into(),
+            detected_patterns: Vec::new(),
+            missing_patterns: vec![
+                "pane_signal".into(),
+                "control-plane.ps1 -Action signal".into(),
+                "task_id".into(),
+            ],
+            severity: AlertSeverity::Info,
+            timestamp: "2026-05-18T00:02:00Z".into(),
+        };
+
+        let value = serde_json::to_value(event.clone()).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "event": "dispatch_template_warning",
+                "request_id": "req-2",
+                "session": "claude",
+                "detected_patterns": [],
+                "missing_patterns": [
+                    "pane_signal",
+                    "control-plane.ps1 -Action signal",
+                    "task_id"
+                ],
+                "severity": "info",
+                "timestamp": "2026-05-18T00:02:00Z",
             })
         );
 
@@ -1256,6 +1419,15 @@ mod tests {
         let filter = EventFilter::default();
 
         assert!(filter.includes_kind("session_work_state"));
+    }
+
+    #[test]
+    fn filter_default_includes_supervisor_default_events() {
+        let filter = EventFilter::default();
+
+        assert!(filter.includes_kind("supervisor_heartbeat"));
+        assert!(filter.includes_kind("supervisor_alert"));
+        assert!(filter.includes_kind("dispatch_template_warning"));
     }
 
     #[test]

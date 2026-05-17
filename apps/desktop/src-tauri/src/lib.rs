@@ -375,6 +375,9 @@ fn init_supervisor(
         runtime_dir,
         peer_slash_commands_allowed,
         cross_pair_room_broadcast,
+        heartbeat_interval: None,
+        auto_restart_on_stall_sessions: None,
+        auto_restart_stall_threshold: None,
     })
     .map_err(|error| error.to_string())?;
 

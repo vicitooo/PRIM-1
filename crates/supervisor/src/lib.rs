@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader as StdBufReader, Read, Write},
     path::{Path, PathBuf},
@@ -17,12 +17,12 @@ use control_plane::{DEFAULT_ENDPOINT, decode_request, encode_request, encode_res
 use parking_lot::{Mutex, RwLock};
 use pty_host::{ConcretePtySession, PtyEvent, PtyEventHandler, PtyExitStatus, PtySession};
 use shared_types::{
-    ControlKey, ControlPlaneStatus, DeliverMessageRequest, DriverKind, EnvVar, EventCursor,
-    EventFilter, LaunchSpec, LifecycleState, LogLevel, MessageScope, PaneSignalType,
-    RouteDeliveryPhase, RouteMessageRequest, RuntimeEvent, RuntimeSnapshot, SendInputRequest,
-    SessionDefinition, SessionExitReason, SessionGeneration, SessionSnapshot, SidebandPhase,
-    SidebandRequest, SidebandResponse, SidebandResponsePayload, WaitQuietRequest, WorkState,
-    now_rfc3339,
+    AlertSeverity, ControlKey, ControlPlaneStatus, DeliverMessageRequest, DriverKind, EnvVar,
+    EventCursor, EventFilter, HeartbeatSessionSummary, LaunchSpec, LifecycleState, LogLevel,
+    MessageScope, PaneSignalType, RouteDeliveryPhase, RouteMessageRequest, RuntimeEvent,
+    RuntimeSnapshot, SendInputRequest, SessionDefinition, SessionExitReason, SessionGeneration,
+    SessionSnapshot, SidebandPhase, SidebandRequest, SidebandResponse, SidebandResponsePayload,
+    SupervisorAlertType, WaitQuietRequest, WorkState, now_rfc3339,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use uuid::Uuid;
@@ -32,6 +32,12 @@ type EventSink = Arc<dyn Fn(RuntimeEvent) + Send + Sync>;
 const CONTROL_PLANE_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const CONTROL_PLANE_PROBE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const DEFAULT_REQUEST_ACK_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 1800;
+const DEFAULT_AUTO_RESTART_STALL_THRESHOLD_SECS: u64 = 600;
+const AUTO_RESTART_WINDOW: Duration = Duration::from_secs(30 * 60);
+const AUTO_RESTART_MAX_PER_WINDOW: usize = 3;
+const DISPATCH_TEMPLATE_PATTERNS: [&str; 3] =
+    ["pane_signal", "control-plane.ps1 -Action signal", "task_id"];
 const RECENT_ROUTE_OVERLAP_WINDOW: Duration = Duration::from_secs(3);
 const PAIR_NAME_MAX_LEN: usize = 48;
 const RESERVED_PAIR_NAMES: [&str; 5] = ["main", "claude", "codex", "room", "operator"];
@@ -97,6 +103,44 @@ struct RequestAckContext {
 struct RequestAckWatchdog {
     completed: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Debug, Clone)]
+struct AutoRestartOnStallConfig {
+    allowed_sessions: HashSet<String>,
+    threshold: Duration,
+}
+
+impl AutoRestartOnStallConfig {
+    fn enabled_for(&self, session: &str) -> bool {
+        self.allowed_sessions.contains(session)
+    }
+}
+
+#[derive(Debug, Default)]
+struct AutoRestartHistory {
+    attempts: Vec<Instant>,
+    disabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoRestartReservation {
+    Reserved,
+    CapReached,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StallAlertSnapshot {
+    last_work_state: Option<WorkState>,
+    last_session_state: Option<LifecycleState>,
+}
+
+struct StallDetector {
+    generation: SessionGeneration,
+    state: WorkState,
+    entered_at: Instant,
+    handle: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,6 +254,9 @@ pub struct SupervisorConfig {
     pub runtime_dir: PathBuf,
     pub peer_slash_commands_allowed: bool,
     pub cross_pair_room_broadcast: bool,
+    pub heartbeat_interval: Option<Duration>,
+    pub auto_restart_on_stall_sessions: Option<Vec<String>>,
+    pub auto_restart_stall_threshold: Option<Duration>,
 }
 
 struct AuditInner {
@@ -499,6 +546,9 @@ struct SessionSlot {
     last_route_from_session_instant: Option<Instant>,
     last_error: Option<String>,
     quiesce_timer: Option<QuiesceTimer>,
+    stall_state_entered_at: Option<Instant>,
+    stall_state_entered_timestamp: Option<String>,
+    stall_detector: Option<StallDetector>,
 }
 
 impl SessionSlot {
@@ -855,6 +905,9 @@ fn renamed_closed_slot(slot: SessionSlot, definition: SessionDefinition) -> Sess
         last_route_from_session_instant: slot.last_route_from_session_instant,
         last_error: slot.last_error,
         quiesce_timer: None,
+        stall_state_entered_at: None,
+        stall_state_entered_timestamp: None,
+        stall_detector: None,
     }
 }
 
@@ -876,6 +929,9 @@ fn closed_session_slot(definition: SessionDefinition) -> SessionSlot {
         last_route_from_session_instant: None,
         last_error: None,
         quiesce_timer: None,
+        stall_state_entered_at: None,
+        stall_state_entered_timestamp: None,
+        stall_detector: None,
     }
 }
 
@@ -896,6 +952,10 @@ struct SupervisorInner {
     events_watch: tokio::sync::watch::Sender<u64>,
     stale_event_drop_counts: Mutex<HashMap<(String, SessionGeneration), u64>>,
     stale_quiesce_drop_counts: Mutex<HashMap<(String, SessionGeneration), u64>>,
+    started_at: Instant,
+    heartbeat_interval: Duration,
+    auto_restart_on_stall: AutoRestartOnStallConfig,
+    auto_restart_history: Mutex<HashMap<String, AutoRestartHistory>>,
     #[cfg(test)]
     last_detached_worker: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
@@ -936,8 +996,25 @@ impl SupervisorHandle {
         for definition in default_session_definitions(&working_root) {
             slots.insert(definition.name.clone(), closed_session_slot(definition));
         }
+        let heartbeat_interval = config
+            .heartbeat_interval
+            .filter(|duration| !duration.is_zero())
+            .unwrap_or_else(heartbeat_interval_from_env);
+        let auto_restart_on_stall = AutoRestartOnStallConfig {
+            allowed_sessions: config
+                .auto_restart_on_stall_sessions
+                .unwrap_or_else(auto_restart_sessions_from_env)
+                .into_iter()
+                .map(|session| session.trim().to_string())
+                .filter(|session| !session.is_empty())
+                .collect(),
+            threshold: config
+                .auto_restart_stall_threshold
+                .filter(|duration| !duration.is_zero())
+                .unwrap_or_else(auto_restart_stall_threshold_from_env),
+        };
 
-        Ok(Self {
+        let handle = Self {
             inner: Arc::new(SupervisorInner {
                 runtime_dir: config.runtime_dir,
                 audit,
@@ -955,10 +1032,16 @@ impl SupervisorHandle {
                 events_watch,
                 stale_event_drop_counts: Mutex::new(HashMap::new()),
                 stale_quiesce_drop_counts: Mutex::new(HashMap::new()),
+                started_at: Instant::now(),
+                heartbeat_interval,
+                auto_restart_on_stall,
+                auto_restart_history: Mutex::new(HashMap::new()),
                 #[cfg(test)]
                 last_detached_worker: Mutex::new(None),
             }),
-        })
+        };
+        handle.start_supervisor_heartbeat_task();
+        Ok(handle)
     }
 
     pub fn runtime_dir(&self) -> &Path {
@@ -993,6 +1076,46 @@ impl SupervisorHandle {
         }
     }
 
+    fn start_supervisor_heartbeat_task(&self) {
+        let interval = self.inner.heartbeat_interval;
+        let weak = Arc::downgrade(&self.inner);
+        self.inner.background_runtime.spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let Some(inner) = weak.upgrade() else {
+                    break;
+                };
+                SupervisorHandle { inner }.emit_supervisor_heartbeat();
+            }
+        });
+    }
+
+    fn heartbeat_session_summaries(&self) -> Vec<HeartbeatSessionSummary> {
+        let slots = self.inner.slots.lock();
+        let mut summaries = slots
+            .values()
+            .map(|slot| HeartbeatSessionSummary {
+                name: slot.definition.name.clone(),
+                lifecycle_state: slot.state,
+                work_state: slot.work_state_observed.then_some(slot.work_state),
+                process_id: slot.process_id,
+                last_activity_at: slot.last_activity_at.clone(),
+            })
+            .collect::<Vec<_>>();
+        summaries.sort_by(|left, right| left.name.cmp(&right.name));
+        summaries
+    }
+
+    fn emit_supervisor_heartbeat(&self) {
+        self.refresh_session_liveness();
+        self.emit(RuntimeEvent::SupervisorHeartbeat {
+            wrapper_pid: std::process::id(),
+            uptime_secs: self.inner.started_at.elapsed().as_secs(),
+            sessions: self.heartbeat_session_summaries(),
+            timestamp: now_rfc3339(),
+        });
+    }
+
     fn normalize_events_filter(filter: Option<EventFilter>) -> EventFilter {
         filter.unwrap_or_default()
     }
@@ -1009,6 +1132,9 @@ impl SupervisorHandle {
                     | "session_state"
                     | "session_exit"
                     | "session_work_state"
+                    | "supervisor_heartbeat"
+                    | "supervisor_alert"
+                    | "dispatch_template_warning"
                     | "pair_created"
                     | "pair_renamed"
                     | "pair_deleted"
@@ -1345,12 +1471,52 @@ impl SupervisorHandle {
         });
     }
 
+    fn session_state_for_alert(
+        &self,
+        session: &str,
+    ) -> (Option<WorkState>, Option<LifecycleState>) {
+        let slots = self.inner.slots.lock();
+        let Some(slot) = slots.get(session) else {
+            return (None, None);
+        };
+
+        (
+            slot.work_state_observed.then_some(slot.work_state),
+            Some(slot.state),
+        )
+    }
+
+    fn emit_supervisor_alert(
+        &self,
+        alert_type: SupervisorAlertType,
+        request_id: Option<String>,
+        session: Option<String>,
+        action: Option<String>,
+        last_work_state: Option<WorkState>,
+        last_session_state: Option<LifecycleState>,
+        message: String,
+        severity: AlertSeverity,
+    ) {
+        self.emit(RuntimeEvent::SupervisorAlert {
+            alert_type,
+            request_id,
+            session,
+            action,
+            last_work_state,
+            last_session_state,
+            message,
+            severity,
+            timestamp: now_rfc3339(),
+        });
+    }
+
     fn emit_request_ack_timeout(
         &self,
         context: &RequestAckContext,
         session: &str,
         elapsed: Duration,
     ) {
+        let (last_work_state, last_session_state) = self.session_state_for_alert(session);
         self.emit(RuntimeEvent::RequestAckTimeout {
             request_id: context.request_id.clone(),
             session: session.to_string(),
@@ -1358,6 +1524,22 @@ impl SupervisorHandle {
             elapsed_ms: elapsed.as_millis() as u64,
             timestamp: now_rfc3339(),
         });
+        self.emit_supervisor_alert(
+            SupervisorAlertType::AckTimeout,
+            Some(context.request_id.clone()),
+            Some(session.to_string()),
+            Some(context.action.clone()),
+            last_work_state,
+            last_session_state,
+            format!(
+                "Dispatch {} to {} didn't ACK in {}s; last work_state={}",
+                context.action,
+                session,
+                elapsed.as_secs(),
+                work_state_alert_label(last_work_state)
+            ),
+            AlertSeverity::Warn,
+        );
     }
 
     fn emit_route_delivery(&self, event: RouteDeliveryEvent) {
@@ -1420,6 +1602,27 @@ impl SupervisorHandle {
         });
 
         Ok(decision)
+    }
+
+    fn emit_dispatch_template_warning_if_needed(
+        &self,
+        request_id: &str,
+        session: &str,
+        content: &str,
+    ) {
+        let (detected_patterns, missing_patterns) = dispatch_template_pattern_match(content);
+        if !detected_patterns.is_empty() {
+            return;
+        }
+
+        self.emit(RuntimeEvent::DispatchTemplateWarning {
+            request_id: request_id.to_string(),
+            session: session.to_string(),
+            detected_patterns,
+            missing_patterns,
+            severity: AlertSeverity::Info,
+            timestamp: now_rfc3339(),
+        });
     }
 
     fn record_route_from_session(&self, session: &str) {
@@ -1620,6 +1823,197 @@ impl SupervisorHandle {
                 timestamp: now_rfc3339(),
             });
         }
+    }
+
+    fn handle_session_work_state_side_effects(&self, session_name: &str, state: WorkState) {
+        let is_stall_state = matches!(state, WorkState::Blocked | WorkState::ErrorLoop);
+        let now = Instant::now();
+        let timestamp = now_rfc3339();
+        let enabled = self.inner.auto_restart_on_stall.enabled_for(session_name);
+        let threshold = self.inner.auto_restart_on_stall.threshold;
+        let weak = Arc::downgrade(&self.inner);
+
+        let mut slots = self.inner.slots.lock();
+        let Some(slot) = slots.get_mut(session_name) else {
+            return;
+        };
+        cancel_stall_detector_locked(slot);
+
+        if !is_stall_state {
+            slot.stall_state_entered_at = None;
+            slot.stall_state_entered_timestamp = None;
+            return;
+        }
+
+        slot.stall_state_entered_at = Some(now);
+        slot.stall_state_entered_timestamp = Some(timestamp);
+
+        if !enabled {
+            return;
+        }
+
+        let session = session_name.to_string();
+        let generation = slot.generation;
+        let task_session = session.clone();
+        let task = self.inner.background_runtime.spawn(async move {
+            tokio::time::sleep(threshold).await;
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            SupervisorHandle { inner }
+                .fire_stall_detector(task_session, generation, state, now)
+                .await;
+        });
+        slot.stall_detector = Some(StallDetector {
+            generation,
+            state,
+            entered_at: now,
+            handle: task,
+        });
+    }
+
+    async fn fire_stall_detector(
+        &self,
+        session: String,
+        generation: SessionGeneration,
+        state: WorkState,
+        entered_at: Instant,
+    ) {
+        let Some(stall) = self.current_stall_snapshot(&session, generation, state, entered_at)
+        else {
+            return;
+        };
+
+        match self.reserve_auto_restart_attempt(&session) {
+            AutoRestartReservation::Reserved => {
+                self.emit_supervisor_alert(
+                    SupervisorAlertType::SessionStallDetected,
+                    None,
+                    Some(session.clone()),
+                    Some("restart_session".into()),
+                    stall.last_work_state,
+                    stall.last_session_state,
+                    format!(
+                        "Session {} stayed in {} for {}s; issuing auto-restart",
+                        session,
+                        work_state_alert_label(stall.last_work_state),
+                        self.inner.auto_restart_on_stall.threshold.as_secs()
+                    ),
+                    AlertSeverity::Critical,
+                );
+
+                let restart_handle = self.clone();
+                let restart_session = session.clone();
+                let join = tokio::task::spawn_blocking(move || {
+                    restart_handle.restart_session_at(&restart_session, generation)
+                })
+                .await;
+                match join {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => self.emit_supervisor_alert(
+                        SupervisorAlertType::OperatorAttention,
+                        None,
+                        Some(session),
+                        Some("restart_session".into()),
+                        stall.last_work_state,
+                        stall.last_session_state,
+                        format!("Auto-restart failed: {error}"),
+                        AlertSeverity::Critical,
+                    ),
+                    Err(error) => self.emit_supervisor_alert(
+                        SupervisorAlertType::OperatorAttention,
+                        None,
+                        Some(session),
+                        Some("restart_session".into()),
+                        stall.last_work_state,
+                        stall.last_session_state,
+                        format!("Auto-restart worker join failed: {error}"),
+                        AlertSeverity::Critical,
+                    ),
+                }
+            }
+            AutoRestartReservation::CapReached => {
+                self.emit_supervisor_alert(
+                    SupervisorAlertType::SessionStallDetected,
+                    None,
+                    Some(session),
+                    Some("restart_session".into()),
+                    stall.last_work_state,
+                    stall.last_session_state,
+                    format!(
+                        "Auto-restart cap reached: 3 restarts in 30 minutes; manual operator intervention required"
+                    ),
+                    AlertSeverity::Critical,
+                );
+            }
+            AutoRestartReservation::Disabled => {}
+        }
+    }
+
+    fn current_stall_snapshot(
+        &self,
+        session: &str,
+        generation: SessionGeneration,
+        state: WorkState,
+        entered_at: Instant,
+    ) -> Option<StallAlertSnapshot> {
+        let mut slots = self.inner.slots.lock();
+        let slot = slots.get_mut(session)?;
+        let detector_matches = slot
+            .stall_detector
+            .as_ref()
+            .map(|detector| {
+                detector.generation == generation
+                    && detector.state == state
+                    && detector.entered_at == entered_at
+            })
+            .unwrap_or(false);
+        if !detector_matches
+            || slot.generation != generation
+            || slot.work_state != state
+            || !matches!(slot.work_state, WorkState::Blocked | WorkState::ErrorLoop)
+            || slot.state != LifecycleState::Ready
+            || slot.running.is_none()
+            || matches!(
+                slot.stop_intent,
+                Some(StopIntent {
+                    kind: StopIntentKind::Operator,
+                    ..
+                })
+            )
+        {
+            return None;
+        }
+
+        slot.stall_detector.take();
+        Some(StallAlertSnapshot {
+            last_work_state: slot.work_state_observed.then_some(slot.work_state),
+            last_session_state: Some(slot.state),
+        })
+    }
+
+    fn reserve_auto_restart_attempt(&self, session: &str) -> AutoRestartReservation {
+        if !self.inner.auto_restart_on_stall.enabled_for(session) {
+            return AutoRestartReservation::Disabled;
+        }
+
+        let now = Instant::now();
+        let mut history_by_session = self.inner.auto_restart_history.lock();
+        let history = history_by_session.entry(session.to_string()).or_default();
+        if history.disabled {
+            return AutoRestartReservation::Disabled;
+        }
+
+        history
+            .attempts
+            .retain(|attempt| now.duration_since(*attempt) <= AUTO_RESTART_WINDOW);
+        if history.attempts.len() >= AUTO_RESTART_MAX_PER_WINDOW {
+            history.disabled = true;
+            return AutoRestartReservation::CapReached;
+        }
+
+        history.attempts.push(now);
+        AutoRestartReservation::Reserved
     }
 
     #[cfg(test)]
@@ -2464,6 +2858,7 @@ impl SupervisorHandle {
                 decision.reason.unwrap_or("overlap")
             ));
         }
+        self.emit_dispatch_template_warning_if_needed(&request_id, &request.name, &request.content);
 
         let (_, submit_behavior, payloads) =
             self.prepare_delivery_for_session(&request.name, &request.content)?;
@@ -3418,6 +3813,10 @@ impl SupervisorHandle {
     }
 
     fn emit(&self, event: RuntimeEvent) {
+        if let RuntimeEvent::SessionWorkState { session, state, .. } = &event {
+            self.handle_session_work_state_side_effects(session, *state);
+        }
+
         let appended = match self.inner.audit.append(&event) {
             Ok(()) => true,
             Err(error) => {
@@ -4222,11 +4621,20 @@ fn cancel_quiesce_timer_locked(slot: &mut SessionSlot) {
     }
 }
 
+fn cancel_stall_detector_locked(slot: &mut SessionSlot) {
+    if let Some(detector) = slot.stall_detector.take() {
+        detector.handle.abort();
+    }
+}
+
 fn reset_work_state_locked(slot: &mut SessionSlot) {
+    cancel_stall_detector_locked(slot);
     slot.work_state = WorkState::Idle;
     slot.work_state_observed = false;
     slot.work_detail = None;
     slot.work_error_observations.clear();
+    slot.stall_state_entered_at = None;
+    slot.stall_state_entered_timestamp = None;
 }
 
 fn classify_work_state_for_driver(
@@ -4327,6 +4735,9 @@ fn event_kind(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::SessionState { .. } => "session_state",
         RuntimeEvent::SessionExit { .. } => "session_exit",
         RuntimeEvent::SessionWorkState { .. } => "session_work_state",
+        RuntimeEvent::SupervisorHeartbeat { .. } => "supervisor_heartbeat",
+        RuntimeEvent::SupervisorAlert { .. } => "supervisor_alert",
+        RuntimeEvent::DispatchTemplateWarning { .. } => "dispatch_template_warning",
         RuntimeEvent::PairCreated { .. } => "pair_created",
         RuntimeEvent::PairRenamed { .. } => "pair_renamed",
         RuntimeEvent::PairDeleted { .. } => "pair_deleted",
@@ -4396,6 +4807,25 @@ fn event_matches_filter(event: &RuntimeEvent, filter: &EventFilter) -> bool {
                 .iter()
                 .any(|candidate| candidate == session),
             RuntimeEvent::PaneSignal { session, .. } => filter
+                .include_sessions
+                .iter()
+                .any(|candidate| candidate == session),
+            RuntimeEvent::SupervisorHeartbeat { sessions, .. } => sessions.iter().any(|summary| {
+                filter
+                    .include_sessions
+                    .iter()
+                    .any(|candidate| candidate == &summary.name)
+            }),
+            RuntimeEvent::SupervisorAlert { session, .. } => session
+                .as_ref()
+                .map(|value| {
+                    filter
+                        .include_sessions
+                        .iter()
+                        .any(|candidate| candidate == value)
+                })
+                .unwrap_or(false),
+            RuntimeEvent::DispatchTemplateWarning { session, .. } => filter
                 .include_sessions
                 .iter()
                 .any(|candidate| candidate == session),
@@ -4632,6 +5062,65 @@ fn request_ack_timeout() -> Duration {
         .filter(|seconds| *seconds > 0)
         .map(Duration::from_secs)
         .unwrap_or(Duration::from_secs(DEFAULT_REQUEST_ACK_TIMEOUT_SECS))
+}
+
+fn heartbeat_interval_from_env() -> Duration {
+    positive_duration_from_env(
+        "PRIM1_HEARTBEAT_INTERVAL_SECS",
+        DEFAULT_HEARTBEAT_INTERVAL_SECS,
+    )
+}
+
+fn auto_restart_stall_threshold_from_env() -> Duration {
+    positive_duration_from_env(
+        "PRIM1_AUTO_RESTART_STALL_THRESHOLD_SECS",
+        DEFAULT_AUTO_RESTART_STALL_THRESHOLD_SECS,
+    )
+}
+
+fn positive_duration_from_env(name: &str, default_seconds: u64) -> Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(default_seconds))
+}
+
+fn auto_restart_sessions_from_env() -> Vec<String> {
+    std::env::var("PRIM1_AUTO_RESTART_ON_STALL")
+        .unwrap_or_default()
+        .split(',')
+        .map(|session| session.trim().to_string())
+        .filter(|session| !session.is_empty())
+        .collect()
+}
+
+fn dispatch_template_pattern_match(content: &str) -> (Vec<String>, Vec<String>) {
+    let lower_content = content.to_ascii_lowercase();
+    let mut detected = Vec::new();
+    let mut missing = Vec::new();
+
+    for pattern in DISPATCH_TEMPLATE_PATTERNS {
+        if lower_content.contains(&pattern.to_ascii_lowercase()) {
+            detected.push(pattern.to_string());
+        } else {
+            missing.push(pattern.to_string());
+        }
+    }
+
+    (detected, missing)
+}
+
+fn work_state_alert_label(state: Option<WorkState>) -> &'static str {
+    match state {
+        Some(WorkState::Idle) => "idle",
+        Some(WorkState::Thinking) => "thinking",
+        Some(WorkState::ToolCall) => "tool_call",
+        Some(WorkState::Blocked) => "blocked",
+        Some(WorkState::ErrorLoop) => "error_loop",
+        None => "unknown",
+    }
 }
 
 fn session_name_of(request: &SidebandRequest) -> Option<&str> {
@@ -5412,6 +5901,9 @@ mod tests {
             runtime_dir: root.join("runtime"),
             peer_slash_commands_allowed: false,
             cross_pair_room_broadcast: false,
+            heartbeat_interval: None,
+            auto_restart_on_stall_sessions: None,
+            auto_restart_stall_threshold: None,
         })
         .unwrap()
     }
@@ -5426,6 +5918,9 @@ mod tests {
             runtime_dir: root.join("runtime"),
             peer_slash_commands_allowed: allowed,
             cross_pair_room_broadcast: false,
+            heartbeat_interval: None,
+            auto_restart_on_stall_sessions: None,
+            auto_restart_stall_threshold: None,
         })
         .unwrap()
     }
@@ -5440,6 +5935,30 @@ mod tests {
             runtime_dir: root.join("runtime"),
             peer_slash_commands_allowed: false,
             cross_pair_room_broadcast: enabled,
+            heartbeat_interval: None,
+            auto_restart_on_stall_sessions: None,
+            auto_restart_stall_threshold: None,
+        })
+        .unwrap()
+    }
+
+    fn test_supervisor_with_wrapper_defaults(
+        heartbeat_interval: Option<Duration>,
+        auto_restart_sessions: Option<Vec<String>>,
+        auto_restart_threshold: Option<Duration>,
+    ) -> SupervisorHandle {
+        let root = std::env::temp_dir().join(format!(
+            "cli-master-wrapper-defaults-test-{}",
+            Uuid::new_v4()
+        ));
+        SupervisorHandle::new(SupervisorConfig {
+            working_root: root.clone(),
+            runtime_dir: root.join("runtime"),
+            peer_slash_commands_allowed: false,
+            cross_pair_room_broadcast: false,
+            heartbeat_interval,
+            auto_restart_on_stall_sessions: auto_restart_sessions,
+            auto_restart_stall_threshold: auto_restart_threshold,
         })
         .unwrap()
     }
@@ -5573,6 +6092,44 @@ mod tests {
             .filter(|event| matches!(event, RuntimeEvent::SessionExit { .. }))
             .cloned()
             .collect()
+    }
+
+    fn supervisor_alert_events(events: &Arc<Mutex<Vec<RuntimeEvent>>>) -> Vec<RuntimeEvent> {
+        events
+            .lock()
+            .iter()
+            .filter(|event| matches!(event, RuntimeEvent::SupervisorAlert { .. }))
+            .cloned()
+            .collect()
+    }
+
+    fn dispatch_template_warning_events(
+        events: &Arc<Mutex<Vec<RuntimeEvent>>>,
+    ) -> Vec<RuntimeEvent> {
+        events
+            .lock()
+            .iter()
+            .filter(|event| matches!(event, RuntimeEvent::DispatchTemplateWarning { .. }))
+            .cloned()
+            .collect()
+    }
+
+    fn wait_for_event_count<F>(events: &Arc<Mutex<Vec<RuntimeEvent>>>, expected: usize, matches: F)
+    where
+        F: Fn(&RuntimeEvent) -> bool,
+    {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let count = events.lock().iter().filter(|event| matches(event)).count();
+            if count >= expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {expected} matching event(s); saw {count}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn session_token(supervisor: &SupervisorHandle, name: &str) -> String {
@@ -7735,6 +8292,157 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_heartbeat_fires_at_configured_interval_with_session_summary() {
+        let supervisor =
+            test_supervisor_with_wrapper_defaults(Some(Duration::from_millis(25)), None, None);
+        let events = capture_runtime_events(&supervisor);
+        set_session_dispatch_state(
+            &supervisor,
+            "codex",
+            LifecycleState::Ready,
+            Some(WorkState::Thinking),
+        );
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_mut("codex").unwrap();
+            slot.process_id = Some(4242);
+            slot.last_activity_at = Some("2026-05-18T00:00:00Z".into());
+        }
+
+        wait_for_event_count(&events, 1, |event| {
+            matches!(event, RuntimeEvent::SupervisorHeartbeat { .. })
+        });
+
+        let heartbeats = events
+            .lock()
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::SupervisorHeartbeat {
+                    wrapper_pid,
+                    sessions,
+                    ..
+                } => Some((*wrapper_pid, sessions.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!heartbeats.is_empty());
+        assert_eq!(heartbeats[0].0, std::process::id());
+        assert!(heartbeats[0].1.iter().any(|summary| {
+            summary.name == "codex"
+                && summary.lifecycle_state == LifecycleState::Ready
+                && summary.work_state == Some(WorkState::Thinking)
+                && summary.process_id == Some(4242)
+                && summary.last_activity_at.as_deref() == Some("2026-05-18T00:00:00Z")
+        }));
+    }
+
+    #[test]
+    fn request_ack_timeout_co_emits_supervisor_alert() {
+        let supervisor = test_supervisor();
+        let events = capture_runtime_events(&supervisor);
+        set_session_dispatch_state(
+            &supervisor,
+            "codex",
+            LifecycleState::Ready,
+            Some(WorkState::Blocked),
+        );
+        let context = RequestAckContext {
+            request_id: "req-timeout".into(),
+            action: "deliver_message".into(),
+            timeout: Duration::from_secs(60),
+        };
+
+        supervisor.emit_request_ack_timeout(&context, "codex", Duration::from_secs(60));
+
+        assert!(events.lock().iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RequestAckTimeout {
+                request_id,
+                session,
+                action,
+                elapsed_ms,
+                ..
+            } if request_id == "req-timeout"
+                && session == "codex"
+                && action == "deliver_message"
+                && *elapsed_ms == 60000
+        )));
+        let alerts = supervisor_alert_events(&events);
+        assert_eq!(alerts.len(), 1);
+        assert!(matches!(
+            &alerts[0],
+            RuntimeEvent::SupervisorAlert {
+                alert_type: SupervisorAlertType::AckTimeout,
+                request_id: Some(request_id),
+                session: Some(session),
+                action: Some(action),
+                last_work_state: Some(WorkState::Blocked),
+                last_session_state: Some(LifecycleState::Ready),
+                severity: AlertSeverity::Warn,
+                message,
+                ..
+            } if request_id == "req-timeout"
+                && session == "codex"
+                && action == "deliver_message"
+                && message.contains("didn't ACK in 60s")
+        ));
+    }
+
+    #[test]
+    fn deliver_message_with_completion_signal_text_emits_no_template_warning() {
+        let supervisor = test_supervisor();
+        let events = capture_runtime_events(&supervisor);
+        let (pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
+
+        let snapshot = supervisor
+            .deliver_message(DeliverMessageRequest {
+                name: "codex".into(),
+                content: "Task must call pane_signal with task_id task-410 when done.".into(),
+            })
+            .unwrap();
+
+        assert_eq!(snapshot.name, "codex");
+        assert!(dispatch_template_warning_events(&events).is_empty());
+    }
+
+    #[test]
+    fn deliver_message_without_completion_signal_text_emits_template_warning() {
+        let supervisor = test_supervisor();
+        let events = capture_runtime_events(&supervisor);
+        let (pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
+
+        supervisor
+            .deliver_message(DeliverMessageRequest {
+                name: "codex".into(),
+                content: "Please inspect the repo and report back.".into(),
+            })
+            .unwrap();
+
+        let warnings = dispatch_template_warning_events(&events);
+        assert_eq!(warnings.len(), 1);
+        let expected_missing = DISPATCH_TEMPLATE_PATTERNS
+            .iter()
+            .map(|pattern| pattern.to_string())
+            .collect::<Vec<_>>();
+        match &warnings[0] {
+            RuntimeEvent::DispatchTemplateWarning {
+                session,
+                detected_patterns,
+                missing_patterns,
+                severity: AlertSeverity::Info,
+                ..
+            } => {
+                assert_eq!(session, "codex");
+                assert!(detected_patterns.is_empty());
+                assert_eq!(missing_patterns, &expected_missing);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
     fn wait_quiet_returns_after_no_real_content_for_n_sec() {
         let supervisor = test_supervisor();
         install_synthetic_running_session(&supervisor, "claude", DriverKind::Claude);
@@ -8034,6 +8742,63 @@ mod tests {
                 ..
             }
         ));
+        wait_for_event_count(&events, 1, |event| {
+            matches!(
+                event,
+                RuntimeEvent::SessionState {
+                    session,
+                    state: LifecycleState::Ready,
+                    reason,
+                    ..
+                } if session == "codex" && reason == "session ready"
+            )
+        });
+    }
+
+    #[test]
+    fn auto_restart_on_stall_alerts_and_restarts_allowed_session() {
+        let supervisor = test_supervisor_with_wrapper_defaults(
+            None,
+            Some(vec!["codex".into()]),
+            Some(Duration::from_millis(25)),
+        );
+        let (old_pty, _, _) = mock_pty_session_with_exit_status(
+            None,
+            Some(pty_exit_status(0, None, true)),
+            MockKillBehavior::Immediate,
+        );
+        let (new_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        supervisor.set_pty_spawner_for_tests(Arc::new(QueuePtySpawner::new(vec![new_pty])));
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, old_pty);
+        let events = capture_runtime_events(&supervisor);
+
+        supervisor.handle_pty_event(
+            "codex",
+            0,
+            PtyEvent::Output("You've hit your usage limit.".into()),
+        );
+
+        wait_for_event_count(&events, 1, |event| {
+            matches!(
+                event,
+                RuntimeEvent::SupervisorAlert {
+                    alert_type: SupervisorAlertType::SessionStallDetected,
+                    session: Some(session),
+                    severity: AlertSeverity::Critical,
+                    ..
+                } if session == "codex"
+            )
+        });
+        wait_for_event_count(&events, 1, |event| {
+            matches!(
+                event,
+                RuntimeEvent::SessionExit {
+                    session,
+                    reason: SessionExitReason::RestartStop,
+                    ..
+                } if session == "codex"
+            )
+        });
         assert!(events.lock().iter().any(|event| matches!(
             event,
             RuntimeEvent::SessionState {
@@ -8043,6 +8808,110 @@ mod tests {
                 ..
             } if session == "codex" && reason == "session ready"
         )));
+        assert_eq!(
+            supervisor.inner.slots.lock().get("codex").unwrap().state,
+            LifecycleState::Ready
+        );
+    }
+
+    #[test]
+    fn auto_restart_on_stall_clears_when_state_recovers_before_threshold() {
+        let supervisor = test_supervisor_with_wrapper_defaults(
+            None,
+            Some(vec!["codex".into()]),
+            Some(Duration::from_millis(100)),
+        );
+        let (pty, _, kill_count) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
+        let events = capture_runtime_events(&supervisor);
+
+        supervisor.handle_pty_event(
+            "codex",
+            0,
+            PtyEvent::Output("You've hit your usage limit.".into()),
+        );
+        supervisor.handle_pty_event("codex", 0, PtyEvent::Output("Working 1s".into()));
+        thread::sleep(Duration::from_millis(150));
+
+        assert_eq!(kill_count.load(Ordering::SeqCst), 0);
+        assert!(supervisor_alert_events(&events).is_empty());
+        assert!(session_exit_events(&events).is_empty());
+    }
+
+    #[test]
+    fn auto_restart_on_stall_caps_fourth_restart_attempt() {
+        let supervisor = test_supervisor_with_wrapper_defaults(
+            None,
+            Some(vec!["codex".into()]),
+            Some(Duration::from_millis(25)),
+        );
+        {
+            let mut history = supervisor.inner.auto_restart_history.lock();
+            history.insert(
+                "codex".into(),
+                AutoRestartHistory {
+                    attempts: vec![Instant::now(), Instant::now(), Instant::now()],
+                    disabled: false,
+                },
+            );
+        }
+        let (pty, _, kill_count) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
+        let events = capture_runtime_events(&supervisor);
+
+        supervisor.handle_pty_event(
+            "codex",
+            0,
+            PtyEvent::Output("You've hit your usage limit.".into()),
+        );
+
+        wait_for_event_count(&events, 1, |event| {
+            matches!(
+                event,
+                RuntimeEvent::SupervisorAlert {
+                    alert_type: SupervisorAlertType::SessionStallDetected,
+                    session: Some(session),
+                    severity: AlertSeverity::Critical,
+                    message,
+                    ..
+                } if session == "codex" && message.contains("cap reached")
+            )
+        });
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(kill_count.load(Ordering::SeqCst), 0);
+        assert!(session_exit_events(&events).is_empty());
+        assert!(
+            supervisor
+                .inner
+                .auto_restart_history
+                .lock()
+                .get("codex")
+                .unwrap()
+                .disabled
+        );
+    }
+
+    #[test]
+    fn auto_restart_on_stall_disabled_by_default() {
+        let supervisor = test_supervisor_with_wrapper_defaults(
+            None,
+            Some(Vec::new()),
+            Some(Duration::from_millis(25)),
+        );
+        let (pty, _, kill_count) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
+        let events = capture_runtime_events(&supervisor);
+
+        supervisor.handle_pty_event(
+            "codex",
+            0,
+            PtyEvent::Output("You've hit your usage limit.".into()),
+        );
+        thread::sleep(Duration::from_millis(80));
+
+        assert_eq!(kill_count.load(Ordering::SeqCst), 0);
+        assert!(supervisor_alert_events(&events).is_empty());
+        assert!(session_exit_events(&events).is_empty());
     }
 
     #[test]

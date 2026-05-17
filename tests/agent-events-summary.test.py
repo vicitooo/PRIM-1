@@ -210,6 +210,65 @@ def write_fixture(path: Path) -> None:
             "timestamp": "2026-05-17T20:00:10+00:00",
         },
         {
+            "event": "supervisor_heartbeat",
+            "wrapper_pid": 4242,
+            "uptime_secs": 1800,
+            "sessions": [
+                {
+                    "name": "codex",
+                    "lifecycle_state": "ready",
+                    "work_state": "thinking",
+                    "process_id": 1234,
+                    "last_activity_at": "2026-05-17T20:00:09+00:00",
+                },
+                {
+                    "name": "claude",
+                    "lifecycle_state": "closed",
+                    "work_state": None,
+                    "process_id": None,
+                    "last_activity_at": None,
+                },
+            ],
+            "timestamp": "2026-05-17T20:00:10.200000+00:00",
+        },
+        {
+            "event": "supervisor_alert",
+            "alert_type": "ack_timeout",
+            "request_id": "req-timeout-123456",
+            "session": "codex",
+            "action": "deliver_message",
+            "last_work_state": "blocked",
+            "last_session_state": "ready",
+            "message": "Dispatch deliver_message to codex didn't ACK in 60s; last work_state=blocked",
+            "severity": "warn",
+            "timestamp": "2026-05-17T20:00:10.300000+00:00",
+        },
+        {
+            "event": "supervisor_alert",
+            "alert_type": "session_stall_detected",
+            "request_id": None,
+            "session": "codex",
+            "action": "restart_session",
+            "last_work_state": "error_loop",
+            "last_session_state": "ready",
+            "message": "Session codex stayed in error_loop for 600s; issuing auto-restart",
+            "severity": "critical",
+            "timestamp": "2026-05-17T20:00:10.400000+00:00",
+        },
+        {
+            "event": "dispatch_template_warning",
+            "request_id": "req-template-123456",
+            "session": "claude",
+            "detected_patterns": [],
+            "missing_patterns": [
+                "pane_signal",
+                "control-plane.ps1 -Action signal",
+                "task_id",
+            ],
+            "severity": "info",
+            "timestamp": "2026-05-17T20:00:10.500000+00:00",
+        },
+        {
             "event": "sideband_request_lifecycle",
             "request_id": "req-failed-123456",
             "action": "send_input",
@@ -258,10 +317,18 @@ def test_fixture_summary_and_fail_on():
         assert "req-disp" in out
         assert "req-dispatch-idle" not in out
         assert "ack_timeout" in out
+        assert "heartbeat" in out
+        assert "sessions=2 active=1" in out
+        assert "supervisor_alert" in out
+        assert "severity=critical" in out
+        assert "template_warning" in out
+        assert "pane_signal,control-plane.ps1 -Action signal,task_id" in out
         assert "lifecycle_failed" in out
 
         failed = run_summary("--audit-log", str(fixture), "--fail-on", "blocked,failed,timeout")
         assert failed.returncode == 1
+        alert_failed = run_summary("--audit-log", str(fixture), "--fail-on", "alert")
+        assert alert_failed.returncode == 1
 
 
 def test_filters_and_events_since_stdin():
@@ -285,6 +352,7 @@ def test_filters_and_events_since_stdin():
         assert "pane_signal" in stdin_result.stdout
         assert "session_exit" in stdin_result.stdout
         assert "route_delivery" in stdin_result.stdout
+        assert "supervisor_alert" in stdin_result.stdout
 
 
 def test_error_loop_work_state_counts_as_blocked():

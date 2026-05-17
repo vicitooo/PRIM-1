@@ -141,6 +141,16 @@ Work-state events:
 - output quiescence can transition a session back to `idle`
 - repeated blocked observations with the same detail can escalate to `error_loop`
 
+Supervisor default events:
+
+- `supervisor_heartbeat` is emitted automatically every `PRIM1_HEARTBEAT_INTERVAL_SECS` seconds; default is `1800`
+- heartbeat payload fields are `wrapper_pid`, `uptime_secs`, `sessions`, and `timestamp`
+- each heartbeat session summary carries `name`, `lifecycle_state`, optional `work_state`, optional `process_id`, and optional `last_activity_at`
+- `supervisor_alert` is the wrapper-owned operator attention channel; fields are `alert_type`, optional `request_id`, optional `session`, optional `action`, optional `last_work_state`, optional `last_session_state`, `message`, `severity`, and `timestamp`
+- alert types are `ack_timeout`, `session_stall_detected`, and `operator_attention`
+- alert severities are `info`, `warn`, and `critical`
+- `dispatch_template_warning` is emitted for `deliver_message` when dispatch content contains none of `pane_signal`, `control-plane.ps1 -Action signal`, or `task_id`; it is `severity: info` and does not block delivery
+
 Exit-cause events:
 
 - `session_exit` captures why a supervised process stopped separately from UI-compatible lifecycle state
@@ -202,13 +212,13 @@ Minimum fields:
 - summary
 - result
 
-`session_work_state` and `session_exit` events are part of the default signal event stream. Work-state events are derived from driver classifiers, not from explicit pane requests. Exit events are derived from PTY exit status, requested-stop intent, PTY transport errors, and liveness pruning. Both are intended for supervision dashboards, summary tools, and external pollers that need semantic state without parsing raw `session_output`.
+`session_work_state`, `session_exit`, `supervisor_heartbeat`, `supervisor_alert`, and `dispatch_template_warning` events are part of the default signal event stream. Work-state events are derived from driver classifiers, not from explicit pane requests. Exit events are derived from PTY exit status, requested-stop intent, PTY transport errors, and liveness pruning. Supervisor default events are emitted by wrapper policy so operators do not need separate heartbeat, ACK-timeout, or template-compliance monitors.
 
 Pane-bound sideband requests (`send_input`, `send_key`, `deliver_message`, `route_message`) must expose two correlated layers:
 
 - `sideband_request_lifecycle` records supervisor request processing, keyed by `request_id`
 - `dispatch_attempt` records the pre-PTY-write target state for `send_input`, `send_key`, `deliver_message`, and each resolved `route_message` recipient
-- `request_ack` records successful PTY-write completion for the target session, keyed by the same `request_id`; `request_ack_timeout` records a missing PTY-write completion after `PRIM1_REQUEST_ACK_TIMEOUT_SECS` (default 60)
+- `request_ack` records successful PTY-write completion for the target session, keyed by the same `request_id`; `request_ack_timeout` records a missing PTY-write completion after `PRIM1_REQUEST_ACK_TIMEOUT_SECS` (default 60) and co-emits `supervisor_alert` with `alert_type: "ack_timeout"` and `severity: "warn"`
 - failed or timed-out `sideband_request_lifecycle` events include optional `error` text with the same message returned to the caller
 
 Dispatch overlap rules:
@@ -227,6 +237,13 @@ Dispatch gate modes:
 - default mode and `-AllowBusy` emit `dispatch_attempt` and proceed with the PTY write
 - `-RequireIdle` emits `dispatch_attempt` and aborts before the PTY write when `overlap: true`
 - aborted `-RequireIdle` route requests emit one `dispatch_attempt` per resolved recipient, then abort the entire route without partial delivery, `request_ack`, or `route_delivery`
+
+Dispatch template warning rules:
+
+- `deliver_message` scans the content for `pane_signal`, `control-plane.ps1 -Action signal`, or `task_id`
+- if none are present, it emits `dispatch_template_warning` with `detected_patterns: []`, all three entries in `missing_patterns`, and `severity: "info"`
+- if at least one marker is present, no warning is emitted
+- warnings are advisory only; delivery still proceeds
 
 Route sideband requests expose a third delivery-truth layer:
 
@@ -263,6 +280,16 @@ Pane signal sideband requests expose a first-class completion/liveness channel:
 
 - a legacy empty touch-file is also written at `.runtime/dispatch-triggers/<task_id>.<signal_type>` for existing watchers
 - legacy touch-file write failure emits a warning `system_log` but does not roll back or suppress the canonical JSON write path
+
+Auto-restart-on-stall rules:
+
+- disabled by default; enable per pane with `PRIM1_AUTO_RESTART_ON_STALL=claude,codex`
+- threshold is `PRIM1_AUTO_RESTART_STALL_THRESHOLD_SECS`, default `600`
+- when enabled, a transition into `blocked` or `error_loop` arms a generation-bound timer for that session
+- any transition out of `blocked`/`error_loop` before the threshold cancels the timer
+- if the timer fires and the same generation is still `ready`, running, and in the same stalled work state, the wrapper emits `supervisor_alert` (`alert_type: "session_stall_detected"`, `severity: "critical"`) and internally calls the existing restart flow
+- the restart flow emits `session_exit` with `reason: "restart_stop"` for the old process and `session_state: ready` for the new process when start succeeds
+- the cap is 3 auto-restarts per session per 30-minute wrapper-lifetime window; the 4th eligible stall emits a critical `supervisor_alert`, disables further auto-restarts for that session until wrapper restart, and leaves the pane for manual intervention
 
 ## 11. Cost telemetry contract
 
