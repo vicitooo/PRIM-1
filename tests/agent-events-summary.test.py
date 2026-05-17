@@ -34,6 +34,14 @@ def write_fixture(path: Path) -> None:
             "timestamp": "2026-05-17T20:00:01+00:00",
         },
         {
+            "event": "session_work_state",
+            "session": "codex",
+            "state": "thinking",
+            "detail": "Working 12s",
+            "previous_state": "idle",
+            "timestamp": "2026-05-17T20:00:01.500000+00:00",
+        },
+        {
             "event": "route_delivery",
             "request_id": "req-route-ok",
             "route_id": "route-ok-123456",
@@ -196,6 +204,8 @@ def test_fixture_summary_and_fail_on():
         assert "pane_signal" in out
         assert "type=done" in out
         assert "type=blocked" in out
+        assert "work_state" in out
+        assert "idle->thinking" in out
         assert "route_delivery" in out
         assert "2/2 written, 0 failed" in out
         assert "2/3 written, 1 failed: claude" in out
@@ -229,6 +239,32 @@ def test_filters_and_events_since_stdin():
         assert "route_delivery" in stdin_result.stdout
 
 
+def test_error_loop_work_state_counts_as_blocked():
+    events = {
+        "events": [
+            {
+                "event": "session_work_state",
+                "session": "codex",
+                "state": "error_loop",
+                "detail": "usage_limit",
+                "previous_state": "blocked",
+                "timestamp": "2026-05-17T20:00:01.500000+00:00",
+            }
+        ]
+    }
+
+    result = run_summary(
+        "--events-since-stdin",
+        "--fail-on",
+        "blocked",
+        input_text=json.dumps(events),
+    )
+
+    assert result.returncode == 1
+    assert "blocked->error_loop" in result.stdout
+
+
 if __name__ == "__main__":
     test_fixture_summary_and_fail_on()
     test_filters_and_events_since_stdin()
+    test_error_loop_work_state_counts_as_blocked()

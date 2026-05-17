@@ -21,7 +21,7 @@ use shared_types::{
     EventFilter, LaunchSpec, LifecycleState, LogLevel, MessageScope, PaneSignalType,
     RouteDeliveryPhase, RouteMessageRequest, RuntimeEvent, RuntimeSnapshot, SendInputRequest,
     SessionDefinition, SessionGeneration, SessionSnapshot, SidebandPhase, SidebandRequest,
-    SidebandResponse, SidebandResponsePayload, WaitQuietRequest, now_rfc3339,
+    SidebandResponse, SidebandResponsePayload, WaitQuietRequest, WorkState, now_rfc3339,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use uuid::Uuid;
@@ -455,6 +455,9 @@ struct QuiesceTimer {
 struct SessionSlot {
     definition: SessionDefinition,
     state: LifecycleState,
+    work_state: WorkState,
+    work_detail: Option<String>,
+    work_error_observations: HashMap<String, Vec<Instant>>,
     running: Option<RunningSession>,
     generation: SessionGeneration,
     process_id: Option<u32>,
@@ -601,6 +604,9 @@ fn renamed_closed_slot(slot: SessionSlot, definition: SessionDefinition) -> Sess
     SessionSlot {
         definition,
         state: LifecycleState::Closed,
+        work_state: WorkState::Idle,
+        work_detail: None,
+        work_error_observations: HashMap::new(),
         running: None,
         generation: slot.generation,
         process_id: None,
@@ -615,6 +621,9 @@ fn closed_session_slot(definition: SessionDefinition) -> SessionSlot {
     SessionSlot {
         definition,
         state: LifecycleState::Closed,
+        work_state: WorkState::Idle,
+        work_detail: None,
+        work_error_observations: HashMap::new(),
         running: None,
         generation: 0,
         process_id: None,
@@ -753,6 +762,7 @@ impl SupervisorHandle {
                 kind.as_str(),
                 "session_output"
                     | "session_state"
+                    | "session_work_state"
                     | "pair_created"
                     | "pair_renamed"
                     | "pair_deleted"
@@ -1244,7 +1254,7 @@ impl SupervisorHandle {
         armed_at: Instant,
         threshold: Duration,
     ) {
-        let (maybe_event, stale_drop) = {
+        let (events, stale_drop) = {
             let mut slots = self.inner.slots.lock();
             let Some(slot) = slots.get_mut(&session_name) else {
                 return;
@@ -1258,31 +1268,34 @@ impl SupervisorHandle {
                     {
                         slot.state = LifecycleState::Idle;
                         slot.last_activity_at = Some(now_rfc3339());
-                        (
-                            Some(RuntimeEvent::SessionState {
-                                session: session_name.clone(),
-                                state: LifecycleState::Idle,
-                                reason: format!("quiesce timeout {}s", threshold.as_secs()),
-                                timestamp: now_rfc3339(),
-                            }),
-                            false,
-                        )
+                        let mut events = vec![RuntimeEvent::SessionState {
+                            session: session_name.clone(),
+                            state: LifecycleState::Idle,
+                            reason: format!("quiesce timeout {}s", threshold.as_secs()),
+                            timestamp: now_rfc3339(),
+                        }];
+                        if let Some(event) =
+                            transition_work_state_locked(&session_name, slot, WorkState::Idle, None)
+                        {
+                            events.push(event);
+                        }
+                        (events, false)
                     } else {
-                        (None, true)
+                        (Vec::new(), true)
                     }
                 }
                 Some(timer) => {
                     slot.quiesce_timer = Some(timer);
-                    (None, true)
+                    (Vec::new(), true)
                 }
-                None => (None, true),
+                None => (Vec::new(), true),
             }
         };
 
         if stale_drop {
             self.note_stale_quiesce_drop(&session_name, armed_generation);
         }
-        if let Some(event) = maybe_event {
+        for event in events {
             self.emit(event);
         }
     }
@@ -1392,6 +1405,7 @@ impl SupervisorHandle {
                 slot.process_id = None;
                 slot.last_activity_at = Some(now_rfc3339());
                 slot.last_real_output_at = None;
+                reset_work_state_locked(slot);
                 if let Some(mut running) = slot.running.take()
                     && let Some(pty) = running.pty.take()
                 {
@@ -1581,6 +1595,7 @@ impl SupervisorHandle {
             slot.process_id = None;
             slot.last_activity_at = Some(now_rfc3339());
             slot.last_real_output_at = None;
+            reset_work_state_locked(slot);
             slot.running.take().and_then(|running| running.pty)
         };
 
@@ -1652,6 +1667,7 @@ impl SupervisorHandle {
             slot.last_error = None;
             slot.last_activity_at = Some(now_rfc3339());
             slot.last_real_output_at = None;
+            reset_work_state_locked(slot);
             let snapshot = slot.snapshot();
             let mut definition = slot.definition.clone();
             definition.args.extend(extra_args.clone());
@@ -1694,6 +1710,7 @@ impl SupervisorHandle {
                     slot.state = LifecycleState::Ready;
                     slot.last_activity_at = Some(now_rfc3339());
                     slot.last_real_output_at = None;
+                    reset_work_state_locked(slot);
                     slot.snapshot()
                 };
                 self.emit(RuntimeEvent::SystemLog {
@@ -1720,6 +1737,7 @@ impl SupervisorHandle {
                     slot.state = LifecycleState::Failed;
                     slot.last_error = Some(error.to_string());
                     slot.last_real_output_at = None;
+                    reset_work_state_locked(slot);
                     let snapshot = slot.snapshot();
                     drop(slots);
                     self.emit(RuntimeEvent::SystemLog {
@@ -1758,6 +1776,7 @@ impl SupervisorHandle {
             cancel_quiesce_timer_locked(slot);
             slot.state = LifecycleState::Restarting;
             slot.last_activity_at = Some(now_rfc3339());
+            reset_work_state_locked(slot);
             let snapshot = slot.snapshot();
             drop(slots);
             self.emit(RuntimeEvent::SessionState {
@@ -2189,6 +2208,7 @@ impl SupervisorHandle {
                 slot.last_activity_at = Some(timestamp.clone());
                 slot.last_error = None;
                 cancel_quiesce_timer_locked(slot);
+                reset_work_state_locked(slot);
 
                 log_events.push(RuntimeEvent::SystemLog {
                     level: LogLevel::Warn,
@@ -2253,7 +2273,7 @@ impl SupervisorHandle {
             PtyEvent::Output(chunk) => {
                 let has_real_content = chunk_has_real_content(&chunk);
                 let real_output_at = has_real_content.then(Instant::now);
-                let (transitioned_to_ready, quiesce_arm) = {
+                let (transitioned_to_ready, quiesce_arm, work_state_event) = {
                     let mut slots = self.inner.slots.lock();
                     if let Some(slot) = slots.get_mut(session_name) {
                         let transitioned = slot.state != LifecycleState::Ready;
@@ -2261,14 +2281,19 @@ impl SupervisorHandle {
                             slot.state = LifecycleState::Ready;
                             slot.last_activity_at = Some(now_rfc3339());
                         }
+                        let work_state_event =
+                            classify_work_state_for_driver(slot.definition.driver, &chunk)
+                                .and_then(|(state, detail)| {
+                                    transition_work_state_locked(session_name, slot, state, detail)
+                                });
                         let quiesce_arm = real_output_at.map(|armed_at| {
                             slot.last_real_output_at = Some(armed_at);
                             cancel_quiesce_timer_locked(slot);
                             (slot.definition.driver, slot.generation, armed_at)
                         });
-                        (transitioned, quiesce_arm)
+                        (transitioned, quiesce_arm, work_state_event)
                     } else {
-                        (false, None)
+                        (false, None, None)
                     }
                 };
 
@@ -2283,6 +2308,10 @@ impl SupervisorHandle {
                         reason: "session emitted output".into(),
                         timestamp: now_rfc3339(),
                     });
+                }
+
+                if let Some(event) = work_state_event {
+                    self.emit(event);
                 }
 
                 self.emit(RuntimeEvent::SessionOutput {
@@ -2302,6 +2331,7 @@ impl SupervisorHandle {
                         slot.last_activity_at = Some(now_rfc3339());
                         slot.last_real_output_at = None;
                         cancel_quiesce_timer_locked(slot);
+                        reset_work_state_locked(slot);
                     }
                 }
                 self.emit(RuntimeEvent::SessionState {
@@ -2322,6 +2352,7 @@ impl SupervisorHandle {
                         slot.last_activity_at = Some(now_rfc3339());
                         slot.last_real_output_at = None;
                         cancel_quiesce_timer_locked(slot);
+                        reset_work_state_locked(slot);
                     }
                 }
                 self.emit(RuntimeEvent::SystemLog {
@@ -3659,6 +3690,63 @@ fn cancel_quiesce_timer_locked(slot: &mut SessionSlot) {
     }
 }
 
+fn reset_work_state_locked(slot: &mut SessionSlot) {
+    slot.work_state = WorkState::Idle;
+    slot.work_detail = None;
+    slot.work_error_observations.clear();
+}
+
+fn classify_work_state_for_driver(
+    driver: DriverKind,
+    chunk: &str,
+) -> Option<(WorkState, Option<String>)> {
+    match driver {
+        DriverKind::Claude => driver_claude::classify_work_state(chunk),
+        DriverKind::Codex => driver_codex::classify_work_state(chunk),
+        DriverKind::GenericTerminal => None,
+    }
+}
+
+fn transition_work_state_locked(
+    session_name: &str,
+    slot: &mut SessionSlot,
+    mut state: WorkState,
+    detail: Option<String>,
+) -> Option<RuntimeEvent> {
+    if state == WorkState::Blocked {
+        if let Some(key) = detail.as_deref() {
+            let now = Instant::now();
+            let observations = slot
+                .work_error_observations
+                .entry(key.to_string())
+                .or_default();
+            observations.retain(|seen_at| now.duration_since(*seen_at) <= Duration::from_secs(60));
+            observations.push(now);
+            if observations.len() > 2 {
+                state = WorkState::ErrorLoop;
+            }
+        }
+    } else if state != WorkState::ErrorLoop {
+        slot.work_error_observations.clear();
+    }
+
+    if slot.work_state == state {
+        slot.work_detail = detail;
+        return None;
+    }
+
+    let previous_state = Some(slot.work_state);
+    slot.work_state = state;
+    slot.work_detail = detail.clone();
+    Some(RuntimeEvent::SessionWorkState {
+        session: session_name.to_string(),
+        state,
+        detail,
+        previous_state,
+        timestamp: now_rfc3339(),
+    })
+}
+
 fn quiesce_threshold(driver: DriverKind) -> Option<Duration> {
     let threshold = match driver {
         DriverKind::Claude => Duration::from_secs(3),
@@ -3674,6 +3762,7 @@ fn event_kind(event: &RuntimeEvent) -> &'static str {
     match event {
         RuntimeEvent::SessionOutput { .. } => "session_output",
         RuntimeEvent::SessionState { .. } => "session_state",
+        RuntimeEvent::SessionWorkState { .. } => "session_work_state",
         RuntimeEvent::PairCreated { .. } => "pair_created",
         RuntimeEvent::PairRenamed { .. } => "pair_renamed",
         RuntimeEvent::PairDeleted { .. } => "pair_deleted",
@@ -3696,7 +3785,8 @@ fn event_matches_filter(event: &RuntimeEvent, filter: &EventFilter) -> bool {
     if !filter.include_sessions.is_empty() {
         let session_match = match event {
             RuntimeEvent::SessionOutput { session, .. }
-            | RuntimeEvent::SessionState { session, .. } => filter
+            | RuntimeEvent::SessionState { session, .. }
+            | RuntimeEvent::SessionWorkState { session, .. } => filter
                 .include_sessions
                 .iter()
                 .any(|candidate| candidate == session),
@@ -4819,6 +4909,15 @@ mod tests {
             .lock()
             .iter()
             .filter(|event| matches!(event, RuntimeEvent::PaneSignal { .. }))
+            .cloned()
+            .collect()
+    }
+
+    fn work_state_events(events: &Arc<Mutex<Vec<RuntimeEvent>>>) -> Vec<RuntimeEvent> {
+        events
+            .lock()
+            .iter()
+            .filter(|event| matches!(event, RuntimeEvent::SessionWorkState { .. }))
             .cloned()
             .collect()
     }
@@ -6522,6 +6621,7 @@ mod tests {
                 "route_delivery".into(),
                 "pane_signal".into(),
                 "session_state".into(),
+                "session_work_state".into(),
                 "system_log".into(),
                 "sideband_request_lifecycle".into(),
                 "request_ack".into(),
@@ -6872,6 +6972,110 @@ mod tests {
             RuntimeEvent::SystemLog { message, .. }
                 if message.contains("Dropped stale quiesce timer")
         )));
+    }
+
+    #[test]
+    fn work_state_transitions_idle_thinking_idle() {
+        let supervisor = test_supervisor();
+        install_synthetic_running_session(&supervisor, "codex", DriverKind::Codex);
+        let events = capture_runtime_events(&supervisor);
+
+        supervisor.handle_pty_event("codex", 0, PtyEvent::Output("Working 12s".into()));
+        let armed_at = {
+            let slots = supervisor.inner.slots.lock();
+            slots.get("codex").unwrap().last_real_output_at.unwrap()
+        };
+        supervisor.fire_quiesce_timer("codex".into(), 0, armed_at, Duration::from_secs(2));
+
+        let work_events = work_state_events(&events);
+        assert_eq!(work_events.len(), 2);
+        match &work_events[0] {
+            RuntimeEvent::SessionWorkState {
+                session,
+                state,
+                previous_state,
+                detail,
+                ..
+            } => {
+                assert_eq!(session, "codex");
+                assert_eq!(*state, WorkState::Thinking);
+                assert_eq!(*previous_state, Some(WorkState::Idle));
+                assert_eq!(detail.as_deref(), Some("Working 12s"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        match &work_events[1] {
+            RuntimeEvent::SessionWorkState {
+                session,
+                state,
+                previous_state,
+                detail,
+                ..
+            } => {
+                assert_eq!(session, "codex");
+                assert_eq!(*state, WorkState::Idle);
+                assert_eq!(*previous_state, Some(WorkState::Thinking));
+                assert_eq!(detail, &None);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn work_state_identical_thinking_chunks_emit_once() {
+        let supervisor = test_supervisor();
+        install_synthetic_running_session(&supervisor, "codex", DriverKind::Codex);
+        let events = capture_runtime_events(&supervisor);
+
+        for idx in 0..5 {
+            supervisor.handle_pty_event("codex", 0, PtyEvent::Output(format!("Working {idx}s")));
+        }
+
+        let work_events = work_state_events(&events);
+        assert_eq!(work_events.len(), 1);
+        assert!(matches!(
+            &work_events[0],
+            RuntimeEvent::SessionWorkState {
+                state: WorkState::Thinking,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn work_state_repeated_blocked_hint_escalates_to_error_loop() {
+        let supervisor = test_supervisor();
+        install_synthetic_running_session(&supervisor, "codex", DriverKind::Codex);
+        let events = capture_runtime_events(&supervisor);
+
+        for _ in 0..3 {
+            supervisor.handle_pty_event(
+                "codex",
+                0,
+                PtyEvent::Output("You've hit your usage limit.".into()),
+            );
+        }
+
+        let work_events = work_state_events(&events);
+        assert_eq!(work_events.len(), 2);
+        assert!(matches!(
+            &work_events[0],
+            RuntimeEvent::SessionWorkState {
+                state: WorkState::Blocked,
+                detail: Some(detail),
+                previous_state: Some(WorkState::Idle),
+                ..
+            } if detail == "usage_limit"
+        ));
+        assert!(matches!(
+            &work_events[1],
+            RuntimeEvent::SessionWorkState {
+                state: WorkState::ErrorLoop,
+                detail: Some(detail),
+                previous_state: Some(WorkState::Blocked),
+                ..
+            } if detail == "usage_limit"
+        ));
     }
 
     #[test]

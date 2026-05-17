@@ -105,7 +105,7 @@ Example:
 ```
 
 - `agent-events.ps1`
-  Outside-supervisor convenience wrapper over `control-plane.ps1 -Action events_since`. Uses `.runtime/cursors/<consumer>.json`, starts from `null` on first run, writes `next_cursor` back atomically, and prints one compressed JSON line per event.
+  Outside-supervisor convenience wrapper over `control-plane.ps1 -Action events_since`. Uses `.runtime/cursors/<consumer>.json`, starts from `null` on first run, writes `next_cursor` back atomically, and prints one compressed JSON line per event. Default signal events include route receipts, pane signals, session lifecycle, session work-state, system logs, sideband lifecycle, and request ACK events.
 
 Example:
 
@@ -114,7 +114,7 @@ Example:
 ```
 
 - `agent-events-summary.py`
-  Human-readable summary helper for the receipt/signal event families emitted by the control plane. Reads a JSONL audit log directly, or `events_since` JSON from stdin. Groups `route_delivery` phases into one logical route line and summarizes `pane_signal`, `request_ack`, `request_ack_timeout`, and failed/timed-out sideband lifecycle events.
+  Human-readable summary helper for the receipt/signal event families emitted by the control plane. Reads a JSONL audit log directly, or `events_since` JSON from stdin. Groups `route_delivery` phases into one logical route line and summarizes `pane_signal`, `session_work_state`, `request_ack`, `request_ack_timeout`, and failed/timed-out sideband lifecycle events.
 
 Examples:
 

@@ -1,6 +1,49 @@
 use std::path::Path;
 
-use shared_types::{DriverKind, LaunchSpec, SessionDefinition};
+use shared_types::{DriverKind, LaunchSpec, SessionDefinition, WorkState};
+
+pub fn classify_work_state(chunk: &str) -> Option<(WorkState, Option<String>)> {
+    let normalized = chunk.replace('\u{2026}', "...");
+    let lower = normalized.to_ascii_lowercase();
+
+    if lower.contains("stream disconnected")
+        || lower.contains("retry your request")
+        || lower.contains("network error")
+        || lower.contains("timed out")
+    {
+        return Some((WorkState::Blocked, Some("stream_disconnected".into())));
+    }
+
+    if lower.contains("rate limit") || lower.contains("usage limit") {
+        return Some((WorkState::ErrorLoop, Some("rate_limit".into())));
+    }
+    if lower.contains("api error") {
+        return Some((WorkState::ErrorLoop, Some("api_error".into())));
+    }
+    if lower.contains("context length exceeded") || lower.contains("context_length_exceeded") {
+        return Some((WorkState::ErrorLoop, Some("context_length_exceeded".into())));
+    }
+
+    if normalized.contains("Thinking...") || normalized.contains("Thinking ") {
+        return Some((WorkState::Thinking, Some("Thinking...".into())));
+    }
+
+    if lower.contains("tool use")
+        || lower.contains("tool_use")
+        || lower.contains("<tool")
+        || lower.contains("⏺")
+        || lower.contains("●")
+        || lower.contains("⎿")
+    {
+        return Some((WorkState::ToolCall, None));
+    }
+
+    if lower.contains("? for shortcuts") || lower.contains("esc to interrupt") {
+        return Some((WorkState::Idle, None));
+    }
+
+    None
+}
 
 pub fn default_session(working_dir: &str) -> SessionDefinition {
     SessionDefinition {
@@ -100,9 +143,7 @@ fn wrapper_root_for_session(working_dir: &str) -> String {
     if is_wrapper_root {
         working_dir.to_string()
     } else {
-        path.join(&wrapper_name)
-            .to_string_lossy()
-            .into_owned()
+        path.join(&wrapper_name).to_string_lossy().into_owned()
     }
 }
 
@@ -187,5 +228,47 @@ mod tests {
     #[test]
     fn wrapper_root_helper_keeps_existing_wrapper_path() {
         assert_eq!(wrapper_root_for_session(WRAPPER_ROOT), WRAPPER_ROOT);
+    }
+
+    #[test]
+    fn classify_claude_thinking_markers() {
+        assert_eq!(
+            classify_work_state("Thinking…").unwrap().0,
+            WorkState::Thinking
+        );
+        assert_eq!(
+            classify_work_state("Thinking... next").unwrap().0,
+            WorkState::Thinking
+        );
+    }
+
+    #[test]
+    fn classify_claude_error_and_blocked_patterns() {
+        assert_eq!(
+            classify_work_state("stream disconnected before completion").unwrap(),
+            (WorkState::Blocked, Some("stream_disconnected".into()))
+        );
+        assert_eq!(
+            classify_work_state("API Error: rate limit exceeded")
+                .unwrap()
+                .0,
+            WorkState::ErrorLoop
+        );
+        assert_eq!(
+            classify_work_state("context length exceeded").unwrap(),
+            (WorkState::ErrorLoop, Some("context_length_exceeded".into()))
+        );
+    }
+
+    #[test]
+    fn classify_claude_tool_and_idle_patterns() {
+        assert_eq!(
+            classify_work_state("⏺ Read(file)").unwrap().0,
+            WorkState::ToolCall
+        );
+        assert_eq!(
+            classify_work_state("? for shortcuts").unwrap().0,
+            WorkState::Idle
+        );
     }
 }

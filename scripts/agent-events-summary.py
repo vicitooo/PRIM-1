@@ -18,6 +18,7 @@ from typing import Iterable
 
 SUMMARY_EVENTS = {
     "pane_signal",
+    "session_work_state",
     "route_delivery",
     "request_ack",
     "request_ack_timeout",
@@ -244,6 +245,17 @@ def event_to_line(event: dict, sequence: int) -> SummaryLine | None:
             f"{format_time(timestamp)} pane_signal      task={event.get('task_id') or '?'}  "
             f"type={signal_type}  session={event.get('session') or '?'}  "
             f"summary={quote_summary(event.get('summary'))}"
+        )
+        return SummaryLine(timestamp, sequence, line, conditions)
+
+    if kind == "session_work_state":
+        state = str(event.get("state") or "?")
+        conditions = {"blocked"} if state in {"blocked", "error_loop"} else set()
+        detail = f"  detail={quote_summary(event.get('detail'))}" if event.get("detail") else ""
+        previous = event.get("previous_state") or "?"
+        line = (
+            f"{format_time(timestamp)} work_state       session={event.get('session') or '?'}  "
+            f"{previous}->{state}{detail}"
         )
         return SummaryLine(timestamp, sequence, line, conditions)
 

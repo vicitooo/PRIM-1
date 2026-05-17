@@ -131,6 +131,7 @@ Behavior:
   - `route_delivery`
   - `pane_signal`
   - `system_log`
+  - `session_work_state`
   - `control_plane_ready`
   - `sideband_request_lifecycle`
   - `request_ack`
@@ -174,6 +175,7 @@ What callers see:
 - every sideband response includes `request_id` when the request decoded successfully
 - pane-bound `send_input`, `key`, `deliver`, and `route` requests emit `request_ack` after PTY writes complete; if the write path remains incomplete past `PRIM1_REQUEST_ACK_TIMEOUT_SECS` (default 60), they emit `request_ack_timeout`
 - `route` requests emit `route_delivery` with one `resolved` event for the resolved pane fan-out and one `written` or `failed` event per pane recipient; each event carries `request_id`, `route_id`, `logical_to`, `recipient_count`, `payload_part_count`, `bytes_written`, and optional `error`
+- pane output can emit `session_work_state` on semantic work-state transitions only; events carry `session`, `state`, optional `detail`, `previous_state`, and `timestamp`
 - `signal` requests emit one `pane_signal` event with `request_id`, resolved `session`, `task_id`, `signal_type`, `summary`, `artifact_paths`, `commit_sha`, and `timestamp`
 - failed or timed-out `sideband_request_lifecycle` audit events include an optional `error` field with the response message
 - `timed_out: true` now returns exit code `124`
@@ -263,7 +265,7 @@ Outside-supervisor convenience wrapper over `control-plane.ps1 -Action events_si
 Defaults:
 
 - consumer cursor file: `.runtime/cursors/outside-supervisor.json`
-- kinds: `routed_message`, `route_delivery`, `pane_signal`, `session_state`, `system_log`, `sideband_request_lifecycle`, `request_ack`, `request_ack_timeout`
+- kinds: `routed_message`, `route_delivery`, `pane_signal`, `session_state`, `session_work_state`, `system_log`, `sideband_request_lifecycle`, `request_ack`, `request_ack_timeout`
 - `-MaxWaitSeconds 15`
 - `-MaxEvents 200`
 
@@ -432,3 +434,5 @@ Recommended outside-supervisor pattern:
 - cursor file: `.runtime/cursors/<consumer>.json`
 
 `wait_quiet` remains a synchronous "no real output for N seconds" helper. `session_state: idle` from `events_since` is the better "probably done" signal for ongoing supervision because it is emitted into the audit log and guarded by session generation.
+
+`session_work_state` supplements lifecycle state with semantic pane activity. The supervisor emits it only when a driver's classifier changes state, including quiesce-driven `idle` transitions, so consumers should not expect one event per output chunk. States are `idle`, `thinking`, `tool_call`, `blocked`, and `error_loop`; repeated blocked hints with the same detail can escalate to `error_loop`.

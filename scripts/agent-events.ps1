@@ -3,7 +3,7 @@ param(
   [string]$CursorFile,
   [int]$MaxEvents = 200,
   [int]$MaxWaitSeconds = 15,
-  [string[]]$IncludeKinds = @("routed_message", "route_delivery", "pane_signal", "session_state", "system_log", "sideband_request_lifecycle", "request_ack", "request_ack_timeout"),
+  [string[]]$IncludeKinds = @("routed_message", "route_delivery", "pane_signal", "session_state", "session_work_state", "system_log", "sideband_request_lifecycle", "request_ack", "request_ack_timeout"),
   [string[]]$IncludeSessions,
   [string[]]$IncludeScopes,
   [string]$InfoFile

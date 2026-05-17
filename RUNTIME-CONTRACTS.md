@@ -132,6 +132,15 @@ Meaning:
 - output implies liveness
 - lack of output while busy implies stall risk
 
+Work-state events:
+
+- `session_work_state` captures semantic pane activity separately from lifecycle state
+- allowed work states: `idle`, `thinking`, `tool_call`, `blocked`, `error_loop`
+- each event carries `session`, `state`, optional `detail`, optional `previous_state`, and `timestamp`
+- events are transition-based; repeated output in the same work state updates supervisor memory but does not emit another audit event
+- output quiescence can transition a session back to `idle`
+- repeated blocked observations with the same detail can escalate to `error_loop`
+
 ## 8. Restart contract
 
 Agents never restart peers directly.
@@ -179,6 +188,8 @@ Minimum fields:
 - lifecycle state
 - summary
 - result
+
+`session_work_state` events are part of the default signal event stream. They are derived from driver classifiers, not from explicit pane requests, and are intended for supervision dashboards, summary tools, and external pollers that need semantic state without parsing raw `session_output`.
 
 Pane-bound sideband requests (`send_input`, `send_key`, `deliver_message`, `route_message`) must expose two correlated layers:
 

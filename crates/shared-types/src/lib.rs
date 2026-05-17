@@ -35,6 +35,16 @@ pub enum LifecycleState {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
+pub enum WorkState {
+    Idle,
+    Thinking,
+    ToolCall,
+    Blocked,
+    ErrorLoop,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
 pub enum MessageScope {
     Direct,
     Room,
@@ -202,8 +212,9 @@ pub struct EventFilter {
 
 impl EventFilter {
     pub const ALL_KINDS: &'static str = "all";
-    pub const DEFAULT_INCLUDE_KINDS: [&'static str; 12] = [
+    pub const DEFAULT_INCLUDE_KINDS: [&'static str; 13] = [
         "session_state",
+        "session_work_state",
         "pair_created",
         "pair_renamed",
         "pair_deleted",
@@ -247,6 +258,13 @@ pub enum RuntimeEvent {
         session: String,
         state: LifecycleState,
         reason: String,
+        timestamp: String,
+    },
+    SessionWorkState {
+        session: String,
+        state: WorkState,
+        detail: Option<String>,
+        previous_state: Option<WorkState>,
         timestamp: String,
     },
     PairCreated {
@@ -643,6 +661,33 @@ mod tests {
     }
 
     #[test]
+    fn session_work_state_event_round_trips_via_json() {
+        let event = RuntimeEvent::SessionWorkState {
+            session: "codex".into(),
+            state: WorkState::Thinking,
+            detail: Some("Working 12s".into()),
+            previous_state: Some(WorkState::Idle),
+            timestamp: "2026-05-17T00:00:00Z".into(),
+        };
+
+        let value = serde_json::to_value(event.clone()).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "event": "session_work_state",
+                "session": "codex",
+                "state": "thinking",
+                "detail": "Working 12s",
+                "previous_state": "idle",
+                "timestamp": "2026-05-17T00:00:00Z",
+            })
+        );
+
+        let roundtrip: RuntimeEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(roundtrip, event);
+    }
+
+    #[test]
     fn route_delivery_event_round_trips_via_json() {
         let event = RuntimeEvent::RouteDelivery {
             request_id: "req-1".into(),
@@ -931,6 +976,30 @@ mod tests {
     }
 
     #[test]
+    fn work_state_uses_snake_case_for_all_variants() {
+        assert_eq!(
+            serde_json::to_value(WorkState::Idle).unwrap(),
+            json!("idle")
+        );
+        assert_eq!(
+            serde_json::to_value(WorkState::Thinking).unwrap(),
+            json!("thinking")
+        );
+        assert_eq!(
+            serde_json::to_value(WorkState::ToolCall).unwrap(),
+            json!("tool_call")
+        );
+        assert_eq!(
+            serde_json::to_value(WorkState::Blocked).unwrap(),
+            json!("blocked")
+        );
+        assert_eq!(
+            serde_json::to_value(WorkState::ErrorLoop).unwrap(),
+            json!("error_loop")
+        );
+    }
+
+    #[test]
     fn pane_signal_response_payload_round_trips() {
         let payload = SidebandResponsePayload::PaneSignal {
             signal_path: ".runtime/signals/task-418__done__20260517T000000.000Z.json".into(),
@@ -1001,6 +1070,13 @@ mod tests {
         let filter = EventFilter::default();
 
         assert!(filter.includes_kind("pane_signal"));
+    }
+
+    #[test]
+    fn filter_default_includes_session_work_state() {
+        let filter = EventFilter::default();
+
+        assert!(filter.includes_kind("session_work_state"));
     }
 
     #[test]
