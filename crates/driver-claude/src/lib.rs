@@ -66,17 +66,41 @@ pub fn launch_spec(definition: &SessionDefinition) -> LaunchSpec {
 }
 
 fn wrapper_root_for_session(working_dir: &str) -> String {
+    // Explicit override via env var — canonical mechanism for pointing the
+    // Claude pane's --add-dir at the wrapper's source tree, regardless of
+    // where the pane's working_dir sits in the user's filesystem.
+    if let Ok(root) = std::env::var("PRIM1_WRAPPER_ROOT") {
+        let trimmed = root.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    // Fallback heuristic: assume the wrapper lives at <working_dir>/<name>.
+    // <name> defaults to "PRIM-1" (the canonical repo name); can be
+    // overridden via PRIM1_WRAPPER_DIRNAME for users who clone under a
+    // different directory name. "CLI-master-wrapper" is recognized as a
+    // wrapper root for backward compatibility with pre-rename setups.
+    let wrapper_name = std::env::var("PRIM1_WRAPPER_DIRNAME")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "PRIM-1".to_string());
+
     let path = Path::new(working_dir);
     let is_wrapper_root = path
         .file_name()
         .and_then(|name| name.to_str())
-        .map(|name| name.eq_ignore_ascii_case("CLI-master-wrapper"))
+        .map(|name| {
+            name.eq_ignore_ascii_case(&wrapper_name)
+                || name.eq_ignore_ascii_case("CLI-master-wrapper")
+        })
         .unwrap_or(false);
 
     if is_wrapper_root {
         working_dir.to_string()
     } else {
-        path.join("CLI-master-wrapper")
+        path.join(&wrapper_name)
             .to_string_lossy()
             .into_owned()
     }
@@ -89,12 +113,12 @@ mod tests {
     #[cfg(windows)]
     const WORKSPACE_ROOT: &str = r"C:\Users\example\workspace";
     #[cfg(windows)]
-    const WRAPPER_ROOT: &str = r"C:\Users\example\workspace\CLI-master-wrapper";
+    const WRAPPER_ROOT: &str = r"C:\Users\example\workspace\PRIM-1";
 
     #[cfg(not(windows))]
     const WORKSPACE_ROOT: &str = "/home/example/workspace";
     #[cfg(not(windows))]
-    const WRAPPER_ROOT: &str = "/home/example/workspace/CLI-master-wrapper";
+    const WRAPPER_ROOT: &str = "/home/example/workspace/PRIM-1";
 
     #[cfg(windows)]
     #[test]

@@ -2,10 +2,10 @@ use anyhow::Context;
 use shared_types::{SidebandRequest, SidebandResponse};
 
 #[cfg(windows)]
-pub const DEFAULT_ENDPOINT: &str = r"\\.\pipe\cli-master-wrapper";
+pub const DEFAULT_ENDPOINT: &str = r"\\.\pipe\prim1";
 
 #[cfg(not(windows))]
-pub const DEFAULT_ENDPOINT: &str = "/tmp/cli-master-wrapper.sock";
+pub const DEFAULT_ENDPOINT: &str = "/tmp/prim1.sock";
 
 pub fn decode_request(raw: &str) -> anyhow::Result<SidebandRequest> {
     serde_json::from_str(strip_utf8_bom(raw)).context("failed to decode sideband request")
