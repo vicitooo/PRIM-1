@@ -13,8 +13,12 @@ members = [
 
 [workspace.package]
 edition = "2024"
-authors = ["Victor", "Codex"]
-license = "MIT"
+authors = ["Victor Valtchev"]
+license = "Apache-2.0"
+repository = "https://github.com/vicitooo/PRIM-1"
+description = "PRIM-1 — local multi-agent runtime for terminal-first AI tools (Claude Code + Codex CLI in supervised PTY panes with structured peer routing)."
+keywords = ["agents", "ai", "pty", "tauri", "runtime"]
+readme = "README.md"
 
 [workspace.dependencies]
 anyhow = "1.0.102"

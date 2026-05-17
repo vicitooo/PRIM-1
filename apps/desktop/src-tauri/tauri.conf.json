@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Bridge 0.4",
+  "productName": "PRIM-1",
   "version": "0.1.0",
-  "identifier": "com.alex.omniaprime",
+  "identifier": "io.prim1.runtime",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -13,7 +13,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "Bridge 0.4",
+        "title": "PRIM-1",
         "width": 1560,
         "height": 980,
         "minWidth": 1280,

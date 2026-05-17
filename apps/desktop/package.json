@@ -1,8 +1,16 @@
 {
-  "name": "cli-master-wrapper-desktop",
-  "private": true,
+  "name": "prim1-desktop",
   "version": "0.1.0",
   "type": "module",
+  "description": "PRIM-1 desktop runtime — Tauri shell hosting supervised PTY panes for Claude Code + Codex CLI.",
+  "author": "Victor Valtchev",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vicitooo/PRIM-1.git",
+    "directory": "apps/desktop"
+  },
+  "homepage": "https://github.com/vicitooo/PRIM-1",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
