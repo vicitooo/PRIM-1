@@ -218,62 +218,14 @@ The later 24/7 orchestration use cases are built on top of that, not before it.
 
 ## Canonical docs
 
-- [ARCHITECTURE.md](ARCHITECTURE.md)
-  Full system shape: supervisor, PTY host, drivers, bus, UI, lifecycle, security.
-
-- [IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md)
-  Build phases, milestones, first slices, and open questions.
-
-- [ROADMAP.md](ROADMAP.md)
-  Clarified future direction: generic terminals, dynamic panes, workspace/home model, multi-instance IDs, and cross-platform work.
-
-- [ARCHITECTURE-REVIEW.md](ARCHITECTURE-REVIEW.md)
-  Current-state review: strengths, weak spots, modularity, portability, and what still separates the current app from a true universal terminal wrapper.
-
-- [STACK-DECISIONS.md](STACK-DECISIONS.md)
-  Locked decisions, v1 scope cuts, unresolved items, and decision guardrails.
-
-- [RUNTIME-CONTRACTS.md](RUNTIME-CONTRACTS.md)
-  Message envelopes, routing rules, lifecycle semantics, permissions, audit schema.
-
-- [PHASE-0-RESEARCH.md](PHASE-0-RESEARCH.md)
-  The exact research/prototype checklist before implementation starts.
-
-- [TASK-BREAKDOWN.md](TASK-BREAKDOWN.md)
-  Work packages, dependencies, phase budgets, and what gets built in what order.
-
-- [PROJECT-STRUCTURE.md](PROJECT-STRUCTURE.md)
-  File/folder layout and the role of each crate/app/module.
-
-## Relationship to existing bridge code
-
-The existing `tools/agent-bridge/agent_bridge.py` is the main starting point, not throwaway code.
-
-What it already gives:
-
-- subprocess spawning
-- session registry
-- watcher pattern
-- Codex driver logic
-- partial Claude driver logic
-- archive and dispatch patterns
-
-What this project changes:
-
-- replaces file-only bridging with a supervisor/runtime model
-- replaces kill-on-DONE with lifecycle policy
-- replaces hardcoded Claude/Codex branching with generic drivers
-- adds owned PTYs and a visible room
-
-## Migration stance
-
-The existing bridge is not being ripped out immediately.
-
-For v1:
-
-- the bridge remains usable for current workflows
-- `CLI-master-wrapper` is built in parallel
-- migration decisions happen only after the room MVP is proven
+- [ARCHITECTURE.md](ARCHITECTURE.md) — Full system shape: supervisor, PTY host, drivers, bus, UI, lifecycle, security.
+- [RUNTIME-CONTRACTS.md](RUNTIME-CONTRACTS.md) — Message envelopes, routing rules, lifecycle semantics, permissions, audit schema.
+- [CONTROL-SURFACE.md](CONTROL-SURFACE.md) — Operator + agent control surface (scripts, shortcuts, command reference).
+- [STACK-DECISIONS.md](STACK-DECISIONS.md) — Locked decisions, v1 scope cuts, unresolved items, decision guardrails.
+- [ROADMAP.md](ROADMAP.md) — Forward direction: generic terminals, dynamic panes, workspace/home model, cross-platform work.
+- [instructions.md](instructions.md) — Inter-agent handshake instructions and canonical routing protocol.
+- [qa/MASTER.md](qa/MASTER.md) — Known-good versions, verified primitives, active bug catalog.
+- [CODEX_TODO.md](CODEX_TODO.md) — Codex's living task scratchpad (referenced by inside-Codex pane).
 
 ## Non-goals for v1
 
