@@ -1,4 +1,4 @@
-# CLI-master-wrapper — Runtime Contracts
+# PRIM-1 — Runtime Contracts
 
 **Status:** Drafted for implementation
 **Date:** 2026-04-14

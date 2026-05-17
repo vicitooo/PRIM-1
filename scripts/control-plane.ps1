@@ -8,7 +8,7 @@ param(
   [string]$Name,
   [ValidateSet("enter", "up", "down", "left", "right", "tab", "esc", "ctrl_c")]
   [string]$Key,
-  [string]$From = "victor",
+  [string]$From = "operator",
   [string]$To,
   [ValidateSet("direct", "room", "system", "private")]
   [string]$Scope = "direct",

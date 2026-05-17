@@ -10,16 +10,19 @@ Examples:
     # Last 10 room events
     python supervisor-routed-events.py --last 10
 
-    # All events with tag prefix CRM-python supervisor-routed-events.py --tag CRM-# Count + category breakdown for a campaign
-    python supervisor-routed-events.py --tag CRM--summary
+    # All events with tag prefix CAMPAIGN-A
+    python supervisor-routed-events.py --tag CAMPAIGN-A
+
+    # Count + category breakdown for a campaign
+    python supervisor-routed-events.py --tag CAMPAIGN-A --summary
 
     # All events where codex routed to room
     python supervisor-routed-events.py --from codex --to room --last 20
 
-Rule reference: memory/feedback_prim1_room_protocol_discipline.md
 """
 import argparse
 import json
+import os
 import re
 import sys
 from collections import Counter
@@ -28,7 +31,10 @@ from pathlib import Path
 
 
 def find_audit_path() -> Path:
-    audit_dir = Path("./.runtime/audit")
+    audit_dir = Path(
+        os.environ.get("PRIM1_AUDIT_DIR")
+        or Path(__file__).resolve().parent.parent / ".runtime" / "audit"
+    )
     files = sorted(audit_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not files:
         print(f"no audit files in {audit_dir}", file=sys.stderr)
@@ -47,7 +53,7 @@ def iter_lines(path: Path):
 
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tag", help="Filter to events whose content starts with this tag prefix (e.g. CRM-)")
+    ap.add_argument("--tag", help="Filter to events whose content starts with this tag prefix (e.g. CAMPAIGN-A)")
     ap.add_argument("--from", dest="from_", help="Filter by from pane (claude / codex / outside-claude)")
     ap.add_argument("--to", help="Filter by to pane (claude / codex / room)")
     ap.add_argument("--last", type=int, default=None, help="Show only the last N matching events")

@@ -1,6 +1,6 @@
-# Sub-scope A — BUILD_A_V1 plan excerpt (synthetic fixture)
+# Scenario A divergence plan excerpt (synthetic fixture)
 
-Mirrors the real BUILD_A_V1 failure: plan locked 50 integration
+Mirrors a BUILD-report divergence: plan locked 50 integration
 tests across 8 spec files; tree actually had 29 tests across 6 files.
 Used as a regression fixture for the verifier.
 

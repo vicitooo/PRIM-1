@@ -120,7 +120,7 @@ try {
       "-File", $controlPlaneScript,
       "-Action", "deliver",
       "-Session", "claude",
-      "-Content", "hello from victor",
+      "-Content", "hello from operator",
       "-InfoFile", $testRuntime.InfoPath,
       "-Quiet"
     )
@@ -131,7 +131,7 @@ try {
     $captured = Get-Content -LiteralPath $testRuntime.CapturePath -Raw | ConvertFrom-Json
     Assert-Equal $captured.kind "deliver_message" "Expected a deliver_message sideband request."
     Assert-Equal $captured.name "claude" "Expected deliver to preserve the target session."
-    Assert-Equal $captured.content "hello from victor" "Expected deliver to preserve the message body."
+    Assert-Equal $captured.content "hello from operator" "Expected deliver to preserve the message body."
   } finally {
     if ($job) {
       Remove-Job -Job $job -Force -ErrorAction SilentlyContinue

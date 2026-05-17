@@ -1,4 +1,4 @@
-# CLI-master-wrapper — Roadmap
+# PRIM-1 — Roadmap
 
 **Status:** Directional roadmap after the first real Windows MVP
 **Date:** 2026-04-15

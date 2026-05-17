@@ -32,16 +32,11 @@ interface PaneGroup {
 
 type PairFocusTarget = "create" | "delete" | `rename:${string}` | null;
 
-const RESERVED_PAIR_NAMES = new Set(["main", "claude", "codex", "room", "victor", "alex"]);
+const RESERVED_PAIR_NAMES = new Set(["main", "claude", "codex", "room", "operator"]);
 const PAIR_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
 const PAIR_NAME_MAX_LEN = 48;
 
-/** Display alias for pane titles — theme rebrand.
-    Claude (or {pair}-claude) → ALT (Alt Cunningham)
-    Codex  (or {pair}-codex)  → SO MI (Songbird) */
-function paneDisplayTitle(name: string, original: string): string {
-  if (name === "claude" || name.endsWith("-claude")) return "ALT";
-  if (name === "codex"  || name.endsWith("-codex"))  return "SO MI";
+function paneDisplayTitle(_name: string, original: string): string {
   return original;
 }
 
@@ -52,32 +47,32 @@ if (!(app instanceof HTMLDivElement)) {
 
 app.innerHTML = `
   <div class="app-shell">
-    <div class="blackwall-ticker" aria-hidden="true">
-      <div class="blackwall-ticker-track">
-        <span class="blackwall-ticker-cell">INTEGRITY <span class="blackwall-ticker-glyph">&#9635;</span> 98.6%</span>
-        <span class="blackwall-ticker-sep">&#9670;</span>
-        <span class="blackwall-ticker-cell">BLACKWALL <span class="blackwall-ticker-glyph">&#8756;</span> STABLE</span>
-        <span class="blackwall-ticker-sep">&#9670;</span>
-        <span class="blackwall-ticker-cell">CHANNELS: ALT // SO MI</span>
-        <span class="blackwall-ticker-sep">&#9670;</span>
-        <span class="blackwall-ticker-cell">LATENCY: 12.4ms</span>
-        <span class="blackwall-ticker-sep">&#9670;</span>
-        <span class="blackwall-ticker-cell">BREACH ATTEMPTS: 0</span>
-        <span class="blackwall-ticker-sep">&#9670;</span>
-        <span class="blackwall-ticker-cell">ROGUE AI SIGNATURES: NULL</span>
-        <span class="blackwall-ticker-sep">&#9670;</span>
-        <span class="blackwall-ticker-cell">FW VERSION: 2.4.0</span>
-        <span class="blackwall-ticker-sep">&#9670;</span>
-        <span class="blackwall-ticker-cell">NET STATUS: GREEN</span>
-        <span class="blackwall-ticker-sep">&#9670;</span>
-        <span class="blackwall-ticker-cell">NCPD ICE: NEUTRAL</span>
-        <span class="blackwall-ticker-sep">&#9670;</span>
-        <span class="blackwall-ticker-cell">TRAUMA TEAM: STANDBY</span>
-        <span class="blackwall-ticker-sep">&#9670;</span>
-        <span class="blackwall-ticker-cell">BLACKWALL <span class="blackwall-ticker-glyph">&#8756;</span> STABLE</span>
-        <span class="blackwall-ticker-sep">&#9670;</span>
-        <span class="blackwall-ticker-cell">UPLINK: ENCRYPTED</span>
-        <span class="blackwall-ticker-sep">&#9670;</span>
+    <div class="prim1-ticker" aria-hidden="true">
+      <div class="prim1-ticker-track">
+        <span class="prim1-ticker-cell">INTEGRITY <span class="prim1-ticker-glyph">&#9635;</span> 98.6%</span>
+        <span class="prim1-ticker-sep">&#9670;</span>
+        <span class="prim1-ticker-cell">PRIM-1 <span class="prim1-ticker-glyph">&#8756;</span> STABLE</span>
+        <span class="prim1-ticker-sep">&#9670;</span>
+        <span class="prim1-ticker-cell">CHANNELS: CLAUDE // CODEX</span>
+        <span class="prim1-ticker-sep">&#9670;</span>
+        <span class="prim1-ticker-cell">LATENCY: 12.4ms</span>
+        <span class="prim1-ticker-sep">&#9670;</span>
+        <span class="prim1-ticker-cell">BREACH ATTEMPTS: 0</span>
+        <span class="prim1-ticker-sep">&#9670;</span>
+        <span class="prim1-ticker-cell">UNHANDLED EVENTS: 0</span>
+        <span class="prim1-ticker-sep">&#9670;</span>
+        <span class="prim1-ticker-cell">FW VERSION: 2.4.0</span>
+        <span class="prim1-ticker-sep">&#9670;</span>
+        <span class="prim1-ticker-cell">NET STATUS: GREEN</span>
+        <span class="prim1-ticker-sep">&#9670;</span>
+        <span class="prim1-ticker-cell">ACCESS CHECKS: PASS</span>
+        <span class="prim1-ticker-sep">&#9670;</span>
+        <span class="prim1-ticker-cell">RECOVERY: STANDBY</span>
+        <span class="prim1-ticker-sep">&#9670;</span>
+        <span class="prim1-ticker-cell">PRIM-1 <span class="prim1-ticker-glyph">&#8756;</span> STABLE</span>
+        <span class="prim1-ticker-sep">&#9670;</span>
+        <span class="prim1-ticker-cell">UPLINK: ENCRYPTED</span>
+        <span class="prim1-ticker-sep">&#9670;</span>
       </div>
     </div>
     <header class="topbar panel">
@@ -101,7 +96,7 @@ app.innerHTML = `
       </svg>
       <div class="topbar-brand">
         <div class="brand-logo-frame" aria-hidden="true">
-          <img class="brand-logo" src="/textures/logo.png" alt="" />
+          <span class="brand-logo" aria-hidden="true">P1</span>
           <svg class="brand-logo-bracket" viewBox="0 0 60 60" aria-hidden="true">
             <path d="M 0 14 L 0 0 L 14 0" style="stroke: var(--bronze)" stroke-width="2" fill="none" stroke-linecap="square" />
             <path d="M 46 0 L 60 0 L 60 14" style="stroke: var(--bronze)" stroke-width="2" fill="none" stroke-linecap="square" />
@@ -111,7 +106,7 @@ app.innerHTML = `
             <path d="M 60 22 L 60 38" style="stroke: var(--copper-hot)" stroke-width="1.5" fill="none" opacity="0.7" />
           </svg>
         </div>
-        <h1>Bridge 0.4</h1>
+        <h1>PRIM-1 0.4</h1>
         <span class="topbar-active-tag">Active pair</span>
       </div>
       <div class="topbar-status">
@@ -571,7 +566,7 @@ const routeToCombobox = new Combobox(
   "route-to",
 );
 routeFromCombobox.setOptions([
-  { value: "alex", label: "Alex" },
+  { value: "operator", label: "Operator" },
   { value: "claude", label: paneDisplayTitle("claude", "Claude") },
   { value: "codex", label: paneDisplayTitle("codex", "Codex") },
 ]);
@@ -606,7 +601,7 @@ let paneButtonsWired = false;
    3) Add the name to THEME_CYCLE if you want it in the picker rotation */
 
 const TERMINAL_THEMES = {
-  blackwall: {
+  prim1: {
     session: {
       background: "#03060a",
       foreground: "#ff2d8c",
@@ -638,7 +633,7 @@ const TERMINAL_THEMES = {
       white: "#b8e8ff", brightWhite: "#e0f7ff",
     },
   },
-  "blackwall-deep": {
+  "prim1-deep": {
     session: {
       background: "#000000",
       foreground: "#ff5cb8",
@@ -708,11 +703,11 @@ type ThemeName = keyof typeof TERMINAL_THEMES;
 
 /** Themes the picker cycles through. `light` is intentionally excluded \u2014 kept
     in TERMINAL_THEMES + styles.css for future repair but not user-exposed. */
-const THEME_CYCLE: ThemeName[] = ["blackwall", "blackwall-deep"];
+const THEME_CYCLE: ThemeName[] = ["prim1", "prim1-deep"];
 
 const THEME_LABELS: Record<ThemeName, { glyph: string; label: string }> = {
-  blackwall:        { glyph: "\u25C7", label: "BLACKWALL" },       // \u25C7 open diamond
-  "blackwall-deep": { glyph: "\u25C6", label: "BLACKWALL DEEP" },  // \u25C6 filled diamond
+  prim1:        { glyph: "\u25C7", label: "PRIM-1" },       // \u25C7 open diamond
+  "prim1-deep": { glyph: "\u25C6", label: "PRIM-1 DEEP" },  // \u25C6 filled diamond
   light:            { glyph: "\u25C8", label: "LIGHT" },
 };
 
@@ -740,7 +735,7 @@ function applyTheme(name: ThemeName): void {
 function currentThemeName(): ThemeName {
   const stored = document.documentElement.dataset.theme;
   if (stored && stored in TERMINAL_THEMES) return stored as ThemeName;
-  return "blackwall";
+  return "prim1";
 }
 
 function wireThemeToggle(): void {
@@ -758,7 +753,7 @@ function wireThemeToggle(): void {
     "R;G;B" so banner text stays in sync with the current theme. */
 function brandBannerAnsi(): string {
   const raw = getComputedStyle(document.documentElement)
-    .getPropertyValue("--blackwall")
+    .getPropertyValue("--prim1")
     .trim();
   const m = raw.match(/^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i);
   if (!m) return "255;45;140";
@@ -776,12 +771,12 @@ function secondaryAnsiRgb(): string {
   return `${parseInt(m[1], 16)};${parseInt(m[2], 16)};${parseInt(m[3], 16)}`;
 }
 
-/** Load saved theme from localStorage, migrating legacy "dark" \u2192 "blackwall" */
+/** Load saved theme from localStorage, migrating legacy "dark" \u2192 "prim1" */
 function loadSavedTheme(): ThemeName {
   const raw = localStorage.getItem("prim1-theme");
-  if (raw === "dark" || raw === null) return "blackwall";
+  if (raw === "dark" || raw === null) return "prim1";
   if (raw in TERMINAL_THEMES) return raw as ThemeName;
-  return "blackwall";
+  return "prim1";
 }
 
 applyTheme(loadSavedTheme());
@@ -1684,13 +1679,13 @@ function populateRouterOptions(sessions: SessionSnapshot[]): void {
   const sessionNames = sessions.map((session) => session.name);
 
   const fromOptions: ComboboxOption[] = [
-    { value: "alex", label: "Alex" },
+    { value: "operator", label: "Operator" },
     ...sessions.map((s) => ({ value: s.name, label: paneDisplayTitle(s.name, s.title) })),
   ];
   routeFromCombobox.setOptions(fromOptions);
-  routeFromCombobox.value = previousFrom === "alex" || sessionNames.includes(previousFrom)
+  routeFromCombobox.value = previousFrom === "operator" || sessionNames.includes(previousFrom)
     ? previousFrom
-    : "alex";
+    : "operator";
 
   const toOptions: ComboboxOption[] = [
     ...sessions.map((s) => ({ value: s.name, label: paneDisplayTitle(s.name, s.title) })),

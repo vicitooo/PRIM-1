@@ -5,10 +5,10 @@ enumerate the claimed counts against the actual tree, exit 0 on match or
 1 on divergence. Designed to be runnable by a plan-gate builder pre-commit
 as a self-check, AND by a supervisor during BUILD diff review.
 
-Motivation: autonomous run surfaced codex BUILD-report honesty
-regressions (sub-scope A claimed 30 integration tests / tree had 29 /
-plan locked 50 — 86% shortfall). Sub-agent diff review caught it; codex
-self-verification did not. This script is the mechanical fallback.
+Motivation: an autonomous run surfaced BUILD-report honesty regressions
+(sub-scope A claimed fewer integration tests than the locked plan required).
+Sub-agent diff review caught it; self-verification did not. This script is
+the mechanical fallback.
 
 Usage:
     python verify-build-report.py --plan <path> --subscope <label> [options]
@@ -32,9 +32,7 @@ Parser rules:
     Nested describe(...) blocks do not affect test-block counts — the
     regex matches `test(` / `it(` line-anchored regardless of nesting.
 
-Tested in CLI-master-wrapper/scripts/tests/test_verify_build_report.py.
-
-Rule: memory/feedback_build_report_structural_verification.md.
+Tested in scripts/tests/test_verify_build_report.py.
 """
 from __future__ import annotations
 

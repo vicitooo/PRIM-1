@@ -9,10 +9,6 @@
  * The handler operates on an injected RuntimeEventContext rather than
  * module-level globals. main.ts constructs a production ctx wiring the
  * live DOM + supervisor; tests construct a mock ctx with spy functions.
- *
- * Rule references:
- *   memory/feedback_maintainability_bar.md (non-author navigability)
- *   CLI-master-wrapper/STATE-SYNC-AUDIT-2026-04-22.md (Gap 1, Gap 2)
  */
 
 import type { RuntimeEvent, SessionSnapshot } from "./types";

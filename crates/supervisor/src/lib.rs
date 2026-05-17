@@ -31,7 +31,7 @@ type EventSink = Arc<dyn Fn(RuntimeEvent) + Send + Sync>;
 const CONTROL_PLANE_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const CONTROL_PLANE_PROBE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const PAIR_NAME_MAX_LEN: usize = 48;
-const RESERVED_PAIR_NAMES: [&str; 5] = ["main", "claude", "codex", "room", "victor"];
+const RESERVED_PAIR_NAMES: [&str; 5] = ["main", "claude", "codex", "room", "operator"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SubmitBehavior {
@@ -459,7 +459,7 @@ fn pair_slot_names(name: &str) -> (String, String) {
 ///
 /// - `claude` and `codex` (the protected main pair) -> `"main"`
 /// - `<prefix>-claude` and `<prefix>-codex` -> `<prefix>`
-/// - any other name -> the name itself (singleton pair, e.g. `victor`)
+/// - any other name -> the name itself (singleton pair, e.g. `operator`)
 ///
 /// `"main"` is collision-safe because it is reserved by `validate_pair_name`.
 fn pair_of(session_name: &str) -> &str {
@@ -4567,7 +4567,7 @@ mod tests {
             "claude".to_string(),
             "codex".to_string(),
             "room".to_string(),
-            "victor".to_string(),
+            "operator".to_string(),
             "with space".to_string(),
             "with/slash".to_string(),
             "with.dot".to_string(),
@@ -4744,7 +4744,7 @@ mod tests {
 
     #[test]
     fn pair_of_singleton_for_non_convention_names() {
-        assert_eq!(pair_of("victor"), "victor");
+        assert_eq!(pair_of("operator"), "operator");
         assert_eq!(pair_of("supervisor"), "supervisor");
     }
 
@@ -4901,7 +4901,7 @@ mod tests {
     fn routed_message_payload_ends_with_terminal_submit() {
         let payload = routed_message_payload(
             &RouteMessageRequest {
-                from: "victor".into(),
+                from: "operator".into(),
                 to: "claude".into(),
                 scope: MessageScope::Direct,
                 content: "tell me a joke".into(),
@@ -4910,7 +4910,7 @@ mod tests {
         );
 
         assert!(payload.ends_with('\n'));
-        assert!(payload.contains("[Direct message from victor]"));
+        assert!(payload.contains("[Direct message from operator]"));
         assert!(payload.contains("tell me a joke"));
     }
 
@@ -4918,7 +4918,7 @@ mod tests {
     fn codex_payload_is_single_line() {
         let payload = routed_message_payload(
             &RouteMessageRequest {
-                from: "victor".into(),
+                from: "operator".into(),
                 to: "codex".into(),
                 scope: MessageScope::Direct,
                 content: "tell me\na joke".into(),
@@ -4927,14 +4927,14 @@ mod tests {
         );
 
         assert!(!payload.contains('\n'));
-        assert_eq!(payload, "[Direct message from victor] tell me a joke");
+        assert_eq!(payload, "[Direct message from operator] tell me a joke");
     }
 
     #[test]
     fn claude_payload_stays_multiline_even_with_delayed_submit() {
         let payload = routed_message_payload(
             &RouteMessageRequest {
-                from: "victor".into(),
+                from: "operator".into(),
                 to: "claude".into(),
                 scope: MessageScope::Direct,
                 content: "tell me\na joke".into(),
@@ -4944,7 +4944,7 @@ mod tests {
 
         assert!(payload.starts_with('\n'));
         assert!(payload.ends_with('\n'));
-        assert!(payload.contains("[Direct message from victor]"));
+        assert!(payload.contains("[Direct message from operator]"));
         assert!(payload.contains("tell me\na joke"));
     }
 
@@ -4952,7 +4952,7 @@ mod tests {
     fn generic_terminal_payload_uses_multiline_prompt_shape() {
         let payload = routed_message_payload(
             &RouteMessageRequest {
-                from: "victor".into(),
+                from: "operator".into(),
                 to: "terminal".into(),
                 scope: MessageScope::Direct,
                 content: "hello".into(),
@@ -4962,7 +4962,7 @@ mod tests {
 
         assert!(payload.starts_with('\n'));
         assert!(payload.ends_with('\n'));
-        assert!(payload.contains("[Direct message from victor]"));
+        assert!(payload.contains("[Direct message from operator]"));
         assert!(payload.contains("hello"));
     }
 
@@ -6457,7 +6457,7 @@ mod tests {
         let response = supervisor.apply_sideband_request(SidebandRequest::RouteMessage {
             token: status.token.clone(),
             request: RouteMessageRequest {
-                from: "victor".into(),
+                from: "operator".into(),
                 to: "claude".into(),
                 scope: MessageScope::Direct,
                 content: "hi".into(),
@@ -6488,7 +6488,7 @@ mod tests {
                 scope,
                 content,
                 ..
-            } if from == "victor"
+            } if from == "operator"
                 && to == "claude"
                 && *scope == MessageScope::Direct
                 && content == "hi"
@@ -6501,7 +6501,7 @@ mod tests {
 
         let error = supervisor
             .route_message(RouteMessageRequest {
-                from: "victor".into(),
+                from: "operator".into(),
                 to: "claude".into(),
                 scope: MessageScope::Direct,
                 content: "hello".into(),

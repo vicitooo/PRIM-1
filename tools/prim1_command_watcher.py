@@ -586,7 +586,7 @@ def load_config(script_path: Path, runtime_dir: Optional[Path], config_path: Opt
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="PRIM-001 slash-command watcher")
+    parser = argparse.ArgumentParser(description="PRIM-1 slash-command watcher")
     parser.add_argument("--runtime-dir", type=Path, default=None)
     parser.add_argument("--config", type=Path, default=None)
     parser.add_argument("--control-plane-info", type=Path, default=None)

@@ -1,4 +1,4 @@
-# CLI-master-wrapper — Stack Decisions
+# PRIM-1 — Stack Decisions
 
 **Status:** Locked unless explicitly changed
 **Date:** 2026-04-14
@@ -111,7 +111,7 @@ V1 includes:
 
 - one supervised Claude instance
 - one supervised Codex instance
-- Victor in the room
+- the operator in the room
 - direct messages
 - room broadcast
 - supervisor-controlled restart/close
@@ -120,7 +120,7 @@ V1 includes:
 
 V1 excludes:
 
-- Telegram
+- external notification
 - remote operator mode
 - multi-machine federation
 - agent trees / sub-agent orchestration
@@ -135,7 +135,7 @@ The first real use case is:
 
 That means:
 
-- Victor talks to Claude and Codex in the same app
+- the operator talks to Claude and Codex in the same app
 - Claude and Codex can message each other through the supervisor
 - all communication is visible in real time
 
@@ -163,7 +163,7 @@ The existing bridge is not replaced on day one.
 Plan:
 
 - keep the existing bridge operational
-- build `CLI-master-wrapper` in parallel
+- build `PRIM-1` in parallel
 - only decide migration/cutover after the room MVP works
 
 ## 9. Open decisions that remain

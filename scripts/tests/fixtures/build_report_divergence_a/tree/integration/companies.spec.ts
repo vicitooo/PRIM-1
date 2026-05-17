@@ -1,4 +1,4 @@
-// Synthetic fixture — BUILD_A_V1 divergence reproducer.
+// Synthetic fixture - scenario A divergence reproducer.
 import { test } from "vitest";
 
 test("companies list", () => {});

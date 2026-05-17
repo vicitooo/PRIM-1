@@ -11,12 +11,12 @@ Usage:
     python supervisor-detect-stream-errors.py [--window-minutes N] [audit-path]
 
 If audit-path is omitted, defaults to most recent *.jsonl in
-CLI-master-wrapper/.runtime/audit/. Window defaults to 90 minutes.
+PRIM1_AUDIT_DIR, or <repo-root>/.runtime/audit. Window defaults to 90 minutes.
 
-Rule reference: memory/feedback_codex_stream_recovery_silent.md
 Related supervisor script: supervisor-last-pane-activity.py
 """
 import json
+import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -37,7 +37,10 @@ ERROR_RE = re.compile("|".join(ERROR_PATTERNS), re.IGNORECASE)
 
 
 def find_audit_path() -> Path:
-    audit_dir = Path("./.runtime/audit")
+    audit_dir = Path(
+        os.environ.get("PRIM1_AUDIT_DIR")
+        or Path(__file__).resolve().parent.parent / ".runtime" / "audit"
+    )
     files = sorted(audit_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not files:
         print(f"no audit files in {audit_dir}", file=sys.stderr)

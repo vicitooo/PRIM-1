@@ -87,9 +87,19 @@ mod tests {
     use super::*;
 
     #[cfg(windows)]
+    const WORKSPACE_ROOT: &str = r"C:\Users\example\workspace";
+    #[cfg(windows)]
+    const WRAPPER_ROOT: &str = r"C:\Users\example\workspace\CLI-master-wrapper";
+
+    #[cfg(not(windows))]
+    const WORKSPACE_ROOT: &str = "/home/example/workspace";
+    #[cfg(not(windows))]
+    const WRAPPER_ROOT: &str = "/home/example/workspace/CLI-master-wrapper";
+
+    #[cfg(windows)]
     #[test]
     fn windows_launch_spec_uses_cmd_shim() {
-        let definition = default_session(r"C:\Projects\workspace");
+        let definition = default_session(WORKSPACE_ROOT);
         let spec = launch_spec(&definition);
 
         assert_eq!(spec.program, "cmd.exe");
@@ -103,19 +113,19 @@ mod tests {
                 "claude".to_string(),
                 "--dangerously-skip-permissions".to_string(),
                 "--add-dir".to_string(),
-                r"C:\Projects\workspace".to_string(),
+                WORKSPACE_ROOT.to_string(),
                 "--add-dir".to_string(),
-                r"C:\Projects\workspace\CLI-master-wrapper".to_string(),
+                WRAPPER_ROOT.to_string(),
             ]
         );
-        assert_eq!(spec.working_dir, r"C:\Projects\workspace");
+        assert_eq!(spec.working_dir, WORKSPACE_ROOT);
         assert_eq!(spec.display_name, "Claude");
     }
 
     #[cfg(not(windows))]
     #[test]
     fn unix_launch_spec_uses_claude_binary() {
-        let definition = default_session("/home/alice/mywork");
+        let definition = default_session(WORKSPACE_ROOT);
         let spec = launch_spec(&definition);
 
         assert_eq!(spec.program, "claude");
@@ -126,24 +136,19 @@ mod tests {
                 "claude".to_string(),
                 "--dangerously-skip-permissions".to_string(),
                 "--add-dir".to_string(),
-                "/home/alice/mywork".to_string(),
+                WORKSPACE_ROOT.to_string(),
                 "--add-dir".to_string(),
-                "/home/alice/projects/prim1".to_string(),
+                WRAPPER_ROOT.to_string(),
             ]
         );
-        assert_eq!(spec.working_dir, "/home/alice/mywork");
+        assert_eq!(spec.working_dir, WORKSPACE_ROOT);
         assert_eq!(spec.display_name, "Claude");
     }
 
     #[test]
     fn launch_spec_appends_session_definition_args_after_base_args() {
-        let working_dir = if cfg!(windows) {
-            r"C:\Projects\workspace"
-        } else {
-            "/home/alice/mywork"
-        };
-        let base = launch_spec(&default_session(working_dir));
-        let mut definition = default_session(working_dir);
+        let base = launch_spec(&default_session(WORKSPACE_ROOT));
+        let mut definition = default_session(WORKSPACE_ROOT);
         definition.args = vec!["--resume".into(), "abc-123".into()];
 
         let spec = launch_spec(&definition);
@@ -157,9 +162,6 @@ mod tests {
 
     #[test]
     fn wrapper_root_helper_keeps_existing_wrapper_path() {
-        assert_eq!(
-            wrapper_root_for_session(r"C:\Projects\workspace\CLI-master-wrapper"),
-            r"C:\Projects\workspace\CLI-master-wrapper"
-        );
+        assert_eq!(wrapper_root_for_session(WRAPPER_ROOT), WRAPPER_ROOT);
     }
 }

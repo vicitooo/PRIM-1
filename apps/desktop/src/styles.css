@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════
-   OMNIA PRIME — TACTICAL HUD INTERFACE
+   PRIM-1 — TACTICAL HUD INTERFACE
    Yellow primary frame, cyan secondary detail, magenta destructive.
    Pure-black field, sharp angular geometry, fixed-pixel SVG corners
    so chamfers never distort with aspect ratio.
@@ -28,10 +28,10 @@
   --red-bright:    #ff4350;
   --red-deep:      #a8141d;
 
-  /* ── Bridge identity — magenta-pink for BLACKWALL 0.4 brand + ALT / SO MI pane titles ── */
-  --blackwall:        #ff2d8c;
-  --blackwall-deep:   #b22556;
-  --blackwall-glow:   rgba(255, 45, 140, 0.6);
+  /* ── PRIM-1 identity — magenta-pink for brand and pane titles ── */
+  --prim1:        #ff2d8c;
+  --prim1-deep:   #b22556;
+  --prim1-glow:   rgba(255, 45, 140, 0.6);
 
   /* ── Semantic action colors ── */
   --green:         #5dbabe; /* Launch */
@@ -51,7 +51,7 @@
   /* ── Corner overlay sizing ── */
   --corner: 56px;
 
-  /* ── Radii (cyberpunk = sharp) ── */
+  /* ── Radii: sharp geometry ── */
   --radius-sm: 0;
   --radius-md: 0;
   --radius-lg: 0;
@@ -341,11 +341,20 @@ button, input, select, textarea { font: inherit; }
 }
 .brand-logo {
   width: 48px;
-  height: auto;
+  height: 48px;
   position: absolute;
   top: 50%;
   left: 50%;
   transform: translate(-50%, -50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: "Rajdhani", "Montserrat", system-ui, sans-serif;
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0;
+  color: var(--bronze);
   filter: drop-shadow(0 0 12px color-mix(in srgb, var(--bronze) 60%, transparent));
   user-select: none;
   pointer-events: none;
@@ -367,7 +376,7 @@ button, input, select, textarea { font: inherit; }
   line-height: 1;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--blackwall);
+  color: var(--prim1);
   text-shadow:
     0 0 12px rgba(255, 45, 140, 0.7),
     0 0 28px rgba(255, 45, 140, 0.35),
@@ -447,9 +456,9 @@ button, input, select, textarea { font: inherit; }
   color: var(--text-primary);
 }
 
-/* Terminal pane titles (ALT / SO MI) — blackwall magenta */
+/* Terminal pane titles — PRIM-1 magenta */
 .terminal-card .card-head h2 {
-  color: var(--blackwall);
+  color: var(--prim1);
   text-shadow:
     0 0 10px rgba(255, 45, 140, 0.65),
     0 0 22px rgba(255, 45, 140, 0.25),
@@ -467,7 +476,7 @@ button, input, select, textarea { font: inherit; }
 }
 
 .group-picker .card-head h2 {
-  color: var(--blackwall);
+  color: var(--prim1);
   font-size: 19px;
   text-shadow:
     0 0 10px rgba(255, 45, 140, 0.6),
@@ -956,9 +965,9 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
 }
 
 .group-chip[data-active="true"] {
-  --btn-color: var(--blackwall);
+  --btn-color: var(--prim1);
   --btn-glow: rgba(255, 45, 140, 0.65);
-  color: var(--blackwall);
+  color: var(--prim1);
   background: transparent;
   text-shadow:
     0 0 8px rgba(255, 45, 140, 0.7),
@@ -976,7 +985,7 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
 }
 
 .group-chip[data-active="true"]::before {
-  background: var(--blackwall);
+  background: var(--prim1);
   box-shadow: 0 0 8px rgba(255, 45, 140, 0.7);
 }
 
@@ -1107,7 +1116,7 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
 }
 .pair-dialog h3 {
   margin: 0;
-  color: var(--blackwall);
+  color: var(--prim1);
   font-family: "Rajdhani", "Montserrat", system-ui, sans-serif;
   font-size: 16px;
   font-weight: 700;
@@ -1478,11 +1487,11 @@ textarea:focus-visible {
   line-height: 1;
   flex-shrink: 0;
   z-index: 2;
-  color: var(--blackwall);
-  border-color: var(--blackwall);
-  --btn-color: var(--blackwall);
-  --btn-glow: var(--blackwall-glow);
-  text-shadow: 0 0 6px var(--blackwall-glow);
+  color: var(--prim1);
+  border-color: var(--prim1);
+  --btn-color: var(--prim1);
+  --btn-glow: var(--prim1-glow);
+  text-shadow: 0 0 6px var(--prim1-glow);
 }
 
 /* ══════════════════════════════════════
@@ -1497,13 +1506,13 @@ textarea:focus-visible {
 ::selection { background: var(--copper-hot); color: #ffffff; }
 
 /* ══════════════════════════════════════
-   THEME — BLACKWALL DEEP
+   THEME — PRIM-1 DEEP
    Lore-flavored: magenta primary (replaces yellow), violet secondary
    (replaces cyan), deep crimson destructive, pure-black surfaces.
-   Inspired by the in-lore Bridge barrier + Songbird's signature palette.
+   Secondary high-contrast signal theme for long-running monitoring.
    ══════════════════════════════════════ */
 
-[data-theme="blackwall-deep"] {
+[data-theme="prim1-deep"] {
   /* Surfaces — pure black, no blue tint */
   --bg-base:       #000000;
   --bg-panel:      #000000;
@@ -1542,13 +1551,13 @@ textarea:focus-visible {
   --frame-dark:     rgba(0, 0, 0, 0.55);
 
   /* Brand identity — even more vivid pink, the centerpiece of this theme */
-  --blackwall:        #ff5cb8;
-  --blackwall-deep:   #c8388a;
-  --blackwall-glow:   rgba(255, 92, 184, 0.65);
+  --prim1:        #ff5cb8;
+  --prim1-deep:   #c8388a;
+  --prim1-glow:   rgba(255, 92, 184, 0.65);
 }
 
 /* Body: deeper field with violet/magenta wash instead of yellow forge glow */
-[data-theme="blackwall-deep"] body {
+[data-theme="prim1-deep"] body {
   background-image:
     repeating-linear-gradient(
       0deg,
@@ -1561,14 +1570,13 @@ textarea:focus-visible {
     radial-gradient(ellipse at 80% 88%, rgba(154, 58, 204, 0.06), transparent 55%);
 }
 
-[data-theme="blackwall-deep"] body::after {
+[data-theme="prim1-deep"] body::after {
   background: radial-gradient(ellipse, rgba(216, 56, 154, 0.08), transparent 70%);
 }
 
-/* Brand wordmark — chromatic aberration / RGB-split glitch text. Sells the
-   "reading through dirty cyberware" Bridge feel without animation. */
-[data-theme="blackwall-deep"] .topbar h1 {
-  color: var(--blackwall);
+/* Brand wordmark — chromatic aberration / RGB-split text for signal noise. */
+[data-theme="prim1-deep"] .topbar h1 {
+  color: var(--prim1);
   text-shadow:
     0 0 14px rgba(255, 92, 184, 0.75),
     0 0 32px rgba(255, 92, 184, 0.4),
@@ -1578,8 +1586,8 @@ textarea:focus-visible {
 }
 
 /* Pane titles still in brand pink — chromatic split too, lighter so terminal stays readable */
-[data-theme="blackwall-deep"] .terminal-card .card-head h2 {
-  color: var(--blackwall);
+[data-theme="prim1-deep"] .terminal-card .card-head h2 {
+  color: var(--prim1);
   text-shadow:
     0 0 12px rgba(255, 92, 184, 0.7),
     0 0 24px rgba(255, 92, 184, 0.3),
@@ -1588,18 +1596,18 @@ textarea:focus-visible {
 }
 
 /* Slow heartbeat pulse on the theme-toggle diamond glyph — signal monitor vibe */
-[data-theme="blackwall-deep"] .theme-toggle {
-  animation: blackwallPulse 2.4s ease-in-out infinite;
+[data-theme="prim1-deep"] .theme-toggle {
+  animation: prim1Pulse 2.4s ease-in-out infinite;
 }
-@keyframes blackwallPulse {
+@keyframes prim1Pulse {
   0%, 100% {
-    text-shadow: 0 0 4px var(--blackwall-glow);
+    text-shadow: 0 0 4px var(--prim1-glow);
     filter: brightness(1);
   }
   50% {
     text-shadow:
-      0 0 12px var(--blackwall-glow),
-      0 0 24px var(--blackwall-glow);
+      0 0 12px var(--prim1-glow),
+      0 0 24px var(--prim1-glow);
     filter: brightness(1.25);
   }
 }
@@ -1608,7 +1616,7 @@ textarea:focus-visible {
    Hidden in default theme, scrolls slowly in deep theme. Absolutely positioned
    so it doesn't steal a grid row from app-shell — the deep-theme app-shell
    padding-top is bumped to make room for it. */
-.blackwall-ticker {
+.prim1-ticker {
   display: none;
   position: absolute;
   top: 0;
@@ -1618,28 +1626,28 @@ textarea:focus-visible {
   overflow: hidden;
 }
 
-[data-theme="blackwall-deep"] .app-shell {
+[data-theme="prim1-deep"] .app-shell {
   padding-top: calc(0.7rem + 18px);
 }
 
-[data-theme="blackwall-deep"] .blackwall-ticker {
+[data-theme="prim1-deep"] .prim1-ticker {
   display: flex;
   align-items: center;
   font-family: "JetBrains Mono", Consolas, monospace;
   font-size: 9px;
   font-weight: 600;
   letter-spacing: 0.2em;
-  color: color-mix(in srgb, var(--blackwall) 60%, transparent);
-  text-shadow: 0 0 4px color-mix(in srgb, var(--blackwall) 35%, transparent);
+  color: color-mix(in srgb, var(--prim1) 60%, transparent);
+  text-shadow: 0 0 4px color-mix(in srgb, var(--prim1) 35%, transparent);
   border-top: 1px solid color-mix(in srgb, var(--red) 30%, transparent);
-  border-bottom: 1px solid color-mix(in srgb, var(--blackwall) 18%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--prim1) 18%, transparent);
   pointer-events: none;
   user-select: none;
   z-index: 5;
 }
 
-[data-theme="blackwall-deep"] .blackwall-ticker::before,
-[data-theme="blackwall-deep"] .blackwall-ticker::after {
+[data-theme="prim1-deep"] .prim1-ticker::before,
+[data-theme="prim1-deep"] .prim1-ticker::after {
   /* fade edges so text doesn't pop in/out abruptly at the viewport boundaries */
   content: '';
   position: absolute;
@@ -1649,58 +1657,54 @@ textarea:focus-visible {
   pointer-events: none;
   z-index: 1;
 }
-[data-theme="blackwall-deep"] .blackwall-ticker::before {
+[data-theme="prim1-deep"] .prim1-ticker::before {
   left: 0;
   background: linear-gradient(90deg, var(--bg-base), transparent);
 }
-[data-theme="blackwall-deep"] .blackwall-ticker::after {
+[data-theme="prim1-deep"] .prim1-ticker::after {
   right: 0;
   background: linear-gradient(270deg, var(--bg-base), transparent);
 }
 
-[data-theme="blackwall-deep"] .blackwall-ticker-track {
+[data-theme="prim1-deep"] .prim1-ticker-track {
   display: inline-flex;
   align-items: center;
   gap: 1.4em;
   white-space: nowrap;
   padding-left: 100%;
-  animation: blackwallTickerScroll 90s linear infinite;
+  animation: prim1TickerScroll 90s linear infinite;
 }
 
-[data-theme="blackwall-deep"] .blackwall-ticker-cell {
+[data-theme="prim1-deep"] .prim1-ticker-cell {
   flex-shrink: 0;
 }
 
-[data-theme="blackwall-deep"] .blackwall-ticker-glyph {
+[data-theme="prim1-deep"] .prim1-ticker-glyph {
   color: color-mix(in srgb, var(--red) 80%, transparent);
   font-size: 11px;
   margin: 0 0.2em;
   vertical-align: -1px;
 }
 
-[data-theme="blackwall-deep"] .blackwall-ticker-sep {
-  color: color-mix(in srgb, var(--blackwall) 40%, transparent);
+[data-theme="prim1-deep"] .prim1-ticker-sep {
+  color: color-mix(in srgb, var(--prim1) 40%, transparent);
   font-size: 8px;
   flex-shrink: 0;
 }
 
-@keyframes blackwallTickerScroll {
+@keyframes prim1TickerScroll {
   0% { transform: translateX(0); }
   100% { transform: translateX(-100%); }
 }
 
-/* Logo PNG is yellow at the source — shift it to the brand pink via hue-rotate.
-   Preserves depth/highlights in the logo, just rolls the dominant hue around the wheel. */
-[data-theme="blackwall-deep"] .brand-logo {
-  filter:
-    hue-rotate(265deg)
-    saturate(1.15)
-    drop-shadow(0 0 12px color-mix(in srgb, var(--blackwall) 65%, transparent));
+/* Text mark follows the active signal palette. */
+[data-theme="prim1-deep"] .brand-logo {
+  color: var(--prim1);
+  filter: drop-shadow(0 0 12px color-mix(in srgb, var(--prim1) 65%, transparent));
 }
 
-/* Crimson corner-bleed on every panel — Songbird red-to-black ombré soaking
-   into the magenta frame. Layered radial gradients on top of the frame fill. */
-[data-theme="blackwall-deep"] .panel {
+/* Crimson corner-bleed on every panel. Layered radial gradients sit above the frame fill. */
+[data-theme="prim1-deep"] .panel {
   background:
     radial-gradient(ellipse 35% 25% at 0% 0%, color-mix(in srgb, var(--red-deep) 90%, transparent) 0%, transparent 70%),
     radial-gradient(ellipse 35% 25% at 100% 100%, color-mix(in srgb, var(--red-deep) 90%, transparent) 0%, transparent 70%),
@@ -1709,7 +1713,7 @@ textarea:focus-visible {
 
 /* Viewport-edge red bleed — the firewall is right at the perimeter, just out of view.
    Combines with the vignette already on body::before. */
-[data-theme="blackwall-deep"] body::before {
+[data-theme="prim1-deep"] body::before {
   background:
     linear-gradient(180deg, color-mix(in srgb, var(--red) 24%, transparent) 0%, transparent 6%),
     linear-gradient(0deg, color-mix(in srgb, var(--red) 18%, transparent) 0%, transparent 5%),
@@ -1718,16 +1722,16 @@ textarea:focus-visible {
 
 /* Dissolve effect — applies the SVG turbulence/displacement filter to specific
    elements so they periodically fragment + reform, like AIs materializing past
-   the Bridge. Filter is always-on but its displacement scale is 0 most of
+   the PRIM-1. Filter is always-on but its displacement scale is 0 most of
    the cycle, so it's quiet between bursts. */
-[data-theme="blackwall-deep"] .topbar h1 {
-  filter: url(#blackwall-dissolve-strong);
+[data-theme="prim1-deep"] .topbar h1 {
+  filter: url(#prim1-dissolve-strong);
   position: relative;
 }
 
-/* "ICE probe" pierce — thin red scan line sweeps the brand wordmark every
+/* Signal scan — thin red scan line sweeps the brand wordmark every
    ~22s. Dormant most of the cycle, brief glow during the sweep. */
-[data-theme="blackwall-deep"] .topbar h1::after {
+[data-theme="prim1-deep"] .topbar h1::after {
   content: '';
   position: absolute;
   left: -8%;
@@ -1745,9 +1749,9 @@ textarea:focus-visible {
   top: 0;
   opacity: 0;
   pointer-events: none;
-  animation: blackwallIcePierce 22s linear infinite;
+  animation: prim1IcePierce 22s linear infinite;
 }
-@keyframes blackwallIcePierce {
+@keyframes prim1IcePierce {
   0%, 96.5% {
     top: 0%;
     opacity: 0;
@@ -1774,16 +1778,16 @@ textarea:focus-visible {
   }
 }
 
-[data-theme="blackwall-deep"] .terminal-card .card-head h2 {
-  filter: url(#blackwall-dissolve);
+[data-theme="prim1-deep"] .terminal-card .card-head h2 {
+  filter: url(#prim1-dissolve);
 }
 
-[data-theme="blackwall-deep"] .group-picker .card-head h2 {
-  filter: url(#blackwall-dissolve);
+[data-theme="prim1-deep"] .group-picker .card-head h2 {
+  filter: url(#prim1-dissolve);
 }
 
-[data-theme="blackwall-deep"] .group-chip[data-active="true"] {
-  filter: url(#blackwall-dissolve);
+[data-theme="prim1-deep"] .group-chip[data-active="true"] {
+  filter: url(#prim1-dissolve);
 }
 
 /* ══════════════════════════════════════

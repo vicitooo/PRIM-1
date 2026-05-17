@@ -1,4 +1,4 @@
-# CLI-master-wrapper — Architecture
+# PRIM-1 — Architecture
 
 **Status:** Canonical architecture spec
 **Date:** 2026-04-14
@@ -7,7 +7,7 @@
 
 Build a generic local runtime for terminal-first AI tools where:
 
-- Victor remains in the live loop
+- the operator remains in the live loop
 - supervised agents communicate in real time
 - all terminal activity is visible
 - lifecycle is controlled by a single supervisor
@@ -279,7 +279,7 @@ The first useful UI is a four-surface room:
 - Claude pane
 - Codex pane
 - System log pane
-- Victor input/router
+- the operator input/router
 
 There should also be a small retractable control surface for:
 
@@ -440,7 +440,7 @@ What may come and go:
 
 - actual child CLI processes
 
-To Victor, the agent appears persistent. Under the hood, the process can be restarted, resumed, or recreated by policy.
+To the operator, the agent appears persistent. Under the hood, the process can be restarted, resumed, or recreated by policy.
 
 ### 11.1 Supervisor-of-supervisor
 
@@ -519,7 +519,7 @@ To be replaced:
 
 ## 15. Non-goals for architecture v1
 
-- Telegram or external notification channels
+- external notification or external notification channels
 - multi-machine federation
 - productized SaaS concerns
 - complex workflow automation

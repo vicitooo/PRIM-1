@@ -1,10 +1,10 @@
 <#
 .SYNOPSIS
-  PRIM-001 wrapper health check — wrapper process, panes, control plane,
+  PRIM-1 wrapper health check — wrapper process, panes, control plane,
   watcher, audit log, credentials, and recent error surface in one command.
 
 .DESCRIPTION
-  Reports a structured view of PRIM-001 runtime health. Intended as the
+  Reports a structured view of PRIM-1 runtime health. Intended as the
   single-command operator check before long-running sessions or as part of
   an autonomous heartbeat loop.
 
@@ -310,7 +310,7 @@ function Write-Line($label, $value, $color = "White") {
 
 if (-not $Quiet) {
   Write-Host ""
-  Write-Host "PRIM-001 health check  $($report.timestamp)" -ForegroundColor Cyan
+  Write-Host "PRIM-1 health check  $($report.timestamp)" -ForegroundColor Cyan
   Write-Host ("-" * 70)
 
   if ($report.wrapper.pid) {

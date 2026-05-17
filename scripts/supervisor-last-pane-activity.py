@@ -7,7 +7,7 @@ Usage:
     python supervisor-last-pane-activity.py [audit-path]
 
 If audit-path is omitted, defaults to the most recent file in
-CLI-master-wrapper/.runtime/audit/.
+PRIM1_AUDIT_DIR, or <repo-root>/.runtime/audit.
 
 Output format (one line per pane):
     <pane>  last_event=<iso-timestamp>  age=<N>s  <hint>
@@ -19,7 +19,6 @@ Hints:
     long-quiet  — 45min-3h (flag for probe)
     stalled     — >3h (probe or restart)
 
-Rule reference: memory/feedback_codex_stream_recovery_silent.md
 """
 import json
 import os
@@ -29,7 +28,10 @@ from pathlib import Path
 
 
 def find_audit_path() -> Path:
-    audit_dir = Path("./.runtime/audit")
+    audit_dir = Path(
+        os.environ.get("PRIM1_AUDIT_DIR")
+        or Path(__file__).resolve().parent.parent / ".runtime" / "audit"
+    )
     if not audit_dir.exists():
         print(f"audit dir not found: {audit_dir}", file=sys.stderr)
         sys.exit(1)

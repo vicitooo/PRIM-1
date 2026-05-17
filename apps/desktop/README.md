@@ -1,6 +1,6 @@
 # Desktop App
 
-This app is the first real UI shell for `CLI-master-wrapper`.
+This app is the first real UI shell for `PRIM-1`.
 
 ## Stack
 
@@ -12,7 +12,7 @@ This app is the first real UI shell for `CLI-master-wrapper`.
 
 - renders supervised Claude and Codex panes
 - renders a system log pane
-- lets Victor route direct or room messages
+- lets the operator route direct or room messages
 - exposes start / restart / stop controls for each session
 - listens to the supervisor event bus in real time
 - writes desktop-process diagnostics to `.runtime/desktop-events.jsonl`

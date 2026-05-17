@@ -2,13 +2,13 @@
 
 Layer 1 — Unit (12 tests)
 Layer 2 — Module end-to-end (2 tests)
-Layer 3 — Integration with shape divergence fixture (1 test)
+Layer 3 — Integration with scenario-A divergence fixture (1 test)
 Layer 4 — CLI usability (3 tests)
 Layer 5 — Adversarial positive + negative controls (5 tests)
 
 Total: 23 tests. Verifier block in plan-v3 locks this count.
 
-Run: pytest CLI-master-wrapper/scripts/tests/test_verify_build_report.py -v
+Run: pytest scripts/tests/test_verify_build_report.py -v
 """
 from __future__ import annotations
 
@@ -215,16 +215,16 @@ def test_end_to_end_clean(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Layer 3 — Integration with shape fixture (1)
+# Layer 3 — Integration with scenario-A divergence fixture (1)
 # ---------------------------------------------------------------------------
 
-def test_against_build_a_v1_divergence_fixture() -> None:
-    """Synthetic reproducer of BUILD_A_V1: plan=50, tree=29."""
+def test_against_scenario_a_divergence_fixture() -> None:
+    """Synthetic reproducer for a verifier mismatch: plan=50, tree=29."""
     fixture_dir = FIXTURES_DIR / "build_report_divergence_a"
     plan = fixture_dir / "plan-excerpt.md"
     tree_root = fixture_dir / "tree"
-    assert plan.exists(), "missing fixture plan"
-    assert tree_root.exists(), "missing fixture tree"
+    assert plan.exists(), "missing scenario-A fixture plan"
+    assert tree_root.exists(), "missing scenario-A fixture tree"
 
     result = vbr.run(plan, "A", tree_root, None)
     assert result == 1  # should detect divergence

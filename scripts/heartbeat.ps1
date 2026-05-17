@@ -1,11 +1,11 @@
 <#
 .SYNOPSIS
-  PRIM-001 heartbeat — runs health-check.ps1, writes a one-line status record
+  PRIM-1 heartbeat — runs health-check.ps1, writes a one-line status record
   to .runtime/heartbeat.log, optionally routes a BLOCKED message to the room
   when N consecutive heartbeats fail.
 
 .DESCRIPTION
-  Intended as the loop body for autonomous PRIM-001 monitoring. Call it every
+  Intended as the loop body for autonomous PRIM-1 monitoring. Call it every
   30-120 seconds from a scheduled task, cron equivalent, or a simple while loop:
 
     while ($true) { .\scripts\heartbeat.ps1; Start-Sleep -Seconds 60 }
@@ -16,7 +16,7 @@
     3. Writes one JSONL line to .runtime/heartbeat.log with timestamp, overall
        status, pane states, and failure/warning counts
     4. If overall is "fail" for -AlertThreshold consecutive heartbeats, routes a
-       BLOCKED room message to surface the problem to Victor
+       BLOCKED room message to surface the problem to the operator
 
   Heartbeat log lines are append-only. Rotation / archival is the operator's
   job (pick a cron/retention strategy that fits).
@@ -27,7 +27,7 @@
 
 .PARAMETER RoomFrom
   The -From actor for alert routing. Default "heartbeat". Chosen to be visually
-  distinct from claude/codex/victor in the audit log.
+  distinct from claude/codex/operator in the audit log.
 #>
 param(
   [int]$AlertThreshold = 3,

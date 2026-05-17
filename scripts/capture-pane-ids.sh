@@ -13,9 +13,9 @@
 
 set -euo pipefail
 
-CLAUDE_PROJ="C:/Users/alice/.claude/projects/D--All-Repos-sample"
-CODEX_ROOT="C:/Users/alice/.codex/sessions"
-SUPERVISOR_SESSION="00000000-0000-4000-8000-000000000003"   # outside-supervisor — exclude
+CLAUDE_PROJ="${PRIM1_CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
+CODEX_ROOT="${PRIM1_CODEX_SESSIONS_DIR:-$HOME/.codex/sessions}"
+SUPERVISOR_SESSION="${PRIM1_SUPERVISOR_SESSION_ID:-}"   # optional supervising session to exclude
 
 echo "=== PRIM-1 pane session IDs — $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
 echo ""
@@ -25,12 +25,12 @@ for role in "CLAUDE-pane" "FRONTENDQA-claude"; do
   found=""
   while IFS= read -r f; do
     id=$(basename "$f" .jsonl)
-    [ "$id" = "$SUPERVISOR_SESSION" ] && continue
+    [ -n "$SUPERVISOR_SESSION" ] && [ "$id" = "$SUPERVISOR_SESSION" ] && continue
     if head -c 60000 "$f" 2>/dev/null | grep -q "You are $role"; then
       found="$id"
       break
     fi
-  done < <(ls -t "$CLAUDE_PROJ"/*.jsonl 2>/dev/null)
+  done < <(find "$CLAUDE_PROJ" -name "*.jsonl" -type f -print0 2>/dev/null | xargs -0 ls -t 2>/dev/null || true)
   case "$role" in
     "CLAUDE-pane")        echo "claude              $found" ;;
     "FRONTENDQA-claude")  echo "FrontendQA-claude   $found" ;;

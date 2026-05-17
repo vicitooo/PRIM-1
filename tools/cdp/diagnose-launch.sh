@@ -3,27 +3,30 @@
 # Run after starting the wrapper with PRIM1_CDP_PORT=9222.
 
 set -e
-CDP="python ./tools/cdp/cdp.py"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+CDP="${PRIM1_CDP_TOOL:-$REPO_ROOT/tools/cdp/cdp.py}"
 
 echo "=== 1. CDP targets ==="
-$CDP targets
+"$PYTHON_BIN" "$CDP" targets
 
 echo ""
 echo "=== 2. Launch button info (main/claude) ==="
-$CDP info 'button[data-action="start"][data-session="claude"]'
+"$PYTHON_BIN" "$CDP" info 'button[data-action="start"][data-session="claude"]'
 
 echo ""
 echo "=== 3. Launch button outer HTML ==="
-$CDP html 'button[data-action="start"][data-session="claude"]'
+"$PYTHON_BIN" "$CDP" html 'button[data-action="start"][data-session="claude"]'
 
 echo ""
 echo "=== 4. Dispatch synthetic click on Launch ==="
-$CDP click 'button[data-action="start"][data-session="claude"]'
+"$PYTHON_BIN" "$CDP" click 'button[data-action="start"][data-session="claude"]'
 
 echo ""
 echo "=== 5. Ancestor listener trace ==="
-$CDP listeners 'button[data-action="start"][data-session="claude"]'
+"$PYTHON_BIN" "$CDP" listeners 'button[data-action="start"][data-session="claude"]'
 
 echo ""
 echo "=== 6. Any console messages (2.5s window) ==="
-$CDP console-dump
+"$PYTHON_BIN" "$CDP" console-dump

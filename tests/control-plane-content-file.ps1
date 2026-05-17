@@ -136,7 +136,7 @@ Assert-True ($missingResult.Output -like "*failed to resolve -ContentFile*") "Ex
 $wrongActionResult = Invoke-ControlPlane -Arguments @(
   "-File", $controlPlaneScript,
   "-Action", "route",
-  "-From", "victor",
+  "-From", "operator",
   "-To", "claude",
   "-ContentFile", $payloadPath,
   "-InfoFile", $testRuntime.InfoPath,

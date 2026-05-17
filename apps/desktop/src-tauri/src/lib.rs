@@ -631,33 +631,33 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn normalize_path_for_child_processes_strips_verbatim_drive_prefix() {
-        let path = PathBuf::from(r"\\?\.");
+        let path = PathBuf::from(r"\\?\C:\Users\example\projects\prim1");
 
         assert_eq!(
             normalize_path_for_child_processes(path),
-            PathBuf::from(r".")
+            PathBuf::from(r"C:\Users\example\projects\prim1")
         );
     }
 
     #[cfg(windows)]
     #[test]
     fn normalize_path_for_child_processes_strips_verbatim_unc_prefix() {
-        let path = PathBuf::from(r"\\?\UNC\server\share\CLI-master-wrapper");
+        let path = PathBuf::from(r"\\?\UNC\server\share\prim1");
 
         assert_eq!(
             normalize_path_for_child_processes(path),
-            PathBuf::from(r"\\server\share\CLI-master-wrapper")
+            PathBuf::from(r"\\server\share\prim1")
         );
     }
 
     #[cfg(windows)]
     #[test]
     fn resolve_agent_working_root_returns_parent_repo_root() {
-        let path = PathBuf::from(r".");
+        let path = PathBuf::from(r"C:\Users\example\projects\prim1");
 
         assert_eq!(
             resolve_agent_working_root(&path).unwrap(),
-            PathBuf::from(r"<workspace>")
+            PathBuf::from(r"C:\Users\example\projects")
         );
     }
 

@@ -74,7 +74,7 @@ Three distinct operator-to-pane paths already exist:
 
 - `send_input`
   - raw bytes to PTY stdin
-  - this is the PRIM-001 load-bearing path
+  - this is the PRIM-1 load-bearing path
 - `send_control_key`
   - implemented inside the supervisor
   - maps keys to byte sequences:
@@ -171,7 +171,7 @@ Important limitation:
 - `SESSION_NAMES = ["claude", "codex"]`
 - pane HTML is inlined for those two sessions only
 - launch/restart/stop buttons exist only for those panes
-- router dropdowns are fixed to `victor`, `claude`, `codex`, and `room`
+- router dropdowns are fixed to `operator`, `claude`, `codex`, and `room`
 
 This means the current UI is a fixed two-pane dashboard, not a general session workspace.
 
@@ -263,7 +263,7 @@ Minimal fix direction:
 - add a `create_session` control-plane command that accepts a sanitized session definition or launch profile
 - support two modes:
   - curated launch templates in v1
-  - arbitrary binary mode later if Victor wants full raw power
+  - arbitrary binary mode later if the operator wants full raw power
 - use `driver-generic-terminal` as the initial implementation target
 
 Scope: days for curated mode, weeks for fully general arbitrary-binary support with safe UX and validation.
@@ -356,7 +356,7 @@ Minimal fix direction:
 - make "resume Claude session" a dedicated launch preset, not just raw extra args
 - support two levels:
   - minimal: operator pastes a session id manually
-  - enriched: wrapper queries `<workspace>/tools/cra.py` to list resumable Claude sessions
+  - enriched: wrapper queries `<workspace-root>/tools/cra.py` to list resumable Claude sessions
 - store the selected session id inside the pane's launch profile so restart reuses it
 
 Important caution:
@@ -524,7 +524,7 @@ Ship next:
 
 Why second:
 
-- this is Victor's highest-value controllability case
+- this is the operator's highest-value controllability case
 - it depends on launch profile persistence but not yet on dynamic panes
 
 ### Iteration 3: Dynamic session registry plus generic terminal pane
@@ -565,14 +565,14 @@ Why fourth:
 | Generic arbitrary-binary support | weeks if fully general |
 | Workspace save/restore | days for simple JSON, weeks for product-grade durability |
 
-## Open Questions For Victor
+## Open Questions
 
 - Should v1 controllability support only curated binaries, or truly arbitrary binaries?
 - Should full argument override be allowed, or only additive flags on curated drivers?
 - Is plain-text env persistence acceptable for local operator use, or do secrets need separate handling immediately?
 - Should `cra.py` integration be first-class in the first resume iteration, or should manual session-id entry ship first?
 - Should pane removal hard-stop a running process automatically, or should stop-before-remove remain mandatory?
-- Is workspace layout in v1 just pane order and launch profiles, or does Victor want saved visual geometry immediately?
+- Is workspace layout in v1 just pane order and launch profiles, or does the operator want saved visual geometry immediately?
 
 ## Recommendation
 

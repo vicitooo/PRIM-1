@@ -35,7 +35,7 @@ Scripts should wrap the control plane, not bypass the supervisor.
 Example:
 
 ```powershell
-.\scripts\control-plane.ps1 -Action route -From victor -To claude -Scope direct -Content "Review the Codex pane."
+.\scripts\control-plane.ps1 -Action route -From operator -To claude -Scope direct -Content "Review the Codex pane."
 .\scripts\control-plane.ps1 -Action start -Session claude -ExtraArgs '--resume', '00000000-0000-0000-0000-000000000000'
 .\scripts\control-plane.ps1 -Action input -Session claude -ContentFile ".runtime\compact-prompts\compact-full.txt"
 .\scripts\control-plane.ps1 -Action deliver -Session claude -Content "Multi-line`nmessage body"
@@ -123,7 +123,7 @@ Example:
 Example:
 
 ```powershell
-.\scripts\handshake-route.ps1 -Actor claude -Action start -Token "SMOKE-1A2B3C4D" -Path ".\.runtime\smoke\handshake-20260415T120000Z-SMOKE-1A2B3C4D.txt"
+.\scripts\handshake-route.ps1 -Actor claude -Action start -Token "SMOKE-1A2B3C4D" -Path "<repo-root>\.runtime\smoke\handshake-20260415T120000Z-SMOKE-1A2B3C4D.txt"
 .\scripts\handshake-route.ps1 -Actor codex -Action ready -Token "SMOKE-1A2B3C4D"
 ```
 

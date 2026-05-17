@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  PRIM-001 test runner — executes every PRIM-001 test suite in sequence and
+  PRIM-1 test runner — executes every PRIM-1 test suite in sequence and
   reports pass/fail. One-command gate for trusting the wrapper before a long run.
 
 .DESCRIPTION
@@ -82,7 +82,7 @@ function Invoke-Suite {
 $script:SkipLiveFlag = $SkipLive.IsPresent
 
 Write-Host ""
-Write-Host "PRIM-001 test runner" -ForegroundColor Cyan
+Write-Host "PRIM-1 test runner" -ForegroundColor Cyan
 Write-Host ("=" * 70)
 Write-Host "wrapper root: $wrapperRoot"
 if ($SkipLive) { Write-Host "mode: skip live suites (unit-only gate)" }
@@ -127,7 +127,7 @@ $passCount = ($results | Where-Object { $_.Status -eq "pass" }).Count
 $failCount = ($results | Where-Object { $_.Status -eq "fail" }).Count
 $skipCount = ($results | Where-Object { $_.Status -eq "skip" }).Count
 
-Write-Host "PRIM-001 test runner: $passCount pass, $failCount fail, $skipCount skip  (total $totalMs ms)"
+Write-Host "PRIM-1 test runner: $passCount pass, $failCount fail, $skipCount skip  (total $totalMs ms)"
 
 if ($failCount -gt 0) {
   Write-Host ""

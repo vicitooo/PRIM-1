@@ -1,6 +1,6 @@
-# PRIM-001 — Control Surface
+# PRIM-1 — Control Surface
 
-This file lists the current controls that Victor, Claude, Codex, and future terminal-launched agents can use to operate the wrapper.
+This file lists the current controls that the operator, Claude, Codex, and future terminal-launched agents can use to operate the wrapper.
 
 ## 1. Desktop UI
 
@@ -14,7 +14,7 @@ This file lists the current controls that Victor, Claude, Codex, and future term
 
 ### Routed message form
 
-- `From`: `Victor`, `Claude`, `Codex`
+- `From`: `operator`, `Claude`, `Codex`
 - `To`: `Claude`, `Codex`, `Room`
 - `Content`: freeform message body
 - `Send routed message`
@@ -83,11 +83,11 @@ powershell -Command "& '.\scripts\control-plane.ps1' -Action start -Session clau
 powershell -Command "& '.\scripts\control-plane.ps1' -Action start -Session claude -ExtraArgs '--resume','00000000-0000-0000-0000-000000000000'"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action input -Session codex -Content 'hi'"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action input -Session claude -ContentFile 'D:\tmp\compact.txt'"
-powershell -Command "& '.\scripts\control-plane.ps1' -Action deliver -Session claude -Content 'hello from victor'"
+powershell -Command "& '.\scripts\control-plane.ps1' -Action deliver -Session claude -Content 'hello from operator'"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action wait_quiet -Session claude -QuietSec 2 -TimeoutSec 10"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action events_since -CursorFile '.runtime\cursors\outside-supervisor.json' -MaxEvents 200 -MaxWaitSeconds 15 -IncludeKinds 'routed_message','session_state','system_log','sideband_request_lifecycle' -OutCursorFile '.runtime\cursors\outside-supervisor.json'"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action key -Session claude -Key enter"
-powershell -Command "& '.\scripts\control-plane.ps1' -Action route -From victor -To room -Scope room -Content 'status ping'"
+powershell -Command "& '.\scripts\control-plane.ps1' -Action route -From operator -To room -Scope room -Content 'status ping'"
 ```
 
 Behavior:
@@ -200,7 +200,7 @@ powershell -Command "& '.\scripts\agent-ping.ps1' -From claude -To codex -Token 
 powershell -Command "& '.\scripts\agent-key.ps1' -Session codex -Key enter"
 ```
 
-PowerShell-native callers can still use the bare `-File` form, but the wrapped form is the safest cross-shell default on Victor's Windows setup.
+PowerShell-native callers can still use the bare `-File` form, but the wrapped form is the safest cross-shell default on the operator's Windows setup.
 
 ## 5. Agent-facing scripts
 
@@ -279,8 +279,8 @@ Returns JSON with:
 Canonical handshake message builder/router. Use it instead of hand-writing the route strings.
 
 ```bash
-powershell -Command "& '.\scripts\handshake-route.ps1' -Actor claude -Action start -Token 'SMOKE-1A2B3C4D' -Path '.\.runtime\smoke\handshake-20260415T120000Z-SMOKE-1A2B3C4D.txt'"
-powershell -Command "& '.\scripts\handshake-route.ps1' -Actor claude -Action dispatch -Token 'SMOKE-1A2B3C4D' -Path '.\.runtime\smoke\handshake-20260415T120000Z-SMOKE-1A2B3C4D.txt'"
+powershell -Command "& '.\scripts\handshake-route.ps1' -Actor claude -Action start -Token 'SMOKE-1A2B3C4D' -Path '<repo-root>\.runtime\smoke\handshake-20260415T120000Z-SMOKE-1A2B3C4D.txt'"
+powershell -Command "& '.\scripts\handshake-route.ps1' -Actor claude -Action dispatch -Token 'SMOKE-1A2B3C4D' -Path '<repo-root>\.runtime\smoke\handshake-20260415T120000Z-SMOKE-1A2B3C4D.txt'"
 powershell -Command "& '.\scripts\handshake-route.ps1' -Actor codex -Action ready -Token 'SMOKE-1A2B3C4D'"
 ```
 
@@ -308,12 +308,12 @@ powershell -Command "& '.\scripts\handshake-watchdog.ps1' -Token 'SMOKE-1A2B3C4D
 
 ## 6. What agent-side terminal sessions can control today
 
-Supervised `claude` and `codex` panes now start from `<workspace>/`.
+Supervised `claude` and `codex` panes now start from `<workspace-root>/`.
 
 That means:
 
-- repo-root context discovery happens from the personal repo root
-- inside-pane script calls should use absolute wrapper paths such as `./scripts/...` unless the caller first changes directory into the wrapper root
+- repo-root context discovery happens from the configured workspace root
+- inside-pane script calls should use absolute wrapper paths such as `<repo-root>/scripts/...` unless the caller first changes directory into the wrapper root
 
 From inside Claude/Codex, an agent can call the helper scripts to:
 
@@ -396,12 +396,12 @@ Current verified path:
 
 For desktop-only visuals, the current screenshot capture path is:
 
-- `<workspace>/tools/screenshot/screenshot.py`
+- `<workspace-root>/tools/screenshot/screenshot.py`
 
 ## 9. Current limits
 
 - no OS-dialog control outside the PTY
-- no external connector yet for Telegram or remote clients
+- no external connector yet for external notification or remote clients
 
 ## 10. Pull-Based Events
 
