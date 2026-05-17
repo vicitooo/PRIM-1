@@ -96,10 +96,21 @@ docs/                     Design + planning documents
 
 ## Runtime configuration
 
-Two environment toggles modify runtime behavior (restart the wrapper after changing):
+Environment variables modify runtime behavior. Set them in a gitignored `.env` at the repo root (loaded automatically at startup) or in your shell. Values containing spaces must be quoted in `.env`:
 
-- `PRIM1_PEER_SLASH_COMMANDS_ALLOWED=1` — re-enables pane-bound `send_input` / `send_key` control over peer panes. Default off (panes can only control their own session).
-- `PRIM1_CROSS_PAIR_ROOM_BROADCAST=1` — re-enables legacy cross-pair Room fan-out. Default behavior is pair-scoped — each pair's room messages stay within its own pair group.
+```
+PRIM1_AGENT_WORKING_ROOT="C:/path/to/your working repo"
+```
+
+| Variable | Purpose |
+|---|---|
+| `PRIM1_AGENT_WORKING_ROOT` | Absolute path used as `working_dir` for default-spawned agent panes. Set this to the directory whose `CLAUDE.md` / project context you want loaded. When unset, falls back to the parent directory of the wrapper repo (legacy heuristic; works only when the wrapper lives inside your working repo). |
+| `PRIM1_WRAPPER_ROOT` | Absolute path to the wrapper source tree, used for Claude's `--add-dir` so the Claude pane can read wrapper internals. When unset, falls back to `<working_dir>/<PRIM1_WRAPPER_DIRNAME or PRIM-1>`. |
+| `PRIM1_WRAPPER_DIRNAME` | Override the wrapper directory name used by the `PRIM1_WRAPPER_ROOT` fallback. Default: `PRIM-1`. |
+| `PRIM1_PEER_SLASH_COMMANDS_ALLOWED` | `1` / `true` — re-enable pane-bound `send_input` / `send_key` control over peer panes. Default off (panes can only control their own session). |
+| `PRIM1_CROSS_PAIR_ROOM_BROADCAST` | `1` / `true` — re-enable legacy cross-pair Room fan-out. Default off (pair-scoped). |
+
+Restart the wrapper after changing `.env` or environment variables — they are read at startup only.
 
 ## Design rules
 

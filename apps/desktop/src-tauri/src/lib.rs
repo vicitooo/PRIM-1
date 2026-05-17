@@ -278,6 +278,20 @@ fn resolve_project_root() -> Result<PathBuf, String> {
 }
 
 fn resolve_agent_working_root(project_root: &Path) -> Result<PathBuf, String> {
+    // Explicit override via env var — canonical mechanism for pointing the
+    // agent panes' working directory at the operator's working repo,
+    // independent of where the wrapper binary lives on disk. Loaded from
+    // .env at the PRIM-1 root by main() at startup (see load_dotenv_from_project_root).
+    if let Ok(env_root) = std::env::var("PRIM1_AGENT_WORKING_ROOT") {
+        let trimmed = env_root.trim();
+        if !trimmed.is_empty() {
+            return Ok(normalize_path_for_child_processes(PathBuf::from(trimmed)));
+        }
+    }
+
+    // Fallback heuristic: parent of project_root. Works only when the wrapper
+    // lives inside the operator's working repo (pre-extraction layout).
+    // Post-extraction the env var override is the canonical configuration.
     let personal_root = project_root.parent().ok_or_else(|| {
         format!(
             "failed to resolve personal repo root from {}",
@@ -606,6 +620,7 @@ mod tests {
     use std::{path::PathBuf, sync::Mutex};
 
     static PEER_SLASH_ENV_LOCK: Mutex<()> = Mutex::new(());
+    static AGENT_WORKING_ROOT_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn strip_osc_sequences_removes_bell_terminated_title_updates() {
@@ -652,11 +667,75 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn resolve_agent_working_root_returns_parent_repo_root() {
+    fn resolve_agent_working_root_returns_parent_repo_root_when_env_unset() {
+        let _guard = AGENT_WORKING_ROOT_ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("PRIM1_AGENT_WORKING_ROOT");
+        unsafe {
+            std::env::remove_var("PRIM1_AGENT_WORKING_ROOT");
+        }
+
         let path = PathBuf::from(r"C:\Users\example\projects\prim1");
+        let resolved = resolve_agent_working_root(&path);
+
+        if let Some(value) = previous {
+            unsafe {
+                std::env::set_var("PRIM1_AGENT_WORKING_ROOT", value);
+            }
+        }
 
         assert_eq!(
-            resolve_agent_working_root(&path).unwrap(),
+            resolved.unwrap(),
+            PathBuf::from(r"C:\Users\example\projects")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_agent_working_root_uses_env_var_when_set() {
+        let _guard = AGENT_WORKING_ROOT_ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("PRIM1_AGENT_WORKING_ROOT");
+        unsafe {
+            std::env::set_var("PRIM1_AGENT_WORKING_ROOT", r"D:\custom\working\root");
+        }
+
+        let path = PathBuf::from(r"C:\Users\example\projects\prim1");
+        let resolved = resolve_agent_working_root(&path);
+
+        match previous {
+            Some(value) => unsafe {
+                std::env::set_var("PRIM1_AGENT_WORKING_ROOT", value);
+            },
+            None => unsafe {
+                std::env::remove_var("PRIM1_AGENT_WORKING_ROOT");
+            },
+        }
+
+        assert_eq!(resolved.unwrap(), PathBuf::from(r"D:\custom\working\root"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_agent_working_root_ignores_empty_env_var() {
+        let _guard = AGENT_WORKING_ROOT_ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("PRIM1_AGENT_WORKING_ROOT");
+        unsafe {
+            std::env::set_var("PRIM1_AGENT_WORKING_ROOT", "   ");
+        }
+
+        let path = PathBuf::from(r"C:\Users\example\projects\prim1");
+        let resolved = resolve_agent_working_root(&path);
+
+        match previous {
+            Some(value) => unsafe {
+                std::env::set_var("PRIM1_AGENT_WORKING_ROOT", value);
+            },
+            None => unsafe {
+                std::env::remove_var("PRIM1_AGENT_WORKING_ROOT");
+            },
+        }
+
+        assert_eq!(
+            resolved.unwrap(),
             PathBuf::from(r"C:\Users\example\projects")
         );
     }
@@ -793,12 +872,46 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
-    fn resolve_agent_working_root_returns_parent_repo_root() {
-        let path = PathBuf::from("/workspace/cli-master-wrapper");
+    fn resolve_agent_working_root_returns_parent_repo_root_when_env_unset() {
+        let _guard = AGENT_WORKING_ROOT_ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("PRIM1_AGENT_WORKING_ROOT");
+        unsafe {
+            std::env::remove_var("PRIM1_AGENT_WORKING_ROOT");
+        }
 
-        assert_eq!(
-            resolve_agent_working_root(&path).unwrap(),
-            PathBuf::from("/workspace")
-        );
+        let path = PathBuf::from("/workspace/cli-master-wrapper");
+        let resolved = resolve_agent_working_root(&path);
+
+        if let Some(value) = previous {
+            unsafe {
+                std::env::set_var("PRIM1_AGENT_WORKING_ROOT", value);
+            }
+        }
+
+        assert_eq!(resolved.unwrap(), PathBuf::from("/workspace"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn resolve_agent_working_root_uses_env_var_when_set() {
+        let _guard = AGENT_WORKING_ROOT_ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("PRIM1_AGENT_WORKING_ROOT");
+        unsafe {
+            std::env::set_var("PRIM1_AGENT_WORKING_ROOT", "/home/op/myrepo");
+        }
+
+        let path = PathBuf::from("/workspace/cli-master-wrapper");
+        let resolved = resolve_agent_working_root(&path);
+
+        match previous {
+            Some(value) => unsafe {
+                std::env::set_var("PRIM1_AGENT_WORKING_ROOT", value);
+            },
+            None => unsafe {
+                std::env::remove_var("PRIM1_AGENT_WORKING_ROOT");
+            },
+        }
+
+        assert_eq!(resolved.unwrap(), PathBuf::from("/home/op/myrepo"));
     }
 }

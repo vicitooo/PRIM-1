@@ -21,6 +21,7 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["devtools"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+dotenvy = { workspace = true }
 shared-types = { path = "../../../crates/shared-types" }
 supervisor = { path = "../../../crates/supervisor" }
 pty-host = { path = "../../../crates/pty-host" }
