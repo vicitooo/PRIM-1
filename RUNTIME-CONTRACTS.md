@@ -193,6 +193,35 @@ Route sideband requests expose a third delivery-truth layer:
 - every resolved pane recipient emits `phase: "written"` with `recipient`, `recipient_index`, `payload_part_count`, and `bytes_written`, or `phase: "failed"` with `error`
 - partial failure is non-transactional: successful recipient writes remain delivered and audited, and the route request returns an error naming the failed recipient(s)
 
+Pane signal sideband requests expose a first-class completion/liveness channel:
+
+- request kind: `pane_signal`
+- signal types: `done`, `blocked`, `yellow`, `heartbeat`, `progress`
+- pane-bound tokens resolve `session` from the credential binding; callers cannot spoof another pane name in the request payload
+- master/operator-token calls are allowed and record `session: "supervisor"`
+- every accepted signal emits a `pane_signal` audit event keyed by `request_id`
+- the canonical signal record is written before audit emission to `.runtime/signals/<task_id>__<signal_type>__<timestamp>.json`
+- the filename timestamp is UTC and filesystem-safe (`YYYYMMDDTHHMMSS.nnnnnnnnnZ`) because raw RFC3339 colons are invalid on Windows
+- `task_id` is sanitized for filenames; the original `task_id` remains in the JSON payload
+- canonical JSON contains the full `pane_signal` audit event payload:
+
+```json
+{
+  "event": "pane_signal",
+  "request_id": "uuid",
+  "session": "codex",
+  "task_id": "task-418",
+  "signal_type": "done",
+  "summary": "completed",
+  "artifact_paths": [],
+  "commit_sha": null,
+  "timestamp": "2026-05-17T00:00:00Z"
+}
+```
+
+- a legacy empty touch-file is also written at `.runtime/dispatch-triggers/<task_id>.<signal_type>` for existing watchers
+- legacy touch-file write failure emits a warning `system_log` but does not roll back or suppress the canonical JSON write path
+
 ## 11. Cost telemetry contract
 
 Supervisor must have a hook for:

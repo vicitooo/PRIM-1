@@ -202,13 +202,14 @@ pub struct EventFilter {
 
 impl EventFilter {
     pub const ALL_KINDS: &'static str = "all";
-    pub const DEFAULT_INCLUDE_KINDS: [&'static str; 11] = [
+    pub const DEFAULT_INCLUDE_KINDS: [&'static str; 12] = [
         "session_state",
         "pair_created",
         "pair_renamed",
         "pair_deleted",
         "routed_message",
         "route_delivery",
+        "pane_signal",
         "system_log",
         "control_plane_ready",
         "sideband_request_lifecycle",
@@ -284,6 +285,18 @@ pub enum RuntimeEvent {
         error: Option<String>,
         timestamp: String,
     },
+    PaneSignal {
+        request_id: String,
+        session: String,
+        task_id: String,
+        signal_type: PaneSignalType,
+        summary: String,
+        #[serde(default)]
+        artifact_paths: Vec<String>,
+        #[serde(default)]
+        commit_sha: Option<String>,
+        timestamp: String,
+    },
     SystemLog {
         level: LogLevel,
         message: String,
@@ -329,6 +342,16 @@ pub enum RouteDeliveryPhase {
     Resolved,
     Written,
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneSignalType {
+    Done,
+    Blocked,
+    Yellow,
+    Heartbeat,
+    Progress,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -400,6 +423,16 @@ pub enum SidebandRequest {
         token: String,
         request: RouteMessageRequest,
     },
+    PaneSignal {
+        token: String,
+        task_id: String,
+        signal_type: PaneSignalType,
+        summary: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        artifact_paths: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        commit_sha: Option<String>,
+    },
 }
 
 impl SidebandRequest {
@@ -416,7 +449,8 @@ impl SidebandRequest {
             | Self::EventsSince { token, .. }
             | Self::SendInput { token, .. }
             | Self::SendKey { token, .. }
-            | Self::RouteMessage { token, .. } => token,
+            | Self::RouteMessage { token, .. }
+            | Self::PaneSignal { token, .. } => token,
         }
     }
 }
@@ -439,6 +473,10 @@ pub enum SidebandResponsePayload {
     },
     EventsSinceError {
         echoed_cursor: serde_json::Value,
+    },
+    PaneSignal {
+        signal_path: String,
+        legacy_touch_path: String,
     },
 }
 
@@ -648,6 +686,92 @@ mod tests {
     }
 
     #[test]
+    fn pane_signal_request_round_trips_with_optional_fields() {
+        let request = SidebandRequest::PaneSignal {
+            token: "secret".into(),
+            task_id: "task-418".into(),
+            signal_type: PaneSignalType::Done,
+            summary: "signal complete".into(),
+            artifact_paths: vec!["evidence/one.md".into()],
+            commit_sha: Some("abc123".into()),
+        };
+
+        let value = serde_json::to_value(request.clone()).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "kind": "pane_signal",
+                "token": "secret",
+                "task_id": "task-418",
+                "signal_type": "done",
+                "summary": "signal complete",
+                "artifact_paths": ["evidence/one.md"],
+                "commit_sha": "abc123",
+            })
+        );
+
+        let roundtrip: SidebandRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(roundtrip, request);
+    }
+
+    #[test]
+    fn pane_signal_request_defaults_absent_optional_fields() {
+        let request: SidebandRequest = serde_json::from_value(json!({
+            "kind": "pane_signal",
+            "token": "secret",
+            "task_id": "task-418",
+            "signal_type": "blocked",
+            "summary": "blocked on credentials"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            request,
+            SidebandRequest::PaneSignal {
+                token: "secret".into(),
+                task_id: "task-418".into(),
+                signal_type: PaneSignalType::Blocked,
+                summary: "blocked on credentials".into(),
+                artifact_paths: Vec::new(),
+                commit_sha: None,
+            }
+        );
+    }
+
+    #[test]
+    fn pane_signal_event_round_trips_via_json() {
+        let event = RuntimeEvent::PaneSignal {
+            request_id: "req-1".into(),
+            session: "codex".into(),
+            task_id: "task-418".into(),
+            signal_type: PaneSignalType::Yellow,
+            summary: "complete with caveats".into(),
+            artifact_paths: Vec::new(),
+            commit_sha: None,
+            timestamp: "2026-05-17T00:00:00Z".into(),
+        };
+
+        let value = serde_json::to_value(event.clone()).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "event": "pane_signal",
+                "request_id": "req-1",
+                "session": "codex",
+                "task_id": "task-418",
+                "signal_type": "yellow",
+                "summary": "complete with caveats",
+                "artifact_paths": [],
+                "commit_sha": null,
+                "timestamp": "2026-05-17T00:00:00Z",
+            })
+        );
+
+        let roundtrip: RuntimeEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(roundtrip, event);
+    }
+
+    #[test]
     fn sideband_lifecycle_event_skips_absent_error() {
         let event = RuntimeEvent::SidebandRequestLifecycle {
             request_id: "req-1".into(),
@@ -783,6 +907,43 @@ mod tests {
     }
 
     #[test]
+    fn pane_signal_type_uses_snake_case_for_all_variants() {
+        assert_eq!(
+            serde_json::to_value(PaneSignalType::Done).unwrap(),
+            json!("done")
+        );
+        assert_eq!(
+            serde_json::to_value(PaneSignalType::Blocked).unwrap(),
+            json!("blocked")
+        );
+        assert_eq!(
+            serde_json::to_value(PaneSignalType::Yellow).unwrap(),
+            json!("yellow")
+        );
+        assert_eq!(
+            serde_json::to_value(PaneSignalType::Heartbeat).unwrap(),
+            json!("heartbeat")
+        );
+        assert_eq!(
+            serde_json::to_value(PaneSignalType::Progress).unwrap(),
+            json!("progress")
+        );
+    }
+
+    #[test]
+    fn pane_signal_response_payload_round_trips() {
+        let payload = SidebandResponsePayload::PaneSignal {
+            signal_path: ".runtime/signals/task-418__done__20260517T000000.000Z.json".into(),
+            legacy_touch_path: ".runtime/dispatch-triggers/task-418.done".into(),
+        };
+
+        let roundtrip: SidebandResponsePayload =
+            serde_json::from_value(serde_json::to_value(payload.clone()).unwrap()).unwrap();
+
+        assert_eq!(roundtrip, payload);
+    }
+
+    #[test]
     fn event_cursor_roundtrips_json() {
         let cursor = EventCursor {
             audit_file: "2026-04-18.jsonl".into(),
@@ -833,6 +994,13 @@ mod tests {
         let filter = EventFilter::default();
 
         assert!(filter.includes_kind("route_delivery"));
+    }
+
+    #[test]
+    fn filter_default_includes_pane_signal() {
+        let filter = EventFilter::default();
+
+        assert!(filter.includes_kind("pane_signal"));
     }
 
     #[test]

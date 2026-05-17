@@ -1,6 +1,6 @@
 param(
   [Parameter(Mandatory = $true)]
-  [ValidateSet("ping", "list", "start", "stop", "restart", "input", "deliver", "wait_quiet", "events_since", "key", "route", "create-pair")]
+  [ValidateSet("ping", "list", "start", "stop", "restart", "input", "deliver", "wait_quiet", "events_since", "key", "route", "create-pair", "signal")]
   [string]$Action,
 
   [string]$Session,
@@ -14,6 +14,12 @@ param(
   [string]$Scope = "direct",
   [string]$Content,
   [string]$ContentFile,
+  [string]$TaskId,
+  [ValidateSet("done", "blocked", "yellow", "heartbeat", "progress")]
+  [string]$SignalType,
+  [string]$Summary,
+  [string[]]$ArtifactPaths,
+  [string]$CommitSha,
   [string]$Cursor,
   [string]$CursorFile,
   [int]$MaxEvents = 0,
@@ -140,6 +146,27 @@ function Resolve-JsonInput {
   }
 }
 
+function Normalize-StringArray {
+  param(
+    [string[]]$Values
+  )
+
+  $normalized = @()
+  foreach ($value in @($Values)) {
+    if ($null -eq $value) {
+      continue
+    }
+    foreach ($part in ($value -split ",")) {
+      $trimmed = $part.Trim()
+      if ($trimmed) {
+        $normalized += $trimmed
+      }
+    }
+  }
+
+  return [string[]]$normalized
+}
+
 function Write-AtomicText {
   param(
     [Parameter(Mandatory = $true)]
@@ -171,8 +198,18 @@ if ($null -ne $ExtraArgs) {
   $normalizedExtraArgs = [string[]]@($ExtraArgs)
 }
 
+[string[]]$normalizedArtifactPaths = Normalize-StringArray -Values $ArtifactPaths
+
 if ($normalizedExtraArgs.Count -gt 0 -and $Action -ne "start") {
   throw "-ExtraArgs is only supported for -Action start"
+}
+
+if ($normalizedArtifactPaths.Count -gt 0 -and $Action -ne "signal") {
+  throw "-ArtifactPaths is only supported for -Action signal"
+}
+
+if ($CommitSha -and $Action -ne "signal") {
+  throw "-CommitSha is only supported for -Action signal"
 }
 
 foreach ($arg in $normalizedExtraArgs) {
@@ -293,6 +330,30 @@ $payload = switch ($Action) {
         content = $Content
       }
     }
+  }
+  "signal" {
+    if ([string]::IsNullOrWhiteSpace($TaskId)) { throw "signal requires -TaskId" }
+    if (-not $SignalType) { throw "signal requires -SignalType" }
+    if ([string]::IsNullOrWhiteSpace($Summary)) { throw "signal requires -Summary" }
+    # Omit optional fields when empty/null. PowerShell 5.1 ConvertTo-Json
+    # serializes empty [string[]] as null and explicit $null as JSON null;
+    # the Rust SidebandRequest deserializer rejects null for non-Option
+    # fields (artifact_paths is Vec<String>). Letting #[serde(default)]
+    # kick in via field omission is the canonical fix.
+    $signalPayload = @{
+      kind = "pane_signal"
+      token = $info.token
+      task_id = $TaskId
+      signal_type = $SignalType
+      summary = $Summary
+    }
+    if ($normalizedArtifactPaths.Count -gt 0) {
+      $signalPayload.artifact_paths = [string[]]$normalizedArtifactPaths
+    }
+    if ($CommitSha) {
+      $signalPayload.commit_sha = $CommitSha
+    }
+    $signalPayload
   }
   "create-pair" {
     if (-not $Name) { throw "create-pair requires -Name" }

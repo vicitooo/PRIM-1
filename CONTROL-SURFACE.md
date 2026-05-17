@@ -74,6 +74,7 @@ Supported actions:
 - `events_since`
 - `key`
 - `route`
+- `signal`
 
 Canonical examples:
 
@@ -88,6 +89,7 @@ powershell -Command "& '.\scripts\control-plane.ps1' -Action wait_quiet -Session
 powershell -Command "& '.\scripts\control-plane.ps1' -Action events_since -CursorFile '.runtime\cursors\outside-supervisor.json' -MaxEvents 200 -MaxWaitSeconds 15 -IncludeKinds 'routed_message','route_delivery','session_state','system_log','sideband_request_lifecycle' -OutCursorFile '.runtime\cursors\outside-supervisor.json'"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action key -Session claude -Key enter"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action route -From operator -To room -Scope room -Content 'status ping'"
+powershell -Command "& '.\scripts\control-plane.ps1' -Action signal -TaskId smoke -SignalType done -Summary 'smoke test'"
 ```
 
 Behavior:
@@ -113,6 +115,10 @@ Behavior:
 - large Codex-targeted `deliver` payloads are flattened and chunked below the paste-staging threshold before each Enter submit
 - `-Action wait_quiet` waits for no real session content for `-QuietSec` seconds, up to `-TimeoutSec`
 - `wait_quiet` is **not** turn-completion detection; long-think phases may go quiet while the assistant is still in flight
+- `-Action signal` records a first-class pane completion signal; required parameters are `-TaskId`, `-SignalType <done|blocked|yellow|heartbeat|progress>`, and `-Summary`
+- `-Action signal` accepts optional `-ArtifactPaths <string[]>` (comma- or array-form) and `-CommitSha <sha>`
+- pane-bound `signal` calls record the source session from the caller's credential; master/operator calls record `session: "supervisor"`
+- successful `signal` responses include a `payload.kind: "pane_signal"` object with `signal_path` and `legacy_touch_path`
 - `events_since` returns structured JSON only; it does **not** honor `-Quiet`
 - `events_since` reads from a caller-managed cursor file/object and returns:
   - `events`
@@ -123,6 +129,7 @@ Behavior:
   - `session_state`
   - `routed_message`
   - `route_delivery`
+  - `pane_signal`
   - `system_log`
   - `control_plane_ready`
   - `sideband_request_lifecycle`
@@ -153,6 +160,7 @@ Per-action supervisor budgets:
 
 - `ping` / `list`: 2 s
 - `send_input` / `key`: 5 s
+- `signal`: 5 s
 - `deliver`: 10 s
 - `stop`: 10 s
 - `route`: 15 s
@@ -166,6 +174,7 @@ What callers see:
 - every sideband response includes `request_id` when the request decoded successfully
 - pane-bound `send_input`, `key`, `deliver`, and `route` requests emit `request_ack` after PTY writes complete; if the write path remains incomplete past `PRIM1_REQUEST_ACK_TIMEOUT_SECS` (default 60), they emit `request_ack_timeout`
 - `route` requests emit `route_delivery` with one `resolved` event for the resolved pane fan-out and one `written` or `failed` event per pane recipient; each event carries `request_id`, `route_id`, `logical_to`, `recipient_count`, `payload_part_count`, `bytes_written`, and optional `error`
+- `signal` requests emit one `pane_signal` event with `request_id`, resolved `session`, `task_id`, `signal_type`, `summary`, `artifact_paths`, `commit_sha`, and `timestamp`
 - failed or timed-out `sideband_request_lifecycle` audit events include an optional `error` field with the response message
 - `timed_out: true` now returns exit code `124`
 - non-`-Quiet` mode prints `TIMED OUT: <message>` instead of JSON for timeout responses
@@ -174,7 +183,7 @@ What callers see:
 Lane-aware retry rule:
 
 - lifecycle ops (`start` / `stop` / `restart`) are retryable after checking `list` first because retries advance the session generation and stale workers self-abort
-- side-effecting ops (`deliver` / `send_input` / `key` / `route`) are **not** automatically retry-safe on timeout; retry only if you have independent proof nothing landed
+- side-effecting ops (`deliver` / `send_input` / `key` / `route` / `signal`) are **not** automatically retry-safe on timeout; retry only if you have independent proof nothing landed
 - read-only ops (`ping` / `list` / `wait_quiet`) can be retried normally
 
 Mailbox poison queue:
@@ -254,7 +263,7 @@ Outside-supervisor convenience wrapper over `control-plane.ps1 -Action events_si
 Defaults:
 
 - consumer cursor file: `.runtime/cursors/outside-supervisor.json`
-- kinds: `routed_message`, `route_delivery`, `session_state`, `system_log`, `sideband_request_lifecycle`, `request_ack`, `request_ack_timeout`
+- kinds: `routed_message`, `route_delivery`, `pane_signal`, `session_state`, `system_log`, `sideband_request_lifecycle`, `request_ack`, `request_ack_timeout`
 - `-MaxWaitSeconds 15`
 - `-MaxEvents 200`
 

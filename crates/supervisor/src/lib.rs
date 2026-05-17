@@ -18,10 +18,10 @@ use parking_lot::{Mutex, RwLock};
 use pty_host::{ConcretePtySession, PtyEvent, PtyEventHandler, PtySession};
 use shared_types::{
     ControlKey, ControlPlaneStatus, DeliverMessageRequest, DriverKind, EnvVar, EventCursor,
-    EventFilter, LaunchSpec, LifecycleState, LogLevel, MessageScope, RouteDeliveryPhase,
-    RouteMessageRequest, RuntimeEvent, RuntimeSnapshot, SendInputRequest, SessionDefinition,
-    SessionGeneration, SessionSnapshot, SidebandPhase, SidebandRequest, SidebandResponse,
-    SidebandResponsePayload, WaitQuietRequest, now_rfc3339,
+    EventFilter, LaunchSpec, LifecycleState, LogLevel, MessageScope, PaneSignalType,
+    RouteDeliveryPhase, RouteMessageRequest, RuntimeEvent, RuntimeSnapshot, SendInputRequest,
+    SessionDefinition, SessionGeneration, SessionSnapshot, SidebandPhase, SidebandRequest,
+    SidebandResponse, SidebandResponsePayload, WaitQuietRequest, now_rfc3339,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use uuid::Uuid;
@@ -80,6 +80,7 @@ impl SidebandTimeouts {
             SidebandRequest::SendInput { .. } => Duration::from_secs(5),
             SidebandRequest::SendKey { .. } => Duration::from_secs(5),
             SidebandRequest::RouteMessage { .. } => Duration::from_secs(15),
+            SidebandRequest::PaneSignal { .. } => Duration::from_secs(5),
         }
     }
 }
@@ -115,6 +116,12 @@ struct RouteDeliveryEvent {
     phase: RouteDeliveryPhase,
     bytes_written: usize,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaneSignalWritePaths {
+    signal_path: PathBuf,
+    legacy_touch_path: PathBuf,
 }
 
 impl RequestAckWatchdog {
@@ -751,6 +758,7 @@ impl SupervisorHandle {
                     | "pair_deleted"
                     | "routed_message"
                     | "route_delivery"
+                    | "pane_signal"
                     | "system_log"
                     | "control_plane_ready"
                     | "sideband_request_lifecycle"
@@ -1111,6 +1119,71 @@ impl SupervisorHandle {
             error: event.error,
             timestamp: now_rfc3339(),
         });
+    }
+
+    fn record_pane_signal(
+        &self,
+        request_id: &str,
+        token: &str,
+        task_id: String,
+        signal_type: PaneSignalType,
+        summary: String,
+        artifact_paths: Vec<String>,
+        commit_sha: Option<String>,
+    ) -> Result<PaneSignalWritePaths> {
+        let task_id = normalized_required_field("task_id", task_id)?;
+        let summary = normalized_required_field("summary", summary)?;
+        let session = self.resolve_pane_signal_session(token)?;
+        let now = Utc::now();
+        let timestamp = now.to_rfc3339();
+        let signal_type_name = pane_signal_type_name(signal_type);
+        let safe_task_id = pane_signal_filename_component(&task_id);
+        let signal_path = self.runtime_dir().join("signals").join(format!(
+            "{}__{}__{}.json",
+            safe_task_id,
+            signal_type_name,
+            pane_signal_file_timestamp(now)
+        ));
+        let legacy_touch_path = self
+            .runtime_dir()
+            .join("dispatch-triggers")
+            .join(format!("{safe_task_id}.{signal_type_name}"));
+        let event = RuntimeEvent::PaneSignal {
+            request_id: request_id.to_string(),
+            session,
+            task_id,
+            signal_type,
+            summary,
+            artifact_paths,
+            commit_sha,
+            timestamp,
+        };
+        let payload = format!("{}\n", serde_json::to_string_pretty(&event)?);
+
+        write_atomic_bytes(&signal_path, payload.as_bytes()).with_context(|| {
+            format!(
+                "failed to write canonical pane signal {}",
+                signal_path.display()
+            )
+        })?;
+
+        if let Err(error) = write_empty_touch_file(&legacy_touch_path) {
+            self.emit(RuntimeEvent::SystemLog {
+                level: LogLevel::Warn,
+                message: format!(
+                    "pane_signal legacy touch-file write failed for {}: {error}",
+                    legacy_touch_path.display()
+                ),
+                timestamp: now_rfc3339(),
+            });
+        }
+
+        self.emit(event);
+
+        Ok(PaneSignalWritePaths {
+            signal_path,
+            legacy_touch_path,
+        })
     }
 
     fn arm_request_ack_watchdog(
@@ -2354,6 +2427,7 @@ impl SupervisorHandle {
     async fn apply_side_effect_request_async(
         &self,
         request: SidebandRequest,
+        request_id: &str,
         ack_context: Option<RequestAckContext>,
     ) -> SidebandResponse {
         if let Some(response) = self.validate_sideband_request(request.token()) {
@@ -2489,6 +2563,45 @@ impl SupervisorHandle {
                         None => self.route_message(req),
                     })
                     .map(|_| "message routed".into())
+            }
+            SidebandRequest::PaneSignal {
+                token,
+                task_id,
+                signal_type,
+                summary,
+                artifact_paths,
+                commit_sha,
+            } => {
+                let result = self.record_pane_signal(
+                    request_id,
+                    &token,
+                    task_id,
+                    signal_type,
+                    summary,
+                    artifact_paths,
+                    commit_sha,
+                );
+                return match result {
+                    Ok(paths) => SidebandResponse {
+                        ok: true,
+                        message: format!("pane signal recorded at {}", paths.signal_path.display()),
+                        snapshot: Some(self.snapshot()),
+                        timed_out: false,
+                        payload: Some(SidebandResponsePayload::PaneSignal {
+                            signal_path: paths.signal_path.display().to_string(),
+                            legacy_touch_path: paths.legacy_touch_path.display().to_string(),
+                        }),
+                        request_id: None,
+                    },
+                    Err(error) => SidebandResponse {
+                        ok: false,
+                        message: error.to_string(),
+                        snapshot: Some(self.snapshot()),
+                        timed_out: false,
+                        payload: None,
+                        request_id: None,
+                    },
+                };
             }
             SidebandRequest::CreatePair { token, name } => {
                 tokio::task::yield_now().await;
@@ -2692,7 +2805,7 @@ impl SupervisorHandle {
         let started = Instant::now();
         let mut warned = false;
         let ack_context = request_ack_context_for(request_id, action, &request);
-        let operation = self.apply_side_effect_request_async(request, ack_context);
+        let operation = self.apply_side_effect_request_async(request, request_id, ack_context);
         tokio::pin!(operation);
         let slow_warning = tokio::time::sleep(slow_warn_at);
         tokio::pin!(slow_warning);
@@ -2889,6 +3002,18 @@ impl SupervisorHandle {
             .ok_or_else(|| anyhow!("invalid control plane token"))?;
 
         Ok(binding)
+    }
+
+    fn resolve_pane_signal_session(&self, token: &str) -> Result<String> {
+        let binding = self
+            .inner
+            .token_bindings
+            .lock()
+            .get(token)
+            .cloned()
+            .ok_or_else(|| anyhow!("invalid control plane token"))?;
+
+        Ok(binding.unwrap_or_else(|| "supervisor".into()))
     }
 
     fn validate_deliver_message_token(&self, token: &str, target_session: &str) -> Result<()> {
@@ -3370,7 +3495,7 @@ fn run_inline_with_timeout(
     let result = runtime.block_on(async move {
         tokio::time::timeout(
             budget,
-            handle_clone.apply_side_effect_request_async(request_clone, ack_context),
+            handle_clone.apply_side_effect_request_async(request_clone, request_id, ack_context),
         )
         .await
     });
@@ -3554,6 +3679,7 @@ fn event_kind(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::PairDeleted { .. } => "pair_deleted",
         RuntimeEvent::RoutedMessage { .. } => "routed_message",
         RuntimeEvent::RouteDelivery { .. } => "route_delivery",
+        RuntimeEvent::PaneSignal { .. } => "pane_signal",
         RuntimeEvent::SystemLog { .. } => "system_log",
         RuntimeEvent::ControlPlaneReady { .. } => "control_plane_ready",
         RuntimeEvent::SidebandRequestLifecycle { .. } => "sideband_request_lifecycle",
@@ -3605,6 +3731,10 @@ fn event_matches_filter(event: &RuntimeEvent, filter: &EventFilter) -> bool {
                 .include_sessions
                 .iter()
                 .any(|candidate| candidate == session),
+            RuntimeEvent::PaneSignal { session, .. } => filter
+                .include_sessions
+                .iter()
+                .any(|candidate| candidate == session),
             RuntimeEvent::PairCreated { .. }
             | RuntimeEvent::PairRenamed { .. }
             | RuntimeEvent::PairDeleted { .. }
@@ -3637,6 +3767,97 @@ fn message_scope_name(scope: MessageScope) -> &'static str {
         MessageScope::System => "system",
         MessageScope::Private => "private",
     }
+}
+
+fn normalized_required_field(field: &str, value: String) -> Result<String> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return Err(anyhow!("pane_signal requires non-empty {field}"));
+    }
+    Ok(value)
+}
+
+fn pane_signal_type_name(signal_type: PaneSignalType) -> &'static str {
+    match signal_type {
+        PaneSignalType::Done => "done",
+        PaneSignalType::Blocked => "blocked",
+        PaneSignalType::Yellow => "yellow",
+        PaneSignalType::Heartbeat => "heartbeat",
+        PaneSignalType::Progress => "progress",
+    }
+}
+
+fn pane_signal_file_timestamp(now: DateTime<Utc>) -> String {
+    now.format("%Y%m%dT%H%M%S%.9fZ").to_string()
+}
+
+fn pane_signal_filename_component(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let trimmed = sanitized.trim_matches('.');
+    if trimmed.is_empty() {
+        "signal".into()
+    } else {
+        trimmed.into()
+    }
+}
+
+fn write_atomic_bytes(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("path has no UTF-8 filename: {}", path.display()))?;
+    let temp_path = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .with_context(|| format!("failed to create temp file {}", temp_path.display()))?;
+        file.write_all(contents)
+            .with_context(|| format!("failed to write temp file {}", temp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync temp file {}", temp_path.display()))?;
+        drop(file);
+        fs::rename(&temp_path, path).with_context(|| {
+            format!(
+                "failed to rename temp file {} to {}",
+                temp_path.display(),
+                path.display()
+            )
+        })?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+
+    result
+}
+
+fn write_empty_touch_file(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    fs::write(path, b"").with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
 }
 
 fn audit_file_name(date: NaiveDate) -> String {
@@ -3710,6 +3931,7 @@ fn action_label_for(request: &SidebandRequest) -> &'static str {
         SidebandRequest::SendInput { .. } => "send_input",
         SidebandRequest::SendKey { .. } => "send_key",
         SidebandRequest::RouteMessage { .. } => "route_message",
+        SidebandRequest::PaneSignal { .. } => "pane_signal",
     }
 }
 
@@ -3734,7 +3956,8 @@ fn request_ack_context_for(
         | SidebandRequest::StopSession { .. }
         | SidebandRequest::RestartSession { .. }
         | SidebandRequest::WaitQuiet { .. }
-        | SidebandRequest::EventsSince { .. } => None,
+        | SidebandRequest::EventsSince { .. }
+        | SidebandRequest::PaneSignal { .. } => None,
     }
 }
 
@@ -3760,7 +3983,8 @@ fn session_name_of(request: &SidebandRequest) -> Option<&str> {
         SidebandRequest::Ping { .. }
         | SidebandRequest::ListSessions { .. }
         | SidebandRequest::CreatePair { .. }
-        | SidebandRequest::EventsSince { .. } => None,
+        | SidebandRequest::EventsSince { .. }
+        | SidebandRequest::PaneSignal { .. } => None,
     }
 }
 
@@ -4586,6 +4810,15 @@ mod tests {
             .lock()
             .iter()
             .filter(|event| matches!(event, RuntimeEvent::RouteDelivery { .. }))
+            .cloned()
+            .collect()
+    }
+
+    fn pane_signal_events(events: &Arc<Mutex<Vec<RuntimeEvent>>>) -> Vec<RuntimeEvent> {
+        events
+            .lock()
+            .iter()
+            .filter(|event| matches!(event, RuntimeEvent::PaneSignal { .. }))
             .cloned()
             .collect()
     }
@@ -6063,6 +6296,124 @@ mod tests {
     }
 
     #[test]
+    fn pane_signal_pane_bound_token_records_bound_session_and_files() {
+        let supervisor = test_supervisor();
+        let _status = supervisor.start_control_plane().unwrap();
+        let codex_token = session_token(&supervisor, "codex");
+        let events = capture_runtime_events(&supervisor);
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::PaneSignal {
+            token: codex_token,
+            task_id: "task-418".into(),
+            signal_type: PaneSignalType::Done,
+            summary: "signal complete".into(),
+            artifact_paths: vec!["evidence/task-418.md".into()],
+            commit_sha: Some("abc123".into()),
+        });
+
+        assert!(response.ok, "response: {:?}", response);
+        let request_id = response.request_id.clone().expect("request id");
+        let (signal_path, legacy_touch_path) = match response.payload {
+            Some(SidebandResponsePayload::PaneSignal {
+                signal_path,
+                legacy_touch_path,
+            }) => (PathBuf::from(signal_path), PathBuf::from(legacy_touch_path)),
+            other => panic!("unexpected response payload: {other:?}"),
+        };
+        assert!(signal_path.exists(), "missing {}", signal_path.display());
+        assert!(
+            signal_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("task-418__done__")
+        );
+        assert!(
+            legacy_touch_path.exists(),
+            "missing {}",
+            legacy_touch_path.display()
+        );
+        assert_eq!(
+            legacy_touch_path.file_name().unwrap().to_string_lossy(),
+            "task-418.done"
+        );
+
+        let signals = pane_signal_events(&events);
+        assert_eq!(signals.len(), 1);
+        match &signals[0] {
+            RuntimeEvent::PaneSignal {
+                request_id: event_request_id,
+                session,
+                task_id,
+                signal_type,
+                summary,
+                artifact_paths,
+                commit_sha,
+                ..
+            } => {
+                assert_eq!(event_request_id, &request_id);
+                assert_eq!(session, "codex");
+                assert_eq!(task_id, "task-418");
+                assert_eq!(*signal_type, PaneSignalType::Done);
+                assert_eq!(summary, "signal complete");
+                assert_eq!(artifact_paths, &vec!["evidence/task-418.md".to_string()]);
+                assert_eq!(commit_sha.as_deref(), Some("abc123"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let persisted: RuntimeEvent =
+            serde_json::from_str(&fs::read_to_string(signal_path).unwrap()).unwrap();
+        assert_eq!(persisted, signals[0]);
+    }
+
+    #[test]
+    fn pane_signal_master_token_records_supervisor_session() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let events = capture_runtime_events(&supervisor);
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::PaneSignal {
+            token: status.token,
+            task_id: "smoke".into(),
+            signal_type: PaneSignalType::Heartbeat,
+            summary: "still alive".into(),
+            artifact_paths: Vec::new(),
+            commit_sha: None,
+        });
+
+        assert!(response.ok, "response: {:?}", response);
+        let signals = pane_signal_events(&events);
+        assert_eq!(signals.len(), 1);
+        assert!(matches!(
+            &signals[0],
+            RuntimeEvent::PaneSignal {
+                session,
+                signal_type: PaneSignalType::Heartbeat,
+                ..
+            } if session == "supervisor"
+        ));
+    }
+
+    #[test]
+    fn pane_signal_rejects_invalid_token() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::PaneSignal {
+            token: format!("{}-wrong", status.token),
+            task_id: "task-418".into(),
+            signal_type: PaneSignalType::Blocked,
+            summary: "blocked".into(),
+            artifact_paths: Vec::new(),
+            commit_sha: None,
+        });
+
+        assert!(!response.ok);
+        assert_eq!(response.message, "invalid control plane token");
+    }
+
+    #[test]
     fn deliver_message_claude_delivers_multi_line_intact() {
         let supervisor = test_supervisor();
         install_synthetic_running_session(&supervisor, "claude", DriverKind::Claude);
@@ -6169,6 +6520,7 @@ mod tests {
             include_kinds: vec![
                 "routed_message".into(),
                 "route_delivery".into(),
+                "pane_signal".into(),
                 "session_state".into(),
                 "system_log".into(),
                 "sideband_request_lifecycle".into(),
