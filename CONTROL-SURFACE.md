@@ -123,6 +123,8 @@ Behavior:
   - `system_log`
   - `control_plane_ready`
   - `sideband_request_lifecycle`
+  - `request_ack`
+  - `request_ack_timeout`
 - `events_since` accepts:
   - `-Cursor` or `-CursorFile`
   - `-MaxEvents`
@@ -158,6 +160,8 @@ Per-action supervisor budgets:
 
 What callers see:
 
+- every sideband response includes `request_id` when the request decoded successfully
+- pane-bound `send_input`, `key`, `deliver`, and `route` requests emit `request_ack` after PTY writes complete; if the write path remains incomplete past `PRIM1_REQUEST_ACK_TIMEOUT_SECS` (default 60), they emit `request_ack_timeout`
 - `timed_out: true` now returns exit code `124`
 - non-`-Quiet` mode prints `TIMED OUT: <message>` instead of JSON for timeout responses
 - `-Quiet` mode also surfaces the timeout banner and exits `124`
@@ -245,7 +249,7 @@ Outside-supervisor convenience wrapper over `control-plane.ps1 -Action events_si
 Defaults:
 
 - consumer cursor file: `.runtime/cursors/outside-supervisor.json`
-- kinds: `routed_message`, `session_state`, `system_log`, `sideband_request_lifecycle`
+- kinds: `routed_message`, `session_state`, `system_log`, `sideband_request_lifecycle`, `request_ack`, `request_ack_timeout`
 - `-MaxWaitSeconds 15`
 - `-MaxEvents 200`
 

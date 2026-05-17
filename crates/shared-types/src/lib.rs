@@ -202,7 +202,7 @@ pub struct EventFilter {
 
 impl EventFilter {
     pub const ALL_KINDS: &'static str = "all";
-    pub const DEFAULT_INCLUDE_KINDS: [&'static str; 8] = [
+    pub const DEFAULT_INCLUDE_KINDS: [&'static str; 10] = [
         "session_state",
         "pair_created",
         "pair_renamed",
@@ -211,6 +211,8 @@ impl EventFilter {
         "system_log",
         "control_plane_ready",
         "sideband_request_lifecycle",
+        "request_ack",
+        "request_ack_timeout",
     ];
 
     pub fn includes_kind(&self, kind: &str) -> bool {
@@ -284,6 +286,20 @@ pub enum RuntimeEvent {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         extra_args: Vec<String>,
         phase: SidebandPhase,
+        elapsed_ms: u64,
+        timestamp: String,
+    },
+    RequestAck {
+        request_id: String,
+        session: String,
+        action: String,
+        bytes_written: usize,
+        timestamp: String,
+    },
+    RequestAckTimeout {
+        request_id: String,
+        session: String,
+        action: String,
         elapsed_ms: u64,
         timestamp: String,
     },
@@ -409,6 +425,8 @@ pub struct SidebandResponse {
     pub timed_out: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<SidebandResponsePayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -485,6 +503,7 @@ mod tests {
             snapshot: None,
             timed_out: false,
             payload: None,
+            request_id: None,
         })
         .unwrap();
 
@@ -512,6 +531,7 @@ mod tests {
         assert_eq!(response.snapshot, None);
         assert!(!response.timed_out);
         assert_eq!(response.payload, None);
+        assert_eq!(response.request_id, None);
     }
 
     #[test]
@@ -522,6 +542,78 @@ mod tests {
             snapshot: None,
             timed_out: true,
             payload: None,
+            request_id: None,
+        };
+
+        let roundtrip: SidebandResponse =
+            serde_json::from_value(serde_json::to_value(response.clone()).unwrap()).unwrap();
+
+        assert_eq!(roundtrip, response);
+    }
+
+    #[test]
+    fn request_ack_event_round_trips_via_json() {
+        let event = RuntimeEvent::RequestAck {
+            request_id: "req-1".into(),
+            session: "codex".into(),
+            action: "send_input".into(),
+            bytes_written: 7,
+            timestamp: "2026-05-17T00:00:00Z".into(),
+        };
+
+        let value = serde_json::to_value(event.clone()).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "event": "request_ack",
+                "request_id": "req-1",
+                "session": "codex",
+                "action": "send_input",
+                "bytes_written": 7,
+                "timestamp": "2026-05-17T00:00:00Z",
+            })
+        );
+
+        let roundtrip: RuntimeEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(roundtrip, event);
+    }
+
+    #[test]
+    fn request_ack_timeout_event_round_trips_via_json() {
+        let event = RuntimeEvent::RequestAckTimeout {
+            request_id: "req-1".into(),
+            session: "codex".into(),
+            action: "send_input".into(),
+            elapsed_ms: 60_000,
+            timestamp: "2026-05-17T00:00:00Z".into(),
+        };
+
+        let value = serde_json::to_value(event.clone()).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "event": "request_ack_timeout",
+                "request_id": "req-1",
+                "session": "codex",
+                "action": "send_input",
+                "elapsed_ms": 60000,
+                "timestamp": "2026-05-17T00:00:00Z",
+            })
+        );
+
+        let roundtrip: RuntimeEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(roundtrip, event);
+    }
+
+    #[test]
+    fn sideband_response_round_trips_with_request_id() {
+        let response = SidebandResponse {
+            ok: true,
+            message: "input sent".into(),
+            snapshot: None,
+            timed_out: false,
+            payload: None,
+            request_id: Some("req-1".into()),
         };
 
         let roundtrip: SidebandResponse =
@@ -578,6 +670,14 @@ mod tests {
         let filter = EventFilter::default();
 
         assert!(filter.includes_kind("sideband_request_lifecycle"));
+    }
+
+    #[test]
+    fn filter_default_includes_request_ack_events() {
+        let filter = EventFilter::default();
+
+        assert!(filter.includes_kind("request_ack"));
+        assert!(filter.includes_kind("request_ack_timeout"));
     }
 
     #[test]

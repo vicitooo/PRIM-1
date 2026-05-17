@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -30,6 +30,7 @@ type EventSink = Arc<dyn Fn(RuntimeEvent) + Send + Sync>;
 
 const CONTROL_PLANE_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const CONTROL_PLANE_PROBE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+const DEFAULT_REQUEST_ACK_TIMEOUT_SECS: u64 = 60;
 const PAIR_NAME_MAX_LEN: usize = 48;
 const RESERVED_PAIR_NAMES: [&str; 5] = ["main", "claude", "codex", "room", "operator"];
 
@@ -80,6 +81,31 @@ impl SidebandTimeouts {
             SidebandRequest::SendKey { .. } => Duration::from_secs(5),
             SidebandRequest::RouteMessage { .. } => Duration::from_secs(15),
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RequestAckContext {
+    request_id: String,
+    action: String,
+    timeout: Duration,
+}
+
+struct RequestAckWatchdog {
+    completed: Arc<AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl RequestAckWatchdog {
+    fn cancel(&self) {
+        self.completed.store(true, Ordering::SeqCst);
+        self.task.abort();
+    }
+}
+
+impl Drop for RequestAckWatchdog {
+    fn drop(&mut self) {
+        self.cancel();
     }
 }
 
@@ -767,6 +793,7 @@ impl SupervisorHandle {
             snapshot: Some(self.snapshot()),
             timed_out: false,
             payload: Some(SidebandResponsePayload::EventsSinceError { echoed_cursor }),
+            request_id: None,
         }
     }
 
@@ -1001,6 +1028,52 @@ impl SupervisorHandle {
             elapsed_ms: elapsed.as_millis() as u64,
             timestamp: now_rfc3339(),
         });
+    }
+
+    fn emit_request_ack(&self, context: &RequestAckContext, session: &str, bytes_written: usize) {
+        self.emit(RuntimeEvent::RequestAck {
+            request_id: context.request_id.clone(),
+            session: session.to_string(),
+            action: context.action.clone(),
+            bytes_written,
+            timestamp: now_rfc3339(),
+        });
+    }
+
+    fn emit_request_ack_timeout(
+        &self,
+        context: &RequestAckContext,
+        session: &str,
+        elapsed: Duration,
+    ) {
+        self.emit(RuntimeEvent::RequestAckTimeout {
+            request_id: context.request_id.clone(),
+            session: session.to_string(),
+            action: context.action.clone(),
+            elapsed_ms: elapsed.as_millis() as u64,
+            timestamp: now_rfc3339(),
+        });
+    }
+
+    fn arm_request_ack_watchdog(
+        &self,
+        context: &RequestAckContext,
+        session: &str,
+    ) -> RequestAckWatchdog {
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_for_task = Arc::clone(&completed);
+        let handle = self.clone();
+        let context = context.clone();
+        let session = session.to_string();
+        let started = Instant::now();
+        let task = self.inner.background_runtime.spawn(async move {
+            tokio::time::sleep(context.timeout).await;
+            if !completed_for_task.swap(true, Ordering::SeqCst) {
+                handle.emit_request_ack_timeout(&context, &session, started.elapsed());
+            }
+        });
+
+        RequestAckWatchdog { completed, task }
     }
 
     fn arm_quiesce_timer(
@@ -1569,9 +1642,9 @@ impl SupervisorHandle {
         self.start_session_at(name, expected_start, Vec::new())
     }
 
-    pub fn send_input(&self, request: SendInputRequest) -> Result<SessionSnapshot> {
+    fn send_input_with_bytes(&self, request: SendInputRequest) -> Result<(SessionSnapshot, usize)> {
         self.refresh_session_liveness();
-        let snapshot = {
+        let (snapshot, bytes_written) = {
             let mut slots = self.inner.slots.lock();
             let slot = slots
                 .get_mut(&request.name)
@@ -1580,7 +1653,7 @@ impl SupervisorHandle {
                 .running
                 .as_ref()
                 .ok_or_else(|| anyhow!("session '{}' is not running", request.name))?;
-            running
+            let bytes_written = running
                 .pty
                 .as_ref()
                 .ok_or_else(|| anyhow!("session '{}' transport is not available", request.name))?
@@ -1588,7 +1661,7 @@ impl SupervisorHandle {
             cancel_quiesce_timer_locked(slot);
             slot.state = LifecycleState::Busy;
             slot.last_activity_at = Some(now_rfc3339());
-            slot.snapshot()
+            (slot.snapshot(), bytes_written)
         };
 
         self.emit(RuntimeEvent::SessionState {
@@ -1598,6 +1671,24 @@ impl SupervisorHandle {
             timestamp: now_rfc3339(),
         });
 
+        Ok((snapshot, bytes_written))
+    }
+
+    pub fn send_input(&self, request: SendInputRequest) -> Result<SessionSnapshot> {
+        self.send_input_with_bytes(request)
+            .map(|(snapshot, _bytes_written)| snapshot)
+    }
+
+    fn send_input_with_request_ack(
+        &self,
+        request: SendInputRequest,
+        ack_context: &RequestAckContext,
+    ) -> Result<SessionSnapshot> {
+        let session_name = request.name.clone();
+        let watchdog = self.arm_request_ack_watchdog(ack_context, &session_name);
+        let (snapshot, bytes_written) = self.send_input_with_bytes(request)?;
+        watchdog.cancel();
+        self.emit_request_ack(ack_context, &snapshot.name, bytes_written);
         Ok(snapshot)
     }
 
@@ -1608,7 +1699,38 @@ impl SupervisorHandle {
         })
     }
 
+    fn send_control_key_with_request_ack(
+        &self,
+        name: &str,
+        key: ControlKey,
+        ack_context: &RequestAckContext,
+    ) -> Result<SessionSnapshot> {
+        self.send_input_with_request_ack(
+            SendInputRequest {
+                name: name.into(),
+                input: control_key_sequence(key).into(),
+            },
+            ack_context,
+        )
+    }
+
     pub fn route_message(&self, request: RouteMessageRequest) -> Result<RuntimeSnapshot> {
+        self.route_message_inner(request, None)
+    }
+
+    fn route_message_with_request_ack(
+        &self,
+        request: RouteMessageRequest,
+        ack_context: &RequestAckContext,
+    ) -> Result<RuntimeSnapshot> {
+        self.route_message_inner(request, Some(ack_context))
+    }
+
+    fn route_message_inner(
+        &self,
+        request: RouteMessageRequest,
+        ack_context: Option<&RequestAckContext>,
+    ) -> Result<RuntimeSnapshot> {
         self.refresh_session_liveness();
         let recipients =
             self.resolve_recipients(&request.to, request.scope, Some(request.from.as_str()));
@@ -1632,7 +1754,14 @@ impl SupervisorHandle {
         for recipient in recipients {
             let submit_behavior = self.submit_behavior_for_session(&recipient)?;
             let payloads = routed_message_payloads(&request, submit_behavior);
-            self.deliver_prepared_payloads(&recipient, &payloads, submit_behavior)?;
+            let watchdog =
+                ack_context.map(|context| self.arm_request_ack_watchdog(context, &recipient));
+            let bytes_written =
+                self.deliver_prepared_payloads(&recipient, &payloads, submit_behavior)?;
+            if let (Some(context), Some(watchdog)) = (ack_context, watchdog.as_ref()) {
+                watchdog.cancel();
+                self.emit_request_ack(context, &recipient, bytes_written);
+            }
         }
 
         self.emit(RuntimeEvent::SystemLog {
@@ -1645,10 +1774,34 @@ impl SupervisorHandle {
     }
 
     pub fn deliver_message(&self, request: DeliverMessageRequest) -> Result<SessionSnapshot> {
+        self.deliver_message_inner(request, None)
+    }
+
+    fn deliver_message_with_request_ack(
+        &self,
+        request: DeliverMessageRequest,
+        ack_context: &RequestAckContext,
+    ) -> Result<SessionSnapshot> {
+        self.deliver_message_inner(request, Some(ack_context))
+    }
+
+    fn deliver_message_inner(
+        &self,
+        request: DeliverMessageRequest,
+        ack_context: Option<&RequestAckContext>,
+    ) -> Result<SessionSnapshot> {
         let (_, submit_behavior, payloads) =
             self.prepare_delivery_for_session(&request.name, &request.content)?;
 
-        self.deliver_prepared_payloads(&request.name, &payloads, submit_behavior)?;
+        let watchdog =
+            ack_context.map(|context| self.arm_request_ack_watchdog(context, &request.name));
+        let bytes_written =
+            self.deliver_prepared_payloads(&request.name, &payloads, submit_behavior)?;
+        if let (Some(context), Some(watchdog)) = (ack_context, watchdog.as_ref()) {
+            watchdog.cancel();
+            self.emit_request_ack(context, &request.name, bytes_written);
+        }
+
         let snapshot = {
             let mut slots = self.inner.slots.lock();
             let slot = slots
@@ -1976,6 +2129,7 @@ impl SupervisorHandle {
                 snapshot: None,
                 timed_out: false,
                 payload: None,
+                request_id: None,
             });
         };
 
@@ -1986,6 +2140,7 @@ impl SupervisorHandle {
                 snapshot: None,
                 timed_out: false,
                 payload: None,
+                request_id: None,
             });
         }
 
@@ -2000,6 +2155,7 @@ impl SupervisorHandle {
                 snapshot: Some(self.snapshot()),
                 timed_out: false,
                 payload: None,
+                request_id: None,
             },
             Err(error) => SidebandResponse {
                 ok: false,
@@ -2007,6 +2163,7 @@ impl SupervisorHandle {
                 snapshot: Some(self.snapshot()),
                 timed_out: false,
                 payload: None,
+                request_id: None,
             },
         }
     }
@@ -2041,7 +2198,11 @@ impl SupervisorHandle {
         self.sideband_response_from_outcome(outcome)
     }
 
-    async fn apply_side_effect_request_async(&self, request: SidebandRequest) -> SidebandResponse {
+    async fn apply_side_effect_request_async(
+        &self,
+        request: SidebandRequest,
+        ack_context: Option<RequestAckContext>,
+    ) -> SidebandResponse {
         if let Some(response) = self.validate_sideband_request(request.token()) {
             return response;
         }
@@ -2108,6 +2269,7 @@ impl SupervisorHandle {
                             gap_detected: result.gap_detected,
                             as_of: result.as_of,
                         }),
+                        request_id: None,
                     },
                     Err(error) => {
                         let message = if error.to_string().starts_with("audit read error:") {
@@ -2126,19 +2288,38 @@ impl SupervisorHandle {
             } => {
                 tokio::task::yield_now().await;
                 self.validate_deliver_message_token(&token, &name)
-                    .and_then(|_| self.deliver_message(DeliverMessageRequest { name, content }))
+                    .and_then(|_| {
+                        let request = DeliverMessageRequest { name, content };
+                        match ack_context.as_ref() {
+                            Some(context) => {
+                                self.deliver_message_with_request_ack(request, context)
+                            }
+                            None => self.deliver_message(request),
+                        }
+                    })
                     .map(|_| "delivered".into())
             }
             SidebandRequest::SendInput { token, name, input } => {
                 tokio::task::yield_now().await;
                 self.validate_session_action_token(&token, &name)
-                    .and_then(|_| self.send_input(SendInputRequest { name, input }))
+                    .and_then(|_| {
+                        let request = SendInputRequest { name, input };
+                        match ack_context.as_ref() {
+                            Some(context) => self.send_input_with_request_ack(request, context),
+                            None => self.send_input(request),
+                        }
+                    })
                     .map(|_| "input sent".into())
             }
             SidebandRequest::SendKey { token, name, key } => {
                 tokio::task::yield_now().await;
                 self.validate_session_action_token(&token, &name)
-                    .and_then(|_| self.send_control_key(&name, key))
+                    .and_then(|_| match ack_context.as_ref() {
+                        Some(context) => {
+                            self.send_control_key_with_request_ack(&name, key, context)
+                        }
+                        None => self.send_control_key(&name, key),
+                    })
                     .map(|_| format!("key {:?} sent", key))
             }
             SidebandRequest::RouteMessage { token, mut request } => {
@@ -2150,7 +2331,10 @@ impl SupervisorHandle {
                         }
                         request
                     })
-                    .and_then(|req| self.route_message(req))
+                    .and_then(|req| match ack_context.as_ref() {
+                        Some(context) => self.route_message_with_request_ack(req, context),
+                        None => self.route_message(req),
+                    })
                     .map(|_| "message routed".into())
             }
             SidebandRequest::CreatePair { token, name } => {
@@ -2169,6 +2353,7 @@ impl SupervisorHandle {
                     snapshot: Some(self.snapshot()),
                     timed_out: false,
                     payload: None,
+                    request_id: None,
                 };
             }
         };
@@ -2193,7 +2378,7 @@ impl SupervisorHandle {
             Duration::ZERO,
         );
 
-        let response = match SidebandTimeouts::lane(&request) {
+        let mut response = match SidebandTimeouts::lane(&request) {
             OpLane::Lifecycle => {
                 self.run_detached_with_timeout_async(
                     request.clone(),
@@ -2217,6 +2402,8 @@ impl SupervisorHandle {
                 .await
             }
         };
+
+        response.request_id = Some(request_id.clone());
 
         if !response.timed_out {
             let phase = if response.ok {
@@ -2294,6 +2481,7 @@ impl SupervisorHandle {
                             snapshot: Some(self.snapshot()),
                             timed_out: false,
                             payload: None,
+                            request_id: None,
                         },
                     };
                 }
@@ -2327,6 +2515,7 @@ impl SupervisorHandle {
                         snapshot: Some(self.snapshot()),
                         timed_out: true,
                         payload: None,
+                        request_id: None,
                     };
                 }
             }
@@ -2345,7 +2534,8 @@ impl SupervisorHandle {
         let slow_warn_at = budget / 2;
         let started = Instant::now();
         let mut warned = false;
-        let operation = self.apply_side_effect_request_async(request);
+        let ack_context = request_ack_context_for(request_id, action, &request);
+        let operation = self.apply_side_effect_request_async(request, ack_context);
         tokio::pin!(operation);
         let slow_warning = tokio::time::sleep(slow_warn_at);
         tokio::pin!(slow_warning);
@@ -2397,6 +2587,7 @@ impl SupervisorHandle {
                         snapshot: Some(self.snapshot()),
                         timed_out: true,
                         payload: None,
+                        request_id: None,
                     };
                 }
             }
@@ -2610,6 +2801,7 @@ impl SupervisorHandle {
                         snapshot: Some(self.snapshot()),
                         timed_out: false,
                         payload: None,
+                        request_id: None,
                     };
                 };
                 if slot.running.is_none() {
@@ -2619,6 +2811,7 @@ impl SupervisorHandle {
                         snapshot: Some(self.snapshot()),
                         timed_out: false,
                         payload: None,
+                        request_id: None,
                     };
                 }
 
@@ -2637,6 +2830,7 @@ impl SupervisorHandle {
                     payload: Some(SidebandResponsePayload::WaitQuiet {
                         quiet_duration_ms: status,
                     }),
+                    request_id: None,
                 };
             }
 
@@ -2649,6 +2843,7 @@ impl SupervisorHandle {
                     payload: Some(SidebandResponsePayload::WaitQuietTimeout {
                         last_output_age_ms: status,
                     }),
+                    request_id: None,
                 };
             }
 
@@ -2661,22 +2856,25 @@ impl SupervisorHandle {
         session_name: &str,
         payloads: &[String],
         submit_behavior: SubmitBehavior,
-    ) -> Result<()> {
+    ) -> Result<usize> {
+        let mut total_bytes_written = 0;
         for payload in payloads {
-            self.send_input(SendInputRequest {
+            let (_snapshot, bytes_written) = self.send_input_with_bytes(SendInputRequest {
                 name: session_name.into(),
                 input: payload.clone(),
             })?;
+            total_bytes_written += bytes_written;
             if !submit_behavior.delay.is_zero() {
                 thread::sleep(submit_behavior.delay);
             }
-            self.send_input(SendInputRequest {
+            let (_snapshot, bytes_written) = self.send_input_with_bytes(SendInputRequest {
                 name: session_name.into(),
                 input: submit_behavior.sequence.into(),
             })?;
+            total_bytes_written += bytes_written;
         }
 
-        Ok(())
+        Ok(total_bytes_written)
     }
 }
 
@@ -2820,6 +3018,7 @@ fn process_sideband_mailbox_file(
                 snapshot: Some(handle.snapshot()),
                 timed_out: false,
                 payload: None,
+                request_id: None,
             };
             return write_and_archive_response(
                 handle,
@@ -2847,7 +3046,7 @@ fn process_sideband_mailbox_file(
         Duration::ZERO,
     );
 
-    let response = match SidebandTimeouts::lane(&request) {
+    let mut response = match SidebandTimeouts::lane(&request) {
         OpLane::Lifecycle => run_detached_with_timeout(
             handle,
             request.clone(),
@@ -2867,6 +3066,8 @@ fn process_sideband_mailbox_file(
             &extra_args,
         ),
     };
+
+    response.request_id = Some(request_id.clone());
 
     if !response.timed_out {
         let phase = if response.ok {
@@ -2964,6 +3165,7 @@ fn run_detached_with_timeout(
                         snapshot: Some(handle.snapshot()),
                         timed_out: true,
                         payload: None,
+                        request_id: None,
                     };
                 }
             }
@@ -2974,6 +3176,7 @@ fn run_detached_with_timeout(
                     snapshot: Some(handle.snapshot()),
                     timed_out: false,
                     payload: None,
+                    request_id: None,
                 };
             }
         }
@@ -2997,10 +3200,11 @@ fn run_inline_with_timeout(
     let slow_warn_at = budget / 2;
     let handle_clone = handle.clone();
     let request_clone = request.clone();
+    let ack_context = request_ack_context_for(request_id, action, &request);
     let result = runtime.block_on(async move {
         tokio::time::timeout(
             budget,
-            handle_clone.apply_side_effect_request_async(request_clone),
+            handle_clone.apply_side_effect_request_async(request_clone, ack_context),
         )
         .await
     });
@@ -3037,6 +3241,7 @@ fn run_inline_with_timeout(
                 snapshot: Some(handle.snapshot()),
                 timed_out: true,
                 payload: None,
+                request_id: None,
             }
         }
     }
@@ -3183,6 +3388,8 @@ fn event_kind(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::SystemLog { .. } => "system_log",
         RuntimeEvent::ControlPlaneReady { .. } => "control_plane_ready",
         RuntimeEvent::SidebandRequestLifecycle { .. } => "sideband_request_lifecycle",
+        RuntimeEvent::RequestAck { .. } => "request_ack",
+        RuntimeEvent::RequestAckTimeout { .. } => "request_ack_timeout",
     }
 }
 
@@ -3211,6 +3418,11 @@ fn event_matches_filter(event: &RuntimeEvent, filter: &EventFilter) -> bool {
                         .any(|candidate| candidate == value)
                 })
                 .unwrap_or(false),
+            RuntimeEvent::RequestAck { session, .. }
+            | RuntimeEvent::RequestAckTimeout { session, .. } => filter
+                .include_sessions
+                .iter()
+                .any(|candidate| candidate == session),
             RuntimeEvent::PairCreated { .. }
             | RuntimeEvent::PairRenamed { .. }
             | RuntimeEvent::PairDeleted { .. }
@@ -3313,6 +3525,40 @@ fn action_label_for(request: &SidebandRequest) -> &'static str {
         SidebandRequest::SendKey { .. } => "send_key",
         SidebandRequest::RouteMessage { .. } => "route_message",
     }
+}
+
+fn request_ack_context_for(
+    request_id: &str,
+    action: &str,
+    request: &SidebandRequest,
+) -> Option<RequestAckContext> {
+    match request {
+        SidebandRequest::DeliverMessage { .. }
+        | SidebandRequest::SendInput { .. }
+        | SidebandRequest::SendKey { .. }
+        | SidebandRequest::RouteMessage { .. } => Some(RequestAckContext {
+            request_id: request_id.to_string(),
+            action: action.to_string(),
+            timeout: request_ack_timeout(),
+        }),
+        SidebandRequest::Ping { .. }
+        | SidebandRequest::ListSessions { .. }
+        | SidebandRequest::CreatePair { .. }
+        | SidebandRequest::StartSession { .. }
+        | SidebandRequest::StopSession { .. }
+        | SidebandRequest::RestartSession { .. }
+        | SidebandRequest::WaitQuiet { .. }
+        | SidebandRequest::EventsSince { .. } => None,
+    }
+}
+
+fn request_ack_timeout() -> Duration {
+    std::env::var("PRIM1_REQUEST_ACK_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(DEFAULT_REQUEST_ACK_TIMEOUT_SECS))
 }
 
 fn session_name_of(request: &SidebandRequest) -> Option<&str> {
@@ -3841,9 +4087,9 @@ mod tests {
     }
 
     impl PtySessionTrait for MockPtySession {
-        fn send_input(&self, _input: &str) -> Result<()> {
+        fn send_input(&self, input: &str) -> Result<usize> {
             self.send_input_count.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            Ok(input.as_bytes().len())
         }
 
         fn resize(&self, _cols: u16, _rows: u16) -> Result<()> {
@@ -6212,6 +6458,59 @@ mod tests {
         assert_eq!(lifecycle_events[0].2, SidebandPhase::Started);
         assert_eq!(lifecycle_events[1].2, SidebandPhase::Completed);
         assert_eq!(lifecycle_events[0].0, lifecycle_events[1].0);
+    }
+
+    #[test]
+    fn sideband_send_input_emits_request_ack_and_response_request_id() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let events = Arc::new(Mutex::new(Vec::<RuntimeEvent>::new()));
+        let captured = events.clone();
+        supervisor.set_event_sink(move |event| {
+            captured.lock().push(event);
+        });
+        let (pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::SendInput {
+            token: status.token,
+            name: "codex".into(),
+            input: "/fast".into(),
+        });
+
+        assert!(response.ok, "got: {}", response.message);
+        let response_request_id = response.request_id.as_deref().unwrap();
+
+        let events = events.lock();
+        let ack_events = events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::RequestAck {
+                    request_id,
+                    session,
+                    action,
+                    bytes_written,
+                    ..
+                } => Some((
+                    request_id.as_str(),
+                    session.as_str(),
+                    action.as_str(),
+                    *bytes_written,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let timeout_count = events
+            .iter()
+            .filter(|event| matches!(event, RuntimeEvent::RequestAckTimeout { .. }))
+            .count();
+
+        assert_eq!(ack_events.len(), 1);
+        assert_eq!(timeout_count, 0);
+        assert_eq!(
+            ack_events[0],
+            (response_request_id, "codex", "send_input", 5)
+        );
     }
 
     #[test]

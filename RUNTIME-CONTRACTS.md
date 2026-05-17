@@ -180,6 +180,11 @@ Minimum fields:
 - summary
 - result
 
+Pane-bound sideband requests (`send_input`, `send_key`, `deliver_message`, `route_message`) must expose two correlated layers:
+
+- `sideband_request_lifecycle` records supervisor request processing, keyed by `request_id`
+- `request_ack` records successful PTY-write completion for the target session, keyed by the same `request_id`; `request_ack_timeout` records a missing PTY-write completion after `PRIM1_REQUEST_ACK_TIMEOUT_SECS` (default 60)
+
 ## 11. Cost telemetry contract
 
 Supervisor must have a hook for:
@@ -200,4 +205,3 @@ Rules:
 - UI crash -> supervisor keeps running
 - reconnect -> UI reattaches to supervisor state
 - child crash -> lifecycle transition, restart policy applies
-

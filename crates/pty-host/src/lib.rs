@@ -29,7 +29,7 @@ pub struct PtyExitStatus {
 }
 
 pub trait PtySession: Send {
-    fn send_input(&self, input: &str) -> anyhow::Result<()>;
+    fn send_input(&self, input: &str) -> anyhow::Result<usize>;
     fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()>;
     fn kill(&self) -> anyhow::Result<()>;
     fn try_wait(&self) -> anyhow::Result<Option<PtyExitStatus>>;
@@ -166,13 +166,13 @@ impl ConcretePtySession {
 }
 
 impl PtySession for ConcretePtySession {
-    fn send_input(&self, input: &str) -> anyhow::Result<()> {
+    fn send_input(&self, input: &str) -> anyhow::Result<usize> {
         let mut writer = self.writer.lock().expect("pty writer poisoned");
         writer
             .write_all(input.as_bytes())
             .context("failed to write PTY input")?;
         writer.flush().context("failed to flush PTY input")?;
-        Ok(())
+        Ok(input.as_bytes().len())
     }
 
     fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()> {

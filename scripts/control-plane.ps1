@@ -352,6 +352,9 @@ if ($Action -eq "events_since") {
       gap_detected = $parsed.payload.gap_detected
       as_of = $parsed.payload.as_of
     }
+    if ($parsed.request_id) {
+      $output.request_id = $parsed.request_id
+    }
 
     if ($OutCursorFile) {
       Write-AtomicText -Path $OutCursorFile -Content (($parsed.payload.next_cursor | ConvertTo-Json -Depth 8 -Compress))
@@ -367,6 +370,9 @@ if ($Action -eq "events_since") {
   }
   if ($parsed.payload) {
     $errorOutput.payload = $parsed.payload
+  }
+  if ($parsed.request_id) {
+    $errorOutput.request_id = $parsed.request_id
   }
 
   Write-Error $parsed.message

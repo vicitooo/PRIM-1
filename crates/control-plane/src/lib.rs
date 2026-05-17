@@ -125,6 +125,7 @@ mod tests {
             }),
             timed_out: false,
             payload: None,
+            request_id: None,
         })
         .unwrap();
         let decoded = decode_response(&json).unwrap();
