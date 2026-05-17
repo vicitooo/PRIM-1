@@ -212,8 +212,9 @@ pub struct EventFilter {
 
 impl EventFilter {
     pub const ALL_KINDS: &'static str = "all";
-    pub const DEFAULT_INCLUDE_KINDS: [&'static str; 13] = [
+    pub const DEFAULT_INCLUDE_KINDS: [&'static str; 14] = [
         "session_state",
+        "session_exit",
         "session_work_state",
         "pair_created",
         "pair_renamed",
@@ -245,6 +246,17 @@ impl EventFilter {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionExitReason {
+    CleanExit,
+    CrashExit,
+    OperatorStop,
+    RestartStop,
+    PtyError,
+    ProcessDisappeared,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum RuntimeEvent {
@@ -258,6 +270,17 @@ pub enum RuntimeEvent {
         session: String,
         state: LifecycleState,
         reason: String,
+        timestamp: String,
+    },
+    SessionExit {
+        session: String,
+        generation: u64,
+        process_id: Option<u32>,
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+        success: bool,
+        reason: SessionExitReason,
+        requested: bool,
         timestamp: String,
     },
     SessionWorkState {
@@ -688,6 +711,61 @@ mod tests {
     }
 
     #[test]
+    fn session_exit_event_round_trips_via_json() {
+        let event = RuntimeEvent::SessionExit {
+            session: "codex".into(),
+            generation: 7,
+            process_id: Some(1234),
+            exit_code: Some(1),
+            signal: None,
+            success: false,
+            reason: SessionExitReason::CrashExit,
+            requested: false,
+            timestamp: "2026-05-18T00:00:00Z".into(),
+        };
+
+        let value = serde_json::to_value(event.clone()).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "event": "session_exit",
+                "session": "codex",
+                "generation": 7,
+                "process_id": 1234,
+                "exit_code": 1,
+                "signal": null,
+                "success": false,
+                "reason": "crash_exit",
+                "requested": false,
+                "timestamp": "2026-05-18T00:00:00Z",
+            })
+        );
+
+        let roundtrip: RuntimeEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(roundtrip, event);
+    }
+
+    #[test]
+    fn session_exit_reason_variants_use_snake_case() {
+        let cases = [
+            (SessionExitReason::CleanExit, "clean_exit"),
+            (SessionExitReason::CrashExit, "crash_exit"),
+            (SessionExitReason::OperatorStop, "operator_stop"),
+            (SessionExitReason::RestartStop, "restart_stop"),
+            (SessionExitReason::PtyError, "pty_error"),
+            (SessionExitReason::ProcessDisappeared, "process_disappeared"),
+        ];
+
+        for (reason, expected) in cases {
+            assert_eq!(serde_json::to_value(reason).unwrap(), json!(expected));
+            assert_eq!(
+                serde_json::from_value::<SessionExitReason>(json!(expected)).unwrap(),
+                reason
+            );
+        }
+    }
+
+    #[test]
     fn route_delivery_event_round_trips_via_json() {
         let event = RuntimeEvent::RouteDelivery {
             request_id: "req-1".into(),
@@ -1077,6 +1155,13 @@ mod tests {
         let filter = EventFilter::default();
 
         assert!(filter.includes_kind("session_work_state"));
+    }
+
+    #[test]
+    fn filter_default_includes_session_exit() {
+        let filter = EventFilter::default();
+
+        assert!(filter.includes_kind("session_exit"));
     }
 
     #[test]

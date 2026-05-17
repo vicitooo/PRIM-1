@@ -10,6 +10,13 @@ export type LifecycleState =
   | "closed";
 export type MessageScope = "direct" | "room" | "system" | "private";
 export type LogLevel = "info" | "warn" | "error";
+export type SessionExitReason =
+  | "clean_exit"
+  | "crash_exit"
+  | "operator_stop"
+  | "restart_stop"
+  | "pty_error"
+  | "process_disappeared";
 
 export interface SessionSnapshot {
   name: string;
@@ -89,6 +96,18 @@ export type RuntimeEvent =
       session: string;
       state: LifecycleState;
       reason: string;
+      timestamp: string;
+    }
+  | {
+      event: "session_exit";
+      session: string;
+      generation: number;
+      process_id: number | null;
+      exit_code: number | null;
+      signal: number | null;
+      success: boolean;
+      reason: SessionExitReason;
+      requested: boolean;
       timestamp: string;
     }
   | {

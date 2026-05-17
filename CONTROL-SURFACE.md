@@ -86,7 +86,7 @@ powershell -Command "& '.\scripts\control-plane.ps1' -Action input -Session code
 powershell -Command "& '.\scripts\control-plane.ps1' -Action input -Session claude -ContentFile 'D:\tmp\compact.txt'"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action deliver -Session claude -Content 'hello from operator'"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action wait_quiet -Session claude -QuietSec 2 -TimeoutSec 10"
-powershell -Command "& '.\scripts\control-plane.ps1' -Action events_since -CursorFile '.runtime\cursors\outside-supervisor.json' -MaxEvents 200 -MaxWaitSeconds 15 -IncludeKinds 'routed_message','route_delivery','session_state','system_log','sideband_request_lifecycle' -OutCursorFile '.runtime\cursors\outside-supervisor.json'"
+powershell -Command "& '.\scripts\control-plane.ps1' -Action events_since -CursorFile '.runtime\cursors\outside-supervisor.json' -MaxEvents 200 -MaxWaitSeconds 15 -IncludeKinds 'routed_message','route_delivery','session_state','session_exit','system_log','sideband_request_lifecycle' -OutCursorFile '.runtime\cursors\outside-supervisor.json'"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action key -Session claude -Key enter"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action route -From operator -To room -Scope room -Content 'status ping'"
 powershell -Command "& '.\scripts\control-plane.ps1' -Action signal -TaskId smoke -SignalType done -Summary 'smoke test'"
@@ -127,6 +127,7 @@ Behavior:
   - `as_of`
 - `events_since` defaults to the signal-only filter:
   - `session_state`
+  - `session_exit`
   - `routed_message`
   - `route_delivery`
   - `pane_signal`
@@ -175,6 +176,7 @@ What callers see:
 - every sideband response includes `request_id` when the request decoded successfully
 - pane-bound `send_input`, `key`, `deliver`, and `route` requests emit `request_ack` after PTY writes complete; if the write path remains incomplete past `PRIM1_REQUEST_ACK_TIMEOUT_SECS` (default 60), they emit `request_ack_timeout`
 - `route` requests emit `route_delivery` with one `resolved` event for the resolved pane fan-out and one `written` or `failed` event per pane recipient; each event carries `request_id`, `route_id`, `logical_to`, `recipient_count`, `payload_part_count`, `bytes_written`, and optional `error`
+- process exits emit `session_exit` alongside the existing `session_state`, carrying `generation`, `process_id`, optional `exit_code` / `signal`, `success`, `reason`, and `requested`
 - pane output can emit `session_work_state` on semantic work-state transitions only; events carry `session`, `state`, optional `detail`, `previous_state`, and `timestamp`
 - `signal` requests emit one `pane_signal` event with `request_id`, resolved `session`, `task_id`, `signal_type`, `summary`, `artifact_paths`, `commit_sha`, and `timestamp`
 - failed or timed-out `sideband_request_lifecycle` audit events include an optional `error` field with the response message
@@ -265,7 +267,7 @@ Outside-supervisor convenience wrapper over `control-plane.ps1 -Action events_si
 Defaults:
 
 - consumer cursor file: `.runtime/cursors/outside-supervisor.json`
-- kinds: `routed_message`, `route_delivery`, `pane_signal`, `session_state`, `session_work_state`, `system_log`, `sideband_request_lifecycle`, `request_ack`, `request_ack_timeout`
+- kinds: `routed_message`, `route_delivery`, `pane_signal`, `session_state`, `session_exit`, `session_work_state`, `system_log`, `sideband_request_lifecycle`, `request_ack`, `request_ack_timeout`
 - `-MaxWaitSeconds 15`
 - `-MaxEvents 200`
 

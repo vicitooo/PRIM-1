@@ -141,6 +141,19 @@ Work-state events:
 - output quiescence can transition a session back to `idle`
 - repeated blocked observations with the same detail can escalate to `error_loop`
 
+Exit-cause events:
+
+- `session_exit` captures why a supervised process stopped separately from UI-compatible lifecycle state
+- each event carries `session`, `generation`, `process_id`, `exit_code`, `signal`, `success`, `reason`, `requested`, and `timestamp`
+- `clean_exit`: the process exited on its own with code `0` / success and no signal indicator
+- `crash_exit`: the process exited on its own with a non-zero code, unsuccessful status, or signal indicator
+- `operator_stop`: a stop request intentionally terminated the current generation
+- `restart_stop`: a restart request intentionally terminated the old generation before the new start
+- `pty_error`: the PTY transport failed and process state is unknown
+- `process_disappeared`: liveness pruning or PTY close found no usable exit status
+- `requested` is `true` only for `operator_stop` and `restart_stop`
+- `session_exit` is co-emitted with the existing `session_state` event for UI compatibility; both events use the same `session` and `timestamp`
+
 ## 8. Restart contract
 
 Agents never restart peers directly.
@@ -189,7 +202,7 @@ Minimum fields:
 - summary
 - result
 
-`session_work_state` events are part of the default signal event stream. They are derived from driver classifiers, not from explicit pane requests, and are intended for supervision dashboards, summary tools, and external pollers that need semantic state without parsing raw `session_output`.
+`session_work_state` and `session_exit` events are part of the default signal event stream. Work-state events are derived from driver classifiers, not from explicit pane requests. Exit events are derived from PTY exit status, requested-stop intent, PTY transport errors, and liveness pruning. Both are intended for supervision dashboards, summary tools, and external pollers that need semantic state without parsing raw `session_output`.
 
 Pane-bound sideband requests (`send_input`, `send_key`, `deliver_message`, `route_message`) must expose two correlated layers:
 

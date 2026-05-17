@@ -15,13 +15,14 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, NaiveDate, Utc};
 use control_plane::{DEFAULT_ENDPOINT, decode_request, encode_request, encode_response};
 use parking_lot::{Mutex, RwLock};
-use pty_host::{ConcretePtySession, PtyEvent, PtyEventHandler, PtySession};
+use pty_host::{ConcretePtySession, PtyEvent, PtyEventHandler, PtyExitStatus, PtySession};
 use shared_types::{
     ControlKey, ControlPlaneStatus, DeliverMessageRequest, DriverKind, EnvVar, EventCursor,
     EventFilter, LaunchSpec, LifecycleState, LogLevel, MessageScope, PaneSignalType,
     RouteDeliveryPhase, RouteMessageRequest, RuntimeEvent, RuntimeSnapshot, SendInputRequest,
-    SessionDefinition, SessionGeneration, SessionSnapshot, SidebandPhase, SidebandRequest,
-    SidebandResponse, SidebandResponsePayload, WaitQuietRequest, WorkState, now_rfc3339,
+    SessionDefinition, SessionExitReason, SessionGeneration, SessionSnapshot, SidebandPhase,
+    SidebandRequest, SidebandResponse, SidebandResponsePayload, WaitQuietRequest, WorkState,
+    now_rfc3339,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use uuid::Uuid;
@@ -447,6 +448,18 @@ struct RunningSession {
     pty: Option<Box<dyn PtySession>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopIntentKind {
+    Operator,
+    Restart,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StopIntent {
+    generation: SessionGeneration,
+    kind: StopIntentKind,
+}
+
 struct QuiesceTimer {
     generation: SessionGeneration,
     handle: tokio::task::JoinHandle<()>,
@@ -460,6 +473,7 @@ struct SessionSlot {
     work_error_observations: HashMap<String, Vec<Instant>>,
     running: Option<RunningSession>,
     generation: SessionGeneration,
+    stop_intent: Option<StopIntent>,
     process_id: Option<u32>,
     last_activity_at: Option<String>,
     last_real_output_at: Option<Instant>,
@@ -484,6 +498,209 @@ impl SessionSlot {
 
     fn title(&self) -> &str {
         &self.definition.title
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionExitClassification {
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    success: bool,
+    reason: SessionExitReason,
+    requested: bool,
+    last_error: Option<String>,
+}
+
+impl SessionExitClassification {
+    fn requested(
+        intent: StopIntent,
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+    ) -> SessionExitClassification {
+        let reason = match intent.kind {
+            StopIntentKind::Operator => SessionExitReason::OperatorStop,
+            StopIntentKind::Restart => SessionExitReason::RestartStop,
+        };
+
+        SessionExitClassification {
+            exit_code,
+            signal,
+            success: true,
+            reason,
+            requested: true,
+            last_error: None,
+        }
+    }
+}
+
+fn classify_session_exit(
+    status: Option<PtyExitStatus>,
+    poll_error: Option<String>,
+    stop_intent: Option<StopIntent>,
+    fallback_reason: SessionExitReason,
+    fallback_error: &str,
+) -> SessionExitClassification {
+    let exit_code = status
+        .as_ref()
+        .and_then(|status| exit_code_i32(status.exit_code));
+    let signal = status
+        .as_ref()
+        .and_then(|status| parse_exit_signal(status.signal.as_deref()));
+
+    if let Some(intent) = stop_intent {
+        return SessionExitClassification::requested(intent, exit_code, signal);
+    }
+
+    if let Some(status) = status {
+        let has_signal_indicator = status
+            .signal
+            .as_ref()
+            .map(|signal| !signal.trim().is_empty())
+            .unwrap_or(false);
+        let success = status.success && !has_signal_indicator;
+        let reason = if success {
+            SessionExitReason::CleanExit
+        } else {
+            SessionExitReason::CrashExit
+        };
+
+        return SessionExitClassification {
+            exit_code,
+            signal,
+            success,
+            reason,
+            requested: false,
+            last_error: session_exit_last_error(reason, exit_code, signal, poll_error.as_deref()),
+        };
+    }
+
+    SessionExitClassification {
+        exit_code: None,
+        signal: None,
+        success: false,
+        reason: fallback_reason,
+        requested: false,
+        last_error: session_exit_last_error(
+            fallback_reason,
+            None,
+            None,
+            poll_error.as_deref().or(Some(fallback_error)),
+        ),
+    }
+}
+
+fn classify_pty_error_exit(
+    error: &str,
+    stop_intent: Option<StopIntent>,
+) -> SessionExitClassification {
+    if let Some(intent) = stop_intent {
+        return SessionExitClassification::requested(intent, None, None);
+    }
+
+    SessionExitClassification {
+        exit_code: None,
+        signal: None,
+        success: false,
+        reason: SessionExitReason::PtyError,
+        requested: false,
+        last_error: Some(error.to_string()),
+    }
+}
+
+fn poll_pty_exit_status(
+    running: Option<&RunningSession>,
+) -> (Option<PtyExitStatus>, Option<String>) {
+    let Some(pty) = running.and_then(|running| running.pty.as_ref()) else {
+        return (None, None);
+    };
+
+    match pty.try_wait() {
+        Ok(status) => (status, None),
+        Err(error) => (None, Some(error.to_string())),
+    }
+}
+
+fn exit_code_i32(exit_code: u32) -> Option<i32> {
+    i32::try_from(exit_code).ok()
+}
+
+fn parse_exit_signal(signal: Option<&str>) -> Option<i32> {
+    let raw = signal?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(value) = raw.parse::<i32>() {
+        return Some(value);
+    }
+
+    let normalized = raw
+        .trim_start_matches("SIG")
+        .trim_start_matches("sig")
+        .to_ascii_uppercase();
+    match normalized.as_str() {
+        "HUP" => Some(1),
+        "INT" => Some(2),
+        "QUIT" => Some(3),
+        "ILL" => Some(4),
+        "TRAP" => Some(5),
+        "ABRT" | "IOT" => Some(6),
+        "BUS" => Some(7),
+        "FPE" => Some(8),
+        "KILL" => Some(9),
+        "USR1" => Some(10),
+        "SEGV" => Some(11),
+        "USR2" => Some(12),
+        "PIPE" => Some(13),
+        "ALRM" => Some(14),
+        "TERM" => Some(15),
+        _ => None,
+    }
+}
+
+fn session_exit_last_error(
+    reason: SessionExitReason,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    detail: Option<&str>,
+) -> Option<String> {
+    match reason {
+        SessionExitReason::CrashExit => {
+            if let Some(signal) = signal {
+                Some(format!("process exited after signal {signal}"))
+            } else if let Some(exit_code) = exit_code {
+                Some(format!("process exited with code {exit_code}"))
+            } else {
+                Some("process exited unsuccessfully".into())
+            }
+        }
+        SessionExitReason::PtyError | SessionExitReason::ProcessDisappeared => Some(
+            detail
+                .unwrap_or("process exit state unavailable")
+                .to_string(),
+        ),
+        SessionExitReason::CleanExit
+        | SessionExitReason::OperatorStop
+        | SessionExitReason::RestartStop => None,
+    }
+}
+
+fn session_exit_event(
+    session: String,
+    generation: SessionGeneration,
+    process_id: Option<u32>,
+    classification: &SessionExitClassification,
+    timestamp: String,
+) -> RuntimeEvent {
+    RuntimeEvent::SessionExit {
+        session,
+        generation,
+        process_id,
+        exit_code: classification.exit_code,
+        signal: classification.signal,
+        success: classification.success,
+        reason: classification.reason,
+        requested: classification.requested,
+        timestamp,
     }
 }
 
@@ -609,6 +826,7 @@ fn renamed_closed_slot(slot: SessionSlot, definition: SessionDefinition) -> Sess
         work_error_observations: HashMap::new(),
         running: None,
         generation: slot.generation,
+        stop_intent: None,
         process_id: None,
         last_activity_at: slot.last_activity_at,
         last_real_output_at: None,
@@ -626,6 +844,7 @@ fn closed_session_slot(definition: SessionDefinition) -> SessionSlot {
         work_error_observations: HashMap::new(),
         running: None,
         generation: 0,
+        stop_intent: None,
         process_id: None,
         last_activity_at: None,
         last_real_output_at: None,
@@ -762,6 +981,7 @@ impl SupervisorHandle {
                 kind.as_str(),
                 "session_output"
                     | "session_state"
+                    | "session_exit"
                     | "session_work_state"
                     | "pair_created"
                     | "pair_renamed"
@@ -1578,7 +1798,7 @@ impl SupervisorHandle {
 
     fn stop_session_at(&self, name: &str, expected: SessionGeneration) -> Result<SessionSnapshot> {
         self.refresh_session_liveness();
-        let pty = {
+        let (pty, stop_intent, process_id) = {
             let mut slots = self.inner.slots.lock();
             let slot = slots
                 .get_mut(name)
@@ -1591,32 +1811,98 @@ impl SupervisorHandle {
             }
 
             cancel_quiesce_timer_locked(slot);
+            let pty = slot.running.take().and_then(|running| running.pty);
+            let process_id = slot.process_id;
+            let stop_intent = pty.as_ref().map(|_| StopIntent {
+                generation: expected,
+                kind: if slot.state == LifecycleState::Restarting {
+                    StopIntentKind::Restart
+                } else {
+                    StopIntentKind::Operator
+                },
+            });
+            slot.stop_intent = stop_intent;
             slot.state = LifecycleState::Closed;
             slot.process_id = None;
             slot.last_activity_at = Some(now_rfc3339());
             slot.last_real_output_at = None;
             reset_work_state_locked(slot);
-            slot.running.take().and_then(|running| running.pty)
+            (pty, stop_intent, process_id)
         };
 
+        let mut exit_status = None;
+        let mut exit_poll_error = None;
         if let Some(pty) = pty {
             let (tx, rx) = std::sync::mpsc::channel();
             thread::spawn(move || {
-                let _ = pty.kill();
-                let _ = tx.send(());
+                let kill_error = pty.kill().err().map(|error| error.to_string());
+                let (status, poll_error) = match pty.try_wait() {
+                    Ok(status) => (status, None),
+                    Err(error) => (None, Some(error.to_string())),
+                };
+                let _ = tx.send((kill_error, status, poll_error));
             });
-            if rx.recv_timeout(Duration::from_secs(5)).is_err() {
-                self.emit(RuntimeEvent::SystemLog {
-                    level: LogLevel::Warn,
-                    message: format!(
-                        "pty.kill() for session '{name}' (gen {expected}) did not return within 5s; proceeding (resource may be leaked)"
-                    ),
-                    timestamp: now_rfc3339(),
-                });
+            match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok((kill_error, status, poll_error)) => {
+                    exit_status = status;
+                    exit_poll_error = kill_error.or(poll_error);
+                }
+                Err(_) => {
+                    exit_poll_error =
+                        Some("pty.kill() did not return within 5s; exit status unavailable".into());
+                    self.emit(RuntimeEvent::SystemLog {
+                        level: LogLevel::Warn,
+                        message: format!(
+                            "pty.kill() for session '{name}' (gen {expected}) did not return within 5s; proceeding (resource may be leaked)"
+                        ),
+                        timestamp: now_rfc3339(),
+                    });
+                }
             }
         }
 
+        let exit_classification = stop_intent.map(|intent| {
+            classify_session_exit(
+                exit_status,
+                exit_poll_error,
+                Some(intent),
+                SessionExitReason::ProcessDisappeared,
+                "requested stop completed without exit status",
+            )
+        });
+
         let snapshot = {
+            let mut slots = self.inner.slots.lock();
+            let slot = slots
+                .get_mut(name)
+                .expect("session disappeared during stop_session_at");
+            if slot.generation != expected {
+                return Err(anyhow!(
+                    "stop_session_at superseded mid-op: expected gen {expected}, current {}",
+                    slot.generation
+                ));
+            }
+            if let Some(classification) = &exit_classification {
+                slot.last_error = classification.last_error.clone();
+                if slot.stop_intent.map(|intent| intent.generation) == Some(expected) {
+                    slot.stop_intent = None;
+                }
+            }
+            slot.snapshot()
+        };
+
+        let timestamp = now_rfc3339();
+        if let Some(classification) = &exit_classification {
+            self.emit(session_exit_event(
+                snapshot.name.clone(),
+                expected,
+                process_id,
+                classification,
+                timestamp.clone(),
+            ));
+        }
+
+        {
             let slots = self.inner.slots.lock();
             let slot = slots
                 .get(name)
@@ -1627,14 +1913,13 @@ impl SupervisorHandle {
                     slot.generation
                 ));
             }
-            slot.snapshot()
-        };
+        }
 
         self.emit(RuntimeEvent::SessionState {
             session: snapshot.name.clone(),
             state: snapshot.lifecycle_state,
             reason: "session stopped".into(),
-            timestamp: now_rfc3339(),
+            timestamp,
         });
         Ok(snapshot)
     }
@@ -2185,6 +2470,7 @@ impl SupervisorHandle {
     fn refresh_session_liveness(&self) {
         let mut lifecycle_events = Vec::new();
         let mut log_events = Vec::new();
+        let mut exit_events = Vec::new();
 
         {
             let mut slots = self.inner.slots.lock();
@@ -2202,11 +2488,20 @@ impl SupervisorHandle {
                 }
 
                 let timestamp = now_rfc3339();
+                let process_id_for_event = slot.process_id;
+                let (exit_status, poll_error) = poll_pty_exit_status(slot.running.as_ref());
+                let classification = classify_session_exit(
+                    exit_status,
+                    poll_error,
+                    slot.stop_intent.take(),
+                    SessionExitReason::ProcessDisappeared,
+                    "process no longer running",
+                );
                 slot.running = None;
                 slot.process_id = None;
                 slot.state = LifecycleState::Closed;
                 slot.last_activity_at = Some(timestamp.clone());
-                slot.last_error = None;
+                slot.last_error = classification.last_error.clone();
                 cancel_quiesce_timer_locked(slot);
                 reset_work_state_locked(slot);
 
@@ -2219,6 +2514,13 @@ impl SupervisorHandle {
                     ),
                     timestamp: timestamp.clone(),
                 });
+                exit_events.push(session_exit_event(
+                    session_name.clone(),
+                    slot.generation,
+                    process_id_for_event,
+                    &classification,
+                    timestamp.clone(),
+                ));
                 lifecycle_events.push(RuntimeEvent::SessionState {
                     session: session_name.clone(),
                     state: LifecycleState::Closed,
@@ -2229,6 +2531,9 @@ impl SupervisorHandle {
         }
 
         for event in log_events {
+            self.emit(event);
+        }
+        for event in exit_events {
             self.emit(event);
         }
         for event in lifecycle_events {
@@ -2322,49 +2627,86 @@ impl SupervisorHandle {
                 });
             }
             PtyEvent::Closed => {
+                let timestamp = now_rfc3339();
+                let mut exit_event = None;
                 {
                     let mut slots = self.inner.slots.lock();
                     if let Some(slot) = slots.get_mut(session_name) {
+                        let process_id = slot.process_id;
+                        let (exit_status, poll_error) = poll_pty_exit_status(slot.running.as_ref());
+                        let classification = classify_session_exit(
+                            exit_status,
+                            poll_error,
+                            slot.stop_intent.take(),
+                            SessionExitReason::ProcessDisappeared,
+                            "session output closed before exit status was available",
+                        );
                         slot.running = None;
                         slot.process_id = None;
                         slot.state = LifecycleState::Closed;
-                        slot.last_activity_at = Some(now_rfc3339());
+                        slot.last_activity_at = Some(timestamp.clone());
+                        slot.last_error = classification.last_error.clone();
                         slot.last_real_output_at = None;
                         cancel_quiesce_timer_locked(slot);
                         reset_work_state_locked(slot);
+                        exit_event = Some(session_exit_event(
+                            session_name.into(),
+                            event_generation,
+                            process_id,
+                            &classification,
+                            timestamp.clone(),
+                        ));
                     }
+                }
+                if let Some(event) = exit_event {
+                    self.emit(event);
                 }
                 self.emit(RuntimeEvent::SessionState {
                     session: session_name.into(),
                     state: LifecycleState::Closed,
                     reason: "session output closed".into(),
-                    timestamp: now_rfc3339(),
+                    timestamp,
                 });
             }
             PtyEvent::Error(error) => {
+                let timestamp = now_rfc3339();
+                let mut exit_event = None;
                 {
                     let mut slots = self.inner.slots.lock();
                     if let Some(slot) = slots.get_mut(session_name) {
+                        let process_id = slot.process_id;
+                        let classification =
+                            classify_pty_error_exit(&error, slot.stop_intent.take());
                         slot.state = LifecycleState::Failed;
-                        slot.last_error = Some(error.clone());
+                        slot.last_error = classification.last_error.clone();
                         slot.running = None;
                         slot.process_id = None;
-                        slot.last_activity_at = Some(now_rfc3339());
+                        slot.last_activity_at = Some(timestamp.clone());
                         slot.last_real_output_at = None;
                         cancel_quiesce_timer_locked(slot);
                         reset_work_state_locked(slot);
+                        exit_event = Some(session_exit_event(
+                            session_name.into(),
+                            event_generation,
+                            process_id,
+                            &classification,
+                            timestamp.clone(),
+                        ));
                     }
                 }
                 self.emit(RuntimeEvent::SystemLog {
                     level: LogLevel::Error,
                     message: format!("{session_name} PTY error: {error}"),
-                    timestamp: now_rfc3339(),
+                    timestamp: timestamp.clone(),
                 });
+                if let Some(event) = exit_event {
+                    self.emit(event);
+                }
                 self.emit(RuntimeEvent::SessionState {
                     session: session_name.into(),
                     state: LifecycleState::Failed,
                     reason: "PTY error".into(),
-                    timestamp: now_rfc3339(),
+                    timestamp,
                 });
             }
         }
@@ -3762,6 +4104,7 @@ fn event_kind(event: &RuntimeEvent) -> &'static str {
     match event {
         RuntimeEvent::SessionOutput { .. } => "session_output",
         RuntimeEvent::SessionState { .. } => "session_state",
+        RuntimeEvent::SessionExit { .. } => "session_exit",
         RuntimeEvent::SessionWorkState { .. } => "session_work_state",
         RuntimeEvent::PairCreated { .. } => "pair_created",
         RuntimeEvent::PairRenamed { .. } => "pair_renamed",
@@ -3786,6 +4129,7 @@ fn event_matches_filter(event: &RuntimeEvent, filter: &EventFilter) -> bool {
         let session_match = match event {
             RuntimeEvent::SessionOutput { session, .. }
             | RuntimeEvent::SessionState { session, .. }
+            | RuntimeEvent::SessionExit { session, .. }
             | RuntimeEvent::SessionWorkState { session, .. } => filter
                 .include_sessions
                 .iter()
@@ -4581,6 +4925,7 @@ mod tests {
 
     struct MockPtySession {
         process_id: Option<u32>,
+        exit_status: Option<pty_host::PtyExitStatus>,
         send_input_count: Arc<AtomicUsize>,
         kill_count: Arc<AtomicUsize>,
         kill_behavior: MockKillBehavior,
@@ -4605,7 +4950,7 @@ mod tests {
         }
 
         fn try_wait(&self) -> Result<Option<pty_host::PtyExitStatus>> {
-            Ok(None)
+            Ok(self.exit_status.clone())
         }
 
         fn process_id(&self) -> Option<u32> {
@@ -4645,11 +4990,20 @@ mod tests {
         process_id: Option<u32>,
         kill_behavior: MockKillBehavior,
     ) -> (Box<dyn PtySessionTrait>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        mock_pty_session_with_exit_status(process_id, None, kill_behavior)
+    }
+
+    fn mock_pty_session_with_exit_status(
+        process_id: Option<u32>,
+        exit_status: Option<pty_host::PtyExitStatus>,
+        kill_behavior: MockKillBehavior,
+    ) -> (Box<dyn PtySessionTrait>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let send_input_count = Arc::new(AtomicUsize::new(0));
         let kill_count = Arc::new(AtomicUsize::new(0));
         (
             Box::new(MockPtySession {
                 process_id,
+                exit_status,
                 send_input_count: send_input_count.clone(),
                 kill_count: kill_count.clone(),
                 kill_behavior,
@@ -4668,6 +5022,18 @@ mod tests {
             }) as Box<dyn PtySessionTrait>,
             send_input_count,
         )
+    }
+
+    fn pty_exit_status(
+        exit_code: u32,
+        signal: Option<&str>,
+        success: bool,
+    ) -> pty_host::PtyExitStatus {
+        pty_host::PtyExitStatus {
+            exit_code,
+            signal: signal.map(ToOwned::to_owned),
+            success,
+        }
     }
 
     struct QueuePtySpawner {
@@ -4877,11 +5243,21 @@ mod tests {
         driver: DriverKind,
         pty: Box<dyn PtySessionTrait>,
     ) {
+        install_mock_running_session_with_process_id(supervisor, name, driver, None, pty);
+    }
+
+    fn install_mock_running_session_with_process_id(
+        supervisor: &SupervisorHandle,
+        name: &str,
+        driver: DriverKind,
+        process_id: Option<u32>,
+        pty: Box<dyn PtySessionTrait>,
+    ) {
         let mut slots = supervisor.inner.slots.lock();
         let slot = slots.get_mut(name).unwrap();
         slot.definition.driver = driver;
         slot.running = Some(RunningSession { pty: Some(pty) });
-        slot.process_id = None;
+        slot.process_id = process_id;
         slot.state = LifecycleState::Busy;
         slot.last_real_output_at = None;
     }
@@ -4918,6 +5294,15 @@ mod tests {
             .lock()
             .iter()
             .filter(|event| matches!(event, RuntimeEvent::SessionWorkState { .. }))
+            .cloned()
+            .collect()
+    }
+
+    fn session_exit_events(events: &Arc<Mutex<Vec<RuntimeEvent>>>) -> Vec<RuntimeEvent> {
+        events
+            .lock()
+            .iter()
+            .filter(|event| matches!(event, RuntimeEvent::SessionExit { .. }))
             .cloned()
             .collect()
     }
@@ -7189,6 +7574,277 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, RuntimeEvent::SessionOutput { .. }))
         );
+    }
+
+    #[test]
+    fn pty_closed_clean_exit_emits_session_exit() {
+        let supervisor = test_supervisor();
+        let (pty, _, _) = mock_pty_session_with_exit_status(
+            Some(1201),
+            Some(pty_exit_status(0, None, true)),
+            MockKillBehavior::Immediate,
+        );
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            Some(1201),
+            pty,
+        );
+        let events = capture_runtime_events(&supervisor);
+
+        supervisor.handle_pty_event("codex", 0, PtyEvent::Closed);
+
+        let exits = session_exit_events(&events);
+        assert_eq!(exits.len(), 1);
+        match &exits[0] {
+            RuntimeEvent::SessionExit {
+                session,
+                generation,
+                process_id,
+                exit_code,
+                signal,
+                success,
+                reason,
+                requested,
+                timestamp,
+            } => {
+                assert_eq!(session, "codex");
+                assert_eq!(*generation, 0);
+                assert_eq!(*process_id, Some(1201));
+                assert_eq!(*exit_code, Some(0));
+                assert_eq!(*signal, None);
+                assert!(*success);
+                assert_eq!(*reason, SessionExitReason::CleanExit);
+                assert!(!requested);
+                assert!(events.lock().iter().any(|event| matches!(
+                    event,
+                    RuntimeEvent::SessionState {
+                        session,
+                        state: LifecycleState::Closed,
+                        reason,
+                        timestamp: state_timestamp,
+                    } if session == "codex"
+                        && reason == "session output closed"
+                        && state_timestamp == timestamp
+                )));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let slot = supervisor
+            .inner
+            .slots
+            .lock()
+            .get("codex")
+            .unwrap()
+            .snapshot();
+        assert_eq!(slot.last_error, None);
+    }
+
+    #[test]
+    fn pty_closed_crash_exit_sets_last_error() {
+        let supervisor = test_supervisor();
+        let (pty, _, _) = mock_pty_session_with_exit_status(
+            Some(1202),
+            Some(pty_exit_status(1, None, false)),
+            MockKillBehavior::Immediate,
+        );
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            Some(1202),
+            pty,
+        );
+        let events = capture_runtime_events(&supervisor);
+
+        supervisor.handle_pty_event("codex", 0, PtyEvent::Closed);
+
+        let exits = session_exit_events(&events);
+        assert_eq!(exits.len(), 1);
+        assert!(matches!(
+            &exits[0],
+            RuntimeEvent::SessionExit {
+                success: false,
+                reason: SessionExitReason::CrashExit,
+                requested: false,
+                exit_code: Some(1),
+                ..
+            }
+        ));
+        let slot = supervisor
+            .inner
+            .slots
+            .lock()
+            .get("codex")
+            .unwrap()
+            .snapshot();
+        assert_eq!(slot.last_error, Some("process exited with code 1".into()));
+    }
+
+    #[test]
+    fn operator_stop_emits_requested_session_exit_without_last_error() {
+        let supervisor = test_supervisor();
+        let process_id = std::process::id();
+        let (pty, _, kill_count) = mock_pty_session_with_exit_status(
+            Some(process_id),
+            Some(pty_exit_status(1, Some("TERM"), false)),
+            MockKillBehavior::Immediate,
+        );
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            Some(process_id),
+            pty,
+        );
+        let events = capture_runtime_events(&supervisor);
+
+        let snapshot = supervisor.stop_session("codex").unwrap();
+
+        assert_eq!(snapshot.lifecycle_state, LifecycleState::Closed);
+        assert_eq!(kill_count.load(Ordering::SeqCst), 1);
+        let exits = session_exit_events(&events);
+        assert_eq!(exits.len(), 1);
+        assert!(matches!(
+            &exits[0],
+            RuntimeEvent::SessionExit {
+                generation: 1,
+                process_id: Some(id),
+                reason: SessionExitReason::OperatorStop,
+                requested: true,
+                success: true,
+                signal: Some(15),
+                ..
+            } if *id == process_id
+        ));
+        let slot = supervisor
+            .inner
+            .slots
+            .lock()
+            .get("codex")
+            .unwrap()
+            .snapshot();
+        assert_eq!(slot.last_error, None);
+    }
+
+    #[test]
+    fn restart_emits_restart_stop_before_new_ready_state() {
+        let supervisor = test_supervisor();
+        let process_id = std::process::id();
+        let (old_pty, _, _) = mock_pty_session_with_exit_status(
+            Some(process_id),
+            Some(pty_exit_status(0, None, true)),
+            MockKillBehavior::Immediate,
+        );
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            Some(process_id),
+            old_pty,
+        );
+        let (new_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        supervisor.set_pty_spawner_for_tests(Arc::new(QueuePtySpawner::new(vec![new_pty])));
+        let events = capture_runtime_events(&supervisor);
+
+        let snapshot = supervisor.restart_session("codex").unwrap();
+
+        assert_eq!(snapshot.lifecycle_state, LifecycleState::Ready);
+        let exits = session_exit_events(&events);
+        assert_eq!(exits.len(), 1);
+        assert!(matches!(
+            &exits[0],
+            RuntimeEvent::SessionExit {
+                reason: SessionExitReason::RestartStop,
+                requested: true,
+                success: true,
+                ..
+            }
+        ));
+        assert!(events.lock().iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SessionState {
+                session,
+                state: LifecycleState::Ready,
+                reason,
+                ..
+            } if session == "codex" && reason == "session ready"
+        )));
+    }
+
+    #[test]
+    fn liveness_pruning_without_exit_status_emits_process_disappeared() {
+        let supervisor = test_supervisor();
+        let (pty, _, _) =
+            mock_pty_session_with_exit_status(Some(u32::MAX), None, MockKillBehavior::Immediate);
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            Some(u32::MAX),
+            pty,
+        );
+        let events = capture_runtime_events(&supervisor);
+
+        let snapshot = supervisor.snapshot();
+
+        let codex = snapshot
+            .sessions
+            .into_iter()
+            .find(|session| session.name == "codex")
+            .unwrap();
+        assert!(!codex.running);
+        let exits = session_exit_events(&events);
+        assert_eq!(exits.len(), 1);
+        assert!(matches!(
+            &exits[0],
+            RuntimeEvent::SessionExit {
+                reason: SessionExitReason::ProcessDisappeared,
+                requested: false,
+                success: false,
+                ..
+            }
+        ));
+        let slot = supervisor
+            .inner
+            .slots
+            .lock()
+            .get("codex")
+            .unwrap()
+            .snapshot();
+        assert_eq!(slot.last_error, Some("process no longer running".into()));
+    }
+
+    #[test]
+    fn pty_error_emits_session_exit_and_last_error() {
+        let supervisor = test_supervisor();
+        let (pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
+        let events = capture_runtime_events(&supervisor);
+
+        supervisor.handle_pty_event("codex", 0, PtyEvent::Error("pipe broke".into()));
+
+        let exits = session_exit_events(&events);
+        assert_eq!(exits.len(), 1);
+        assert!(matches!(
+            &exits[0],
+            RuntimeEvent::SessionExit {
+                reason: SessionExitReason::PtyError,
+                requested: false,
+                success: false,
+                ..
+            }
+        ));
+        let slot = supervisor
+            .inner
+            .slots
+            .lock()
+            .get("codex")
+            .unwrap()
+            .snapshot();
+        assert_eq!(slot.last_error, Some("pipe broke".into()));
     }
 
     #[test]

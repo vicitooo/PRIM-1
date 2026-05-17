@@ -84,6 +84,22 @@ export function handleRuntimeEvent(
       );
       break;
     }
+    case "session_exit": {
+      const previous = ctx.snapshotByName.get(event.session);
+      if (previous) {
+        const lastError = sessionExitLastError(event);
+        const next: SessionSnapshot = {
+          ...previous,
+          process_id: null,
+          running: false,
+          last_activity_at: event.timestamp,
+          last_error: lastError,
+        };
+        ctx.snapshotByName.set(event.session, next);
+        ctx.applyPaneSnapshot(event.session, next);
+      }
+      break;
+    }
     case "pair_created":
       ctx.writeSystem("info", `pair created: ${event.name}`);
       ctx.refreshSnapshotFromEvent(event.name);
@@ -135,5 +151,28 @@ export function handleRuntimeEvent(
       );
       break;
     }
+  }
+}
+
+function sessionExitLastError(
+  event: Extract<RuntimeEvent, { event: "session_exit" }>,
+): string | null {
+  switch (event.reason) {
+    case "crash_exit":
+      if (event.signal !== null) {
+        return `process exited after signal ${event.signal}`;
+      }
+      if (event.exit_code !== null) {
+        return `process exited with code ${event.exit_code}`;
+      }
+      return "process exited unsuccessfully";
+    case "pty_error":
+      return "PTY error";
+    case "process_disappeared":
+      return "process no longer running";
+    case "clean_exit":
+    case "operator_stop":
+    case "restart_stop":
+      return null;
   }
 }

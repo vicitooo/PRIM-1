@@ -18,6 +18,7 @@ from typing import Iterable
 
 SUMMARY_EVENTS = {
     "pane_signal",
+    "session_exit",
     "session_work_state",
     "route_delivery",
     "request_ack",
@@ -256,6 +257,16 @@ def event_to_line(event: dict, sequence: int) -> SummaryLine | None:
         line = (
             f"{format_time(timestamp)} work_state       session={event.get('session') or '?'}  "
             f"{previous}->{state}{detail}"
+        )
+        return SummaryLine(timestamp, sequence, line, conditions)
+
+    if kind == "session_exit":
+        reason = str(event.get("reason") or "?")
+        conditions = {"failed"} if reason in {"crash_exit", "pty_error", "process_disappeared"} else set()
+        line = (
+            f"{format_time(timestamp)} session_exit    session={event.get('session') or '?'}  "
+            f"reason={reason}  code={event.get('exit_code')}  "
+            f"signal={event.get('signal')}  requested={str(bool(event.get('requested'))).lower()}"
         )
         return SummaryLine(timestamp, sequence, line, conditions)
 

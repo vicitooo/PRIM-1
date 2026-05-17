@@ -42,6 +42,18 @@ def write_fixture(path: Path) -> None:
             "timestamp": "2026-05-17T20:00:01.500000+00:00",
         },
         {
+            "event": "session_exit",
+            "session": "codex",
+            "generation": 4,
+            "process_id": 1234,
+            "exit_code": 1,
+            "signal": None,
+            "success": False,
+            "reason": "crash_exit",
+            "requested": False,
+            "timestamp": "2026-05-17T20:00:01.700000+00:00",
+        },
+        {
             "event": "route_delivery",
             "request_id": "req-route-ok",
             "route_id": "route-ok-123456",
@@ -206,6 +218,9 @@ def test_fixture_summary_and_fail_on():
         assert "type=blocked" in out
         assert "work_state" in out
         assert "idle->thinking" in out
+        assert "session_exit" in out
+        assert "reason=crash_exit" in out
+        assert "code=1" in out
         assert "route_delivery" in out
         assert "2/2 written, 0 failed" in out
         assert "2/3 written, 1 failed: claude" in out
@@ -236,6 +251,7 @@ def test_filters_and_events_since_stdin():
         stdin_result = run_summary("--events-since-stdin", input_text=json.dumps(events))
         assert stdin_result.returncode == 0
         assert "pane_signal" in stdin_result.stdout
+        assert "session_exit" in stdin_result.stdout
         assert "route_delivery" in stdin_result.stdout
 
 
