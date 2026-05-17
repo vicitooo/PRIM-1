@@ -50,6 +50,14 @@ desktop.ini
 # Per-machine local settings
 .claude/
 
+# Pane-owned session scratchpads (created by live panes; not repo-tracked content)
+CODEX_TODO.md
+qa/Claude.md
+qa/Codex.md
+qa/exploration-scratch.md
+qa/scratch/
+qa/smoke/
+
 # Tauri build outputs
 src-tauri/target/
 apps/desktop/dist/
