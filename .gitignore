@@ -6,6 +6,8 @@ Cargo.lock.bak
 # Runtime state (audit logs, pane credentials, sideband mailbox, dispatch staging)
 /.runtime/
 .runtime/
+.runtime-test/
+.runtime-tmp/
 
 # Node (Tauri frontend)
 node_modules/
