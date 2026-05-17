@@ -99,6 +99,8 @@ Behavior:
   - otherwise `PRIM1_PANE_CREDENTIALS` is used when present inside a supervised pane
   - otherwise the helper falls back to `.runtime/control-plane.json`
 - `-Quiet` prints only the success/error message for agent-friendly use
+- `-PassThruJson` additionally prints the full sideband response JSON, including `request_id`, even when `-Quiet` is set
+- `-OutRequestIdFile <path>` atomically writes the response `request_id` when one is present
 - `-Action start` accepts `-ExtraArgs <string[]>`; values are appended to the spawned driver's launch args for that invocation only and are recorded on the `start_session` sideband audit event
 - `-Action input` injects raw text only; it does **not** press Enter for you
 - `-Action input` now accepts either:
@@ -162,6 +164,7 @@ What callers see:
 
 - every sideband response includes `request_id` when the request decoded successfully
 - pane-bound `send_input`, `key`, `deliver`, and `route` requests emit `request_ack` after PTY writes complete; if the write path remains incomplete past `PRIM1_REQUEST_ACK_TIMEOUT_SECS` (default 60), they emit `request_ack_timeout`
+- failed or timed-out `sideband_request_lifecycle` audit events include an optional `error` field with the response message
 - `timed_out: true` now returns exit code `124`
 - non-`-Quiet` mode prints `TIMED OUT: <message>` instead of JSON for timeout responses
 - `-Quiet` mode also surfaces the timeout banner and exits `124`

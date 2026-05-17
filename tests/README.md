@@ -18,6 +18,11 @@ Current script-level coverage:
   - checks non-`input` action rejection
   - captures the mailbox fallback payload and asserts the exact string survives shell-hostile characters
 
+- `tests/control-plane-request-id.ps1`
+  - validates `scripts/control-plane.ps1 -PassThruJson`
+  - validates `scripts/control-plane.ps1 -OutRequestIdFile`
+  - validates `scripts/agent-route.ps1` forwards both request-id helper switches
+
 - `tests/control-plane-deliver-wait.ps1`
   - validates `scripts/control-plane.ps1 -Action deliver`
   - validates `scripts/control-plane.ps1 -Action wait_quiet`

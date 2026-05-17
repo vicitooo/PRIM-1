@@ -8,11 +8,12 @@
     1. tools/tests/test_watcher.py       (Python unit tests)
     2. tests/handshake-helpers.ps1       (PowerShell helper tests)
     3. tests/control-plane-content-file.ps1 (PowerShell content-file harness)
-    4. tests/control-plane-deliver-wait.ps1 (PowerShell deliver/wait harness)
-    5. tests/control-plane-timeouts.ps1  (PowerShell timeout harness)
-    6. tests/routing-stress-sequential.ps1  (live transport stress, requires
+    4. tests/control-plane-request-id.ps1 (PowerShell request-id helper harness)
+    5. tests/control-plane-deliver-wait.ps1 (PowerShell deliver/wait harness)
+    6. tests/control-plane-timeouts.ps1  (PowerShell timeout harness)
+    7. tests/routing-stress-sequential.ps1  (live transport stress, requires
                                              wrapper + panes running)
-    7. scripts/health-check.ps1          (live runtime state check)
+    8. scripts/health-check.ps1          (live runtime state check)
 
   Uses direct invocation with $LASTEXITCODE capture. Output is only shown on
   failure unless -Verbose is set.
@@ -101,6 +102,10 @@ $results += Invoke-Suite -Name "handshake helpers" -Block {
 
 $results += Invoke-Suite -Name "control-plane content file" -Block {
   & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scriptRoot "control-plane-content-file.ps1")
+}
+
+$results += Invoke-Suite -Name "control-plane request id" -Block {
+  & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scriptRoot "control-plane-request-id.ps1")
 }
 
 $results += Invoke-Suite -Name "control-plane deliver + wait" -Block {

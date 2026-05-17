@@ -25,6 +25,8 @@ param(
   [int]$QuietSec,
   [int]$TimeoutSec,
   [string]$InfoFile,
+  [string]$OutRequestIdFile,
+  [switch]$PassThruJson,
   [switch]$Quiet
 )
 
@@ -339,7 +341,17 @@ if (-not $response) {
 
 $parsed = $response | ConvertFrom-Json
 
+if ($OutRequestIdFile -and $parsed.request_id) {
+  Write-AtomicText -Path $OutRequestIdFile -Content ([string]$parsed.request_id)
+}
+
 if ($Action -eq "events_since") {
+  if ($PassThruJson) {
+    $parsed | ConvertTo-Json -Depth 12 -Compress
+    if (-not $parsed.ok) { exit 1 }
+    exit 0
+  }
+
   if ($parsed.ok) {
     if (-not $parsed.payload -or $parsed.payload.kind -ne "events_since") {
       throw "events_since response missing events_since payload"
@@ -381,26 +393,37 @@ if ($Action -eq "events_since") {
 }
 
 if ($Quiet) {
+  $jsonOutput = $null
+  if ($PassThruJson) {
+    $jsonOutput = $parsed | ConvertTo-Json -Depth 12 -Compress
+  }
+
   if ($parsed.timed_out) {
     Write-Error ("TIMED OUT: " + $parsed.message)
+    if ($jsonOutput) { $jsonOutput }
     exit 124
   }
 
   if (-not $parsed.ok) {
     Write-Error $parsed.message
+    if ($jsonOutput) { $jsonOutput }
     exit 1
   }
 
   $parsed.message
+  if ($jsonOutput) { $jsonOutput }
   exit 0
 }
 
 if ($parsed.timed_out) {
   Write-Host ("TIMED OUT: " + $parsed.message)
+  if ($PassThruJson) {
+    $parsed | ConvertTo-Json -Depth 12 -Compress
+  }
   exit 124
 }
 
-$parsed | ConvertTo-Json -Depth 8
+$parsed | ConvertTo-Json -Depth 12
 
 if (-not $parsed.ok) {
   exit 1

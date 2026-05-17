@@ -31,6 +31,8 @@ Scripts should wrap the control plane, not bypass the supervisor.
   - `key`
   - `route`
   - optional `-Quiet` mode for agent-friendly success/error output
+  - optional `-PassThruJson` for full response JSON alongside quiet output
+  - optional `-OutRequestIdFile <path>` for request-id correlation
 
 Example:
 
@@ -41,6 +43,7 @@ Example:
 .\scripts\control-plane.ps1 -Action deliver -Session claude -Content "Multi-line`nmessage body"
 .\scripts\control-plane.ps1 -Action wait_quiet -Session claude -QuietSec 2 -TimeoutSec 10
 .\scripts\control-plane.ps1 -Action events_since -CursorFile ".runtime\cursors\outside-supervisor.json" -MaxEvents 200 -MaxWaitSeconds 15 -IncludeKinds "routed_message","session_state","system_log","sideband_request_lifecycle" -OutCursorFile ".runtime\cursors\outside-supervisor.json"
+.\scripts\control-plane.ps1 -Action route -From operator -To claude -Content "status ping" -Quiet -PassThruJson -OutRequestIdFile ".runtime\last-request-id.txt"
 ```
 
 Notes:
@@ -50,11 +53,13 @@ Notes:
 - `deliver` and `wait_quiet` honor `-TimeoutSec` for longer mailbox-backed waits when needed
 - `events_since` always emits structured JSON and never routes through `-Quiet`
 - `events_since` extends pipe/mailbox waits to `MaxWaitSeconds + 5`
+- `-PassThruJson` keeps quiet message output and appends the full sideband response JSON
+- `-OutRequestIdFile` writes the raw `request_id` string when the response carries one
 - timeout responses now print `TIMED OUT: <message>` and exit `124`
 - ordinary non-timeout failures still exit `1`
 
 - `agent-route.ps1`
-  Minimal agent-facing wrapper over `control-plane.ps1` for direct or room messages without the verbose JSON snapshot payload.
+  Minimal agent-facing wrapper over `control-plane.ps1` for direct or room messages without the verbose JSON snapshot payload. Supports `-PassThruJson` and `-OutRequestIdFile` passthrough for ACK correlation.
 
 Example:
 

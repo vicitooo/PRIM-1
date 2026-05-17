@@ -1019,12 +1019,28 @@ impl SupervisorHandle {
         phase: SidebandPhase,
         elapsed: Duration,
     ) {
+        self.emit_sideband_lifecycle_with_error(
+            request_id, action, session, extra_args, phase, elapsed, None,
+        );
+    }
+
+    fn emit_sideband_lifecycle_with_error(
+        &self,
+        request_id: &str,
+        action: &str,
+        session: Option<&str>,
+        extra_args: &[String],
+        phase: SidebandPhase,
+        elapsed: Duration,
+        error: Option<String>,
+    ) {
         self.emit(RuntimeEvent::SidebandRequestLifecycle {
             request_id: request_id.to_string(),
             action: action.to_string(),
             session: session.map(ToOwned::to_owned),
             extra_args: extra_args.to_vec(),
             phase,
+            error,
             elapsed_ms: elapsed.as_millis() as u64,
             timestamp: now_rfc3339(),
         });
@@ -2411,13 +2427,15 @@ impl SupervisorHandle {
             } else {
                 SidebandPhase::Failed
             };
-            self.emit_sideband_lifecycle(
+            let error = (!response.ok).then(|| response.message.clone());
+            self.emit_sideband_lifecycle_with_error(
                 &request_id,
                 &action,
                 session.as_deref(),
                 &extra_args,
                 phase,
                 started.elapsed(),
+                error,
             );
         }
 
@@ -2498,20 +2516,22 @@ impl SupervisorHandle {
                 }
                 _ = &mut deadline => {
                     let elapsed = started.elapsed();
-                    self.emit_sideband_lifecycle(
+                    let message = format!(
+                        "lifecycle op '{action}' timed out after {}ms",
+                        elapsed.as_millis()
+                    );
+                    self.emit_sideband_lifecycle_with_error(
                         request_id,
                         action,
                         session,
                         extra_args,
                         SidebandPhase::TimedOut,
                         elapsed,
+                        Some(message.clone()),
                     );
                     return SidebandResponse {
                         ok: false,
-                        message: format!(
-                            "lifecycle op '{action}' timed out after {}ms",
-                            elapsed.as_millis()
-                        ),
+                        message,
                         snapshot: Some(self.snapshot()),
                         timed_out: true,
                         payload: None,
@@ -2570,20 +2590,22 @@ impl SupervisorHandle {
                     );
                 }
                 _ = &mut deadline => {
-                    self.emit_sideband_lifecycle(
+                    let message = format!(
+                        "side-effect op '{action}' timed out after {}ms (boundary pre-PTY-write unless documented otherwise)",
+                        budget.as_millis()
+                    );
+                    self.emit_sideband_lifecycle_with_error(
                         request_id,
                         action,
                         session,
                         extra_args,
                         SidebandPhase::TimedOut,
                         budget,
+                        Some(message.clone()),
                     );
                     return SidebandResponse {
                         ok: false,
-                        message: format!(
-                            "side-effect op '{action}' timed out after {}ms (boundary pre-PTY-write unless documented otherwise)",
-                            budget.as_millis()
-                        ),
+                        message,
                         snapshot: Some(self.snapshot()),
                         timed_out: true,
                         payload: None,
@@ -3075,13 +3097,15 @@ fn process_sideband_mailbox_file(
         } else {
             SidebandPhase::Failed
         };
-        handle.emit_sideband_lifecycle(
+        let error = (!response.ok).then(|| response.message.clone());
+        handle.emit_sideband_lifecycle_with_error(
             &request_id,
             action,
             session,
             &extra_args,
             phase,
             started.elapsed(),
+            error,
         );
     }
 
@@ -3148,20 +3172,22 @@ fn run_detached_with_timeout(
                     );
                 }
                 if elapsed >= budget {
-                    handle.emit_sideband_lifecycle(
+                    let message = format!(
+                        "lifecycle op '{action}' timed out after {}ms",
+                        elapsed.as_millis()
+                    );
+                    handle.emit_sideband_lifecycle_with_error(
                         request_id,
                         action,
                         session,
                         extra_args,
                         SidebandPhase::TimedOut,
                         elapsed,
+                        Some(message.clone()),
                     );
                     return SidebandResponse {
                         ok: false,
-                        message: format!(
-                            "lifecycle op '{action}' timed out after {}ms",
-                            elapsed.as_millis()
-                        ),
+                        message,
                         snapshot: Some(handle.snapshot()),
                         timed_out: true,
                         payload: None,
@@ -3224,20 +3250,22 @@ fn run_inline_with_timeout(
     match result {
         Ok(response) => response,
         Err(_) => {
-            handle.emit_sideband_lifecycle(
+            let message = format!(
+                "side-effect op '{action}' timed out after {}ms (boundary pre-PTY-write unless documented otherwise)",
+                budget.as_millis()
+            );
+            handle.emit_sideband_lifecycle_with_error(
                 request_id,
                 action,
                 session,
                 extra_args,
                 SidebandPhase::TimedOut,
                 budget,
+                Some(message.clone()),
             );
             SidebandResponse {
                 ok: false,
-                message: format!(
-                    "side-effect op '{action}' timed out after {}ms (boundary pre-PTY-write unless documented otherwise)",
-                    budget.as_millis()
-                ),
+                message,
                 snapshot: Some(handle.snapshot()),
                 timed_out: true,
                 payload: None,
@@ -5589,6 +5617,40 @@ mod tests {
 
         assert!(!response.ok);
         assert_eq!(response.message, "invalid control plane token");
+    }
+
+    #[test]
+    fn failed_sideband_lifecycle_event_carries_error_message() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let events = Arc::new(Mutex::new(Vec::<RuntimeEvent>::new()));
+        let captured = events.clone();
+        supervisor.set_event_sink(move |event| {
+            captured.lock().push(event);
+        });
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::Ping {
+            token: format!("{}-wrong", status.token),
+        });
+
+        assert!(!response.ok);
+        let request_id = response.request_id.as_deref().unwrap();
+        let failed = events
+            .lock()
+            .iter()
+            .find_map(|event| match event {
+                RuntimeEvent::SidebandRequestLifecycle {
+                    request_id: event_request_id,
+                    phase: SidebandPhase::Failed,
+                    error,
+                    ..
+                } => Some((event_request_id.clone(), error.clone())),
+                _ => None,
+            })
+            .expect("failed lifecycle event");
+
+        assert_eq!(failed.0, request_id);
+        assert_eq!(failed.1.as_deref(), Some("invalid control plane token"));
     }
 
     #[test]

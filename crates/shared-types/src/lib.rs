@@ -286,6 +286,8 @@ pub enum RuntimeEvent {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         extra_args: Vec<String>,
         phase: SidebandPhase,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
         elapsed_ms: u64,
         timestamp: String,
     },
@@ -570,6 +572,69 @@ mod tests {
                 "session": "codex",
                 "action": "send_input",
                 "bytes_written": 7,
+                "timestamp": "2026-05-17T00:00:00Z",
+            })
+        );
+
+        let roundtrip: RuntimeEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(roundtrip, event);
+    }
+
+    #[test]
+    fn sideband_lifecycle_event_skips_absent_error() {
+        let event = RuntimeEvent::SidebandRequestLifecycle {
+            request_id: "req-1".into(),
+            action: "ping".into(),
+            session: None,
+            extra_args: Vec::new(),
+            phase: SidebandPhase::Started,
+            error: None,
+            elapsed_ms: 0,
+            timestamp: "2026-05-17T00:00:00Z".into(),
+        };
+
+        let value = serde_json::to_value(event.clone()).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "event": "sideband_request_lifecycle",
+                "request_id": "req-1",
+                "action": "ping",
+                "session": null,
+                "phase": "started",
+                "elapsed_ms": 0,
+                "timestamp": "2026-05-17T00:00:00Z",
+            })
+        );
+
+        let roundtrip: RuntimeEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(roundtrip, event);
+    }
+
+    #[test]
+    fn sideband_lifecycle_event_round_trips_error() {
+        let event = RuntimeEvent::SidebandRequestLifecycle {
+            request_id: "req-1".into(),
+            action: "route_message".into(),
+            session: Some("codex".into()),
+            extra_args: Vec::new(),
+            phase: SidebandPhase::Failed,
+            error: Some("no running recipients available for 'codex'".into()),
+            elapsed_ms: 12,
+            timestamp: "2026-05-17T00:00:00Z".into(),
+        };
+
+        let value = serde_json::to_value(event.clone()).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "event": "sideband_request_lifecycle",
+                "request_id": "req-1",
+                "action": "route_message",
+                "session": "codex",
+                "phase": "failed",
+                "error": "no running recipients available for 'codex'",
+                "elapsed_ms": 12,
                 "timestamp": "2026-05-17T00:00:00Z",
             })
         );
