@@ -62,3 +62,4 @@ qa/smoke/
 src-tauri/target/
 apps/desktop/dist/
 apps/desktop/src-tauri/target/
+.runtime/
