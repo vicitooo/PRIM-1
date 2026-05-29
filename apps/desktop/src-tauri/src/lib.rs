@@ -378,6 +378,7 @@ fn init_supervisor(
         heartbeat_interval: None,
         auto_restart_on_stall_sessions: None,
         auto_restart_stall_threshold: None,
+        reaction_window: None,
     })
     .map_err(|error| error.to_string())?;
 

@@ -9,7 +9,8 @@ use windows_sys::Win32::{
     Foundation::HANDLE,
     System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
         SetInformationJobObject, TerminateJobObject,
     },
     System::Threading::GetCurrentProcess,
@@ -67,6 +68,48 @@ impl ProcessJob {
         self.assign_raw(current_process as RawHandle)
     }
 
+    pub fn live_process_ids(&self) -> Result<Vec<u32>> {
+        let mut capacity = 16_usize;
+
+        loop {
+            let bytes = std::mem::size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>()
+                + capacity.saturating_sub(1) * std::mem::size_of::<usize>();
+            let mut buffer = vec![0_u8; bytes];
+            let ok = unsafe {
+                QueryInformationJobObject(
+                    self.handle.as_raw_handle() as HANDLE,
+                    JobObjectBasicProcessIdList,
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len() as u32,
+                    std::ptr::null_mut(),
+                )
+            };
+            let info = unsafe { &*(buffer.as_ptr() as *const JOBOBJECT_BASIC_PROCESS_ID_LIST) };
+
+            if ok != 0 {
+                let listed = info.NumberOfProcessIdsInList as usize;
+                let assigned = info.NumberOfAssignedProcesses as usize;
+                if assigned > listed && assigned > capacity {
+                    capacity = assigned.saturating_add(4);
+                    continue;
+                }
+
+                let process_ids =
+                    unsafe { std::slice::from_raw_parts(info.ProcessIdList.as_ptr(), listed) };
+                return Ok(process_ids
+                    .iter()
+                    .filter_map(|pid| u32::try_from(*pid).ok())
+                    .collect());
+            }
+
+            if capacity >= 4096 {
+                return Err(std::io::Error::last_os_error())
+                    .context("QueryInformationJobObject(BasicProcessIdList) failed");
+            }
+            capacity *= 2;
+        }
+    }
+
     pub fn terminate(&self) -> Result<()> {
         let ok = unsafe { TerminateJobObject(self.handle.as_raw_handle() as HANDLE, 1) };
         if ok == 0 {
@@ -88,6 +131,10 @@ impl ProcessJob {
 
     pub fn assign_current_process(&self) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    pub fn live_process_ids(&self) -> anyhow::Result<Vec<u32>> {
+        Ok(Vec::new())
     }
 }
 
@@ -131,5 +178,23 @@ mod tests {
     fn process_job_drops_cleanly_with_no_assigned_processes() {
         let job = ProcessJob::new().expect("create job");
         drop(job);
+    }
+
+    #[test]
+    fn job_object_lists_assigned_process_id() {
+        let job = ProcessJob::new().expect("create job");
+        let mut child = Command::new("cmd")
+            .args(["/c", "ping -n 100 127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn child");
+        job.assign_raw(child.as_raw_handle())
+            .expect("assign child to job");
+
+        let process_ids = job.live_process_ids().expect("query job pids");
+        assert!(process_ids.contains(&child.id()));
+
+        let _ = child.kill();
     }
 }

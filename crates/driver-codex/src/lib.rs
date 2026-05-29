@@ -1,7 +1,12 @@
 use shared_types::{DriverKind, LaunchSpec, SessionDefinition, WorkState};
 
 pub fn classify_work_state(chunk: &str) -> Option<(WorkState, Option<String>)> {
-    let lower = chunk.to_ascii_lowercase();
+    let normalized = strip_ansi_and_controls(chunk);
+    let lower = normalized.to_ascii_lowercase();
+
+    if let Some(detail) = terminal_signature(&normalized, "codex") {
+        return Some((WorkState::Exited, Some(detail.into())));
+    }
 
     if lower.contains("choose a plan")
         || lower.contains("create a plan")
@@ -37,8 +42,8 @@ pub fn classify_work_state(chunk: &str) -> Option<(WorkState, Option<String>)> {
         return Some((WorkState::Blocked, Some("stream_disconnected".into())));
     }
 
-    if contains_working_timer(chunk) {
-        return Some((WorkState::Thinking, extract_working_detail(chunk)));
+    if contains_working_timer(&normalized) {
+        return Some((WorkState::Thinking, extract_working_detail(&normalized)));
     }
 
     if lower.contains("> run ")
@@ -51,11 +56,155 @@ pub fn classify_work_state(chunk: &str) -> Option<(WorkState, Option<String>)> {
         return Some((WorkState::ToolCall, None));
     }
 
-    if chunk.contains('▌') || lower.contains("esc to interrupt") {
+    if normalized.contains('▌') || lower.contains("esc to interrupt") {
         return Some((WorkState::Idle, None));
     }
 
     None
+}
+
+fn terminal_signature<'a>(chunk: &'a str, agent: &str) -> Option<&'a str> {
+    let lines = nonempty_trimmed_lines(chunk);
+
+    if lines
+        .iter()
+        .any(|line| is_command_not_found_line(line, agent))
+    {
+        return Some("command_not_found");
+    }
+    if lines.iter().any(|line| is_process_exited_line(line)) {
+        return Some("process_exited");
+    }
+    if lines.iter().any(|line| is_npm_cleanup_line(line)) {
+        return Some("npm_cleanup");
+    }
+    if lines.iter().any(|line| is_codex_launch_banner(line)) {
+        return Some("launch_banner");
+    }
+    if is_terminal_prompt_chunk(&lines, agent) {
+        return Some("shell_prompt");
+    }
+
+    None
+}
+
+fn strip_ansi_and_controls(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if matches!(chars.peek(), Some('[' | ']' | '(' | ')')) {
+                let introducer = chars.next();
+                while let Some(next) = chars.next() {
+                    if introducer == Some(']') && next == '\u{7}' {
+                        break;
+                    }
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+
+        if ch.is_control() && ch != '\n' && ch != '\r' && ch != '\t' {
+            continue;
+        }
+
+        output.push(ch);
+    }
+
+    output
+}
+
+fn nonempty_trimmed_lines(chunk: &str) -> Vec<&str> {
+    chunk
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+fn is_process_exited_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.starts_with("[process exited")
+        || lower.starts_with("process exited")
+        || lower.starts_with("process terminated")
+}
+
+fn is_npm_cleanup_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.starts_with("npm ")
+        && (lower.contains("cleanup")
+            || lower.contains("exit handler")
+            || lower.contains("failed to remove"))
+}
+
+fn is_command_not_found_line(line: &str, agent: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.starts_with(&format!("{agent}: command not found"))
+        || lower.contains(&format!("'{agent}' is not recognized"))
+        || lower.contains(&format!("{agent}.cmd")) && lower.contains("not recognized")
+        || lower.contains(&format!("the term '{agent}' is not recognized"))
+}
+
+fn is_codex_launch_banner(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    (lower.starts_with("codex") || lower.contains("openai codex"))
+        && (lower.contains("cli") || lower.contains("codex"))
+}
+
+fn is_terminal_prompt_chunk(lines: &[&str], agent: &str) -> bool {
+    let Some(last) = lines.last() else {
+        return false;
+    };
+    if !is_shell_prompt_line(last) {
+        return false;
+    }
+    lines.len() == 1
+        || lines[..lines.len() - 1]
+            .iter()
+            .all(|line| is_terminal_context_line(line, agent))
+}
+
+fn is_terminal_context_line(line: &str, agent: &str) -> bool {
+    is_process_exited_line(line)
+        || is_npm_cleanup_line(line)
+        || is_command_not_found_line(line, agent)
+}
+
+fn is_shell_prompt_line(line: &str) -> bool {
+    let line = line.trim();
+    if line.is_empty() || line.len() > 180 || line.contains('`') {
+        return false;
+    }
+
+    if line == "$" || line == "#" {
+        return true;
+    }
+    if line.starts_with("PS ") && line.ends_with('>') {
+        return line.contains(":\\") || line.contains(":/");
+    }
+    if is_cmd_prompt_line(line) {
+        return true;
+    }
+    if (line.ends_with('$') || line.ends_with('#'))
+        && (line.contains('@') || line.contains(':') || line.contains("~/") || line.contains('/'))
+    {
+        return true;
+    }
+
+    false
+}
+
+fn is_cmd_prompt_line(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    bytes.len() >= 4
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+        && bytes[bytes.len() - 1] == b'>'
 }
 
 fn contains_working_timer(chunk: &str) -> bool {
@@ -233,5 +382,42 @@ mod tests {
             WorkState::ToolCall
         );
         assert_eq!(classify_work_state("▌").unwrap().0, WorkState::Idle);
+    }
+
+    #[test]
+    fn classify_codex_terminal_signatures_as_exited() {
+        assert_eq!(
+            classify_work_state("\u{1b}[33mnpm warn cleanup Failed to remove some directories\u{1b}[0m\r\nPS C:\\Projects\\PRIM-1>")
+                .unwrap(),
+            (WorkState::Exited, Some("npm_cleanup".into()))
+        );
+        assert_eq!(
+            classify_work_state("[process exited with code 0]").unwrap(),
+            (WorkState::Exited, Some("process_exited".into()))
+        );
+        assert_eq!(
+            classify_work_state("PS C:\\Projects\\PRIM-1>").unwrap(),
+            (WorkState::Exited, Some("shell_prompt".into()))
+        );
+        assert_eq!(
+            classify_work_state("Codex CLI v1.2.3").unwrap(),
+            (WorkState::Exited, Some("launch_banner".into()))
+        );
+    }
+
+    #[test]
+    fn prompt_like_text_inside_prose_is_not_exited() {
+        assert_eq!(
+            classify_work_state("The log included this prompt:\nPS C:\\Projects\\PRIM-1>"),
+            None
+        );
+        assert_eq!(
+            classify_work_state("A bash prompt such as user@host:~/repo$ can appear in docs."),
+            None
+        );
+        assert_eq!(
+            classify_work_state("literal PowerShell example: `PS C:\\Projects\\PRIM-1>`"),
+            None
+        );
     }
 }

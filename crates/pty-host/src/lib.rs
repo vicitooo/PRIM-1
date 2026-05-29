@@ -1,5 +1,8 @@
 use std::{
+    collections::HashSet,
     io::{Read, Write},
+    path::Path,
+    sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
@@ -7,7 +10,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use shared_types::LaunchSpec;
+use shared_types::{DriverKind, LaunchSpec};
 
 mod job;
 pub use job::ProcessJob;
@@ -28,12 +31,32 @@ pub struct PtyExitStatus {
     pub success: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    pub process_id: u32,
+    pub image_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentLiveness {
+    Alive(Vec<ProcessIdentity>),
+    NotYetObserved(Vec<ProcessIdentity>),
+    Exited {
+        last_agent_pids: Vec<u32>,
+        live_processes: Vec<ProcessIdentity>,
+    },
+}
+
 pub trait PtySession: Send {
     fn send_input(&self, input: &str) -> anyhow::Result<usize>;
     fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()>;
     fn kill(&self) -> anyhow::Result<()>;
     fn try_wait(&self) -> anyhow::Result<Option<PtyExitStatus>>;
     fn process_id(&self) -> Option<u32>;
+    fn note_real_output(&self, _driver: DriverKind) {}
+    fn agent_alive(&self, _driver: DriverKind) -> anyhow::Result<AgentLiveness> {
+        Ok(AgentLiveness::NotYetObserved(Vec::new()))
+    }
 }
 
 pub struct ConcretePtySession {
@@ -41,6 +64,8 @@ pub struct ConcretePtySession {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     process_id: Option<u32>,
+    agent_seen: Arc<AtomicBool>,
+    agent_pids_seen: Arc<Mutex<HashSet<u32>>>,
     #[cfg(windows)]
     job: ProcessJob,
 }
@@ -138,6 +163,8 @@ impl ConcretePtySession {
             writer: Arc::new(Mutex::new(writer)),
             child,
             process_id,
+            agent_seen: Arc::new(AtomicBool::new(false)),
+            agent_pids_seen: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(windows)]
             job,
         })
@@ -161,6 +188,57 @@ impl ConcretePtySession {
                 Ok(None) => thread::sleep(Duration::from_millis(10)),
                 Err(_) => break,
             }
+        }
+    }
+
+    fn live_process_identities(&self) -> Result<Vec<ProcessIdentity>> {
+        #[cfg(windows)]
+        {
+            return self
+                .job
+                .live_process_ids()
+                .map(|process_ids| process_identities_for_ids(&process_ids));
+        }
+
+        #[cfg(unix)]
+        {
+            let Some(process_id) = self.process_id else {
+                return Ok(Vec::new());
+            };
+            Ok(process_group_process_identities(process_id))
+        }
+    }
+
+    fn current_agent_processes(&self, driver: DriverKind) -> Result<Vec<ProcessIdentity>> {
+        let live_processes = self.live_process_identities()?;
+        if driver == DriverKind::GenericTerminal {
+            return Ok(live_processes);
+        }
+
+        Ok(live_processes
+            .into_iter()
+            .filter(|process| {
+                process
+                    .image_name
+                    .as_deref()
+                    .map(|name| expected_agent_image_name(driver, name))
+                    .unwrap_or(false)
+            })
+            .collect())
+    }
+
+    fn record_agent_processes(&self, processes: &[ProcessIdentity]) {
+        if processes.is_empty() {
+            return;
+        }
+
+        self.agent_seen.store(true, Ordering::SeqCst);
+        let mut seen = self
+            .agent_pids_seen
+            .lock()
+            .expect("agent pid cache poisoned");
+        for process in processes {
+            seen.insert(process.process_id);
         }
     }
 }
@@ -223,6 +301,53 @@ impl PtySession for ConcretePtySession {
     fn process_id(&self) -> Option<u32> {
         self.process_id
     }
+
+    fn note_real_output(&self, driver: DriverKind) {
+        if let Ok(processes) = self.current_agent_processes(driver) {
+            self.record_agent_processes(&processes);
+        }
+    }
+
+    fn agent_alive(&self, driver: DriverKind) -> anyhow::Result<AgentLiveness> {
+        let live_processes = self.live_process_identities()?;
+        let agent_processes = if driver == DriverKind::GenericTerminal {
+            live_processes.clone()
+        } else {
+            live_processes
+                .iter()
+                .filter(|process| {
+                    process
+                        .image_name
+                        .as_deref()
+                        .map(|name| expected_agent_image_name(driver, name))
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        if !agent_processes.is_empty() {
+            self.record_agent_processes(&agent_processes);
+            return Ok(AgentLiveness::Alive(agent_processes));
+        }
+
+        if self.agent_seen.load(Ordering::SeqCst) {
+            let mut last_agent_pids = self
+                .agent_pids_seen
+                .lock()
+                .expect("agent pid cache poisoned")
+                .iter()
+                .copied()
+                .collect::<Vec<_>>();
+            last_agent_pids.sort_unstable();
+            return Ok(AgentLiveness::Exited {
+                last_agent_pids,
+                live_processes,
+            });
+        }
+
+        Ok(AgentLiveness::NotYetObserved(live_processes))
+    }
 }
 
 impl Drop for ConcretePtySession {
@@ -232,5 +357,173 @@ impl Drop for ConcretePtySession {
 
         let _ = self.kill_immediate_child();
         self.wait_for_child_exit(Duration::from_millis(200));
+    }
+}
+
+pub fn expected_agent_image_name(driver: DriverKind, image_name: &str) -> bool {
+    let base = process_image_basename(image_name).to_ascii_lowercase();
+    if matches!(
+        base.as_str(),
+        "cmd.exe"
+            | "cmd"
+            | "powershell.exe"
+            | "powershell"
+            | "pwsh.exe"
+            | "pwsh"
+            | "conhost.exe"
+            | "conhost"
+    ) {
+        return false;
+    }
+
+    match driver {
+        DriverKind::Codex => {
+            matches!(base.as_str(), "node.exe" | "node")
+                || (base.starts_with("codex") && (base.ends_with(".exe") || !base.contains('.')))
+        }
+        DriverKind::Claude => {
+            matches!(base.as_str(), "node.exe" | "node")
+                || (base.starts_with("claude") && (base.ends_with(".exe") || !base.contains('.')))
+        }
+        DriverKind::GenericTerminal => false,
+    }
+}
+
+fn process_image_basename(image_name: &str) -> &str {
+    Path::new(image_name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(image_name)
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(image_name)
+}
+
+fn process_identities_for_ids(process_ids: &[u32]) -> Vec<ProcessIdentity> {
+    process_ids
+        .iter()
+        .copied()
+        .map(|process_id| ProcessIdentity {
+            process_id,
+            image_name: process_image_name(process_id),
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn process_image_name(process_id: u32) -> Option<String> {
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        System::Threading::{
+            OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+            QueryFullProcessImageNameW,
+        },
+    };
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id);
+        if handle.is_null() {
+            return None;
+        }
+
+        let mut buffer = vec![0_u16; 32_768];
+        let mut size = buffer.len() as u32;
+        let ok =
+            QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, buffer.as_mut_ptr(), &mut size);
+        let _ = CloseHandle(handle);
+        if ok == 0 || size == 0 {
+            return None;
+        }
+
+        Some(String::from_utf16_lossy(&buffer[..size as usize]))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_group_process_identities(process_id: u32) -> Vec<ProcessIdentity> {
+    let Some(target_pgid) = linux_process_group_id(process_id) else {
+        return process_identities_for_ids(&[process_id]);
+    };
+
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return process_identities_for_ids(&[process_id]);
+    };
+
+    let mut process_ids = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| linux_process_group_id(*pid) == Some(target_pgid))
+        .collect::<Vec<_>>();
+    process_ids.sort_unstable();
+    process_identities_for_ids(&process_ids)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_group_process_identities(process_id: u32) -> Vec<ProcessIdentity> {
+    process_identities_for_ids(&[process_id])
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_group_id(process_id: u32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{process_id}/stat")).ok()?;
+    let close_paren = stat.rfind(") ")?;
+    let mut fields = stat[close_paren + 2..].split_whitespace();
+    let _state = fields.next()?;
+    let _ppid = fields.next()?;
+    fields.next()?.parse::<i32>().ok()
+}
+
+#[cfg(unix)]
+fn process_image_name(process_id: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(name) = std::fs::read_to_string(format!("/proc/{process_id}/comm")) {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+        if let Ok(path) = std::fs::read_link(format!("/proc/{process_id}/exe")) {
+            return path.file_name()?.to_str().map(ToOwned::to_owned);
+        }
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expected_agent_image_name_identifies_agents_not_wrappers() {
+        assert!(expected_agent_image_name(
+            DriverKind::Codex,
+            r"C:\Users\me\AppData\Roaming\npm\node.exe"
+        ));
+        assert!(expected_agent_image_name(
+            DriverKind::Codex,
+            r"C:\Program Files\Codex\codex.exe"
+        ));
+        assert!(expected_agent_image_name(
+            DriverKind::Claude,
+            r"C:\Program Files\Claude\claude.exe"
+        ));
+        assert!(expected_agent_image_name(
+            DriverKind::Claude,
+            r"C:\Program Files\Claude\claude-code.exe"
+        ));
+        assert!(!expected_agent_image_name(
+            DriverKind::Codex,
+            r"C:\Windows\System32\cmd.exe"
+        ));
+        assert!(!expected_agent_image_name(
+            DriverKind::Claude,
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+        ));
+        assert!(!expected_agent_image_name(
+            DriverKind::GenericTerminal,
+            "node.exe"
+        ));
     }
 }
