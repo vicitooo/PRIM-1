@@ -527,3 +527,269 @@ mod tests {
         ));
     }
 }
+
+#[cfg(all(test, windows))]
+mod windows_real_process_tests {
+    use super::*;
+    use std::{
+        collections::HashSet,
+        fs,
+        io::Write,
+        os::windows::io::AsRawHandle,
+        path::PathBuf,
+        process::{Command, Stdio},
+        sync::atomic::AtomicBool,
+        sync::{Arc, Mutex},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    };
+
+    #[test]
+    fn agent_alive_reports_exited_when_only_cmd_wrapper_survives() {
+        let batch = TempBatch::new(
+            "@echo off\r\n\
+             set /p PRIM1_START=\r\n\
+             node -e \"setInterval(() => {}, 1000)\"\r\n\
+             set /p PRIM1_HOLD=\r\n",
+        );
+        let job = ProcessJob::new().expect("create process job");
+        let mut child = Command::new("cmd.exe")
+            .args(["/d", "/c"])
+            .arg(batch.path_string())
+            .current_dir(batch.working_dir_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cmd wrapper");
+        let mut child_stdin = child.stdin.take().expect("capture cmd stdin");
+
+        job.assign_raw(AsRawHandle::as_raw_handle(&child))
+            .expect("assign cmd wrapper to job");
+        child_stdin
+            .write_all(b"start\r\n")
+            .expect("release cmd wrapper startup gate");
+
+        let session = concrete_session_for_job_child(job, child);
+
+        let (agent_processes, live_processes) = poll_until(Duration::from_secs(8), || {
+            let live_processes = session
+                .live_process_identities()
+                .expect("query live job process identities");
+            if !live_processes
+                .iter()
+                .any(|process| process_basename_is(process, &["cmd.exe", "cmd"]))
+            {
+                return None;
+            }
+
+            match session
+                .agent_alive(DriverKind::Codex)
+                .expect("query agent liveness")
+            {
+                AgentLiveness::Alive(agent_processes) => Some((agent_processes, live_processes)),
+                AgentLiveness::Exited { .. } | AgentLiveness::NotYetObserved(_) => None,
+            }
+        })
+        .unwrap_or_else(|| panic!("cmd.exe + node.exe did not become live in the job"));
+
+        assert!(
+            live_processes
+                .iter()
+                .any(|process| process_basename_is(process, &["cmd.exe", "cmd"])),
+            "cmd.exe wrapper should be alive with node.exe: {live_processes:?}"
+        );
+        let node_pid = agent_processes
+            .iter()
+            .find(|process| process_basename_is(process, &["node.exe", "node"]))
+            .map(|process| process.process_id)
+            .unwrap_or_else(|| panic!("agent_alive did not report node.exe: {agent_processes:?}"));
+
+        terminate_process_id(node_pid).expect("terminate only the inner node.exe process");
+
+        let mut last_liveness = String::new();
+        let (last_agent_pids, wrapper_only_processes) = poll_until(Duration::from_secs(8), || {
+            let liveness = session
+                .agent_alive(DriverKind::Codex)
+                .expect("query agent liveness after node.exe termination");
+            last_liveness = format!("{liveness:?}");
+            match liveness {
+                AgentLiveness::Exited {
+                    last_agent_pids,
+                    live_processes,
+                } if live_processes
+                    .iter()
+                    .any(|process| process_basename_is(process, &["cmd.exe", "cmd"]))
+                    && live_processes
+                        .iter()
+                        .all(|process| !is_expected_agent_process(DriverKind::Codex, process)) =>
+                {
+                    Some((last_agent_pids, live_processes))
+                }
+                AgentLiveness::Alive(_)
+                | AgentLiveness::NotYetObserved(_)
+                | AgentLiveness::Exited { .. } => None,
+            }
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "agent_alive did not report Exited with only non-agent survivors; last liveness: {last_liveness}"
+            );
+        });
+
+        assert!(
+            last_agent_pids.contains(&node_pid),
+            "last agent PID cache should include killed node.exe PID {node_pid}: {last_agent_pids:?}"
+        );
+        assert!(
+            wrapper_only_processes
+                .iter()
+                .any(|process| process_basename_is(process, &["cmd.exe", "cmd"])),
+            "cmd.exe wrapper should still be alive after node.exe exits: {wrapper_only_processes:?}"
+        );
+        assert!(
+            wrapper_only_processes
+                .iter()
+                .all(|process| !is_expected_agent_process(DriverKind::Codex, process)),
+            "wrapper-only survivors must not read as Codex agents: {wrapper_only_processes:?}"
+        );
+
+        let _ = session.kill();
+        drop(child_stdin);
+    }
+
+    struct TempBatch {
+        root: PathBuf,
+        path: PathBuf,
+    }
+
+    impl TempBatch {
+        fn new(contents: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock before Unix epoch")
+                .as_nanos();
+            let root = std::env::temp_dir()
+                .join(format!("prim1-agent-alive-{}-{unique}", std::process::id()));
+            fs::create_dir_all(&root).expect("create temporary batch directory");
+            let path = root.join("agent-wrapper.cmd");
+            fs::write(&path, contents).expect("write temporary batch file");
+            Self { root, path }
+        }
+
+        fn path_string(&self) -> String {
+            self.path.to_string_lossy().into_owned()
+        }
+
+        fn working_dir_string(&self) -> String {
+            self.root.to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for TempBatch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn poll_until<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> Option<T> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(value) = check() {
+                return Some(value);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn process_basename_is(process: &ProcessIdentity, expected_names: &[&str]) -> bool {
+        process
+            .image_name
+            .as_deref()
+            .map(|name| {
+                let base = process_image_basename(name).to_ascii_lowercase();
+                expected_names.iter().any(|expected| base == *expected)
+            })
+            .unwrap_or(false)
+    }
+
+    fn is_expected_agent_process(driver: DriverKind, process: &ProcessIdentity) -> bool {
+        process
+            .image_name
+            .as_deref()
+            .map(|name| expected_agent_image_name(driver, name))
+            .unwrap_or(false)
+    }
+
+    fn terminate_process_id(process_id: u32) -> Result<()> {
+        use windows_sys::Win32::{
+            Foundation::CloseHandle,
+            System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess},
+        };
+
+        unsafe {
+            let handle = OpenProcess(PROCESS_TERMINATE, 0, process_id);
+            if handle.is_null() {
+                return Err(std::io::Error::last_os_error()).with_context(|| {
+                    format!("OpenProcess(PROCESS_TERMINATE) failed for {process_id}")
+                });
+            }
+
+            let ok = TerminateProcess(handle, 1);
+            let _ = CloseHandle(handle);
+            if ok == 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("TerminateProcess failed for {process_id}"));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn concrete_session_for_job_child(
+        job: ProcessJob,
+        child: std::process::Child,
+    ) -> ConcretePtySession {
+        let process_id = child.id();
+        ConcretePtySession {
+            master: Box::new(NullMasterPty),
+            writer: Arc::new(Mutex::new(Box::new(std::io::sink()))),
+            child: Arc::new(Mutex::new(Box::new(child))),
+            process_id: Some(process_id),
+            agent_seen: Arc::new(AtomicBool::new(false)),
+            agent_pids_seen: Arc::new(Mutex::new(HashSet::new())),
+            job,
+        }
+    }
+
+    struct NullMasterPty;
+
+    impl MasterPty for NullMasterPty {
+        fn resize(&self, _size: PtySize) -> std::result::Result<(), anyhow::Error> {
+            Ok(())
+        }
+
+        fn get_size(&self) -> std::result::Result<PtySize, anyhow::Error> {
+            Ok(PtySize {
+                rows: 40,
+                cols: 120,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+        }
+
+        fn try_clone_reader(
+            &self,
+        ) -> std::result::Result<Box<dyn std::io::Read + Send>, anyhow::Error> {
+            Ok(Box::new(std::io::empty()))
+        }
+
+        fn take_writer(
+            &self,
+        ) -> std::result::Result<Box<dyn std::io::Write + Send>, anyhow::Error> {
+            Ok(Box::new(std::io::sink()))
+        }
+    }
+}
