@@ -2596,6 +2596,7 @@ name = "pty-host"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "portable-pty",
  "shared-types",
  "windows-sys 0.61.2",

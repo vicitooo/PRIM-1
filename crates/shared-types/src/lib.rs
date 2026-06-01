@@ -41,6 +41,7 @@ pub enum WorkState {
     ToolCall,
     Blocked,
     ErrorLoop,
+    Exited,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -212,7 +213,7 @@ pub struct EventFilter {
 
 impl EventFilter {
     pub const ALL_KINDS: &'static str = "all";
-    pub const DEFAULT_INCLUDE_KINDS: [&'static str; 18] = [
+    pub const DEFAULT_INCLUDE_KINDS: [&'static str; 19] = [
         "session_state",
         "session_exit",
         "session_work_state",
@@ -231,6 +232,7 @@ impl EventFilter {
         "sideband_request_lifecycle",
         "request_ack",
         "request_ack_timeout",
+        "dispatch_no_reaction",
     ];
 
     pub fn includes_kind(&self, kind: &str) -> bool {
@@ -263,6 +265,7 @@ pub struct HeartbeatSessionSummary {
 #[serde(rename_all = "snake_case")]
 pub enum SupervisorAlertType {
     AckTimeout,
+    DispatchNoReaction,
     SessionStallDetected,
     OperatorAttention,
 }
@@ -440,6 +443,12 @@ pub enum RuntimeEvent {
         session: String,
         action: String,
         elapsed_ms: u64,
+        timestamp: String,
+    },
+    DispatchNoReaction {
+        request_id: String,
+        session: String,
+        action: String,
         timestamp: String,
     },
 }
@@ -760,6 +769,31 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_no_reaction_event_round_trips_via_json() {
+        let event = RuntimeEvent::DispatchNoReaction {
+            request_id: "req-1".into(),
+            session: "codex".into(),
+            action: "send_input".into(),
+            timestamp: "2026-05-17T00:00:00Z".into(),
+        };
+
+        let value = serde_json::to_value(event.clone()).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "event": "dispatch_no_reaction",
+                "request_id": "req-1",
+                "session": "codex",
+                "action": "send_input",
+                "timestamp": "2026-05-17T00:00:00Z",
+            })
+        );
+
+        let roundtrip: RuntimeEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(roundtrip, event);
+    }
+
+    #[test]
     fn session_work_state_event_round_trips_via_json() {
         let event = RuntimeEvent::SessionWorkState {
             session: "codex".into(),
@@ -1040,6 +1074,7 @@ mod tests {
             "target_tool_call",
             "target_blocked",
             "target_error_loop",
+            "target_exited",
             "target_not_ready",
             "recent_route_from_target",
         ];
@@ -1332,6 +1367,10 @@ mod tests {
             serde_json::to_value(WorkState::ErrorLoop).unwrap(),
             json!("error_loop")
         );
+        assert_eq!(
+            serde_json::to_value(WorkState::Exited).unwrap(),
+            json!("exited")
+        );
     }
 
     #[test]
@@ -1391,6 +1430,7 @@ mod tests {
 
         assert!(filter.includes_kind("request_ack"));
         assert!(filter.includes_kind("request_ack_timeout"));
+        assert!(filter.includes_kind("dispatch_no_reaction"));
     }
 
     #[test]

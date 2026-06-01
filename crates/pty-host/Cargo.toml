@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+libc.workspace = true
 portable-pty.workspace = true
 shared-types = { path = "../shared-types" }
 windows-sys.workspace = true

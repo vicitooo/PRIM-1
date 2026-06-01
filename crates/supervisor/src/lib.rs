@@ -5,7 +5,8 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
+        mpsc,
     },
     thread,
     time::{Duration, Instant},
@@ -15,7 +16,9 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, NaiveDate, Utc};
 use control_plane::{DEFAULT_ENDPOINT, decode_request, encode_request, encode_response};
 use parking_lot::{Mutex, RwLock};
-use pty_host::{ConcretePtySession, PtyEvent, PtyEventHandler, PtyExitStatus, PtySession};
+use pty_host::{
+    AgentLiveness, ConcretePtySession, PtyEvent, PtyEventHandler, PtyExitStatus, PtySession,
+};
 use shared_types::{
     AlertSeverity, ControlKey, ControlPlaneStatus, DeliverMessageRequest, DriverKind, EnvVar,
     EventCursor, EventFilter, HeartbeatSessionSummary, LaunchSpec, LifecycleState, LogLevel,
@@ -31,7 +34,7 @@ type EventSink = Arc<dyn Fn(RuntimeEvent) + Send + Sync>;
 
 const CONTROL_PLANE_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const CONTROL_PLANE_PROBE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
-const DEFAULT_REQUEST_ACK_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_REACTION_WINDOW_SECS: u64 = 12;
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 1800;
 const DEFAULT_AUTO_RESTART_STALL_THRESHOLD_SECS: u64 = 600;
 const AUTO_RESTART_WINDOW: Duration = Duration::from_secs(30 * 60);
@@ -84,10 +87,10 @@ impl SidebandTimeouts {
                 max_wait_seconds, ..
             } => Duration::from_secs(max_wait_seconds.unwrap_or(0) as u64)
                 .saturating_add(Duration::from_secs(5)),
-            SidebandRequest::DeliverMessage { .. } => Duration::from_secs(10),
-            SidebandRequest::SendInput { .. } => Duration::from_secs(5),
-            SidebandRequest::SendKey { .. } => Duration::from_secs(5),
-            SidebandRequest::RouteMessage { .. } => Duration::from_secs(15),
+            SidebandRequest::DeliverMessage { .. } => Duration::from_secs(20),
+            SidebandRequest::SendInput { .. } => Duration::from_secs(20),
+            SidebandRequest::SendKey { .. } => Duration::from_secs(20),
+            SidebandRequest::RouteMessage { .. } => Duration::from_secs(30),
             SidebandRequest::PaneSignal { .. } => Duration::from_secs(5),
         }
     }
@@ -97,12 +100,28 @@ impl SidebandTimeouts {
 struct RequestAckContext {
     request_id: String,
     action: String,
-    timeout: Duration,
 }
 
-struct RequestAckWatchdog {
-    completed: Arc<AtomicBool>,
-    task: tokio::task::JoinHandle<()>,
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DispatchReactionKey {
+    request_id: String,
+    session: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DispatchReactionOutcome {
+    Reacted,
+    Terminal,
+}
+
+struct PendingDispatchReaction {
+    baseline: Instant,
+    sender: mpsc::Sender<DispatchReactionOutcome>,
+}
+
+struct DispatchReactionWaiter {
+    key: DispatchReactionKey,
+    receiver: mpsc::Receiver<DispatchReactionOutcome>,
 }
 
 #[derive(Debug, Clone)]
@@ -186,19 +205,6 @@ struct PaneSignalWritePaths {
     legacy_touch_path: PathBuf,
 }
 
-impl RequestAckWatchdog {
-    fn cancel(&self) {
-        self.completed.store(true, Ordering::SeqCst);
-        self.task.abort();
-    }
-}
-
-impl Drop for RequestAckWatchdog {
-    fn drop(&mut self) {
-        self.cancel();
-    }
-}
-
 trait PtySpawner: Send + Sync {
     fn spawn(&self, spec: &LaunchSpec, handler: PtyEventHandler) -> Result<Box<dyn PtySession>>;
 }
@@ -257,6 +263,7 @@ pub struct SupervisorConfig {
     pub heartbeat_interval: Option<Duration>,
     pub auto_restart_on_stall_sessions: Option<Vec<String>>,
     pub auto_restart_stall_threshold: Option<Duration>,
+    pub reaction_window: Option<Duration>,
 }
 
 struct AuditInner {
@@ -535,6 +542,7 @@ struct SessionSlot {
     work_state: WorkState,
     work_state_observed: bool,
     work_detail: Option<String>,
+    launch_banner_seen: bool,
     work_error_observations: HashMap<String, Vec<Instant>>,
     running: Option<RunningSession>,
     generation: SessionGeneration,
@@ -894,6 +902,7 @@ fn renamed_closed_slot(slot: SessionSlot, definition: SessionDefinition) -> Sess
         work_state: WorkState::Idle,
         work_state_observed: false,
         work_detail: None,
+        launch_banner_seen: false,
         work_error_observations: HashMap::new(),
         running: None,
         generation: slot.generation,
@@ -918,6 +927,7 @@ fn closed_session_slot(definition: SessionDefinition) -> SessionSlot {
         work_state: WorkState::Idle,
         work_state_observed: false,
         work_detail: None,
+        launch_banner_seen: false,
         work_error_observations: HashMap::new(),
         running: None,
         generation: 0,
@@ -952,8 +962,10 @@ struct SupervisorInner {
     events_watch: tokio::sync::watch::Sender<u64>,
     stale_event_drop_counts: Mutex<HashMap<(String, SessionGeneration), u64>>,
     stale_quiesce_drop_counts: Mutex<HashMap<(String, SessionGeneration), u64>>,
+    dispatch_reactions: Mutex<HashMap<DispatchReactionKey, PendingDispatchReaction>>,
     started_at: Instant,
     heartbeat_interval: Duration,
+    reaction_window: Duration,
     auto_restart_on_stall: AutoRestartOnStallConfig,
     auto_restart_history: Mutex<HashMap<String, AutoRestartHistory>>,
     #[cfg(test)]
@@ -1000,6 +1012,10 @@ impl SupervisorHandle {
             .heartbeat_interval
             .filter(|duration| !duration.is_zero())
             .unwrap_or_else(heartbeat_interval_from_env);
+        let reaction_window = config
+            .reaction_window
+            .filter(|duration| !duration.is_zero())
+            .unwrap_or_else(reaction_window_from_env);
         let auto_restart_on_stall = AutoRestartOnStallConfig {
             allowed_sessions: config
                 .auto_restart_on_stall_sessions
@@ -1032,8 +1048,10 @@ impl SupervisorHandle {
                 events_watch,
                 stale_event_drop_counts: Mutex::new(HashMap::new()),
                 stale_quiesce_drop_counts: Mutex::new(HashMap::new()),
+                dispatch_reactions: Mutex::new(HashMap::new()),
                 started_at: Instant::now(),
                 heartbeat_interval,
+                reaction_window,
                 auto_restart_on_stall,
                 auto_restart_history: Mutex::new(HashMap::new()),
                 #[cfg(test)]
@@ -1147,6 +1165,7 @@ impl SupervisorHandle {
                     | "sideband_request_lifecycle"
                     | "request_ack"
                     | "request_ack_timeout"
+                    | "dispatch_no_reaction"
             );
             if !known {
                 return Err(anyhow!("unknown event kind: '{kind}'"));
@@ -1471,6 +1490,147 @@ impl SupervisorHandle {
         });
     }
 
+    fn emit_dispatch_no_reaction(&self, context: &RequestAckContext, session: &str, detail: &str) {
+        let (last_work_state, last_session_state) = self.session_state_for_alert(session);
+        self.emit(RuntimeEvent::DispatchNoReaction {
+            request_id: context.request_id.clone(),
+            session: session.to_string(),
+            action: context.action.clone(),
+            timestamp: now_rfc3339(),
+        });
+        self.emit_supervisor_alert(
+            SupervisorAlertType::DispatchNoReaction,
+            Some(context.request_id.clone()),
+            Some(session.to_string()),
+            Some(context.action.clone()),
+            last_work_state,
+            last_session_state,
+            format!(
+                "Dispatch {} to {} produced no live pane reaction: {}",
+                context.action, session, detail
+            ),
+            AlertSeverity::Critical,
+        );
+    }
+
+    fn register_dispatch_reaction(
+        &self,
+        context: &RequestAckContext,
+        session: &str,
+    ) -> DispatchReactionWaiter {
+        let (sender, receiver) = mpsc::channel();
+        let key = DispatchReactionKey {
+            request_id: context.request_id.clone(),
+            session: session.to_string(),
+        };
+        self.inner.dispatch_reactions.lock().insert(
+            key.clone(),
+            PendingDispatchReaction {
+                baseline: Instant::now(),
+                sender,
+            },
+        );
+        DispatchReactionWaiter { key, receiver }
+    }
+
+    fn cancel_dispatch_reaction(&self, waiter: &DispatchReactionWaiter) {
+        self.inner.dispatch_reactions.lock().remove(&waiter.key);
+    }
+
+    fn resolve_dispatch_reactions_for_session(
+        &self,
+        session: &str,
+        observed_at: Instant,
+        outcome: DispatchReactionOutcome,
+    ) {
+        let matches = {
+            let mut reactions = self.inner.dispatch_reactions.lock();
+            let keys = reactions
+                .iter()
+                .filter(|(key, pending)| key.session == session && observed_at >= pending.baseline)
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|key| reactions.remove(&key))
+                .collect::<Vec<_>>()
+        };
+
+        for pending in matches {
+            let _ = pending.sender.send(outcome);
+        }
+    }
+
+    fn wait_for_dispatch_reaction(
+        &self,
+        waiter: DispatchReactionWaiter,
+        context: &RequestAckContext,
+        session: &str,
+        bytes_written: usize,
+    ) -> Result<()> {
+        match waiter.receiver.recv_timeout(self.inner.reaction_window) {
+            Ok(DispatchReactionOutcome::Reacted) => {
+                self.mark_dispatch_reacted(context, session, bytes_written)?;
+                Ok(())
+            }
+            Ok(DispatchReactionOutcome::Terminal) => {
+                self.emit_dispatch_no_reaction(context, session, "terminal output observed");
+                Err(anyhow!(
+                    "dispatch no reaction from session '{}': terminal output observed",
+                    session
+                ))
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.cancel_dispatch_reaction(&waiter);
+                self.emit_dispatch_no_reaction(
+                    context,
+                    session,
+                    &format!(
+                        "no output, work-state transition, or routed_message within {}ms",
+                        self.inner.reaction_window.as_millis()
+                    ),
+                );
+                Err(anyhow!(
+                    "dispatch no reaction from session '{}' within {}ms",
+                    session,
+                    self.inner.reaction_window.as_millis()
+                ))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.emit_dispatch_no_reaction(context, session, "reaction channel disconnected");
+                Err(anyhow!(
+                    "dispatch no reaction from session '{}': reaction channel disconnected",
+                    session
+                ))
+            }
+        }
+    }
+
+    fn mark_dispatch_reacted(
+        &self,
+        context: &RequestAckContext,
+        session: &str,
+        bytes_written: usize,
+    ) -> Result<()> {
+        let state_event = {
+            let mut slots = self.inner.slots.lock();
+            let slot = slots
+                .get_mut(session)
+                .with_context(|| format!("unknown session '{session}'"))?;
+            cancel_quiesce_timer_locked(slot);
+            slot.state = LifecycleState::Busy;
+            slot.last_activity_at = Some(now_rfc3339());
+            RuntimeEvent::SessionState {
+                session: session.to_string(),
+                state: LifecycleState::Busy,
+                reason: "dispatch reaction observed".into(),
+                timestamp: now_rfc3339(),
+            }
+        };
+        self.emit(state_event);
+        self.emit_request_ack(context, session, bytes_written);
+        Ok(())
+    }
+
     fn session_state_for_alert(
         &self,
         session: &str,
@@ -1510,6 +1670,7 @@ impl SupervisorHandle {
         });
     }
 
+    #[cfg(test)]
     fn emit_request_ack_timeout(
         &self,
         context: &RequestAckContext,
@@ -1633,6 +1794,8 @@ impl SupervisorHandle {
             slot.last_route_from_session_at = Some(timestamp);
             slot.last_route_from_session_instant = Some(now);
         }
+        drop(slots);
+        self.resolve_dispatch_reactions_for_session(session, now, DispatchReactionOutcome::Reacted);
     }
 
     fn record_pane_signal(
@@ -1698,27 +1861,6 @@ impl SupervisorHandle {
             signal_path,
             legacy_touch_path,
         })
-    }
-
-    fn arm_request_ack_watchdog(
-        &self,
-        context: &RequestAckContext,
-        session: &str,
-    ) -> RequestAckWatchdog {
-        let completed = Arc::new(AtomicBool::new(false));
-        let completed_for_task = Arc::clone(&completed);
-        let handle = self.clone();
-        let context = context.clone();
-        let session = session.to_string();
-        let started = Instant::now();
-        let task = self.inner.background_runtime.spawn(async move {
-            tokio::time::sleep(context.timeout).await;
-            if !completed_for_task.swap(true, Ordering::SeqCst) {
-                handle.emit_request_ack_timeout(&context, &session, started.elapsed());
-            }
-        });
-
-        RequestAckWatchdog { completed, task }
     }
 
     fn arm_quiesce_timer(
@@ -2568,18 +2710,8 @@ impl SupervisorHandle {
                 .as_ref()
                 .ok_or_else(|| anyhow!("session '{}' transport is not available", request.name))?
                 .send_input(&request.input)?;
-            cancel_quiesce_timer_locked(slot);
-            slot.state = LifecycleState::Busy;
-            slot.last_activity_at = Some(now_rfc3339());
             (slot.snapshot(), bytes_written)
         };
-
-        self.emit(RuntimeEvent::SessionState {
-            session: snapshot.name.clone(),
-            state: snapshot.lifecycle_state,
-            reason: "input forwarded".into(),
-            timestamp: now_rfc3339(),
-        });
 
         Ok((snapshot, bytes_written))
     }
@@ -2607,10 +2739,15 @@ impl SupervisorHandle {
                 decision.reason.unwrap_or("overlap")
             ));
         }
-        let watchdog = self.arm_request_ack_watchdog(ack_context, &session_name);
-        let (snapshot, bytes_written) = self.send_input_with_bytes(request)?;
-        watchdog.cancel();
-        self.emit_request_ack(ack_context, &snapshot.name, bytes_written);
+        let waiter = self.register_dispatch_reaction(ack_context, &session_name);
+        let (snapshot, bytes_written) = match self.send_input_with_bytes(request) {
+            Ok(result) => result,
+            Err(error) => {
+                self.cancel_dispatch_reaction(&waiter);
+                return Err(error);
+            }
+        };
+        self.wait_for_dispatch_reaction(waiter, ack_context, &snapshot.name, bytes_written)?;
         Ok(snapshot)
     }
 
@@ -2640,13 +2777,18 @@ impl SupervisorHandle {
                 decision.reason.unwrap_or("overlap")
             ));
         }
-        let watchdog = self.arm_request_ack_watchdog(ack_context, name);
-        let (snapshot, bytes_written) = self.send_input_with_bytes(SendInputRequest {
+        let waiter = self.register_dispatch_reaction(ack_context, name);
+        let (snapshot, bytes_written) = match self.send_input_with_bytes(SendInputRequest {
             name: name.into(),
             input: control_key_sequence(key).into(),
-        })?;
-        watchdog.cancel();
-        self.emit_request_ack(ack_context, &snapshot.name, bytes_written);
+        }) {
+            Ok(result) => result,
+            Err(error) => {
+                self.cancel_dispatch_reaction(&waiter);
+                return Err(error);
+            }
+        };
+        self.wait_for_dispatch_reaction(waiter, ack_context, &snapshot.name, bytes_written)?;
         Ok(snapshot)
     }
 
@@ -2759,21 +2901,17 @@ impl SupervisorHandle {
             };
             let payloads = routed_message_payloads(&request, submit_behavior);
             let payload_part_count = payloads.len() as u32;
-            let watchdog =
-                ack_context.map(|context| self.arm_request_ack_watchdog(context, &recipient));
+            let waiter =
+                ack_context.map(|context| self.register_dispatch_reaction(context, &recipient));
             match self.deliver_prepared_payloads(&recipient, &payloads, submit_behavior) {
                 Ok(delivery) => {
-                    if let (Some(context), Some(watchdog)) = (ack_context, watchdog.as_ref()) {
-                        watchdog.cancel();
-                        self.emit_request_ack(context, &recipient, delivery.bytes_written);
-                    }
                     self.emit_route_delivery(RouteDeliveryEvent {
                         request_id: request_id.clone(),
                         route_id: route_id_string.clone(),
                         from: request.from.clone(),
                         logical_to: request.to.clone(),
                         scope: request.scope,
-                        recipient: Some(recipient),
+                        recipient: Some(recipient.clone()),
                         recipient_index: recipient_index as u32,
                         recipient_count,
                         payload_part_count: delivery.payload_part_count,
@@ -2781,10 +2919,35 @@ impl SupervisorHandle {
                         bytes_written: delivery.bytes_written,
                         error: None,
                     });
+                    if let (Some(context), Some(waiter)) = (ack_context, waiter) {
+                        if let Err(error) = self.wait_for_dispatch_reaction(
+                            waiter,
+                            context,
+                            &recipient,
+                            delivery.bytes_written,
+                        ) {
+                            let error = error.to_string();
+                            self.emit_route_delivery(RouteDeliveryEvent {
+                                request_id: request_id.clone(),
+                                route_id: route_id_string.clone(),
+                                from: request.from.clone(),
+                                logical_to: request.to.clone(),
+                                scope: request.scope,
+                                recipient: Some(recipient.clone()),
+                                recipient_index: recipient_index as u32,
+                                recipient_count,
+                                payload_part_count: delivery.payload_part_count,
+                                phase: RouteDeliveryPhase::Failed,
+                                bytes_written: delivery.bytes_written,
+                                error: Some(error.clone()),
+                            });
+                            failures.push((recipient, error));
+                        }
+                    }
                 }
                 Err(error) => {
-                    if let Some(watchdog) = watchdog.as_ref() {
-                        watchdog.cancel();
+                    if let Some(waiter) = waiter.as_ref() {
+                        self.cancel_dispatch_reaction(waiter);
                     }
                     let error = error.to_string();
                     self.emit_route_delivery(RouteDeliveryEvent {
@@ -2863,31 +3026,34 @@ impl SupervisorHandle {
         let (_, submit_behavior, payloads) =
             self.prepare_delivery_for_session(&request.name, &request.content)?;
 
-        let watchdog =
-            ack_context.map(|context| self.arm_request_ack_watchdog(context, &request.name));
-        let delivery = self.deliver_prepared_payloads(&request.name, &payloads, submit_behavior)?;
-        if let (Some(context), Some(watchdog)) = (ack_context, watchdog.as_ref()) {
-            watchdog.cancel();
-            self.emit_request_ack(context, &request.name, delivery.bytes_written);
+        let waiter =
+            ack_context.map(|context| self.register_dispatch_reaction(context, &request.name));
+        let delivery =
+            match self.deliver_prepared_payloads(&request.name, &payloads, submit_behavior) {
+                Ok(delivery) => delivery,
+                Err(error) => {
+                    if let Some(waiter) = waiter.as_ref() {
+                        self.cancel_dispatch_reaction(waiter);
+                    }
+                    return Err(error);
+                }
+            };
+        if let (Some(context), Some(waiter)) = (ack_context, waiter) {
+            self.wait_for_dispatch_reaction(
+                waiter,
+                context,
+                &request.name,
+                delivery.bytes_written,
+            )?;
         }
 
         let snapshot = {
-            let mut slots = self.inner.slots.lock();
+            let slots = self.inner.slots.lock();
             let slot = slots
-                .get_mut(&request.name)
+                .get(&request.name)
                 .with_context(|| format!("unknown session '{}'", request.name))?;
-            cancel_quiesce_timer_locked(slot);
-            slot.state = LifecycleState::Busy;
-            slot.last_activity_at = Some(now_rfc3339());
             slot.snapshot()
         };
-
-        self.emit(RuntimeEvent::SessionState {
-            session: snapshot.name.clone(),
-            state: snapshot.lifecycle_state,
-            reason: "message delivered".into(),
-            timestamp: now_rfc3339(),
-        });
 
         Ok(snapshot)
     }
@@ -3010,6 +3176,7 @@ impl SupervisorHandle {
         let mut lifecycle_events = Vec::new();
         let mut log_events = Vec::new();
         let mut exit_events = Vec::new();
+        let mut terminal_reactions = Vec::new();
 
         {
             let mut slots = self.inner.slots.lock();
@@ -3018,13 +3185,58 @@ impl SupervisorHandle {
                     continue;
                 }
 
-                let Some(process_id) = slot.process_id else {
+                let mut prune_reason: Option<(LifecycleState, SessionExitReason, String)> = None;
+                if let Some(process_id) = slot.process_id {
+                    if !process_id_is_running(process_id) {
+                        prune_reason = Some((
+                            LifecycleState::Closed,
+                            SessionExitReason::ProcessDisappeared,
+                            "process no longer running".into(),
+                        ));
+                    }
+                }
+
+                if prune_reason.is_none() {
+                    let agent_liveness = slot
+                        .running
+                        .as_ref()
+                        .and_then(|running| running.pty.as_ref())
+                        .map(|pty| pty.agent_alive(slot.definition.driver));
+                    match agent_liveness {
+                        Some(Ok(AgentLiveness::Exited { .. })) => {
+                            prune_reason = Some((
+                                LifecycleState::Closed,
+                                SessionExitReason::ProcessDisappeared,
+                                "agent process no longer running".into(),
+                            ));
+                        }
+                        Some(Ok(AgentLiveness::NotYetObserved(_)))
+                            if slot.work_state_observed && slot.work_state == WorkState::Exited =>
+                        {
+                            prune_reason = Some((
+                                LifecycleState::Failed,
+                                SessionExitReason::CrashExit,
+                                "agent terminal signature observed before an agent process was found"
+                                    .into(),
+                            ));
+                        }
+                        Some(Err(error)) => {
+                            log_events.push(RuntimeEvent::SystemLog {
+                                level: LogLevel::Warn,
+                                message: format!(
+                                    "{} agent liveness check failed: {error}",
+                                    slot.title()
+                                ),
+                                timestamp: now_rfc3339(),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+
+                let Some((closed_state, fallback_reason, fallback_error)) = prune_reason else {
                     continue;
                 };
-
-                if process_id_is_running(process_id) {
-                    continue;
-                }
 
                 let timestamp = now_rfc3339();
                 let process_id_for_event = slot.process_id;
@@ -3033,12 +3245,12 @@ impl SupervisorHandle {
                     exit_status,
                     poll_error,
                     slot.stop_intent.take(),
-                    SessionExitReason::ProcessDisappeared,
-                    "process no longer running",
+                    fallback_reason,
+                    &fallback_error,
                 );
                 slot.running = None;
                 slot.process_id = None;
-                slot.state = LifecycleState::Closed;
+                slot.state = closed_state;
                 slot.last_activity_at = Some(timestamp.clone());
                 slot.last_error = classification.last_error.clone();
                 cancel_quiesce_timer_locked(slot);
@@ -3047,9 +3259,10 @@ impl SupervisorHandle {
                 log_events.push(RuntimeEvent::SystemLog {
                     level: LogLevel::Warn,
                     message: format!(
-                        "{} process {} is no longer running; pruning stale session state",
+                        "{} {} (wrapper pid {:?}); pruning stale session state",
                         slot.title(),
-                        process_id
+                        fallback_error,
+                        process_id_for_event
                     ),
                     timestamp: timestamp.clone(),
                 });
@@ -3062,13 +3275,21 @@ impl SupervisorHandle {
                 ));
                 lifecycle_events.push(RuntimeEvent::SessionState {
                     session: session_name.clone(),
-                    state: LifecycleState::Closed,
-                    reason: "process no longer running".into(),
+                    state: closed_state,
+                    reason: fallback_error,
                     timestamp,
                 });
+                terminal_reactions.push((session_name.clone(), Instant::now()));
             }
         }
 
+        for (session, observed_at) in terminal_reactions {
+            self.resolve_dispatch_reactions_for_session(
+                &session,
+                observed_at,
+                DispatchReactionOutcome::Terminal,
+            );
+        }
         for event in log_events {
             self.emit(event);
         }
@@ -3116,30 +3337,78 @@ impl SupervisorHandle {
         match event {
             PtyEvent::Output(chunk) => {
                 let has_real_content = chunk_has_real_content(&chunk);
-                let real_output_at = has_real_content.then(Instant::now);
-                let (transitioned_to_ready, quiesce_arm, work_state_event) = {
-                    let mut slots = self.inner.slots.lock();
-                    if let Some(slot) = slots.get_mut(session_name) {
-                        let transitioned = slot.state != LifecycleState::Ready;
-                        if slot.state != LifecycleState::Ready {
-                            slot.state = LifecycleState::Ready;
-                            slot.last_activity_at = Some(now_rfc3339());
+                let observed_at = Instant::now();
+                let real_output_at = has_real_content.then_some(observed_at);
+                let (
+                    transitioned_to_ready,
+                    quiesce_arm,
+                    work_state_event,
+                    reaction_outcome,
+                    needs_liveness_refresh,
+                ) =
+                    {
+                        let mut slots = self.inner.slots.lock();
+                        if let Some(slot) = slots.get_mut(session_name) {
+                            let transitioned = slot.state != LifecycleState::Ready;
+                            if slot.state != LifecycleState::Ready {
+                                slot.state = LifecycleState::Ready;
+                                slot.last_activity_at = Some(now_rfc3339());
+                            }
+                            if has_real_content {
+                                if let Some(pty) = slot.running.as_ref().and_then(|running| {
+                                    running.pty.as_ref().map(|pty| pty.as_ref())
+                                }) {
+                                    pty.note_real_output(slot.definition.driver);
+                                }
+                            }
+
+                            let classification =
+                                classify_work_state_for_driver(slot.definition.driver, &chunk);
+                            let mut terminal_signature = false;
+                            let mut first_launch_banner = false;
+                            let work_state_event = classification.and_then(|(state, detail)| {
+                                if state == WorkState::Exited {
+                                    terminal_signature = true;
+                                    if detail.as_deref() == Some("launch_banner")
+                                        && !slot.launch_banner_seen
+                                    {
+                                        slot.launch_banner_seen = true;
+                                        first_launch_banner = true;
+                                        return None;
+                                    }
+                                }
+                                transition_work_state_locked(session_name, slot, state, detail)
+                            });
+
+                            let terminal_reaction = terminal_signature && !first_launch_banner;
+                            let quiesce_arm = if terminal_reaction {
+                                cancel_quiesce_timer_locked(slot);
+                                None
+                            } else {
+                                real_output_at.map(|armed_at| {
+                                    slot.last_real_output_at = Some(armed_at);
+                                    cancel_quiesce_timer_locked(slot);
+                                    (slot.definition.driver, slot.generation, armed_at)
+                                })
+                            };
+                            let reaction_outcome = if terminal_reaction {
+                                Some(DispatchReactionOutcome::Terminal)
+                            } else if has_real_content || work_state_event.is_some() {
+                                Some(DispatchReactionOutcome::Reacted)
+                            } else {
+                                None
+                            };
+                            (
+                                transitioned,
+                                quiesce_arm,
+                                work_state_event,
+                                reaction_outcome,
+                                terminal_reaction,
+                            )
+                        } else {
+                            (false, None, None, None, false)
                         }
-                        let work_state_event =
-                            classify_work_state_for_driver(slot.definition.driver, &chunk)
-                                .and_then(|(state, detail)| {
-                                    transition_work_state_locked(session_name, slot, state, detail)
-                                });
-                        let quiesce_arm = real_output_at.map(|armed_at| {
-                            slot.last_real_output_at = Some(armed_at);
-                            cancel_quiesce_timer_locked(slot);
-                            (slot.definition.driver, slot.generation, armed_at)
-                        });
-                        (transitioned, quiesce_arm, work_state_event)
-                    } else {
-                        (false, None, None)
-                    }
-                };
+                    };
 
                 if let Some((driver, generation, armed_at)) = quiesce_arm {
                     self.arm_quiesce_timer(session_name, driver, generation, armed_at);
@@ -3164,9 +3433,18 @@ impl SupervisorHandle {
                     synthetic: false,
                     timestamp: now_rfc3339(),
                 });
+
+                if let Some(outcome) = reaction_outcome {
+                    self.resolve_dispatch_reactions_for_session(session_name, observed_at, outcome);
+                }
+
+                if needs_liveness_refresh {
+                    self.refresh_session_liveness();
+                }
             }
             PtyEvent::Closed => {
                 let timestamp = now_rfc3339();
+                let observed_at = Instant::now();
                 let mut exit_event = None;
                 {
                     let mut slots = self.inner.slots.lock();
@@ -3197,6 +3475,11 @@ impl SupervisorHandle {
                         ));
                     }
                 }
+                self.resolve_dispatch_reactions_for_session(
+                    session_name,
+                    observed_at,
+                    DispatchReactionOutcome::Terminal,
+                );
                 if let Some(event) = exit_event {
                     self.emit(event);
                 }
@@ -3209,6 +3492,7 @@ impl SupervisorHandle {
             }
             PtyEvent::Error(error) => {
                 let timestamp = now_rfc3339();
+                let observed_at = Instant::now();
                 let mut exit_event = None;
                 {
                     let mut slots = self.inner.slots.lock();
@@ -3233,6 +3517,11 @@ impl SupervisorHandle {
                         ));
                     }
                 }
+                self.resolve_dispatch_reactions_for_session(
+                    session_name,
+                    observed_at,
+                    DispatchReactionOutcome::Terminal,
+                );
                 self.emit(RuntimeEvent::SystemLog {
                     level: LogLevel::Error,
                     message: format!("{session_name} PTY error: {error}"),
@@ -4632,6 +4921,7 @@ fn reset_work_state_locked(slot: &mut SessionSlot) {
     slot.work_state = WorkState::Idle;
     slot.work_state_observed = false;
     slot.work_detail = None;
+    slot.launch_banner_seen = false;
     slot.work_error_observations.clear();
     slot.stall_state_entered_at = None;
     slot.stall_state_entered_timestamp = None;
@@ -4710,6 +5000,7 @@ fn dispatch_overlap_reason(decision: &DispatchAttemptDecision) -> Option<&'stati
         Some(WorkState::ToolCall) => Some("target_tool_call"),
         Some(WorkState::Blocked) => Some("target_blocked"),
         Some(WorkState::ErrorLoop) => Some("target_error_loop"),
+        Some(WorkState::Exited) => Some("target_exited"),
         Some(WorkState::Idle) => None,
         None if decision.target_lifecycle_state_before != LifecycleState::Ready => {
             Some("target_not_ready")
@@ -4750,6 +5041,7 @@ fn event_kind(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::SidebandRequestLifecycle { .. } => "sideband_request_lifecycle",
         RuntimeEvent::RequestAck { .. } => "request_ack",
         RuntimeEvent::RequestAckTimeout { .. } => "request_ack_timeout",
+        RuntimeEvent::DispatchNoReaction { .. } => "dispatch_no_reaction",
     }
 }
 
@@ -4802,7 +5094,8 @@ fn event_matches_filter(event: &RuntimeEvent, filter: &EventFilter) -> bool {
                 })
                 .unwrap_or(false),
             RuntimeEvent::RequestAck { session, .. }
-            | RuntimeEvent::RequestAckTimeout { session, .. } => filter
+            | RuntimeEvent::RequestAckTimeout { session, .. }
+            | RuntimeEvent::DispatchNoReaction { session, .. } => filter
                 .include_sessions
                 .iter()
                 .any(|candidate| candidate == session),
@@ -5041,7 +5334,6 @@ fn request_ack_context_for(
         | SidebandRequest::RouteMessage { .. } => Some(RequestAckContext {
             request_id: request_id.to_string(),
             action: action.to_string(),
-            timeout: request_ack_timeout(),
         }),
         SidebandRequest::Ping { .. }
         | SidebandRequest::ListSessions { .. }
@@ -5055,20 +5347,15 @@ fn request_ack_context_for(
     }
 }
 
-fn request_ack_timeout() -> Duration {
-    std::env::var("PRIM1_REQUEST_ACK_TIMEOUT_SECS")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|seconds| *seconds > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(DEFAULT_REQUEST_ACK_TIMEOUT_SECS))
-}
-
 fn heartbeat_interval_from_env() -> Duration {
     positive_duration_from_env(
         "PRIM1_HEARTBEAT_INTERVAL_SECS",
         DEFAULT_HEARTBEAT_INTERVAL_SECS,
     )
+}
+
+fn reaction_window_from_env() -> Duration {
+    positive_duration_from_env("PRIM1_REACTION_WINDOW_SECS", DEFAULT_REACTION_WINDOW_SECS)
 }
 
 fn auto_restart_stall_threshold_from_env() -> Duration {
@@ -5119,6 +5406,7 @@ fn work_state_alert_label(state: Option<WorkState>) -> &'static str {
         Some(WorkState::ToolCall) => "tool_call",
         Some(WorkState::Blocked) => "blocked",
         Some(WorkState::ErrorLoop) => "error_loop",
+        Some(WorkState::Exited) => "exited",
         None => "unknown",
     }
 }
@@ -5648,11 +5936,16 @@ mod tests {
         send_input_count: Arc<AtomicUsize>,
         kill_count: Arc<AtomicUsize>,
         kill_behavior: MockKillBehavior,
+        agent_liveness: Arc<Mutex<AgentLiveness>>,
+        on_send: Option<Arc<dyn Fn() + Send + Sync>>,
     }
 
     impl PtySessionTrait for MockPtySession {
         fn send_input(&self, input: &str) -> Result<usize> {
             self.send_input_count.fetch_add(1, Ordering::SeqCst);
+            if let Some(on_send) = self.on_send.clone() {
+                thread::spawn(move || on_send());
+            }
             Ok(input.as_bytes().len())
         }
 
@@ -5674,6 +5967,10 @@ mod tests {
 
         fn process_id(&self) -> Option<u32> {
             self.process_id
+        }
+
+        fn agent_alive(&self, _driver: DriverKind) -> Result<AgentLiveness> {
+            Ok(self.agent_liveness.lock().clone())
         }
     }
 
@@ -5717,6 +6014,22 @@ mod tests {
         exit_status: Option<pty_host::PtyExitStatus>,
         kill_behavior: MockKillBehavior,
     ) -> (Box<dyn PtySessionTrait>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        mock_pty_session_full(
+            process_id,
+            exit_status,
+            kill_behavior,
+            AgentLiveness::NotYetObserved(Vec::new()),
+            None,
+        )
+    }
+
+    fn mock_pty_session_full(
+        process_id: Option<u32>,
+        exit_status: Option<pty_host::PtyExitStatus>,
+        kill_behavior: MockKillBehavior,
+        agent_liveness: AgentLiveness,
+        on_send: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> (Box<dyn PtySessionTrait>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let send_input_count = Arc::new(AtomicUsize::new(0));
         let kill_count = Arc::new(AtomicUsize::new(0));
         (
@@ -5726,9 +6039,30 @@ mod tests {
                 send_input_count: send_input_count.clone(),
                 kill_count: kill_count.clone(),
                 kill_behavior,
+                agent_liveness: Arc::new(Mutex::new(agent_liveness)),
+                on_send,
             }) as Box<dyn PtySessionTrait>,
             send_input_count,
             kill_count,
+        )
+    }
+
+    fn reacting_pty_session(
+        supervisor: &SupervisorHandle,
+        session: &str,
+        chunk: &str,
+    ) -> (Box<dyn PtySessionTrait>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let handle = supervisor.clone();
+        let session = session.to_string();
+        let chunk = chunk.to_string();
+        mock_pty_session_full(
+            None,
+            None,
+            MockKillBehavior::Immediate,
+            AgentLiveness::Alive(Vec::new()),
+            Some(Arc::new(move || {
+                handle.handle_pty_event(&session, 0, PtyEvent::Output(chunk.clone()));
+            })),
         )
     }
 
@@ -5904,6 +6238,7 @@ mod tests {
             heartbeat_interval: None,
             auto_restart_on_stall_sessions: None,
             auto_restart_stall_threshold: None,
+            reaction_window: Some(Duration::from_millis(200)),
         })
         .unwrap()
     }
@@ -5921,6 +6256,7 @@ mod tests {
             heartbeat_interval: None,
             auto_restart_on_stall_sessions: None,
             auto_restart_stall_threshold: None,
+            reaction_window: Some(Duration::from_millis(200)),
         })
         .unwrap()
     }
@@ -5938,6 +6274,7 @@ mod tests {
             heartbeat_interval: None,
             auto_restart_on_stall_sessions: None,
             auto_restart_stall_threshold: None,
+            reaction_window: Some(Duration::from_millis(200)),
         })
         .unwrap()
     }
@@ -5959,6 +6296,7 @@ mod tests {
             heartbeat_interval,
             auto_restart_on_stall_sessions: auto_restart_sessions,
             auto_restart_stall_threshold: auto_restart_threshold,
+            reaction_window: Some(Duration::from_millis(200)),
         })
         .unwrap()
     }
@@ -6047,6 +6385,15 @@ mod tests {
             .collect()
     }
 
+    fn dispatch_no_reaction_events(events: &Arc<Mutex<Vec<RuntimeEvent>>>) -> Vec<RuntimeEvent> {
+        events
+            .lock()
+            .iter()
+            .filter(|event| matches!(event, RuntimeEvent::DispatchNoReaction { .. }))
+            .cloned()
+            .collect()
+    }
+
     fn set_session_dispatch_state(
         supervisor: &SupervisorHandle,
         name: &str,
@@ -6128,6 +6475,20 @@ mod tests {
                 Instant::now() < deadline,
                 "timed out waiting for {expected} matching event(s); saw {count}"
             );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_until<F>(timeout: Duration, condition: F)
+    where
+        F: Fn() -> bool,
+    {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if condition() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for condition");
             thread::sleep(Duration::from_millis(10));
         }
     }
@@ -6457,7 +6818,7 @@ mod tests {
     #[test]
     fn start_session_passes_extra_args_to_spawned_launch_spec() {
         let supervisor = test_supervisor();
-        let (pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        let (pty, _, _) = reacting_pty_session(&supervisor, "codex", "Working 1s");
         let (spawner, specs) = CapturingPtySpawner::new(vec![pty]);
         supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
 
@@ -6500,7 +6861,7 @@ mod tests {
                 .clone()
         };
         let expected = build_launch_spec(&baseline_definition);
-        let (pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        let (pty, _, _) = reacting_pty_session(&supervisor, "codex", "Working 1s");
         let (spawner, specs) = CapturingPtySpawner::new(vec![pty]);
         supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
 
@@ -6532,7 +6893,7 @@ mod tests {
     fn sideband_start_session_audit_records_extra_args() {
         let supervisor = test_supervisor();
         let status = supervisor.start_control_plane().unwrap();
-        let (pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        let (pty, _, _) = reacting_pty_session(&supervisor, "codex", "Working 1s");
         let (spawner, _) = CapturingPtySpawner::new(vec![pty]);
         supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
 
@@ -6564,7 +6925,7 @@ mod tests {
     fn sideband_start_session_audit_omits_empty_extra_args() {
         let supervisor = test_supervisor();
         let status = supervisor.start_control_plane().unwrap();
-        let (pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        let (pty, _, _) = reacting_pty_session(&supervisor, "codex", "Working 1s");
         let (spawner, _) = CapturingPtySpawner::new(vec![pty]);
         supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
 
@@ -8292,6 +8653,55 @@ mod tests {
     }
 
     #[test]
+    fn terminal_work_state_suppresses_quiesce_and_blocks_require_idle_dispatch() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let events = capture_runtime_events(&supervisor);
+        install_synthetic_running_session(&supervisor, "codex", DriverKind::Codex);
+
+        supervisor.handle_pty_event(
+            "codex",
+            0,
+            PtyEvent::Output("PS C:\\Projects\\PRIM-1>".into()),
+        );
+
+        {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get("codex").unwrap();
+            assert_eq!(slot.work_state, WorkState::Exited);
+            assert!(slot.work_state_observed);
+            assert!(slot.quiesce_timer.is_none());
+        }
+        assert!(work_state_events(&events).iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SessionWorkState {
+                session,
+                state: WorkState::Exited,
+                detail: Some(detail),
+                ..
+            } if session == "codex" && detail == "shell_prompt"
+        )));
+        assert!(!events.lock().iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SessionState {
+                session,
+                state: LifecycleState::Idle,
+                ..
+            } if session == "codex"
+        )));
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::SendInput {
+            token: status.token,
+            name: "codex".into(),
+            input: "hello".into(),
+            require_idle: true,
+        });
+
+        assert!(!response.ok);
+        assert_eq!(response.message, "dispatch aborted: target target_exited");
+    }
+
+    #[test]
     fn supervisor_heartbeat_fires_at_configured_interval_with_session_summary() {
         let supervisor =
             test_supervisor_with_wrapper_defaults(Some(Duration::from_millis(25)), None, None);
@@ -8349,7 +8759,6 @@ mod tests {
         let context = RequestAckContext {
             request_id: "req-timeout".into(),
             action: "deliver_message".into(),
-            timeout: Duration::from_secs(60),
         };
 
         supervisor.emit_request_ack_timeout(&context, "codex", Duration::from_secs(60));
@@ -8799,15 +9208,17 @@ mod tests {
                 } if session == "codex"
             )
         });
-        assert!(events.lock().iter().any(|event| matches!(
-            event,
-            RuntimeEvent::SessionState {
-                session,
-                state: LifecycleState::Ready,
-                reason,
-                ..
-            } if session == "codex" && reason == "session ready"
-        )));
+        wait_for_event_count(&events, 1, |event| {
+            matches!(
+                event,
+                RuntimeEvent::SessionState {
+                    session,
+                    state: LifecycleState::Ready,
+                    reason,
+                    ..
+                } if session == "codex" && reason == "session ready"
+            )
+        });
         assert_eq!(
             supervisor.inner.slots.lock().get("codex").unwrap().state,
             LifecycleState::Ready
@@ -9118,7 +9529,7 @@ mod tests {
         supervisor.set_event_sink(move |event| {
             captured.lock().push(event);
         });
-        let (pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        let (pty, _, _) = reacting_pty_session(&supervisor, "codex", "Working 1s");
         install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
 
         let response = supervisor.apply_sideband_request(SidebandRequest::SendInput {
@@ -9164,11 +9575,219 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_attempt_idle_ready_proceeds_without_overlap() {
+    fn no_output_dispatch_emits_no_reaction_and_does_not_force_busy() {
         let supervisor = test_supervisor();
         let status = supervisor.start_control_plane().unwrap();
         let events = capture_runtime_events(&supervisor);
         let (pty, send_count, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
+        set_session_dispatch_state(
+            &supervisor,
+            "codex",
+            LifecycleState::Ready,
+            Some(WorkState::Idle),
+        );
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::SendInput {
+            token: status.token,
+            name: "codex".into(),
+            input: "hello".into(),
+            require_idle: false,
+        });
+
+        assert!(!response.ok);
+        assert_eq!(send_count.load(Ordering::SeqCst), 1);
+        assert!(request_ack_events(&events).is_empty());
+        assert_eq!(dispatch_no_reaction_events(&events).len(), 1);
+        assert!(
+            supervisor_alert_events(&events)
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    RuntimeEvent::SupervisorAlert {
+                        alert_type: SupervisorAlertType::DispatchNoReaction,
+                        request_id: Some(request_id),
+                        session: Some(session),
+                        action: Some(action),
+                        severity: AlertSeverity::Critical,
+                        ..
+                    } if request_id == response.request_id.as_deref().unwrap()
+                        && session == "codex"
+                        && action == "send_input"
+                ))
+        );
+        let slots = supervisor.inner.slots.lock();
+        assert_eq!(slots.get("codex").unwrap().state, LifecycleState::Ready);
+    }
+
+    #[test]
+    fn request_ack_is_emitted_only_after_reaction_output() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let events = capture_runtime_events(&supervisor);
+        let (pty, send_count, _) = reacting_pty_session(&supervisor, "codex", "Working 1s");
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
+        set_session_dispatch_state(
+            &supervisor,
+            "codex",
+            LifecycleState::Ready,
+            Some(WorkState::Idle),
+        );
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::SendInput {
+            token: status.token,
+            name: "codex".into(),
+            input: "hello".into(),
+            require_idle: false,
+        });
+
+        assert!(response.ok, "got: {}", response.message);
+        assert_eq!(send_count.load(Ordering::SeqCst), 1);
+        let events = events.lock();
+        let output_index = events
+            .iter()
+            .position(|event| matches!(event, RuntimeEvent::SessionOutput { .. }))
+            .unwrap();
+        let ack_index = events
+            .iter()
+            .position(|event| matches!(event, RuntimeEvent::RequestAck { .. }))
+            .unwrap();
+        assert!(output_index < ack_index);
+    }
+
+    #[test]
+    fn terminal_output_is_negative_reaction_not_ack() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let events = capture_runtime_events(&supervisor);
+        let handle = supervisor.clone();
+        let (pty, send_count, _) = mock_pty_session_full(
+            None,
+            None,
+            MockKillBehavior::Immediate,
+            AgentLiveness::Alive(Vec::new()),
+            Some(Arc::new(move || {
+                handle.handle_pty_event(
+                    "codex",
+                    0,
+                    PtyEvent::Output("PS C:\\Projects\\PRIM-1>".into()),
+                );
+            })),
+        );
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
+        set_session_dispatch_state(
+            &supervisor,
+            "codex",
+            LifecycleState::Ready,
+            Some(WorkState::Idle),
+        );
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::SendInput {
+            token: status.token,
+            name: "codex".into(),
+            input: "hello".into(),
+            require_idle: false,
+        });
+
+        assert!(!response.ok);
+        assert_eq!(send_count.load(Ordering::SeqCst), 1);
+        assert!(request_ack_events(&events).is_empty());
+        assert_eq!(dispatch_no_reaction_events(&events).len(), 1);
+        assert!(work_state_events(&events).iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SessionWorkState {
+                session,
+                state: WorkState::Exited,
+                detail: Some(detail),
+                ..
+            } if session == "codex" && detail == "shell_prompt"
+        )));
+    }
+
+    #[test]
+    fn output_before_dispatch_baseline_does_not_resolve_reaction() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let events = capture_runtime_events(&supervisor);
+        let (pty, send_count, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
+        set_session_dispatch_state(
+            &supervisor,
+            "codex",
+            LifecycleState::Ready,
+            Some(WorkState::Idle),
+        );
+        supervisor.handle_pty_event("codex", 0, PtyEvent::Output("Working 1s".into()));
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::SendInput {
+            token: status.token,
+            name: "codex".into(),
+            input: "hello".into(),
+            require_idle: false,
+        });
+
+        assert!(!response.ok);
+        assert_eq!(send_count.load(Ordering::SeqCst), 1);
+        assert!(request_ack_events(&events).is_empty());
+        assert_eq!(dispatch_no_reaction_events(&events).len(), 1);
+    }
+
+    #[test]
+    fn route_fails_when_any_recipient_does_not_react() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let events = capture_runtime_events(&supervisor);
+        let (claude_pty, claude_send_count, _) =
+            reacting_pty_session(&supervisor, "claude", "Thinking...");
+        let (codex_pty, codex_send_count, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "claude", DriverKind::Claude, claude_pty);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, codex_pty);
+        set_session_dispatch_state(
+            &supervisor,
+            "claude",
+            LifecycleState::Ready,
+            Some(WorkState::Idle),
+        );
+        set_session_dispatch_state(
+            &supervisor,
+            "codex",
+            LifecycleState::Ready,
+            Some(WorkState::Idle),
+        );
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::RouteMessage {
+            token: status.token,
+            request: RouteMessageRequest {
+                from: "operator".into(),
+                to: "room".into(),
+                scope: MessageScope::Room,
+                content: "status".into(),
+            },
+            require_idle: false,
+        });
+
+        assert!(!response.ok);
+        assert!(claude_send_count.load(Ordering::SeqCst) > 0);
+        assert!(codex_send_count.load(Ordering::SeqCst) > 0);
+        assert_eq!(request_ack_events(&events).len(), 1);
+        assert_eq!(dispatch_no_reaction_events(&events).len(), 1);
+        assert!(route_delivery_events(&events).iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RouteDelivery {
+                phase: RouteDeliveryPhase::Failed,
+                recipient: Some(recipient),
+                error: Some(error),
+                ..
+            } if recipient == "codex" && error.contains("dispatch no reaction")
+        )));
+    }
+
+    #[test]
+    fn dispatch_attempt_idle_ready_proceeds_without_overlap() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let events = capture_runtime_events(&supervisor);
+        let (pty, send_count, _) = reacting_pty_session(&supervisor, "codex", "Working 1s");
         install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
         set_session_dispatch_state(
             &supervisor,
@@ -9216,7 +9835,7 @@ mod tests {
         let supervisor = test_supervisor();
         let status = supervisor.start_control_plane().unwrap();
         let events = capture_runtime_events(&supervisor);
-        let (pty, send_count, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        let (pty, send_count, _) = reacting_pty_session(&supervisor, "codex", "Working 1s");
         install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
         set_session_dispatch_state(
             &supervisor,
@@ -9254,7 +9873,7 @@ mod tests {
         let supervisor = test_supervisor();
         let status = supervisor.start_control_plane().unwrap();
         let events = capture_runtime_events(&supervisor);
-        let (pty, send_count, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        let (pty, send_count, _) = reacting_pty_session(&supervisor, "codex", "Working 1s");
         install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
         set_session_dispatch_state(
             &supervisor,
@@ -9290,7 +9909,7 @@ mod tests {
         let supervisor = test_supervisor();
         let status = supervisor.start_control_plane().unwrap();
         let events = capture_runtime_events(&supervisor);
-        let (pty, send_count, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        let (pty, send_count, _) = reacting_pty_session(&supervisor, "codex", "Working 1s");
         install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
         set_session_dispatch_state(
             &supervisor,
@@ -9385,6 +10004,13 @@ mod tests {
             &[],
         );
         assert!(response.timed_out);
+        wait_until(Duration::from_secs(1), || {
+            let slots = supervisor.inner.slots.lock();
+            slots
+                .get("claude")
+                .map(|slot| slot.running.is_none())
+                .unwrap_or(false)
+        });
 
         let snapshot = supervisor.start_session("claude", Vec::new()).unwrap();
         assert_eq!(snapshot.lifecycle_state, LifecycleState::Ready);
@@ -9549,7 +10175,7 @@ mod tests {
         let claude_token = session_token(&supervisor, "claude");
         let cursor = supervisor.current_eof_cursor().unwrap();
         let (claude_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
-        let (codex_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        let (codex_pty, _, _) = reacting_pty_session(&supervisor, "codex", "Working 1s");
         install_mock_running_session(&supervisor, "claude", DriverKind::Claude, claude_pty);
         install_mock_running_session(&supervisor, "codex", DriverKind::Codex, codex_pty);
 
@@ -9600,7 +10226,7 @@ mod tests {
         let supervisor = test_supervisor();
         let status = supervisor.start_control_plane().unwrap();
         let cursor = supervisor.current_eof_cursor().unwrap();
-        let (claude_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        let (claude_pty, _, _) = reacting_pty_session(&supervisor, "claude", "Thinking...");
         install_mock_running_session(&supervisor, "claude", DriverKind::Claude, claude_pty);
 
         let response = supervisor.apply_sideband_request(SidebandRequest::RouteMessage {
@@ -9650,7 +10276,7 @@ mod tests {
         let supervisor = test_supervisor();
         let claude_token = session_token(&supervisor, "claude");
         let events = capture_runtime_events(&supervisor);
-        let (codex_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        let (codex_pty, _, _) = reacting_pty_session(&supervisor, "codex", "Working 1s");
         install_mock_running_session(&supervisor, "codex", DriverKind::Codex, codex_pty);
         let long_content = (0..120)
             .map(|index| format!("segment-{index:03}"))
@@ -9803,8 +10429,9 @@ mod tests {
         let status = supervisor.start_control_plane().unwrap();
         let events = capture_runtime_events(&supervisor);
         let (claude_pty, claude_send_count, _) =
-            mock_pty_session(None, MockKillBehavior::Immediate);
-        let (codex_pty, codex_send_count, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+            reacting_pty_session(&supervisor, "claude", "Thinking...");
+        let (codex_pty, codex_send_count, _) =
+            reacting_pty_session(&supervisor, "codex", "Working 1s");
         install_mock_running_session(&supervisor, "claude", DriverKind::Claude, claude_pty);
         install_mock_running_session(&supervisor, "codex", DriverKind::Codex, codex_pty);
         set_session_dispatch_state(
@@ -10146,6 +10773,148 @@ mod tests {
                 .to_string()
                 .contains("session 'claude' is not running")
         );
+    }
+
+    #[test]
+    fn agent_liveness_prunes_dead_inner_child_while_wrapper_pid_lives() {
+        let supervisor = test_supervisor();
+        let events = capture_runtime_events(&supervisor);
+        let wrapper_pid = std::process::id();
+        let (pty, _, _) = mock_pty_session_full(
+            Some(wrapper_pid),
+            None,
+            MockKillBehavior::Immediate,
+            AgentLiveness::Exited {
+                last_agent_pids: vec![4242],
+                live_processes: vec![pty_host::ProcessIdentity {
+                    process_id: wrapper_pid,
+                    image_name: Some("cmd.exe".into()),
+                }],
+            },
+            None,
+        );
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            Some(wrapper_pid),
+            pty,
+        );
+
+        let snapshot = supervisor.snapshot();
+        let codex = snapshot
+            .sessions
+            .into_iter()
+            .find(|session| session.name == "codex")
+            .unwrap();
+        assert!(!codex.running);
+        assert_eq!(codex.lifecycle_state, LifecycleState::Closed);
+        assert_eq!(codex.process_id, None);
+        assert!(session_exit_events(&events).iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SessionExit {
+                session,
+                process_id: Some(pid),
+                reason: SessionExitReason::ProcessDisappeared,
+                ..
+            } if session == "codex" && *pid == wrapper_pid
+        )));
+
+        let error = supervisor
+            .deliver_message(DeliverMessageRequest {
+                name: "codex".into(),
+                content: "hello".into(),
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("session 'codex' is not running"));
+    }
+
+    #[test]
+    fn delayed_agent_start_does_not_prune_cmd_only_window() {
+        let supervisor = test_supervisor();
+        let wrapper_pid = std::process::id();
+        let (pty, _, _) = mock_pty_session_full(
+            Some(wrapper_pid),
+            None,
+            MockKillBehavior::Immediate,
+            AgentLiveness::NotYetObserved(vec![pty_host::ProcessIdentity {
+                process_id: wrapper_pid,
+                image_name: Some("cmd.exe".into()),
+            }]),
+            None,
+        );
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            Some(wrapper_pid),
+            pty,
+        );
+
+        let snapshot = supervisor.snapshot();
+        let codex = snapshot
+            .sessions
+            .into_iter()
+            .find(|session| session.name == "codex")
+            .unwrap();
+        assert!(codex.running);
+        assert_eq!(codex.process_id, Some(wrapper_pid));
+    }
+
+    #[test]
+    fn wrapper_only_command_not_found_terminal_output_closes_session() {
+        let supervisor = test_supervisor();
+        let events = capture_runtime_events(&supervisor);
+        let wrapper_pid = std::process::id();
+        let (pty, _, _) = mock_pty_session_full(
+            Some(wrapper_pid),
+            None,
+            MockKillBehavior::Immediate,
+            AgentLiveness::NotYetObserved(vec![pty_host::ProcessIdentity {
+                process_id: wrapper_pid,
+                image_name: Some("cmd.exe".into()),
+            }]),
+            None,
+        );
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            Some(wrapper_pid),
+            pty,
+        );
+
+        supervisor.handle_pty_event(
+            "codex",
+            0,
+            PtyEvent::Output("codex: command not found".into()),
+        );
+
+        let snapshot = supervisor.snapshot();
+        let codex = snapshot
+            .sessions
+            .into_iter()
+            .find(|session| session.name == "codex")
+            .unwrap();
+        assert!(!codex.running);
+        assert_eq!(codex.lifecycle_state, LifecycleState::Failed);
+        assert!(work_state_events(&events).iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SessionWorkState {
+                session,
+                state: WorkState::Exited,
+                detail: Some(detail),
+                ..
+            } if session == "codex" && detail == "command_not_found"
+        )));
+        assert!(session_exit_events(&events).iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SessionExit {
+                session,
+                reason: SessionExitReason::CrashExit,
+                ..
+            } if session == "codex"
+        )));
     }
 
     #[test]
