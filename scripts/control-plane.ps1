@@ -479,13 +479,16 @@ if ($Quiet) {
   }
 
   if ($parsed.timed_out) {
-    Write-Error ("TIMED OUT: " + $parsed.message)
+    # Quiet mode is a machine-facing, message-only surface. Write the stable
+    # line to stdout and let exit code 124 carry the error classification;
+    # Write-Error adds host-width-dependent formatting in Windows PowerShell.
+    Write-Output ("TIMED OUT: " + $parsed.message)
     if ($jsonOutput) { $jsonOutput }
     exit 124
   }
 
   if (-not $parsed.ok) {
-    Write-Error $parsed.message
+    Write-Output $parsed.message
     if ($jsonOutput) { $jsonOutput }
     exit 1
   }

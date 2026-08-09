@@ -144,7 +144,7 @@ try {
       "-Quiet"
     )
     Assert-Equal $result.ExitCode 124 "Timed-out stop should keep exit code 124 in -Quiet mode."
-    Assert-True ($result.Output.Contains("TIMED OUT: $timeoutMessage")) "Timed-out stop should surface the timeout banner in -Quiet mode."
+    Assert-Equal $result.Output ("TIMED OUT: " + $timeoutMessage) "Timed-out stop should return one stable timeout line in -Quiet mode."
   } finally {
     if ($job) {
       Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
