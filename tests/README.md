@@ -1,6 +1,16 @@
-# tests
+# Tests
 
-Test strategy scaffold.
+From the repository root, create a project-local environment and install the
+pinned Python test dependency with:
+
+```powershell
+python -m venv .runtime\test-venv
+.\.runtime\test-venv\Scripts\python.exe -m pip install -r requirements-test.txt
+```
+
+The complete production gate is being consolidated separately; the existing
+`tests/run-all.ps1` command covers only deterministic and opt-in live
+control-script suites and deliberately identifies that narrower scope.
 
 Expected v1 test mix:
 
@@ -41,5 +51,3 @@ Current script-level coverage:
   - validates `scripts/new-smoke-token.ps1`
   - validates canonical `scripts/handshake-route.ps1` payload generation in `-DryRun` mode
   - validates `scripts/handshake-watchdog.ps1` success detection and timeout dry-run behavior against synthetic audit files
-
-The detailed strategy should be locked during Phase 0.

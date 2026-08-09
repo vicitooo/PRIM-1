@@ -183,6 +183,36 @@ struct RouteDeliveryEvent {
     error: Option<String>,
 }
 
+struct SidebandLifecycleEvent<'a> {
+    request_id: &'a str,
+    action: &'a str,
+    session: Option<&'a str>,
+    extra_args: &'a [String],
+    phase: SidebandPhase,
+    elapsed: Duration,
+    error: Option<String>,
+}
+
+struct SupervisorAlertEvent {
+    alert_type: SupervisorAlertType,
+    request_id: Option<String>,
+    session: Option<String>,
+    action: Option<String>,
+    last_work_state: Option<WorkState>,
+    last_session_state: Option<LifecycleState>,
+    message: String,
+    severity: AlertSeverity,
+}
+
+struct PaneSignalRecord {
+    token: String,
+    task_id: String,
+    signal_type: PaneSignalType,
+    summary: String,
+    artifact_paths: Vec<String>,
+    commit_sha: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DispatchAttemptDecision {
     target_lifecycle_state_before: LifecycleState,
@@ -1453,29 +1483,26 @@ impl SupervisorHandle {
         phase: SidebandPhase,
         elapsed: Duration,
     ) {
-        self.emit_sideband_lifecycle_with_error(
-            request_id, action, session, extra_args, phase, elapsed, None,
-        );
+        self.emit_sideband_lifecycle_with_error(SidebandLifecycleEvent {
+            request_id,
+            action,
+            session,
+            extra_args,
+            phase,
+            elapsed,
+            error: None,
+        });
     }
 
-    fn emit_sideband_lifecycle_with_error(
-        &self,
-        request_id: &str,
-        action: &str,
-        session: Option<&str>,
-        extra_args: &[String],
-        phase: SidebandPhase,
-        elapsed: Duration,
-        error: Option<String>,
-    ) {
+    fn emit_sideband_lifecycle_with_error(&self, event: SidebandLifecycleEvent<'_>) {
         self.emit(RuntimeEvent::SidebandRequestLifecycle {
-            request_id: request_id.to_string(),
-            action: action.to_string(),
-            session: session.map(ToOwned::to_owned),
-            extra_args: extra_args.to_vec(),
-            phase,
-            error,
-            elapsed_ms: elapsed.as_millis() as u64,
+            request_id: event.request_id.to_string(),
+            action: event.action.to_string(),
+            session: event.session.map(ToOwned::to_owned),
+            extra_args: event.extra_args.to_vec(),
+            phase: event.phase,
+            error: event.error,
+            elapsed_ms: event.elapsed.as_millis() as u64,
             timestamp: now_rfc3339(),
         });
     }
@@ -1498,19 +1525,19 @@ impl SupervisorHandle {
             action: context.action.clone(),
             timestamp: now_rfc3339(),
         });
-        self.emit_supervisor_alert(
-            SupervisorAlertType::DispatchNoReaction,
-            Some(context.request_id.clone()),
-            Some(session.to_string()),
-            Some(context.action.clone()),
+        self.emit_supervisor_alert(SupervisorAlertEvent {
+            alert_type: SupervisorAlertType::DispatchNoReaction,
+            request_id: Some(context.request_id.clone()),
+            session: Some(session.to_string()),
+            action: Some(context.action.clone()),
             last_work_state,
             last_session_state,
-            format!(
+            message: format!(
                 "Dispatch {} to {} produced no live pane reaction: {}",
                 context.action, session, detail
             ),
-            AlertSeverity::Critical,
-        );
+            severity: AlertSeverity::Critical,
+        });
     }
 
     fn register_dispatch_reaction(
@@ -1646,26 +1673,16 @@ impl SupervisorHandle {
         )
     }
 
-    fn emit_supervisor_alert(
-        &self,
-        alert_type: SupervisorAlertType,
-        request_id: Option<String>,
-        session: Option<String>,
-        action: Option<String>,
-        last_work_state: Option<WorkState>,
-        last_session_state: Option<LifecycleState>,
-        message: String,
-        severity: AlertSeverity,
-    ) {
+    fn emit_supervisor_alert(&self, alert: SupervisorAlertEvent) {
         self.emit(RuntimeEvent::SupervisorAlert {
-            alert_type,
-            request_id,
-            session,
-            action,
-            last_work_state,
-            last_session_state,
-            message,
-            severity,
+            alert_type: alert.alert_type,
+            request_id: alert.request_id,
+            session: alert.session,
+            action: alert.action,
+            last_work_state: alert.last_work_state,
+            last_session_state: alert.last_session_state,
+            message: alert.message,
+            severity: alert.severity,
             timestamp: now_rfc3339(),
         });
     }
@@ -1685,22 +1702,22 @@ impl SupervisorHandle {
             elapsed_ms: elapsed.as_millis() as u64,
             timestamp: now_rfc3339(),
         });
-        self.emit_supervisor_alert(
-            SupervisorAlertType::AckTimeout,
-            Some(context.request_id.clone()),
-            Some(session.to_string()),
-            Some(context.action.clone()),
+        self.emit_supervisor_alert(SupervisorAlertEvent {
+            alert_type: SupervisorAlertType::AckTimeout,
+            request_id: Some(context.request_id.clone()),
+            session: Some(session.to_string()),
+            action: Some(context.action.clone()),
             last_work_state,
             last_session_state,
-            format!(
+            message: format!(
                 "Dispatch {} to {} didn't ACK in {}s; last work_state={}",
                 context.action,
                 session,
                 elapsed.as_secs(),
                 work_state_alert_label(last_work_state)
             ),
-            AlertSeverity::Warn,
-        );
+            severity: AlertSeverity::Warn,
+        });
     }
 
     fn emit_route_delivery(&self, event: RouteDeliveryEvent) {
@@ -1801,19 +1818,14 @@ impl SupervisorHandle {
     fn record_pane_signal(
         &self,
         request_id: &str,
-        token: &str,
-        task_id: String,
-        signal_type: PaneSignalType,
-        summary: String,
-        artifact_paths: Vec<String>,
-        commit_sha: Option<String>,
+        signal: PaneSignalRecord,
     ) -> Result<PaneSignalWritePaths> {
-        let task_id = normalized_required_field("task_id", task_id)?;
-        let summary = normalized_required_field("summary", summary)?;
-        let session = self.resolve_pane_signal_session(token)?;
+        let task_id = normalized_required_field("task_id", signal.task_id)?;
+        let summary = normalized_required_field("summary", signal.summary)?;
+        let session = self.resolve_pane_signal_session(&signal.token)?;
         let now = Utc::now();
         let timestamp = now.to_rfc3339();
-        let signal_type_name = pane_signal_type_name(signal_type);
+        let signal_type_name = pane_signal_type_name(signal.signal_type);
         let safe_task_id = pane_signal_filename_component(&task_id);
         let signal_path = self.runtime_dir().join("signals").join(format!(
             "{}__{}__{}.json",
@@ -1829,10 +1841,10 @@ impl SupervisorHandle {
             request_id: request_id.to_string(),
             session,
             task_id,
-            signal_type,
+            signal_type: signal.signal_type,
             summary,
-            artifact_paths,
-            commit_sha,
+            artifact_paths: signal.artifact_paths,
+            commit_sha: signal.commit_sha,
             timestamp,
         };
         let payload = format!("{}\n", serde_json::to_string_pretty(&event)?);
@@ -2028,21 +2040,21 @@ impl SupervisorHandle {
 
         match self.reserve_auto_restart_attempt(&session) {
             AutoRestartReservation::Reserved => {
-                self.emit_supervisor_alert(
-                    SupervisorAlertType::SessionStallDetected,
-                    None,
-                    Some(session.clone()),
-                    Some("restart_session".into()),
-                    stall.last_work_state,
-                    stall.last_session_state,
-                    format!(
+                self.emit_supervisor_alert(SupervisorAlertEvent {
+                    alert_type: SupervisorAlertType::SessionStallDetected,
+                    request_id: None,
+                    session: Some(session.clone()),
+                    action: Some("restart_session".into()),
+                    last_work_state: stall.last_work_state,
+                    last_session_state: stall.last_session_state,
+                    message: format!(
                         "Session {} stayed in {} for {}s; issuing auto-restart",
                         session,
                         work_state_alert_label(stall.last_work_state),
                         self.inner.auto_restart_on_stall.threshold.as_secs()
                     ),
-                    AlertSeverity::Critical,
-                );
+                    severity: AlertSeverity::Critical,
+                });
 
                 let restart_handle = self.clone();
                 let restart_session = session.clone();
@@ -2052,41 +2064,39 @@ impl SupervisorHandle {
                 .await;
                 match join {
                     Ok(Ok(_)) => {}
-                    Ok(Err(error)) => self.emit_supervisor_alert(
-                        SupervisorAlertType::OperatorAttention,
-                        None,
-                        Some(session),
-                        Some("restart_session".into()),
-                        stall.last_work_state,
-                        stall.last_session_state,
-                        format!("Auto-restart failed: {error}"),
-                        AlertSeverity::Critical,
-                    ),
-                    Err(error) => self.emit_supervisor_alert(
-                        SupervisorAlertType::OperatorAttention,
-                        None,
-                        Some(session),
-                        Some("restart_session".into()),
-                        stall.last_work_state,
-                        stall.last_session_state,
-                        format!("Auto-restart worker join failed: {error}"),
-                        AlertSeverity::Critical,
-                    ),
+                    Ok(Err(error)) => self.emit_supervisor_alert(SupervisorAlertEvent {
+                        alert_type: SupervisorAlertType::OperatorAttention,
+                        request_id: None,
+                        session: Some(session),
+                        action: Some("restart_session".into()),
+                        last_work_state: stall.last_work_state,
+                        last_session_state: stall.last_session_state,
+                        message: format!("Auto-restart failed: {error}"),
+                        severity: AlertSeverity::Critical,
+                    }),
+                    Err(error) => self.emit_supervisor_alert(SupervisorAlertEvent {
+                        alert_type: SupervisorAlertType::OperatorAttention,
+                        request_id: None,
+                        session: Some(session),
+                        action: Some("restart_session".into()),
+                        last_work_state: stall.last_work_state,
+                        last_session_state: stall.last_session_state,
+                        message: format!("Auto-restart worker join failed: {error}"),
+                        severity: AlertSeverity::Critical,
+                    }),
                 }
             }
             AutoRestartReservation::CapReached => {
-                self.emit_supervisor_alert(
-                    SupervisorAlertType::SessionStallDetected,
-                    None,
-                    Some(session),
-                    Some("restart_session".into()),
-                    stall.last_work_state,
-                    stall.last_session_state,
-                    format!(
-                        "Auto-restart cap reached: 3 restarts in 30 minutes; manual operator intervention required"
-                    ),
-                    AlertSeverity::Critical,
-                );
+                self.emit_supervisor_alert(SupervisorAlertEvent {
+                    alert_type: SupervisorAlertType::SessionStallDetected,
+                    request_id: None,
+                    session: Some(session),
+                    action: Some("restart_session".into()),
+                    last_work_state: stall.last_work_state,
+                    last_session_state: stall.last_session_state,
+                    message: "Auto-restart cap reached: 3 restarts in 30 minutes; manual operator intervention required".to_string(),
+                    severity: AlertSeverity::Critical,
+                });
             }
             AutoRestartReservation::Disabled => {}
         }
@@ -2832,16 +2842,15 @@ impl SupervisorHandle {
                 self.emit_dispatch_attempt(&request_id, "route_message", &request.from, recipient)?;
             attempts.push((recipient.clone(), decision));
         }
-        if require_idle {
-            if let Some((recipient, decision)) =
+        if require_idle
+            && let Some((recipient, decision)) =
                 attempts.iter().find(|(_, decision)| decision.overlap())
-            {
-                return Err(anyhow!(
-                    "dispatch aborted: target {} {}",
-                    recipient,
-                    decision.reason.unwrap_or("overlap")
-                ));
-            }
+        {
+            return Err(anyhow!(
+                "dispatch aborted: target {} {}",
+                recipient,
+                decision.reason.unwrap_or("overlap")
+            ));
         }
 
         self.emit_route_delivery(RouteDeliveryEvent {
@@ -2919,30 +2928,30 @@ impl SupervisorHandle {
                         bytes_written: delivery.bytes_written,
                         error: None,
                     });
-                    if let (Some(context), Some(waiter)) = (ack_context, waiter) {
-                        if let Err(error) = self.wait_for_dispatch_reaction(
+                    if let (Some(context), Some(waiter)) = (ack_context, waiter)
+                        && let Err(error) = self.wait_for_dispatch_reaction(
                             waiter,
                             context,
                             &recipient,
                             delivery.bytes_written,
-                        ) {
-                            let error = error.to_string();
-                            self.emit_route_delivery(RouteDeliveryEvent {
-                                request_id: request_id.clone(),
-                                route_id: route_id_string.clone(),
-                                from: request.from.clone(),
-                                logical_to: request.to.clone(),
-                                scope: request.scope,
-                                recipient: Some(recipient.clone()),
-                                recipient_index: recipient_index as u32,
-                                recipient_count,
-                                payload_part_count: delivery.payload_part_count,
-                                phase: RouteDeliveryPhase::Failed,
-                                bytes_written: delivery.bytes_written,
-                                error: Some(error.clone()),
-                            });
-                            failures.push((recipient, error));
-                        }
+                        )
+                    {
+                        let error = error.to_string();
+                        self.emit_route_delivery(RouteDeliveryEvent {
+                            request_id: request_id.clone(),
+                            route_id: route_id_string.clone(),
+                            from: request.from.clone(),
+                            logical_to: request.to.clone(),
+                            scope: request.scope,
+                            recipient: Some(recipient.clone()),
+                            recipient_index: recipient_index as u32,
+                            recipient_count,
+                            payload_part_count: delivery.payload_part_count,
+                            phase: RouteDeliveryPhase::Failed,
+                            bytes_written: delivery.bytes_written,
+                            error: Some(error.clone()),
+                        });
+                        failures.push((recipient, error));
                     }
                 }
                 Err(error) => {
@@ -3186,14 +3195,14 @@ impl SupervisorHandle {
                 }
 
                 let mut prune_reason: Option<(LifecycleState, SessionExitReason, String)> = None;
-                if let Some(process_id) = slot.process_id {
-                    if !process_id_is_running(process_id) {
-                        prune_reason = Some((
-                            LifecycleState::Closed,
-                            SessionExitReason::ProcessDisappeared,
-                            "process no longer running".into(),
-                        ));
-                    }
+                if let Some(process_id) = slot.process_id
+                    && !process_id_is_running(process_id)
+                {
+                    prune_reason = Some((
+                        LifecycleState::Closed,
+                        SessionExitReason::ProcessDisappeared,
+                        "process no longer running".into(),
+                    ));
                 }
 
                 if prune_reason.is_none() {
@@ -3345,70 +3354,70 @@ impl SupervisorHandle {
                     work_state_event,
                     reaction_outcome,
                     needs_liveness_refresh,
-                ) =
-                    {
-                        let mut slots = self.inner.slots.lock();
-                        if let Some(slot) = slots.get_mut(session_name) {
-                            let transitioned = slot.state != LifecycleState::Ready;
-                            if slot.state != LifecycleState::Ready {
-                                slot.state = LifecycleState::Ready;
-                                slot.last_activity_at = Some(now_rfc3339());
-                            }
-                            if has_real_content {
-                                if let Some(pty) = slot.running.as_ref().and_then(|running| {
-                                    running.pty.as_ref().map(|pty| pty.as_ref())
-                                }) {
-                                    pty.note_real_output(slot.definition.driver);
-                                }
-                            }
-
-                            let classification =
-                                classify_work_state_for_driver(slot.definition.driver, &chunk);
-                            let mut terminal_signature = false;
-                            let mut first_launch_banner = false;
-                            let work_state_event = classification.and_then(|(state, detail)| {
-                                if state == WorkState::Exited {
-                                    terminal_signature = true;
-                                    if detail.as_deref() == Some("launch_banner")
-                                        && !slot.launch_banner_seen
-                                    {
-                                        slot.launch_banner_seen = true;
-                                        first_launch_banner = true;
-                                        return None;
-                                    }
-                                }
-                                transition_work_state_locked(session_name, slot, state, detail)
-                            });
-
-                            let terminal_reaction = terminal_signature && !first_launch_banner;
-                            let quiesce_arm = if terminal_reaction {
-                                cancel_quiesce_timer_locked(slot);
-                                None
-                            } else {
-                                real_output_at.map(|armed_at| {
-                                    slot.last_real_output_at = Some(armed_at);
-                                    cancel_quiesce_timer_locked(slot);
-                                    (slot.definition.driver, slot.generation, armed_at)
-                                })
-                            };
-                            let reaction_outcome = if terminal_reaction {
-                                Some(DispatchReactionOutcome::Terminal)
-                            } else if has_real_content || work_state_event.is_some() {
-                                Some(DispatchReactionOutcome::Reacted)
-                            } else {
-                                None
-                            };
-                            (
-                                transitioned,
-                                quiesce_arm,
-                                work_state_event,
-                                reaction_outcome,
-                                terminal_reaction,
-                            )
-                        } else {
-                            (false, None, None, None, false)
+                ) = {
+                    let mut slots = self.inner.slots.lock();
+                    if let Some(slot) = slots.get_mut(session_name) {
+                        let transitioned = slot.state != LifecycleState::Ready;
+                        if slot.state != LifecycleState::Ready {
+                            slot.state = LifecycleState::Ready;
+                            slot.last_activity_at = Some(now_rfc3339());
                         }
-                    };
+                        if has_real_content
+                            && let Some(pty) = slot
+                                .running
+                                .as_ref()
+                                .and_then(|running| running.pty.as_ref().map(|pty| pty.as_ref()))
+                        {
+                            pty.note_real_output(slot.definition.driver);
+                        }
+
+                        let classification =
+                            classify_work_state_for_driver(slot.definition.driver, &chunk);
+                        let mut terminal_signature = false;
+                        let mut first_launch_banner = false;
+                        let work_state_event = classification.and_then(|(state, detail)| {
+                            if state == WorkState::Exited {
+                                terminal_signature = true;
+                                if detail.as_deref() == Some("launch_banner")
+                                    && !slot.launch_banner_seen
+                                {
+                                    slot.launch_banner_seen = true;
+                                    first_launch_banner = true;
+                                    return None;
+                                }
+                            }
+                            transition_work_state_locked(session_name, slot, state, detail)
+                        });
+
+                        let terminal_reaction = terminal_signature && !first_launch_banner;
+                        let quiesce_arm = if terminal_reaction {
+                            cancel_quiesce_timer_locked(slot);
+                            None
+                        } else {
+                            real_output_at.map(|armed_at| {
+                                slot.last_real_output_at = Some(armed_at);
+                                cancel_quiesce_timer_locked(slot);
+                                (slot.definition.driver, slot.generation, armed_at)
+                            })
+                        };
+                        let reaction_outcome = if terminal_reaction {
+                            Some(DispatchReactionOutcome::Terminal)
+                        } else if has_real_content || work_state_event.is_some() {
+                            Some(DispatchReactionOutcome::Reacted)
+                        } else {
+                            None
+                        };
+                        (
+                            transitioned,
+                            quiesce_arm,
+                            work_state_event,
+                            reaction_outcome,
+                            terminal_reaction,
+                        )
+                    } else {
+                        (false, None, None, None, false)
+                    }
+                };
 
                 if let Some((driver, generation, armed_at)) = quiesce_arm {
                     self.arm_quiesce_timer(session_name, driver, generation, armed_at);
@@ -3809,12 +3818,14 @@ impl SupervisorHandle {
             } => {
                 let result = self.record_pane_signal(
                     request_id,
-                    &token,
-                    task_id,
-                    signal_type,
-                    summary,
-                    artifact_paths,
-                    commit_sha,
+                    PaneSignalRecord {
+                        token,
+                        task_id,
+                        signal_type,
+                        summary,
+                        artifact_paths,
+                        commit_sha,
+                    },
                 );
                 return match result {
                     Ok(paths) => SidebandResponse {
@@ -3913,15 +3924,15 @@ impl SupervisorHandle {
                 SidebandPhase::Failed
             };
             let error = (!response.ok).then(|| response.message.clone());
-            self.emit_sideband_lifecycle_with_error(
-                &request_id,
-                &action,
-                session.as_deref(),
-                &extra_args,
+            self.emit_sideband_lifecycle_with_error(SidebandLifecycleEvent {
+                request_id: &request_id,
+                action: &action,
+                session: session.as_deref(),
+                extra_args: &extra_args,
                 phase,
-                started.elapsed(),
+                elapsed: started.elapsed(),
                 error,
-            );
+            });
         }
 
         response
@@ -4005,15 +4016,15 @@ impl SupervisorHandle {
                         "lifecycle op '{action}' timed out after {}ms",
                         elapsed.as_millis()
                     );
-                    self.emit_sideband_lifecycle_with_error(
+                    self.emit_sideband_lifecycle_with_error(SidebandLifecycleEvent {
                         request_id,
                         action,
                         session,
                         extra_args,
-                        SidebandPhase::TimedOut,
+                        phase: SidebandPhase::TimedOut,
                         elapsed,
-                        Some(message.clone()),
-                    );
+                        error: Some(message.clone()),
+                    });
                     return SidebandResponse {
                         ok: false,
                         message,
@@ -4079,15 +4090,15 @@ impl SupervisorHandle {
                         "side-effect op '{action}' timed out after {}ms (boundary pre-PTY-write unless documented otherwise)",
                         budget.as_millis()
                     );
-                    self.emit_sideband_lifecycle_with_error(
+                    self.emit_sideband_lifecycle_with_error(SidebandLifecycleEvent {
                         request_id,
                         action,
                         session,
                         extra_args,
-                        SidebandPhase::TimedOut,
-                        budget,
-                        Some(message.clone()),
-                    );
+                        phase: SidebandPhase::TimedOut,
+                        elapsed: budget,
+                        error: Some(message.clone()),
+                    });
                     return SidebandResponse {
                         ok: false,
                         message,
@@ -4614,15 +4625,15 @@ fn process_sideband_mailbox_file(
             SidebandPhase::Failed
         };
         let error = (!response.ok).then(|| response.message.clone());
-        handle.emit_sideband_lifecycle_with_error(
-            &request_id,
+        handle.emit_sideband_lifecycle_with_error(SidebandLifecycleEvent {
+            request_id: &request_id,
             action,
             session,
-            &extra_args,
+            extra_args: &extra_args,
             phase,
-            started.elapsed(),
+            elapsed: started.elapsed(),
             error,
-        );
+        });
     }
 
     write_and_archive_response(handle, request_path, outbox_dir, processed_dir, &response)
@@ -4692,15 +4703,15 @@ fn run_detached_with_timeout(
                         "lifecycle op '{action}' timed out after {}ms",
                         elapsed.as_millis()
                     );
-                    handle.emit_sideband_lifecycle_with_error(
+                    handle.emit_sideband_lifecycle_with_error(SidebandLifecycleEvent {
                         request_id,
                         action,
                         session,
                         extra_args,
-                        SidebandPhase::TimedOut,
+                        phase: SidebandPhase::TimedOut,
                         elapsed,
-                        Some(message.clone()),
-                    );
+                        error: Some(message.clone()),
+                    });
                     return SidebandResponse {
                         ok: false,
                         message,
@@ -4770,15 +4781,15 @@ fn run_inline_with_timeout(
                 "side-effect op '{action}' timed out after {}ms (boundary pre-PTY-write unless documented otherwise)",
                 budget.as_millis()
             );
-            handle.emit_sideband_lifecycle_with_error(
+            handle.emit_sideband_lifecycle_with_error(SidebandLifecycleEvent {
                 request_id,
                 action,
                 session,
                 extra_args,
-                SidebandPhase::TimedOut,
-                budget,
-                Some(message.clone()),
-            );
+                phase: SidebandPhase::TimedOut,
+                elapsed: budget,
+                error: Some(message.clone()),
+            });
             SidebandResponse {
                 ok: false,
                 message,
@@ -5946,7 +5957,7 @@ mod tests {
             if let Some(on_send) = self.on_send.clone() {
                 thread::spawn(move || on_send());
             }
-            Ok(input.as_bytes().len())
+            Ok(input.len())
         }
 
         fn resize(&self, _cols: u16, _rows: u16) -> Result<()> {

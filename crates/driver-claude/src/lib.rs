@@ -82,7 +82,7 @@ fn strip_ansi_and_controls(input: &str) -> String {
         if ch == '\u{1b}' {
             if matches!(chars.peek(), Some('[' | ']' | '(' | ')')) {
                 let introducer = chars.next();
-                while let Some(next) = chars.next() {
+                for next in chars.by_ref() {
                     if introducer == Some(']') && next == '\u{7}' {
                         break;
                     }

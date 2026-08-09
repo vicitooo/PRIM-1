@@ -194,10 +194,9 @@ impl ConcretePtySession {
     fn live_process_identities(&self) -> Result<Vec<ProcessIdentity>> {
         #[cfg(windows)]
         {
-            return self
-                .job
+            self.job
                 .live_process_ids()
-                .map(|process_ids| process_identities_for_ids(&process_ids));
+                .map(|process_ids| process_identities_for_ids(&process_ids))
         }
 
         #[cfg(unix)]
@@ -250,7 +249,7 @@ impl PtySession for ConcretePtySession {
             .write_all(input.as_bytes())
             .context("failed to write PTY input")?;
         writer.flush().context("failed to flush PTY input")?;
-        Ok(input.as_bytes().len())
+        Ok(input.len())
     }
 
     fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()> {
