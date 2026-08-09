@@ -1,10 +1,12 @@
 <#
 .SYNOPSIS
-  PRIM-1 test runner — executes every PRIM-1 test suite in sequence and
-  reports pass/fail. One-command gate for trusting the wrapper before a long run.
+  PRIM-1 deterministic control-script test runner.
 
 .DESCRIPTION
-  Runs the following suites in order:
+  Runs the following legacy deterministic and live control-script suites in
+  order. This is not the complete production gate; Rust, TypeScript, packaging,
+  browser, privacy, process, harness-admission, and performance verification are
+  aggregated separately.
     1. tools/tests/test_watcher.py       (Python unit tests)
     2. tests/agent-events-summary.test.py (Python fixture tests)
     3. tests/handshake-helpers.ps1       (PowerShell helper tests)
@@ -16,8 +18,8 @@
                                              wrapper + panes running)
     9. scripts/health-check.ps1          (live runtime state check)
 
-  Uses direct invocation with $LASTEXITCODE capture. Output is only shown on
-  failure unless -Verbose is set.
+  Uses direct invocation with fail-closed $LASTEXITCODE capture. Output is only
+  shown on failure unless -Verbose is set.
 
 .PARAMETER SkipLive
   Skip suites that require a running wrapper + panes (stress test + health check).
@@ -52,14 +54,25 @@ function Invoke-Suite {
 
   Push-Location $wrapperRoot
   $captured = $null
-  $exitCode = 0
+  $exitCode = 1
   try {
+    # Native exit state is sticky in Windows PowerShell 5.1. Clear it so a
+    # scriptblock that never launches a native process cannot inherit success
+    # from the preceding suite.
+    $global:LASTEXITCODE = $null
     $captured = & $Block 2>&1 | Out-String
-    $exitCode = $LASTEXITCODE
-    if ($null -eq $exitCode) { $exitCode = 0 }
+    $observedExitCode = $global:LASTEXITCODE
+    if ($null -eq $observedExitCode) {
+      $captured = ($captured + "`nrunner error: suite completed without an external process exit code").Trim()
+    } else {
+      $exitCode = [int]$observedExitCode
+    }
   } catch {
-    $captured = $_.Exception.Message
-    $exitCode = 1
+    $observedExitCode = $global:LASTEXITCODE
+    if ($null -ne $observedExitCode -and [int]$observedExitCode -ne 0) {
+      $exitCode = [int]$observedExitCode
+    }
+    $captured = ($_ | Out-String).Trim()
   } finally {
     Pop-Location
   }
@@ -88,6 +101,7 @@ Write-Host "PRIM-1 test runner" -ForegroundColor Cyan
 Write-Host ("=" * 70)
 Write-Host "wrapper root: $wrapperRoot"
 if ($SkipLive) { Write-Host "mode: skip live suites (unit-only gate)" }
+Write-Host "scope: control-script suites only; not the complete production gate"
 Write-Host ""
 
 $results = @()
@@ -133,13 +147,15 @@ $totalMs = [int](((Get-Date) - $start).TotalMilliseconds)
 
 Write-Host ""
 Write-Host ("=" * 70)
-$passCount = ($results | Where-Object { $_.Status -eq "pass" }).Count
-$failCount = ($results | Where-Object { $_.Status -eq "fail" }).Count
-$skipCount = ($results | Where-Object { $_.Status -eq "skip" }).Count
+$resultCount = @($results).Count
+$passCount = @($results | Where-Object { $_.Status -eq "pass" }).Count
+$failCount = @($results | Where-Object { $_.Status -eq "fail" }).Count
+$skipCount = @($results | Where-Object { $_.Status -eq "skip" }).Count
+$classifiedCount = $passCount + $failCount + $skipCount
 
 Write-Host "PRIM-1 test runner: $passCount pass, $failCount fail, $skipCount skip  (total $totalMs ms)"
 
-if ($failCount -gt 0) {
+if ($resultCount -eq 0 -or $classifiedCount -ne $resultCount -or $failCount -gt 0) {
   Write-Host ""
   Write-Host "FAILED SUITES:" -ForegroundColor Red
   foreach ($r in $results | Where-Object { $_.Status -eq "fail" }) {
@@ -148,6 +164,11 @@ if ($failCount -gt 0) {
       Write-Host "    output:" -ForegroundColor Gray
       $r.Output -split "`n" | Where-Object { $_.Trim() } | Select-Object -First 20 | ForEach-Object { Write-Host "    $_" -ForegroundColor Gray }
     }
+  }
+  if ($resultCount -eq 0) {
+    Write-Host "  - runner produced no suite results" -ForegroundColor Red
+  } elseif ($classifiedCount -ne $resultCount) {
+    Write-Host "  - runner produced $($resultCount - $classifiedCount) unclassified suite result(s)" -ForegroundColor Red
   }
   Write-Host ""
   Write-Host "OVERALL: FAIL" -ForegroundColor Red
