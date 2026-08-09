@@ -1,6 +1,6 @@
 # ADR 0002 — Runtime lifetime and honest resume
 
-**Status:** Proposed; requires Victor approval
+**Status:** Accepted by Victor on 2026-08-10
 
 **Date:** 2026-08-10
 
@@ -46,6 +46,6 @@ This makes Windows-native Claude/Codex/Grok dependent on WSL and confuses host p
 - No silent restart or fallback from failed resume to a new conversation.
 - UI close, app quit, backend crash, WSL shutdown, harness exit, attachment close, and target stop are distinct events.
 
-## Approval question
+## Decision
 
-Choose Option A for the first production slice—explicit quit confirmation, owned-session shutdown, and later logical resume in fresh PTYs—or require Option B and UI-close process survival before the daily-driver/room release can be considered complete?
+Victor accepted Option A for the first production slice: explicit quit confirmation, owned-session shutdown, and later logical resume in fresh PTYs. A persistent host remains deferred until measured workflow demand earns it.

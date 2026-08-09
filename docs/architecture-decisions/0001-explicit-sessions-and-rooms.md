@@ -1,6 +1,6 @@
 # ADR 0001 — Explicit sessions and rooms
 
-**Status:** Proposed; requires Victor approval
+**Status:** Accepted by Victor on 2026-08-10
 
 **Date:** 2026-08-10
 
@@ -35,18 +35,18 @@ This adds a second service/protocol and imports outside goals before local tabs/
 
 **Rejected.**
 
-## Proposed consequences
+## Consequences
 
 - Fixed-pair routing is characterized, replaced, and deleted rather than wrapped forever.
 - Session labels and harness kinds stop serving as authorization.
-- Room cardinality is decided separately. The recommended first slice permits zero or one active room per session; the identity model does not make multi-room support impossible.
+- The separately accepted first slice permits zero or one active room per session; the identity model does not make multi-room support impossible.
 - Joining exposes only future room messages; private terminal scrollback/history stays private.
 - Direct and room sends use explicit recipient identities and fail closed.
 - The product can add Grok, Prime, Hermes, or a future driver without another room model.
 - Compatibility aliases and their tests are temporary and removable once no named consumer remains.
 
-## Approval question
+## Decision
 
-Approve Option B: replace name-derived Claude/Codex pairs with stable PRIM-managed sessions plus explicit room membership, while retaining PRIM-1's native sideband—not Agent Bus—as the communication mechanism?
+Victor accepted Option B: replace name-derived Claude/Codex pairs with stable PRIM-managed sessions plus explicit room membership, while retaining PRIM-1's native sideband—not Agent Bus—as the communication mechanism.
 
-The one-active-room recommendation is a separate product decision and is not bundled into this approval.
+Victor separately accepted zero or one active room per session for the first slice; the identity model remains extensible to a future multi-room decision.

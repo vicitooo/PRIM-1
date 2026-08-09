@@ -1,6 +1,6 @@
 # ADR 0003 — Shared room feed and explicit delivery
 
-**Status:** Proposed; requires Victor approval
+**Status:** Accepted by Victor on 2026-08-10
 
 **Date:** 2026-08-10
 
@@ -47,7 +47,7 @@ This gives the operator visibility but cannot support harness-to-harness collabo
 - Pending, written, accepted, and failed are distinct where the harness can prove them. A pre-delivery UI/event emission is never labeled delivered.
 - Room-derived session credentials can post/read only their authorized rooms and deliver only to eligible members. Operator authority may explicitly deliver across rooms; session-to-session cross-room delivery requires a separate explicit grant and is never implied by membership. Unknown sender, unknown target, stale run, and unauthorized cross-room requests fail closed.
 - Two rooms with identical labels remain isolated by `RoomId`.
-- Feed retention is separate from active visibility. The first-slice recommendation uses a bounded, authorized in-memory feed with explicit cursor-gap behavior. With retention off, the durable audit stores metadata/status but no message content or content-derived hash; existing historical audit files remain readable legacy evidence and are not rewritten.
+- Feed retention is separate from active visibility. The accepted first slice uses a bounded, authorized in-memory feed with explicit cursor-gap behavior. With retention off, the durable audit stores metadata/status but no message content or content-derived hash; existing historical audit files remain readable legacy evidence and are not rewritten.
 
 ## Consequences
 
@@ -56,6 +56,6 @@ This gives the operator visibility but cannot support harness-to-harness collabo
 - The operator can see exactly which content was merely posted, which recipients were addressed, and what each delivery proved.
 - Multi-member rooms do not force every message through every model.
 
-## Approval question
+## Decision
 
-Approve Option B: a shared native-sideband room feed readable by members, with no automatic prompt injection and with explicit recipients or Send All for harness delivery?
+Victor accepted Option B: a shared native-sideband room feed readable by members, with no automatic prompt injection and with explicit recipients or Send All for harness delivery.
