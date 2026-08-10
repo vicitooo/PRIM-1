@@ -58,9 +58,21 @@ Codex CLI's TUI has a content-length threshold above which pasted content is sta
 
 **Workaround:** Keep pane-script `input` content under the threshold. Use the visible desktop terminal for larger interactive transfers.
 
+### Room history is bounded and process-memory-only
+
+Room definitions and membership survive restart, but room messages and delivery
+details do not. Each room retains at most 512 events / 16 MiB while the desktop
+process is alive. A reader that falls behind receives an explicit eviction or
+epoch-reset gap; PRIM-1 does not silently reconstruct missing conversation from
+the metadata audit.
+
 ### Durable audit is metadata-only
 
-The durable audit intentionally excludes terminal output and routed-message content. Use the live desktop panes to inspect conversation content; use audit events for lifecycle, authorization, dispatch, and delivery receipts only. A receipt proves that the supervisor wrote to a pane, not that the model understood or completed the request.
+The durable audit intentionally excludes terminal output and routed/room-message
+content. Use the live desktop panes and room feed to inspect conversation
+content; use audit events for lifecycle, authorization, membership, dispatch,
+and delivery receipts only. A receipt proves that the supervisor wrote to a
+pane, not that the model understood or completed the request.
 
 ## Roadmap items tracked publicly
 

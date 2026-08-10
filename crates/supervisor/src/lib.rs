@@ -24,16 +24,28 @@ use pty_host::{
 };
 use serde::{Deserialize, Serialize};
 use shared_types::{
-    AlertSeverity, ControlKey, ControlPlaneSnapshot, ControlPlaneStatus, DriverKind, EnvVar,
-    HeartbeatSessionSummary, LaunchSpec, LifecycleState, LogLevel, MessageScope,
-    OperatorRouteMessageRequest, RouteDeliveryPhase, RunEventIdentity, RuntimeEvent,
-    RuntimeSnapshot, SendInputRequest, SessionDefinition, SessionExitReason, SessionGeneration,
-    SessionId, SessionSnapshot, SidebandRequest, SidebandResponse, SidebandResponsePayload,
-    SupervisorAlertType, WaitQuietRequest, WorkState, now_rfc3339,
+    AddRoomMemberRequest, AlertSeverity, ControlKey, ControlPlaneSnapshot, ControlPlaneStatus,
+    CreateRoomRequest, DeleteRoomRequest, DeliverRoomMessageRequest, DriverKind, EnvVar,
+    HeartbeatSessionSummary, LaunchSpec, LifecycleState, LogLevel, MessageScope, MoveRoomRequest,
+    OperatorRouteMessageRequest, PostRoomMessageRequest, ROOM_EVENT_SCHEMA_VERSION,
+    ReadRoomFeedRequest, RemoveRoomMemberRequest, RenameRoomRequest, RoomDeliveryFailure,
+    RoomDeliveryResult, RoomDeliveryStatus, RoomFeedItem, RoomFeedPage, RoomId,
+    RoomMembershipAction, RoomMessageSender, RoomPostResult, RoomRecipientSelection, RoomSnapshot,
+    RouteDeliveryPhase, RunEventIdentity, RuntimeEvent, RuntimeSnapshot, SendInputRequest,
+    SessionDefinition, SessionExitReason, SessionGeneration, SessionId, SessionSnapshot,
+    SidebandRequest, SidebandResponse, SidebandResponsePayload, SupervisorAlertType,
+    WaitQuietRequest, WorkState, now_rfc3339,
 };
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
+
+mod rooms;
+
+use rooms::{
+    PersistedRoomV1, ROOM_CATALOG_FILE_NAME, ROOM_MAX_COUNT, ROOM_MEMBER_MAX_COUNT, RoomCatalogV1,
+    RoomRuntime, RoomState, default_room_label, validate_room_label,
+};
 
 type EventSink = Arc<dyn Fn(RuntimeEvent) + Send + Sync>;
 
@@ -2433,6 +2445,7 @@ fn ensure_run_input_safety_locked(
 struct SupervisorInner {
     runtime_dir: PathBuf,
     catalog: Mutex<SessionCatalogV1>,
+    rooms: Mutex<RoomState>,
     audit: AuditLog,
     slots: Mutex<SessionRegistry>,
     event_sink: RwLock<Option<EventSink>>,
@@ -2450,6 +2463,7 @@ struct SupervisorInner {
     events_seq: AtomicU64,
     events_watch: tokio::sync::watch::Sender<u64>,
     run_event_publish: Mutex<HashMap<Uuid, RunEventPublishState>>,
+    room_event_publish: Mutex<()>,
     stale_event_drop_counts: Mutex<HashMap<(SessionId, SessionGeneration, Uuid), u64>>,
     stale_quiesce_drop_counts: Mutex<HashMap<(SessionId, SessionGeneration), u64>>,
     started_at: Instant,
@@ -2460,6 +2474,8 @@ struct SupervisorInner {
     auto_restart_history: Mutex<HashMap<SessionId, AutoRestartHistory>>,
     #[cfg(test)]
     fail_next_catalog_write: AtomicBool,
+    #[cfg(test)]
+    fail_next_room_catalog_write: AtomicBool,
     #[cfg(test)]
     pty_event_before_commit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
@@ -2474,6 +2490,30 @@ struct SupervisorInner {
     sideband_after_initial_authorization: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     control_plane_after_prepare: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    room_delivery_after_preflight: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    room_event_after_append: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+struct RoomDeliveryLease {
+    inner: Arc<SupervisorInner>,
+    room_id: RoomId,
+}
+
+impl Drop for RoomDeliveryLease {
+    fn drop(&mut self) {
+        let mut rooms = self.inner.rooms.lock();
+        let Some(room) = rooms.get_mut(self.room_id) else {
+            debug_assert!(
+                false,
+                "in-flight room disappeared before its delivery lease"
+            );
+            return;
+        };
+        debug_assert!(room.in_flight_deliveries > 0);
+        room.in_flight_deliveries = room.in_flight_deliveries.saturating_sub(1);
+    }
 }
 
 #[derive(Clone)]
@@ -2558,6 +2598,13 @@ fn audit_event_projection(event: &RuntimeEvent, _inner: &SupervisorInner) -> Opt
             new_working_dir: "[path omitted]".into(),
             timestamp: timestamp.clone(),
         },
+        RuntimeEvent::RoomFeedEvent { feed_event } => {
+            let mut feed_event = feed_event.clone();
+            if let RoomFeedItem::Message { content, .. } = &mut feed_event.item {
+                *content = "[content omitted]".into();
+            }
+            RuntimeEvent::RoomFeedEvent { feed_event }
+        }
         event => event.clone(),
     };
 
@@ -2885,6 +2932,10 @@ fn session_catalog_path(runtime_dir: &Path) -> PathBuf {
     runtime_dir.join(SESSION_CATALOG_FILE_NAME)
 }
 
+fn room_catalog_path(runtime_dir: &Path) -> PathBuf {
+    runtime_dir.join(ROOM_CATALOG_FILE_NAME)
+}
+
 fn read_session_catalog(path: &Path) -> Result<SessionCatalogV1> {
     let file = File::open(path)
         .with_context(|| format!("failed to open session catalog {}", path.display()))?;
@@ -2919,6 +2970,13 @@ fn read_session_catalog(path: &Path) -> Result<SessionCatalogV1> {
         validate_driver_working_directory_pair(session.driver, &session.working_directory)?;
     }
     Ok(catalog)
+}
+
+fn read_room_catalog(path: &Path) -> Result<RoomCatalogV1> {
+    let file = File::open(path)
+        .with_context(|| format!("failed to open room catalog {}", path.display()))?;
+    serde_json::from_reader(StdBufReader::new(file))
+        .with_context(|| format!("failed to parse room catalog {}", path.display()))
 }
 
 fn validate_persisted_qualified_directory(
@@ -2971,11 +3029,31 @@ fn persist_session_catalog(runtime_dir: &Path, catalog: &SessionCatalogV1) -> Re
     if catalog.schema_version != SESSION_CATALOG_SCHEMA_VERSION {
         return Err(anyhow!("refusing to persist an unsupported catalog schema"));
     }
-    let destination = session_catalog_path(runtime_dir);
-    let temporary = runtime_dir.join(format!(
-        ".{SESSION_CATALOG_FILE_NAME}.{}.tmp",
-        Uuid::new_v4()
-    ));
+    persist_catalog(
+        runtime_dir,
+        SESSION_CATALOG_FILE_NAME,
+        "session catalog",
+        catalog,
+    )
+}
+
+fn persist_room_catalog(runtime_dir: &Path, catalog: &RoomCatalogV1) -> Result<()> {
+    if catalog.schema_version != rooms::ROOM_CATALOG_SCHEMA_VERSION {
+        return Err(anyhow!(
+            "refusing to persist an unsupported room catalog schema"
+        ));
+    }
+    persist_catalog(runtime_dir, ROOM_CATALOG_FILE_NAME, "room catalog", catalog)
+}
+
+fn persist_catalog<T: Serialize>(
+    runtime_dir: &Path,
+    file_name: &str,
+    subject: &str,
+    catalog: &T,
+) -> Result<()> {
+    let destination = runtime_dir.join(file_name);
+    let temporary = runtime_dir.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
     let write_result = (|| -> Result<()> {
         let mut file = OpenOptions::new()
             .write(true)
@@ -2983,19 +3061,19 @@ fn persist_session_catalog(runtime_dir: &Path, catalog: &SessionCatalogV1) -> Re
             .open(&temporary)
             .with_context(|| {
                 format!(
-                    "failed to create temporary session catalog {}",
+                    "failed to create temporary {subject} {}",
                     temporary.display()
                 )
             })?;
         restrict_path_to_current_user(&temporary, false)?;
         serde_json::to_writer_pretty(&mut file, catalog)
-            .context("failed to serialize session catalog")?;
+            .with_context(|| format!("failed to serialize {subject}"))?;
         file.write_all(b"\n")?;
         file.flush()?;
         file.sync_all()?;
         drop(file);
 
-        replace_catalog_file(&temporary, &destination)?;
+        replace_catalog_file(&temporary, &destination, subject)?;
         // The temporary file is already private. Rename/ReplaceFile is the commit
         // point, so no fallible work may follow it or disk and memory could diverge.
         Ok(())
@@ -3007,14 +3085,14 @@ fn persist_session_catalog(runtime_dir: &Path, catalog: &SessionCatalogV1) -> Re
 }
 
 #[cfg(windows)]
-fn replace_catalog_file(temporary: &Path, destination: &Path) -> Result<()> {
+fn replace_catalog_file(temporary: &Path, destination: &Path, subject: &str) -> Result<()> {
     use std::os::windows::ffi::OsStrExt as _;
     use windows_sys::Win32::Storage::FileSystem::{REPLACEFILE_WRITE_THROUGH, ReplaceFileW};
 
     if !destination.exists() {
         return fs::rename(temporary, destination).with_context(|| {
             format!(
-                "failed to install initial session catalog {}",
+                "failed to install initial {subject} {}",
                 destination.display()
             )
         });
@@ -3042,7 +3120,7 @@ fn replace_catalog_file(temporary: &Path, destination: &Path) -> Result<()> {
     {
         return Err(std::io::Error::last_os_error()).with_context(|| {
             format!(
-                "failed to atomically replace session catalog {}",
+                "failed to atomically replace {subject} {}",
                 destination.display()
             )
         });
@@ -3051,10 +3129,10 @@ fn replace_catalog_file(temporary: &Path, destination: &Path) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-fn replace_catalog_file(temporary: &Path, destination: &Path) -> Result<()> {
+fn replace_catalog_file(temporary: &Path, destination: &Path, subject: &str) -> Result<()> {
     fs::rename(temporary, destination).with_context(|| {
         format!(
-            "failed to atomically replace session catalog {}",
+            "failed to atomically replace {subject} {}",
             destination.display()
         )
     })
@@ -3389,6 +3467,16 @@ impl SupervisorHandle {
                 )
             })
             .collect();
+        let room_catalog_path = room_catalog_path(&config.runtime_dir);
+        let room_catalog = if room_catalog_path.exists() {
+            read_room_catalog(&room_catalog_path)?
+        } else {
+            let catalog = RoomCatalogV1::empty();
+            persist_room_catalog(&config.runtime_dir, &catalog)?;
+            catalog
+        };
+        let known_sessions = slots.by_id.keys().copied().collect::<HashSet<_>>();
+        let rooms = RoomState::from_catalog(room_catalog, &known_sessions)?;
         let heartbeat_interval = config
             .heartbeat_interval
             .filter(|duration| !duration.is_zero())
@@ -3411,6 +3499,7 @@ impl SupervisorHandle {
             inner: Arc::new(SupervisorInner {
                 runtime_dir: config.runtime_dir,
                 catalog: Mutex::new(catalog),
+                rooms: Mutex::new(rooms),
                 audit,
                 slots: Mutex::new(slots),
                 event_sink: RwLock::new(None),
@@ -3430,6 +3519,7 @@ impl SupervisorHandle {
                 events_seq: AtomicU64::new(0),
                 events_watch,
                 run_event_publish: Mutex::new(run_event_publish),
+                room_event_publish: Mutex::new(()),
                 stale_event_drop_counts: Mutex::new(HashMap::new()),
                 stale_quiesce_drop_counts: Mutex::new(HashMap::new()),
                 started_at: Instant::now(),
@@ -3440,6 +3530,8 @@ impl SupervisorHandle {
                 auto_restart_history: Mutex::new(HashMap::new()),
                 #[cfg(test)]
                 fail_next_catalog_write: AtomicBool::new(false),
+                #[cfg(test)]
+                fail_next_room_catalog_write: AtomicBool::new(false),
                 #[cfg(test)]
                 pty_event_before_commit: Mutex::new(None),
                 #[cfg(test)]
@@ -3454,6 +3546,10 @@ impl SupervisorHandle {
                 sideband_after_initial_authorization: Mutex::new(None),
                 #[cfg(test)]
                 control_plane_after_prepare: Mutex::new(None),
+                #[cfg(test)]
+                room_delivery_after_preflight: Mutex::new(None),
+                #[cfg(test)]
+                room_event_after_append: Mutex::new(None),
             }),
         };
         handle.start_supervisor_heartbeat_task();
@@ -4219,6 +4315,13 @@ impl SupervisorHandle {
     }
 
     #[cfg(test)]
+    fn fail_next_room_catalog_write_for_tests(&self) {
+        self.inner
+            .fail_next_room_catalog_write
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
     fn set_run_input_before_commit_for_tests<F>(&self, hook: F)
     where
         F: FnOnce() + Send + 'static,
@@ -4226,9 +4329,33 @@ impl SupervisorHandle {
         *self.inner.run_input_before_commit.lock() = Some(Box::new(hook));
     }
 
+    #[cfg(test)]
+    fn set_room_delivery_after_preflight_for_tests<F>(&self, hook: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        *self.inner.room_delivery_after_preflight.lock() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn set_room_event_after_append_for_tests<F>(&self, hook: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        *self.inner.room_event_after_append.lock() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn run_room_event_after_append_hook_for_tests(&self) {
+        if let Some(hook) = self.inner.room_event_after_append.lock().take() {
+            hook();
+        }
+    }
+
     pub fn snapshot(&self) -> RuntimeSnapshot {
         self.refresh_session_liveness();
         let sessions = self.inner.slots.lock().ordered_snapshots();
+        let rooms = self.inner.rooms.lock().snapshots();
         let workspace_preference = self
             .inner
             .catalog
@@ -4245,6 +4372,7 @@ impl SupervisorHandle {
 
         RuntimeSnapshot {
             sessions,
+            rooms,
             workspace_preference,
             control_plane,
             runtime_dir: self.runtime_dir().display().to_string(),
@@ -4645,6 +4773,18 @@ impl SupervisorHandle {
             return Err(anyhow!("injected session catalog persistence failure"));
         }
         persist_session_catalog(&self.inner.runtime_dir, candidate)
+    }
+
+    fn persist_room_catalog_candidate(&self, candidate: &RoomCatalogV1) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .inner
+            .fail_next_room_catalog_write
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err(anyhow!("injected room catalog persistence failure"));
+        }
+        persist_room_catalog(&self.inner.runtime_dir, candidate)
     }
 
     fn ensure_wsl_reconciled(&self) -> Result<()> {
@@ -5077,6 +5217,12 @@ impl SupervisorHandle {
                     ));
                 }
             }
+            let rooms = self.inner.rooms.lock();
+            if let Some(room_id) = rooms.room_by_session.get(&session_id) {
+                return Err(anyhow!(
+                    "session '{session_id}' belongs to room '{room_id}'; remove it from the room before deletion"
+                ));
+            }
             let label = slot.definition.label.clone();
             let mut catalog = self.inner.catalog.lock();
             let mut candidate = catalog.clone();
@@ -5101,6 +5247,594 @@ impl SupervisorHandle {
             timestamp: now_rfc3339(),
         });
         Ok(())
+    }
+
+    pub fn create_room(&self, request: CreateRoomRequest) -> Result<RoomSnapshot> {
+        self.ensure_active()?;
+        let mut unique_members = HashSet::new();
+        if request.member_ids.len() < 2 {
+            return Err(anyhow!("room creation requires at least two sessions"));
+        }
+        if request.member_ids.len() > ROOM_MEMBER_MAX_COUNT {
+            return Err(anyhow!(
+                "room creation cannot exceed {ROOM_MEMBER_MAX_COUNT} sessions"
+            ));
+        }
+        for session_id in &request.member_ids {
+            if !unique_members.insert(*session_id) {
+                return Err(anyhow!(
+                    "room creation contains duplicate session '{session_id}'"
+                ));
+            }
+        }
+
+        let _room_event_publish = self.inner.room_event_publish.lock();
+        let (snapshot, feed_events) = {
+            let slots = self.inner.slots.lock();
+            for session_id in &request.member_ids {
+                if slots.get_by_id(*session_id).is_none() {
+                    return Err(anyhow!("unknown session id '{session_id}'"));
+                }
+            }
+            let mut rooms = self.inner.rooms.lock();
+            if rooms.order.len() >= ROOM_MAX_COUNT {
+                return Err(anyhow!("room limit of {ROOM_MAX_COUNT} has been reached"));
+            }
+            for session_id in &request.member_ids {
+                if let Some(room_id) = rooms.room_by_session.get(session_id) {
+                    return Err(anyhow!(
+                        "session '{session_id}' already belongs to room '{room_id}'"
+                    ));
+                }
+            }
+            let label = request
+                .label
+                .unwrap_or_else(|| default_room_label(rooms.order.len()));
+            validate_room_label(&label)?;
+            let mut room_id = Uuid::new_v4();
+            while rooms.by_id.contains_key(&room_id) {
+                room_id = Uuid::new_v4();
+            }
+            let definition = PersistedRoomV1 {
+                room_id,
+                label,
+                member_ids: request.member_ids.clone(),
+                membership_revision: 1,
+            };
+            let mut runtime = RoomRuntime::from_persisted(definition.clone());
+            let mut feed_events = Vec::with_capacity(definition.member_ids.len());
+            for session_id in &definition.member_ids {
+                feed_events.push(runtime.append(RoomFeedItem::Membership {
+                    action: RoomMembershipAction::Joined,
+                    session_id: *session_id,
+                    membership_revision: definition.membership_revision,
+                })?);
+            }
+            let snapshot = runtime.snapshot();
+            let mut candidate = rooms.catalog.clone();
+            candidate.rooms.push(definition);
+            self.persist_room_catalog_candidate(&candidate)?;
+            for session_id in &request.member_ids {
+                rooms.room_by_session.insert(*session_id, room_id);
+            }
+            rooms.order.push(room_id);
+            rooms.by_id.insert(room_id, runtime);
+            rooms.catalog = candidate;
+            (snapshot, feed_events)
+        };
+
+        #[cfg(test)]
+        self.run_room_event_after_append_hook_for_tests();
+        self.emit(RuntimeEvent::RoomCreated {
+            schema_version: ROOM_EVENT_SCHEMA_VERSION,
+            room: snapshot.clone(),
+            timestamp: now_rfc3339(),
+        });
+        for feed_event in feed_events {
+            self.emit(RuntimeEvent::RoomFeedEvent { feed_event });
+        }
+        Ok(snapshot)
+    }
+
+    pub fn rename_room(&self, request: RenameRoomRequest) -> Result<RoomSnapshot> {
+        self.ensure_active()?;
+        validate_room_label(&request.label)?;
+        let _room_event_publish = self.inner.room_event_publish.lock();
+        let (snapshot, old_label) = {
+            let mut rooms = self.inner.rooms.lock();
+            let old_label = rooms
+                .get(request.room_id)
+                .ok_or_else(|| anyhow!("unknown room id '{}'", request.room_id))?
+                .definition
+                .label
+                .clone();
+            let mut candidate = rooms.catalog.clone();
+            candidate
+                .rooms
+                .iter_mut()
+                .find(|room| room.room_id == request.room_id)
+                .expect("validated room missing from persisted catalog")
+                .label = request.label.clone();
+            self.persist_room_catalog_candidate(&candidate)?;
+            let room = rooms
+                .get_mut(request.room_id)
+                .expect("validated room disappeared during rename");
+            room.definition.label = request.label.clone();
+            let snapshot = room.snapshot();
+            rooms.catalog = candidate;
+            (snapshot, old_label)
+        };
+        self.emit(RuntimeEvent::RoomRenamed {
+            schema_version: ROOM_EVENT_SCHEMA_VERSION,
+            room_id: request.room_id,
+            old_label,
+            new_label: request.label,
+            timestamp: now_rfc3339(),
+        });
+        Ok(snapshot)
+    }
+
+    pub fn move_room(&self, request: MoveRoomRequest) -> Result<RuntimeSnapshot> {
+        self.ensure_active()?;
+        let _room_event_publish = self.inner.room_event_publish.lock();
+        let old_index = {
+            let mut rooms = self.inner.rooms.lock();
+            let old_index = rooms
+                .order
+                .iter()
+                .position(|room_id| *room_id == request.room_id)
+                .ok_or_else(|| anyhow!("unknown room id '{}'", request.room_id))?;
+            if request.new_index >= rooms.order.len() {
+                return Err(anyhow!(
+                    "room index {} is out of bounds for {} rooms",
+                    request.new_index,
+                    rooms.order.len()
+                ));
+            }
+            if old_index == request.new_index {
+                drop(rooms);
+                return Ok(self.snapshot());
+            }
+            let mut candidate = rooms.catalog.clone();
+            let persisted = candidate.rooms.remove(old_index);
+            candidate.rooms.insert(request.new_index, persisted);
+            self.persist_room_catalog_candidate(&candidate)?;
+            let moved = rooms.order.remove(old_index);
+            rooms.order.insert(request.new_index, moved);
+            rooms.catalog = candidate;
+            old_index
+        };
+        self.emit(RuntimeEvent::RoomMoved {
+            schema_version: ROOM_EVENT_SCHEMA_VERSION,
+            room_id: request.room_id,
+            old_index,
+            new_index: request.new_index,
+            timestamp: now_rfc3339(),
+        });
+        Ok(self.snapshot())
+    }
+
+    pub fn add_room_member(&self, request: AddRoomMemberRequest) -> Result<RoomSnapshot> {
+        self.ensure_active()?;
+        let _room_event_publish = self.inner.room_event_publish.lock();
+        let (snapshot, feed_event, revision) = {
+            let slots = self.inner.slots.lock();
+            if slots.get_by_id(request.session_id).is_none() {
+                return Err(anyhow!("unknown session id '{}'", request.session_id));
+            }
+            let mut rooms = self.inner.rooms.lock();
+            if let Some(room_id) = rooms.room_by_session.get(&request.session_id) {
+                return Err(anyhow!(
+                    "session '{}' already belongs to room '{room_id}'",
+                    request.session_id
+                ));
+            }
+            let room = rooms
+                .get(request.room_id)
+                .ok_or_else(|| anyhow!("unknown room id '{}'", request.room_id))?;
+            if room.definition.member_ids.len() >= ROOM_MEMBER_MAX_COUNT {
+                return Err(anyhow!(
+                    "room '{}' has reached the {ROOM_MEMBER_MAX_COUNT} member limit",
+                    request.room_id
+                ));
+            }
+            let revision = room
+                .definition
+                .membership_revision
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("room membership revision exhausted"))?;
+            let join_floor = room.next_sequence.saturating_sub(1);
+            let prepared = room.prepare_append(RoomFeedItem::Membership {
+                action: RoomMembershipAction::Joined,
+                session_id: request.session_id,
+                membership_revision: revision,
+            })?;
+            let mut candidate = rooms.catalog.clone();
+            let persisted = candidate
+                .rooms
+                .iter_mut()
+                .find(|room| room.room_id == request.room_id)
+                .expect("validated room missing from persisted catalog");
+            persisted.member_ids.push(request.session_id);
+            persisted.membership_revision = revision;
+            self.persist_room_catalog_candidate(&candidate)?;
+            let room = rooms
+                .get_mut(request.room_id)
+                .expect("validated room disappeared during membership update");
+            room.definition.member_ids.push(request.session_id);
+            room.definition.membership_revision = revision;
+            room.join_floor_by_session
+                .insert(request.session_id, join_floor);
+            let feed_event = room.commit_append(prepared);
+            let snapshot = room.snapshot();
+            rooms
+                .room_by_session
+                .insert(request.session_id, request.room_id);
+            rooms.catalog = candidate;
+            (snapshot, feed_event, revision)
+        };
+        #[cfg(test)]
+        self.run_room_event_after_append_hook_for_tests();
+        self.emit(RuntimeEvent::RoomMemberAdded {
+            schema_version: ROOM_EVENT_SCHEMA_VERSION,
+            room_id: request.room_id,
+            session_id: request.session_id,
+            membership_revision: revision,
+            timestamp: now_rfc3339(),
+        });
+        self.emit(RuntimeEvent::RoomFeedEvent { feed_event });
+        Ok(snapshot)
+    }
+
+    pub fn remove_room_member(&self, request: RemoveRoomMemberRequest) -> Result<RoomSnapshot> {
+        self.ensure_active()?;
+        let _room_event_publish = self.inner.room_event_publish.lock();
+        let (snapshot, feed_event, revision) = {
+            let mut rooms = self.inner.rooms.lock();
+            let room = rooms
+                .get(request.room_id)
+                .ok_or_else(|| anyhow!("unknown room id '{}'", request.room_id))?;
+            if !room.definition.member_ids.contains(&request.session_id) {
+                return Err(anyhow!(
+                    "session '{}' is not a member of room '{}'",
+                    request.session_id,
+                    request.room_id
+                ));
+            }
+            let revision = room
+                .definition
+                .membership_revision
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("room membership revision exhausted"))?;
+            let prepared = room.prepare_append(RoomFeedItem::Membership {
+                action: RoomMembershipAction::Removed,
+                session_id: request.session_id,
+                membership_revision: revision,
+            })?;
+            let mut candidate = rooms.catalog.clone();
+            let persisted = candidate
+                .rooms
+                .iter_mut()
+                .find(|room| room.room_id == request.room_id)
+                .expect("validated room missing from persisted catalog");
+            persisted
+                .member_ids
+                .retain(|session_id| *session_id != request.session_id);
+            persisted.membership_revision = revision;
+            self.persist_room_catalog_candidate(&candidate)?;
+            let room = rooms
+                .get_mut(request.room_id)
+                .expect("validated room disappeared during membership update");
+            room.definition
+                .member_ids
+                .retain(|session_id| *session_id != request.session_id);
+            room.definition.membership_revision = revision;
+            room.join_floor_by_session.remove(&request.session_id);
+            let feed_event = room.commit_append(prepared);
+            let snapshot = room.snapshot();
+            rooms.room_by_session.remove(&request.session_id);
+            rooms.catalog = candidate;
+            (snapshot, feed_event, revision)
+        };
+        #[cfg(test)]
+        self.run_room_event_after_append_hook_for_tests();
+        self.emit(RuntimeEvent::RoomMemberRemoved {
+            schema_version: ROOM_EVENT_SCHEMA_VERSION,
+            room_id: request.room_id,
+            session_id: request.session_id,
+            membership_revision: revision,
+            timestamp: now_rfc3339(),
+        });
+        self.emit(RuntimeEvent::RoomFeedEvent { feed_event });
+        Ok(snapshot)
+    }
+
+    pub fn delete_room(&self, request: DeleteRoomRequest) -> Result<()> {
+        self.ensure_active()?;
+        let _room_event_publish = self.inner.room_event_publish.lock();
+        let label = {
+            let mut rooms = self.inner.rooms.lock();
+            let room = rooms
+                .get(request.room_id)
+                .ok_or_else(|| anyhow!("unknown room id '{}'", request.room_id))?;
+            if room.in_flight_deliveries != 0 {
+                return Err(anyhow!(
+                    "room '{}' has a delivery in progress",
+                    request.room_id
+                ));
+            }
+            let label = room.definition.label.clone();
+            let members = room.definition.member_ids.clone();
+            let mut candidate = rooms.catalog.clone();
+            candidate
+                .rooms
+                .retain(|room| room.room_id != request.room_id);
+            self.persist_room_catalog_candidate(&candidate)?;
+            rooms.by_id.remove(&request.room_id);
+            rooms.order.retain(|room_id| *room_id != request.room_id);
+            for session_id in members {
+                rooms.room_by_session.remove(&session_id);
+            }
+            rooms.catalog = candidate;
+            label
+        };
+        self.emit(RuntimeEvent::RoomDeleted {
+            schema_version: ROOM_EVENT_SCHEMA_VERSION,
+            room_id: request.room_id,
+            label,
+            timestamp: now_rfc3339(),
+        });
+        Ok(())
+    }
+
+    pub fn read_room_feed(&self, request: ReadRoomFeedRequest) -> Result<RoomFeedPage> {
+        self.ensure_active()?;
+        let rooms = self.inner.rooms.lock();
+        rooms
+            .get(request.room_id)
+            .ok_or_else(|| anyhow!("unknown room id '{}'", request.room_id))?
+            .read(request.cursor, 0)
+    }
+
+    pub fn post_room_message(&self, request: PostRoomMessageRequest) -> Result<RoomPostResult> {
+        self.post_room_message_as(
+            request.room_id,
+            RoomMessageSender::Operator {},
+            request.content,
+        )
+    }
+
+    pub fn deliver_room_message(
+        &self,
+        request: DeliverRoomMessageRequest,
+    ) -> Result<RoomDeliveryResult> {
+        self.ensure_active()?;
+        validate_message_body(&request.content)?;
+        let (membership_revision, room_label, recipient_ids) = {
+            let rooms = self.inner.rooms.lock();
+            let room = rooms
+                .get(request.room_id)
+                .ok_or_else(|| anyhow!("unknown room id '{}'", request.room_id))?;
+            if room.definition.member_ids.len() < 2 {
+                return Err(anyhow!(
+                    "room '{}' is dormant; room delivery requires at least two members",
+                    request.room_id
+                ));
+            }
+            let recipient_ids = match request.recipients {
+                RoomRecipientSelection::One { session_id } => {
+                    if !room.definition.member_ids.contains(&session_id) {
+                        return Err(anyhow!(
+                            "session '{session_id}' is not a member of room '{}'",
+                            request.room_id
+                        ));
+                    }
+                    vec![session_id]
+                }
+                RoomRecipientSelection::All {} => room.definition.member_ids.clone(),
+            };
+            (
+                room.definition.membership_revision,
+                room.definition.label.clone(),
+                recipient_ids,
+            )
+        };
+
+        self.refresh_session_liveness();
+        let mut delivery_plan = Vec::with_capacity(recipient_ids.len());
+        for recipient_id in &recipient_ids {
+            let (target, behavior, payload) = self
+                .delivery_target_for_session_id(*recipient_id)
+                .and_then(|(target, behavior)| {
+                    if matches!(
+                        self.inner
+                            .slots
+                            .lock()
+                            .get_by_id(*recipient_id)
+                            .map(|slot| slot.definition.driver),
+                        Some(DriverKind::Prime)
+                    ) {
+                        return Err(anyhow!(
+                            "Prime/WSL room delivery is not admitted; use its visible raw terminal input"
+                        ));
+                    }
+                    validate_message_framing(&request.content, behavior)?;
+                    let route = RouteMessageRequest {
+                        from: "operator".into(),
+                        to: room_label.clone(),
+                        scope: MessageScope::Room,
+                        content: request.content.clone(),
+                    };
+                    Ok((target, behavior, routed_message_payload(&route, behavior)))
+                })
+                .map_err(|error| {
+                    anyhow!(
+                        "room delivery preflight failed for recipient '{recipient_id}': {error}"
+                    )
+                })?;
+            delivery_plan.push((
+                *recipient_id,
+                PlannedDelivery {
+                    target,
+                    submit_behavior: behavior,
+                    payload,
+                },
+            ));
+        }
+
+        #[cfg(test)]
+        if let Some(hook) = self.inner.room_delivery_after_preflight.lock().take() {
+            hook();
+        }
+
+        let message_id = Uuid::new_v4();
+        let (message_cursor, _delivery_lease) = {
+            let _room_event_publish = self.inner.room_event_publish.lock();
+            let (message_event, pending_events) = {
+                let mut rooms = self.inner.rooms.lock();
+                let room = rooms.get_mut(request.room_id).ok_or_else(|| {
+                    anyhow!("room '{}' was deleted before delivery", request.room_id)
+                })?;
+                if room.definition.membership_revision != membership_revision {
+                    return Err(anyhow!(
+                        "room '{}' membership changed during delivery preflight; retry",
+                        request.room_id
+                    ));
+                }
+                if room.in_flight_deliveries == usize::MAX {
+                    return Err(anyhow!("room delivery counter exhausted"));
+                }
+                room.ensure_sequence_capacity(1 + recipient_ids.len() * 2)?;
+                let message_event = room.append(RoomFeedItem::Message {
+                    message_id,
+                    sender: RoomMessageSender::Operator {},
+                    content: request.content,
+                    recipient_ids: recipient_ids.clone(),
+                    membership_revision,
+                })?;
+                let mut pending_events = Vec::with_capacity(delivery_plan.len());
+                for (recipient_id, delivery) in &delivery_plan {
+                    pending_events.push(room.append(RoomFeedItem::Delivery {
+                        message_id,
+                        recipient_id: *recipient_id,
+                        status: RoomDeliveryStatus::Pending,
+                        bytes_written: 0,
+                        error: None,
+                        run_id: Some(delivery.target.run_id),
+                        generation: Some(delivery.target.generation),
+                    })?);
+                }
+                room.in_flight_deliveries += 1;
+                (message_event, pending_events)
+            };
+            let delivery_lease = RoomDeliveryLease {
+                inner: self.inner.clone(),
+                room_id: request.room_id,
+            };
+            let message_cursor = message_event.cursor;
+            #[cfg(test)]
+            self.run_room_event_after_append_hook_for_tests();
+            self.emit(RuntimeEvent::RoomFeedEvent {
+                feed_event: message_event,
+            });
+            for feed_event in pending_events {
+                self.emit(RuntimeEvent::RoomFeedEvent { feed_event });
+            }
+            (message_cursor, delivery_lease)
+        };
+
+        let mut failures = Vec::new();
+        let mut written_count = 0usize;
+        for (recipient_id, delivery) in delivery_plan {
+            let (status, bytes_written, error) = match self.deliver_prepared_payload(
+                &delivery.target,
+                &delivery.payload,
+                delivery.submit_behavior,
+            ) {
+                Ok(result) => {
+                    written_count += 1;
+                    (RoomDeliveryStatus::Written, result.bytes_written, None)
+                }
+                Err(error) => {
+                    let bytes_written = error
+                        .downcast_ref::<PtyWriteError>()
+                        .map(PtyWriteError::bytes_written)
+                        .unwrap_or(0);
+                    let error = bounded_room_delivery_error(&error.to_string());
+                    failures.push(RoomDeliveryFailure {
+                        recipient_id,
+                        bytes_written,
+                        error: error.clone(),
+                    });
+                    (RoomDeliveryStatus::Failed, bytes_written, Some(error))
+                }
+            };
+            {
+                let _room_event_publish = self.inner.room_event_publish.lock();
+                let feed_event = {
+                    let mut rooms = self.inner.rooms.lock();
+                    let room = rooms
+                        .get_mut(request.room_id)
+                        .expect("in-flight room cannot be deleted");
+                    room.append(RoomFeedItem::Delivery {
+                        message_id,
+                        recipient_id,
+                        status,
+                        bytes_written,
+                        error,
+                        run_id: Some(delivery.target.run_id),
+                        generation: Some(delivery.target.generation),
+                    })
+                    .expect("room delivery reserved feed sequence capacity")
+                };
+                #[cfg(test)]
+                self.run_room_event_after_append_hook_for_tests();
+                self.emit(RuntimeEvent::RoomFeedEvent { feed_event });
+            }
+        }
+        Ok(RoomDeliveryResult {
+            room_id: request.room_id,
+            message_id,
+            cursor: message_cursor,
+            recipient_count: recipient_ids.len(),
+            written_count,
+            failures,
+        })
+    }
+
+    fn post_room_message_as(
+        &self,
+        room_id: RoomId,
+        sender: RoomMessageSender,
+        content: String,
+    ) -> Result<RoomPostResult> {
+        self.ensure_active()?;
+        validate_message_body(&content)?;
+        let _room_event_publish = self.inner.room_event_publish.lock();
+        let message_id = Uuid::new_v4();
+        let feed_event = {
+            let mut rooms = self.inner.rooms.lock();
+            let room = rooms
+                .get_mut(room_id)
+                .ok_or_else(|| anyhow!("unknown room id '{room_id}'"))?;
+            let membership_revision = room.definition.membership_revision;
+            room.append(RoomFeedItem::Message {
+                message_id,
+                sender,
+                content,
+                recipient_ids: Vec::new(),
+                membership_revision,
+            })?
+        };
+        let result = RoomPostResult {
+            room_id,
+            message_id,
+            cursor: feed_event.cursor,
+        };
+        #[cfg(test)]
+        self.run_room_event_after_append_hook_for_tests();
+        self.emit(RuntimeEvent::RoomFeedEvent { feed_event });
+        Ok(result)
     }
 
     fn schedule_late_termination_reproof(
@@ -7075,6 +7809,26 @@ impl SupervisorHandle {
         Self::validate_pane_caller_locked(caller, slots)
     }
 
+    fn pane_room_binding_locked(
+        caller: &PaneCaller,
+        slots: &SessionRegistry,
+        rooms: &RoomState,
+    ) -> Result<(RoomId, u64)> {
+        Self::validate_pane_caller_locked(caller, slots)?;
+        let room_id = *rooms
+            .room_by_session
+            .get(&caller.session_id)
+            .ok_or_else(|| anyhow!("sideband caller is not a room member"))?;
+        let room = rooms
+            .get(room_id)
+            .ok_or_else(|| anyhow!("sideband caller room is unavailable"))?;
+        let floor = *room
+            .join_floor_by_session
+            .get(&caller.session_id)
+            .ok_or_else(|| anyhow!("sideband caller room membership is unavailable"))?;
+        Ok((room_id, floor))
+    }
+
     fn authorize_sideband_request(
         &self,
         caller: &PaneCaller,
@@ -7094,7 +7848,67 @@ impl SupervisorHandle {
             SidebandRequest::SendInput { name, .. } | SidebandRequest::SendKey { name, .. } => {
                 Self::validate_pane_target_locked(caller, name, &slots)
             }
+            SidebandRequest::RoomRead { .. } => {
+                let rooms = self.inner.rooms.lock();
+                Self::pane_room_binding_locked(caller, &slots, &rooms).map(|_| ())
+            }
+            SidebandRequest::RoomPost { content } => {
+                let rooms = self.inner.rooms.lock();
+                Self::pane_room_binding_locked(caller, &slots, &rooms)?;
+                validate_message_body(content)
+            }
         }
+    }
+
+    fn read_room_feed_from_pane(
+        &self,
+        caller: &PaneCaller,
+        cursor: Option<shared_types::RoomFeedCursor>,
+    ) -> Result<RoomFeedPage> {
+        let slots = self.inner.slots.lock();
+        let rooms = self.inner.rooms.lock();
+        let (room_id, floor) = Self::pane_room_binding_locked(caller, &slots, &rooms)?;
+        rooms
+            .get(room_id)
+            .expect("validated pane room disappeared while room state was locked")
+            .read(cursor, floor)
+    }
+
+    fn post_room_message_from_pane(
+        &self,
+        caller: &PaneCaller,
+        content: String,
+    ) -> Result<RoomPostResult> {
+        validate_message_body(&content)?;
+        let _room_event_publish = self.inner.room_event_publish.lock();
+        let message_id = Uuid::new_v4();
+        let feed_event = {
+            let slots = self.inner.slots.lock();
+            let mut rooms = self.inner.rooms.lock();
+            let (room_id, _floor) = Self::pane_room_binding_locked(caller, &slots, &rooms)?;
+            let room = rooms
+                .get_mut(room_id)
+                .expect("validated pane room disappeared while room state was locked");
+            let membership_revision = room.definition.membership_revision;
+            room.append(RoomFeedItem::Message {
+                message_id,
+                sender: RoomMessageSender::Session {
+                    session_id: caller.session_id,
+                },
+                content,
+                recipient_ids: Vec::new(),
+                membership_revision,
+            })?
+        };
+        let result = RoomPostResult {
+            room_id: feed_event.room_id,
+            message_id,
+            cursor: feed_event.cursor,
+        };
+        #[cfg(test)]
+        self.run_room_event_after_append_hook_for_tests();
+        self.emit(RuntimeEvent::RoomFeedEvent { feed_event });
+        Ok(result)
     }
 
     fn pane_input_target(&self, caller: &PaneCaller, name: &str) -> Result<RunWriteTarget> {
@@ -7248,6 +8062,30 @@ impl SupervisorHandle {
                 self.send_pane_input(caller, &name, control_key_sequence(key))
                     .map(|_| format!("key {:?} sent", key)),
             ),
+            SidebandRequest::RoomRead { cursor } => {
+                match self.read_room_feed_from_pane(caller, cursor) {
+                    Ok(page) => SidebandResponse {
+                        ok: true,
+                        message: "room feed read".into(),
+                        timed_out: false,
+                        payload: Some(SidebandResponsePayload::RoomFeed { page }),
+                        request_id: None,
+                    },
+                    Err(error) => Self::rejected_sideband_response(error.to_string()),
+                }
+            }
+            SidebandRequest::RoomPost { content } => {
+                match self.post_room_message_from_pane(caller, content) {
+                    Ok(result) => SidebandResponse {
+                        ok: true,
+                        message: "room message posted".into(),
+                        timed_out: false,
+                        payload: Some(SidebandResponsePayload::RoomPost { result }),
+                        request_id: None,
+                    },
+                    Err(error) => Self::rejected_sideband_response(error.to_string()),
+                }
+            }
         }
     }
 
@@ -7470,12 +8308,24 @@ impl SupervisorHandle {
             hook();
         }
 
+        if matches!(
+            request,
+            SidebandRequest::RoomRead { .. } | SidebandRequest::RoomPost { .. }
+        ) {
+            return self
+                .apply_authorized_sideband_request(caller, request)
+                .await;
+        }
+
         let request_id = Uuid::new_v4().to_string();
         let action = match &request {
             SidebandRequest::Ping {} => "ping",
             SidebandRequest::WaitQuiet { .. } => "wait_quiet",
             SidebandRequest::SendInput { .. } => "send_input",
             SidebandRequest::SendKey { .. } => "send_key",
+            SidebandRequest::RoomRead { .. } | SidebandRequest::RoomPost { .. } => {
+                unreachable!("room sideband requests return before dispatch metadata")
+            }
         };
         if let Err(error) = self.emit_dispatch_attempt_from_pane_caller(&request_id, action, caller)
         {
@@ -7505,6 +8355,9 @@ impl SupervisorHandle {
             request @ (SidebandRequest::Ping {} | SidebandRequest::WaitQuiet { .. }) => {
                 self.apply_authorized_sideband_request(caller, request)
                     .await
+            }
+            SidebandRequest::RoomRead { .. } | SidebandRequest::RoomPost { .. } => {
+                unreachable!("room sideband requests return before PTY dispatch")
             }
         };
         response.request_id = Some(request_id);
@@ -8341,6 +9194,17 @@ fn validate_message_body(content: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn bounded_room_delivery_error(error: &str) -> String {
+    const MAX_CHARS: usize = 4096;
+    let mut chars = error.chars();
+    let bounded = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{bounded}…")
+    } else {
+        bounded
+    }
 }
 
 fn validate_message_framing(content: &str, behavior: SubmitBehavior) -> Result<()> {
@@ -17443,6 +18307,957 @@ mod tests {
         assert_eq!(fs::read(&catalog_path).unwrap(), catalog_before);
         assert!(events.lock().is_empty());
         assert!(specs.lock().is_empty());
+    }
+
+    #[test]
+    fn room_catalog_crud_reopens_exact_ids_order_membership_without_feed_content_or_spawn() {
+        let root = tempfile::tempdir().expect("create room catalog root");
+        let supervisor = test_supervisor_with_root(root.path().to_path_buf());
+        let grok = create_test_session(
+            &supervisor,
+            "grok",
+            DriverKind::Grok,
+            shared_types::PermissionProfile::Normal,
+        );
+        let terminal = create_test_session(
+            &supervisor,
+            "terminal",
+            DriverKind::GenericTerminal,
+            shared_types::PermissionProfile::Normal,
+        );
+        let (spawner, specs) = CapturingPtySpawner::new(Vec::new());
+        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+        let first = supervisor
+            .create_room(CreateRoomRequest {
+                label: Some("Twin".into()),
+                member_ids: vec![
+                    test_session_id(&supervisor, "claude"),
+                    test_session_id(&supervisor, "codex"),
+                ],
+            })
+            .unwrap();
+        let second = supervisor
+            .create_room(CreateRoomRequest {
+                label: Some("Twin".into()),
+                member_ids: vec![grok.session_id, terminal.session_id],
+            })
+            .unwrap();
+        assert_ne!(first.room_id, second.room_id);
+        supervisor
+            .rename_room(RenameRoomRequest {
+                room_id: second.room_id,
+                label: "Renamed".into(),
+            })
+            .unwrap();
+        supervisor
+            .move_room(MoveRoomRequest {
+                room_id: second.room_id,
+                new_index: 0,
+            })
+            .unwrap();
+        let sentinel = "ROOM-CONTENT-MUST-NOT-PERSIST-λ";
+        supervisor
+            .post_room_message(PostRoomMessageRequest {
+                room_id: first.room_id,
+                content: sentinel.into(),
+            })
+            .unwrap();
+        let before = supervisor.snapshot();
+        assert_eq!(
+            before
+                .rooms
+                .iter()
+                .map(|room| room.room_id)
+                .collect::<Vec<_>>(),
+            vec![second.room_id, first.room_id]
+        );
+        assert!(specs.lock().is_empty());
+        let catalog_path = room_catalog_path(supervisor.runtime_dir());
+        let catalog_bytes = fs::read(&catalog_path).unwrap();
+        assert!(!String::from_utf8_lossy(&catalog_bytes).contains(sentinel));
+        let old_epochs = before
+            .rooms
+            .iter()
+            .map(|room| (room.room_id, room.feed_epoch))
+            .collect::<HashMap<_, _>>();
+        drop(supervisor);
+
+        let reopened = SupervisorHandle::new(test_supervisor_config(root.path())).unwrap();
+        let after = reopened.snapshot();
+        assert_eq!(
+            after
+                .rooms
+                .iter()
+                .map(|room| room.room_id)
+                .collect::<Vec<_>>(),
+            vec![second.room_id, first.room_id]
+        );
+        assert_eq!(after.rooms[0].label, "Renamed");
+        for room in &after.rooms {
+            assert_eq!(room.feed_oldest_sequence, 1);
+            assert_eq!(room.feed_next_sequence, 1);
+            assert_ne!(room.feed_epoch, old_epochs[&room.room_id]);
+        }
+        assert_eq!(fs::read(&catalog_path).unwrap(), catalog_bytes);
+    }
+
+    #[test]
+    fn room_catalog_persistence_failure_has_zero_memory_file_event_or_spawn_mutation() {
+        let supervisor = test_supervisor();
+        let before = supervisor.snapshot();
+        let path = room_catalog_path(supervisor.runtime_dir());
+        let bytes_before = fs::read(&path).unwrap();
+        let events = capture_runtime_events(&supervisor);
+        let (spawner, specs) = CapturingPtySpawner::new(Vec::new());
+        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+        supervisor.fail_next_room_catalog_write_for_tests();
+
+        let error = supervisor
+            .create_room(CreateRoomRequest {
+                label: Some("Must not exist".into()),
+                member_ids: vec![
+                    test_session_id(&supervisor, "claude"),
+                    test_session_id(&supervisor, "codex"),
+                ],
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("injected room catalog"));
+        assert_eq!(supervisor.snapshot().rooms, before.rooms);
+        assert_eq!(fs::read(path).unwrap(), bytes_before);
+        assert!(events.lock().is_empty());
+        assert!(specs.lock().is_empty());
+    }
+
+    #[test]
+    fn corrupt_or_unknown_room_catalog_fails_visibly_without_rewrite() {
+        for (name, replacement, expected_error) in [
+            (
+                "corrupt",
+                b"{ definitely not room JSON".to_vec(),
+                "failed to parse room catalog",
+            ),
+            (
+                "unknown-version",
+                br#"{"schema_version":99,"rooms":[]}"#.to_vec(),
+                "unsupported room catalog schema version 99",
+            ),
+        ] {
+            let root = tempfile::tempdir().expect("create invalid-room-catalog root");
+            let supervisor = empty_test_supervisor_with_root(root.path().to_path_buf());
+            let catalog_path = room_catalog_path(supervisor.runtime_dir());
+            drop(supervisor);
+            fs::write(&catalog_path, &replacement).expect("install invalid room catalog");
+
+            let error = SupervisorHandle::new(test_supervisor_config(root.path()))
+                .err()
+                .expect("invalid room catalog must fail startup");
+            assert!(
+                format!("{error:#}").contains(expected_error),
+                "{name}: {error:#}"
+            );
+            assert_eq!(
+                fs::read(&catalog_path).unwrap(),
+                replacement,
+                "{name}: startup failure must not rewrite the room catalog"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_room_posts_publish_cursor_order_without_a_reload_race() {
+        let supervisor = test_supervisor();
+        let room = supervisor
+            .create_room(CreateRoomRequest {
+                label: Some("Ordered feed".into()),
+                member_ids: vec![
+                    test_session_id(&supervisor, "claude"),
+                    test_session_id(&supervisor, "codex"),
+                ],
+            })
+            .unwrap();
+        let events = capture_runtime_events(&supervisor);
+        let (hook_entered_tx, hook_entered_rx) = mpsc::sync_channel(0);
+        let (hook_release_tx, hook_release_rx) = mpsc::sync_channel(0);
+        supervisor.set_room_event_after_append_for_tests(move || {
+            hook_entered_tx.send(()).unwrap();
+            hook_release_rx.recv().unwrap();
+        });
+
+        let first_supervisor = supervisor.clone();
+        let first = thread::spawn(move || {
+            first_supervisor
+                .post_room_message(PostRoomMessageRequest {
+                    room_id: room.room_id,
+                    content: "first".into(),
+                })
+                .unwrap()
+        });
+        hook_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first post did not reach the publish barrier");
+
+        let second_supervisor = supervisor.clone();
+        let (second_started_tx, second_started_rx) = mpsc::sync_channel(0);
+        let (second_done_tx, second_done_rx) = mpsc::sync_channel(1);
+        let second = thread::spawn(move || {
+            second_started_tx.send(()).unwrap();
+            let result = second_supervisor.post_room_message(PostRoomMessageRequest {
+                room_id: room.room_id,
+                content: "second".into(),
+            });
+            second_done_tx.send(result).unwrap();
+        });
+        second_started_rx.recv().unwrap();
+        assert!(
+            second_done_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "a later post bypassed the earlier append-to-publish interval"
+        );
+
+        hook_release_tx.send(()).unwrap();
+        first.join().unwrap();
+        second_done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second post did not finish")
+            .unwrap();
+        second.join().unwrap();
+
+        let published = events
+            .lock()
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::RoomFeedEvent { feed_event } => match &feed_event.item {
+                    RoomFeedItem::Message { content, .. } => {
+                        Some((feed_event.cursor.sequence, content.clone()))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(published, vec![(3, "first".into()), (4, "second".into())]);
+    }
+
+    #[test]
+    fn session_deletion_fails_closed_while_room_membership_exists() {
+        let supervisor = test_supervisor();
+        let claude = test_session_id(&supervisor, "claude");
+        let room = supervisor
+            .create_room(CreateRoomRequest {
+                label: None,
+                member_ids: vec![claude, test_session_id(&supervisor, "codex")],
+            })
+            .unwrap();
+        let catalog_before = fs::read(session_catalog_path(supervisor.runtime_dir())).unwrap();
+
+        let error = supervisor.delete_session(claude).unwrap_err();
+
+        assert!(error.to_string().contains("remove it from the room"));
+        assert_eq!(
+            fs::read(session_catalog_path(supervisor.runtime_dir())).unwrap(),
+            catalog_before
+        );
+        assert!(
+            supervisor
+                .snapshot()
+                .sessions
+                .iter()
+                .any(|session| session.session_id == claude)
+        );
+        supervisor
+            .remove_room_member(RemoveRoomMemberRequest {
+                room_id: room.room_id,
+                session_id: claude,
+            })
+            .unwrap();
+        supervisor.delete_session(claude).unwrap();
+    }
+
+    #[test]
+    fn feed_only_room_post_writes_no_pty_and_redacts_durable_content() {
+        let supervisor = test_supervisor();
+        let (claude_pty, claude_inputs) = recording_pty_session(std::process::id());
+        let (codex_pty, codex_inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            claude_pty,
+        );
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            codex_pty,
+        );
+        let room = supervisor
+            .create_room(CreateRoomRequest {
+                label: Some("Feed only".into()),
+                member_ids: vec![
+                    test_session_id(&supervisor, "claude"),
+                    test_session_id(&supervisor, "codex"),
+                ],
+            })
+            .unwrap();
+        let sentinel = "FEED-ONLY-PRIVATE-λ-🚀";
+
+        let result = supervisor
+            .post_room_message(PostRoomMessageRequest {
+                room_id: room.room_id,
+                content: sentinel.into(),
+            })
+            .unwrap();
+        let page = supervisor
+            .read_room_feed(ReadRoomFeedRequest {
+                room_id: room.room_id,
+                cursor: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            result.message_id,
+            match &page.events.last().unwrap().item {
+                RoomFeedItem::Message {
+                    message_id,
+                    content,
+                    recipient_ids,
+                    ..
+                } => {
+                    assert_eq!(content, sentinel);
+                    assert!(recipient_ids.is_empty());
+                    *message_id
+                }
+                item => panic!("unexpected feed item: {item:?}"),
+            }
+        );
+        assert!(claude_inputs.lock().is_empty());
+        assert!(codex_inputs.lock().is_empty());
+        let audit = fs::read_to_string(supervisor.audit_log_path()).unwrap();
+        assert!(!audit.contains(sentinel));
+        assert!(audit.contains("[content omitted]"));
+    }
+
+    #[test]
+    fn same_label_rooms_isolate_feed_and_pty_delivery_by_room_id() {
+        let supervisor = test_supervisor();
+        let second_claude = create_test_session(
+            &supervisor,
+            "second-claude",
+            DriverKind::Claude,
+            shared_types::PermissionProfile::Normal,
+        );
+        let second_codex = create_test_session(
+            &supervisor,
+            "second-codex",
+            DriverKind::Codex,
+            shared_types::PermissionProfile::Normal,
+        );
+        let (first_claude_pty, first_claude_inputs) = recording_pty_session(101);
+        let (first_codex_pty, first_codex_inputs) = recording_pty_session(102);
+        let (second_claude_pty, second_claude_inputs) = recording_pty_session(103);
+        let (second_codex_pty, second_codex_inputs) = recording_pty_session(104);
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            first_claude_pty,
+        );
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            first_codex_pty,
+        );
+        install_mock_running_session_by_id_with_mode(
+            &supervisor,
+            second_claude.session_id,
+            DriverKind::Claude,
+            None,
+            second_claude_pty,
+            BracketedPasteMode::Enabled,
+        );
+        install_mock_running_session_by_id_with_mode(
+            &supervisor,
+            second_codex.session_id,
+            DriverKind::Codex,
+            None,
+            second_codex_pty,
+            BracketedPasteMode::Enabled,
+        );
+        let first = supervisor
+            .create_room(CreateRoomRequest {
+                label: Some("Twin".into()),
+                member_ids: vec![
+                    test_session_id(&supervisor, "claude"),
+                    test_session_id(&supervisor, "codex"),
+                ],
+            })
+            .unwrap();
+        let second = supervisor
+            .create_room(CreateRoomRequest {
+                label: Some("Twin".into()),
+                member_ids: vec![second_claude.session_id, second_codex.session_id],
+            })
+            .unwrap();
+        let second_before = supervisor
+            .read_room_feed(ReadRoomFeedRequest {
+                room_id: second.room_id,
+                cursor: None,
+            })
+            .unwrap();
+        let sentinel = "FIRST-ROOM-ONLY";
+
+        let result = supervisor
+            .deliver_room_message(DeliverRoomMessageRequest {
+                room_id: first.room_id,
+                recipients: RoomRecipientSelection::All {},
+                content: sentinel.into(),
+            })
+            .unwrap();
+
+        assert_eq!(result.written_count, 2);
+        assert_eq!(first_claude_inputs.lock().len(), 2);
+        assert_eq!(first_codex_inputs.lock().len(), 2);
+        assert!(second_claude_inputs.lock().is_empty());
+        assert!(second_codex_inputs.lock().is_empty());
+        assert_eq!(
+            supervisor
+                .read_room_feed(ReadRoomFeedRequest {
+                    room_id: second.room_id,
+                    cursor: None,
+                })
+                .unwrap(),
+            second_before
+        );
+        let first_page = supervisor
+            .read_room_feed(ReadRoomFeedRequest {
+                room_id: first.room_id,
+                cursor: None,
+            })
+            .unwrap();
+        assert!(first_page.events.iter().any(|event| matches!(
+            &event.item,
+            RoomFeedItem::Message { content, .. } if content == sentinel
+        )));
+    }
+
+    #[test]
+    fn room_delivery_lease_releases_if_event_publication_unwinds() {
+        let supervisor = test_supervisor();
+        let (claude_pty, claude_inputs) = recording_pty_session(105);
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            claude_pty,
+        );
+        let room = supervisor
+            .create_room(CreateRoomRequest {
+                label: Some("Unwind".into()),
+                member_ids: vec![
+                    test_session_id(&supervisor, "claude"),
+                    test_session_id(&supervisor, "codex"),
+                ],
+            })
+            .unwrap();
+        supervisor.set_event_sink(|event| {
+            if matches!(event, RuntimeEvent::RoomFeedEvent { .. }) {
+                panic!("synthetic room event sink panic");
+            }
+        });
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = supervisor.deliver_room_message(DeliverRoomMessageRequest {
+                room_id: room.room_id,
+                recipients: RoomRecipientSelection::One {
+                    session_id: test_session_id(&supervisor, "claude"),
+                },
+                content: "must not strand the lease".into(),
+            });
+        }));
+
+        assert!(unwind.is_err());
+        assert!(claude_inputs.lock().is_empty());
+        supervisor.set_event_sink(|_| {});
+        supervisor
+            .delete_room(DeleteRoomRequest {
+                room_id: room.room_id,
+            })
+            .expect("a panicking event sink must not strand the room delivery lease");
+    }
+
+    #[test]
+    fn room_send_all_preflights_every_run_then_records_exact_per_recipient_receipts() {
+        let supervisor = test_supervisor();
+        let (claude_pty, claude_inputs) = recording_pty_session(std::process::id());
+        let (codex_pty, codex_inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            claude_pty,
+        );
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            codex_pty,
+        );
+        let room = supervisor
+            .create_room(CreateRoomRequest {
+                label: Some("Exact room".into()),
+                member_ids: vec![
+                    test_session_id(&supervisor, "claude"),
+                    test_session_id(&supervisor, "codex"),
+                ],
+            })
+            .unwrap();
+        let content = "  λ room line one\r\nline two 🚀  \n";
+
+        let result = supervisor
+            .deliver_room_message(DeliverRoomMessageRequest {
+                room_id: room.room_id,
+                recipients: RoomRecipientSelection::All {},
+                content: content.into(),
+            })
+            .unwrap();
+
+        assert_eq!(result.recipient_count, 2);
+        assert_eq!(result.written_count, 2);
+        assert!(result.failures.is_empty());
+        let payload = format!("[Room message from operator]\n{content}");
+        let framed = frame_message_payload(&payload, MessageFraming::BracketedPaste);
+        for inputs in [claude_inputs, codex_inputs] {
+            assert_eq!(inputs.lock().as_slice(), &[framed.clone(), "\r".into()]);
+        }
+        let page = supervisor
+            .read_room_feed(ReadRoomFeedRequest {
+                room_id: room.room_id,
+                cursor: None,
+            })
+            .unwrap();
+        assert!(page.events.iter().any(|event| matches!(
+            &event.item,
+            RoomFeedItem::Message { message_id, content: stored, recipient_ids, .. }
+                if *message_id == result.message_id && stored == content && recipient_ids.len() == 2
+        )));
+        assert_eq!(
+            page.events
+                .iter()
+                .filter(|event| matches!(
+                    event.item,
+                    RoomFeedItem::Delivery {
+                        status: RoomDeliveryStatus::Written,
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn room_delivery_membership_revision_change_after_preflight_is_zero_message_write() {
+        let supervisor = test_supervisor();
+        let (claude_pty, claude_inputs) = recording_pty_session(std::process::id());
+        let (codex_pty, codex_inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            claude_pty,
+        );
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            codex_pty,
+        );
+        let claude = test_session_id(&supervisor, "claude");
+        let room = supervisor
+            .create_room(CreateRoomRequest {
+                label: Some("Revision pin".into()),
+                member_ids: vec![claude, test_session_id(&supervisor, "codex")],
+            })
+            .unwrap();
+        let hook_supervisor = supervisor.clone();
+        supervisor.set_room_delivery_after_preflight_for_tests(move || {
+            hook_supervisor
+                .remove_room_member(RemoveRoomMemberRequest {
+                    room_id: room.room_id,
+                    session_id: claude,
+                })
+                .unwrap();
+        });
+
+        let error = supervisor
+            .deliver_room_message(DeliverRoomMessageRequest {
+                room_id: room.room_id,
+                recipients: RoomRecipientSelection::All {},
+                content: "must not write".into(),
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("membership changed"));
+        assert!(claude_inputs.lock().is_empty());
+        assert!(codex_inputs.lock().is_empty());
+        let page = supervisor
+            .read_room_feed(ReadRoomFeedRequest {
+                room_id: room.room_id,
+                cursor: None,
+            })
+            .unwrap();
+        assert!(!page.events.iter().any(|event| matches!(
+            &event.item,
+            RoomFeedItem::Message { content, .. } if content == "must not write"
+        )));
+    }
+
+    #[test]
+    fn room_send_all_rejects_one_unknown_mode_before_every_message_side_effect() {
+        let supervisor = test_supervisor();
+        let (claude_pty, claude_inputs) = recording_pty_session(std::process::id());
+        let (codex_pty, codex_inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            claude_pty,
+        );
+        install_mock_running_session_with_process_id_and_mode(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            None,
+            codex_pty,
+            BracketedPasteMode::Unknown,
+        );
+        let room = supervisor
+            .create_room(CreateRoomRequest {
+                label: Some("Atomic".into()),
+                member_ids: vec![
+                    test_session_id(&supervisor, "claude"),
+                    test_session_id(&supervisor, "codex"),
+                ],
+            })
+            .unwrap();
+        let before = supervisor
+            .read_room_feed(ReadRoomFeedRequest {
+                room_id: room.room_id,
+                cursor: None,
+            })
+            .unwrap();
+        let audit_before = fs::read(supervisor.audit_log_path()).unwrap();
+        let events = capture_runtime_events(&supervisor);
+
+        let error = supervisor
+            .deliver_room_message(DeliverRoomMessageRequest {
+                room_id: room.room_id,
+                recipients: RoomRecipientSelection::All {},
+                content: "atomically rejected".into(),
+            })
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("bracketed-paste mode is unknown")
+        );
+        assert!(claude_inputs.lock().is_empty());
+        assert!(codex_inputs.lock().is_empty());
+        assert!(events.lock().is_empty());
+        assert_eq!(
+            supervisor
+                .read_room_feed(ReadRoomFeedRequest {
+                    room_id: room.room_id,
+                    cursor: None,
+                })
+                .unwrap(),
+            before
+        );
+        assert_eq!(fs::read(supervisor.audit_log_path()).unwrap(), audit_before);
+    }
+
+    #[test]
+    fn room_send_all_returns_truthful_partial_result_without_retry() {
+        let supervisor = test_supervisor();
+        let (claude_pty, claude_inputs) = recording_pty_session(std::process::id());
+        let (codex_pty, codex_send_count) =
+            write_failing_pty_session(23, "synthetic room partial failure");
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            claude_pty,
+        );
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            codex_pty,
+        );
+        let room = supervisor
+            .create_room(CreateRoomRequest {
+                label: Some("Partial".into()),
+                member_ids: vec![
+                    test_session_id(&supervisor, "claude"),
+                    test_session_id(&supervisor, "codex"),
+                ],
+            })
+            .unwrap();
+
+        let result = supervisor
+            .deliver_room_message(DeliverRoomMessageRequest {
+                room_id: room.room_id,
+                recipients: RoomRecipientSelection::All {},
+                content: "partial truth".into(),
+            })
+            .unwrap();
+
+        assert_eq!(result.recipient_count, 2);
+        assert_eq!(result.written_count, 1);
+        assert_eq!(result.failures.len(), 1);
+        assert_eq!(result.failures[0].bytes_written, 23);
+        assert!(
+            result.failures[0]
+                .error
+                .contains("synthetic room partial failure")
+        );
+        assert_eq!(codex_send_count.load(Ordering::SeqCst), 1);
+        assert_eq!(claude_inputs.lock().len(), 2);
+        let page = supervisor
+            .read_room_feed(ReadRoomFeedRequest {
+                room_id: room.room_id,
+                cursor: None,
+            })
+            .unwrap();
+        assert!(page.events.iter().any(|event| matches!(
+            &event.item,
+            RoomFeedItem::Delivery {
+                status: RoomDeliveryStatus::Failed,
+                bytes_written: 23,
+                error: Some(error),
+                ..
+            } if error.contains("synthetic room partial failure")
+        )));
+    }
+
+    #[test]
+    fn room_deletion_waits_for_the_exact_in_flight_delivery() {
+        let supervisor = test_supervisor();
+        let inputs = Arc::new(Mutex::new(Vec::<String>::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (write_entered_tx, write_entered_rx) = mpsc::sync_channel(1);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            Box::new(FirstWriteBlockingPtySession {
+                process_id: std::process::id(),
+                inputs,
+                calls,
+                first_entered: write_entered_tx,
+                release: release.clone(),
+            }),
+        );
+        let room = supervisor
+            .create_room(CreateRoomRequest {
+                label: Some("In flight".into()),
+                member_ids: vec![
+                    test_session_id(&supervisor, "claude"),
+                    test_session_id(&supervisor, "codex"),
+                ],
+            })
+            .unwrap();
+        let recipient_id = test_session_id(&supervisor, "claude");
+
+        let delivery_supervisor = supervisor.clone();
+        let delivery = thread::spawn(move || {
+            delivery_supervisor.deliver_room_message(DeliverRoomMessageRequest {
+                room_id: room.room_id,
+                recipients: RoomRecipientSelection::One {
+                    session_id: recipient_id,
+                },
+                content: "hold deletion".into(),
+            })
+        });
+        write_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("delivery did not enter its first PTY write");
+
+        let error = supervisor
+            .delete_room(DeleteRoomRequest {
+                room_id: room.room_id,
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("delivery in progress"));
+        assert!(
+            supervisor
+                .snapshot()
+                .rooms
+                .iter()
+                .any(|candidate| candidate.room_id == room.room_id)
+        );
+
+        let (released, ready) = &*release;
+        *released.lock() = true;
+        ready.notify_all();
+        delivery.join().unwrap().unwrap();
+        supervisor
+            .delete_room(DeleteRoomRequest {
+                room_id: room.room_id,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn pane_room_read_and_post_are_kernel_derived_future_only_and_revoked_on_removal() {
+        let supervisor = test_supervisor();
+        let grok = create_test_session(
+            &supervisor,
+            "grok",
+            DriverKind::Grok,
+            shared_types::PermissionProfile::Normal,
+        );
+        let claude = test_session_id(&supervisor, "claude");
+        let room = supervisor
+            .create_room(CreateRoomRequest {
+                label: Some("Pane room".into()),
+                member_ids: vec![test_session_id(&supervisor, "codex"), grok.session_id],
+            })
+            .unwrap();
+        let before_join = supervisor
+            .post_room_message(PostRoomMessageRequest {
+                room_id: room.room_id,
+                content: "before-join-private".into(),
+            })
+            .unwrap();
+        supervisor
+            .remove_room_member(RemoveRoomMemberRequest {
+                room_id: room.room_id,
+                session_id: grok.session_id,
+            })
+            .unwrap();
+        supervisor
+            .add_room_member(AddRoomMemberRequest {
+                room_id: room.room_id,
+                session_id: claude,
+            })
+            .unwrap();
+        let (pty, _inputs) = recording_pty_session(101);
+        install_mock_running_session_with_process_id_and_mode(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            Some(101),
+            pty,
+            BracketedPasteMode::Unknown,
+        );
+        let caller = supervisor
+            .resolve_pane_caller(TestPaneProcess::new(9001, [101]))
+            .unwrap();
+
+        let posted = supervisor.apply_sideband_request(
+            &caller,
+            SidebandRequest::RoomPost {
+                content: "after-join-visible".into(),
+            },
+        );
+        assert!(posted.ok, "{}", posted.message);
+        assert!(posted.request_id.is_none());
+        let Some(SidebandResponsePayload::RoomPost { result: pane_post }) = posted.payload else {
+            panic!("missing room post payload")
+        };
+        let read =
+            supervisor.apply_sideband_request(&caller, SidebandRequest::RoomRead { cursor: None });
+        assert!(read.ok, "{}", read.message);
+        let SidebandResponsePayload::RoomFeed { page } = read.payload.unwrap() else {
+            panic!("missing room feed payload")
+        };
+        let encoded = serde_json::to_string(&page).unwrap();
+        assert!(!encoded.contains("before-join-private"));
+        assert!(encoded.contains("after-join-visible"));
+        assert!(page.events.iter().any(|event| matches!(
+            event.item,
+            RoomFeedItem::Message {
+                sender: RoomMessageSender::Session { session_id },
+                ..
+            } if session_id == claude
+        )));
+
+        for sequence in [0, before_join.cursor.sequence] {
+            let explicit = supervisor.apply_sideband_request(
+                &caller,
+                SidebandRequest::RoomRead {
+                    cursor: Some(shared_types::RoomFeedCursor {
+                        epoch: before_join.cursor.epoch,
+                        sequence,
+                    }),
+                },
+            );
+            assert!(explicit.ok, "{}", explicit.message);
+            let Some(SidebandResponsePayload::RoomFeed { page }) = explicit.payload else {
+                panic!("missing explicit-cursor room feed payload")
+            };
+            let encoded = serde_json::to_string(&page).unwrap();
+            assert!(
+                !encoded.contains("before-join-private"),
+                "an explicit pre-join cursor bypassed the membership join floor"
+            );
+            assert!(encoded.contains("after-join-visible"));
+        }
+
+        {
+            let mut rooms = supervisor.inner.rooms.lock();
+            let runtime = rooms.get_mut(room.room_id).unwrap();
+            for index in 0..513 {
+                runtime
+                    .append(RoomFeedItem::Message {
+                        message_id: Uuid::new_v4(),
+                        sender: RoomMessageSender::Operator {},
+                        content: format!("eviction-{index}"),
+                        recipient_ids: Vec::new(),
+                        membership_revision: runtime.definition.membership_revision,
+                    })
+                    .unwrap();
+            }
+        }
+        let evicted = supervisor.apply_sideband_request(
+            &caller,
+            SidebandRequest::RoomRead {
+                cursor: Some(pane_post.cursor),
+            },
+        );
+        assert!(evicted.ok, "{}", evicted.message);
+        let Some(SidebandResponsePayload::RoomFeed { page }) = evicted.payload else {
+            panic!("missing evicted room feed payload")
+        };
+        assert_eq!(
+            page.gap.as_ref().map(|gap| gap.reason),
+            Some(shared_types::RoomFeedGapReason::Evicted),
+            "the sideband read path must surface authoritative feed eviction"
+        );
+        let gap = page.gap.unwrap();
+        assert_eq!(gap.from_sequence, Some(pane_post.cursor.sequence + 1));
+        assert!(gap.through_sequence.unwrap() > pane_post.cursor.sequence);
+
+        supervisor
+            .remove_room_member(RemoveRoomMemberRequest {
+                room_id: room.room_id,
+                session_id: claude,
+            })
+            .unwrap();
+        let events = capture_runtime_events(&supervisor);
+        let audit_before = fs::read(supervisor.audit_log_path()).unwrap();
+        let denied =
+            supervisor.apply_sideband_request(&caller, SidebandRequest::RoomRead { cursor: None });
+        assert!(!denied.ok);
+        assert!(denied.request_id.is_none());
+        assert!(events.lock().is_empty());
+        assert_eq!(fs::read(supervisor.audit_log_path()).unwrap(), audit_before);
     }
 
     #[test]

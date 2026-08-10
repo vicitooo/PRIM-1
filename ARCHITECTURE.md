@@ -40,20 +40,25 @@ Current product surface:
 - native Windows working-directory selection, backend-qualified Ubuntu paths
   for Prime, and visible `Normal`/`Unsafe` permission profiles
 - Windows-first validation
-- a one-recipient in-process routing core with no current visible composer
-- a tokenless, pane-local Windows sideband limited to self `ping`, `wait_quiet`, `send_input`, and `send_key`
+- explicit, atomically persisted `RoomId` definitions and one-room-per-session
+  membership
+- a bounded in-memory room feed with a visible composer, feed-only Post, and
+  explicit one-member / Send All delivery
+- a tokenless, pane-local Windows sideband limited to self
+  `ping`/`wait_quiet`/`send_input`/`send_key` and membership-derived room
+  read/feed-only post
 
 Target architecture:
 
 - generic terminal-first runtime
 - dynamic pane/layout model
-- explicit `RoomId` membership and feed
 - user-extensible driver catalog
 - portable to Linux/macOS
 
 The current implementation is a **generic persistent-session proof with a
-bounded built-in driver catalog**, not a finished room or arbitrary-layout
-product.
+bounded built-in driver catalog and explicit room/feed slice**, not an
+arbitrary-layout or user-extensible-driver product. Production room fidelity,
+two-room isolation, and multi-member acceptance remain verification gates.
 
 ## 3. Supervisor runtime
 
@@ -187,7 +192,8 @@ That means:
 ## 6. Sideband control plane
 
 The sideband plane is a narrow, pane-local control channel. It is not the
-operator API, room transport, lifecycle API, or inventory API.
+operator API, recipient-delivery transport, lifecycle API, inventory API, or
+room-management API.
 
 The current Windows surface is deliberately limited to:
 
@@ -195,23 +201,25 @@ The current Windows surface is deliberately limited to:
 - `wait_quiet` for the calling pane
 - `send_input` to the calling pane
 - `send_key` to the calling pane
+- `room_read` for the calling pane's current authorized room and join floor
+- feed-only `room_post` with sender derived from that caller
 
 A named-pipe connection provides transport, not authority. On Windows the
 supervisor obtains and pins the kernel-reported client process, requires it to
 belong to exactly one live PTY job, binds the derived pane identity to that run
 generation, and revalidates both affiliation and generation at mutation time.
 There is no bearer token, credential file, caller-supplied identity, peer target,
-or disk-mailbox fallback. Operator lifecycle and routing remain direct
-in-process Tauri commands.
+or disk-mailbox fallback. Room requests accept no caller-supplied `RoomId`,
+sender, peer, or recipient. Operator lifecycle, membership, and recipient
+delivery remain direct in-process Tauri commands.
 
 Prime sessions are intentionally excluded from this native sideband. Their
 Linux descendants cannot be authenticated through the Windows Job membership
 proof used by the named pipe, and no bearer or proxy fallback is introduced.
 
-Future room reads or posts may use the native sideband only after stable
-SessionId/RunId/RoomId membership exists and the supervisor derives the sender
-from the same kernel-bound caller. They must not restore name-based or bearer
-authority.
+Room reads/posts use the same kernel-bound caller proof, derive current
+`RoomId` membership and sender `SessionId` under the supervisor locks, and are
+revoked immediately when the run or membership changes. Prime remains excluded.
 
 ### 6.1 Transport choice
 
@@ -260,7 +268,8 @@ But not for authority, routing, or lifecycle control.
   One sender, one recipient
 
 - `room`
-  Broadcast to all visible participants
+  Shared feed provenance plus an explicit member-recipient snapshot; posting
+  alone never broadcasts prompts
 
 - `system`
   Supervisor-generated events
@@ -271,6 +280,9 @@ But not for authority, routing, or lifecycle control.
 ### 7.2 Current message types
 
 - one-recipient operator-authored direct messages at the backend boundary
+- room messages from the operator or a kernel-derived member
+- room membership events
+- per-recipient room delivery state (`pending`, `written`, `failed`)
 - supervisor-generated lifecycle, delivery, heartbeat, and alert events
 
 Command execution, spawn, restart, and close are not chat message types. They
@@ -305,28 +317,43 @@ behavior measured against Claude Code 2.1.226, Codex 0.147.0, and Grok Build
 real-harness byte oracle remains
 responsible for final-child fidelity and receiver receipt.
 
+Room **Post** validates and appends one provenance-stamped feed message without
+touching any PTY. Room **Send** resolves one membership revision and one or all
+explicit member IDs, preflights every exact run and framing before any
+message-specific mutation, then appends the immutable message plus one pending
+delivery item per recipient. Each recipient uses the same exact-run FIFO writer
+and receives a written or failed feed item with truthful prefix progress. A
+membership change after the commit affects the next message; an in-flight room
+cannot be deleted. Room feed append and publication share one ordering gate so
+cursor order cannot race renderer/audit order.
+
 ### 7.4 Addressing model
 
 The current operator boundary identifies each logical session by opaque
 `SessionId`; restart preserves that ID while creating a new `RunId`, and rename
-changes only its display label. The production routing boundary accepts one
-recipient ID. Unknown or stale IDs fail closed, including delete/recreate with
-the same label. There is no name, label, multi-recipient, or all-session
-fallback.
+changes only its display label. Direct routing accepts one recipient ID. Room
+delivery accepts one member ID or explicit `all` resolved from one `RoomId`
+membership revision. Unknown or stale IDs fail closed, including
+delete/recreate with the same label. There is no name, label, implicit
+multi-recipient, or all-session fallback.
 
 The registry is keyed by `SessionId` with a separate persisted order and a
 deterministic immutable alias table used only by the narrow self-pane sideband.
 The private version-1 catalog stores the workspace preference and ordered
-session intent. It never persists `RunId`, process state, launch arguments,
-environment variables, terminal output, or message content.
+session intent. A separate private version-1 room catalog stores ordered room
+identity, label, member IDs, and membership revision. Neither persists `RunId`,
+process state, launch arguments, environment variables, terminal output, room
+feed events, or message content.
 
 ## 8. UI model
 
-The current useful UI has three surfaces:
+The current useful UI has four surfaces:
 
 - backend-ordered session tabs
 - one active terminal with inactive terminal buffers retained
 - the system log
+- the active room's member list, bounded feed, and Post / explicit-delivery
+  composer
 
 There should also be a small retractable control surface for:
 
@@ -335,7 +362,7 @@ There should also be a small retractable control surface for:
 - reconnect
 - close
 - health
-- refresh and later room actions
+- refresh and room actions
 
 The control surface should stay minimal and subordinate to the core room UX.
 
@@ -351,7 +378,7 @@ Future layout requirements:
 
 - layout presets for one, two, or many sessions
 - workspace-specific session groupings
-- explicit room/feed surfaces
+- simultaneous terminal/room arrangements beyond the current active-room card
 
 ### 8.3 Workspace / home model
 
@@ -476,7 +503,11 @@ These are not deferred hardening tasks. They are mandatory from the first workin
    paths and `/mnt/c/...` are never silently equated.
 
 2. **sideband capability whitelist**
-   After kernel-bound affiliation succeeds, the pane-local schema permits only ping, wait, input, or a supported key for that caller's live run. Peer, lifecycle, inventory, room, and routing actions are absent. This is a protocol boundary, not hostile same-user OS isolation.
+   After kernel-bound affiliation succeeds, the pane-local schema permits only
+   ping, wait, input, a supported key, membership-derived room read, or
+   feed-only room post for that caller's live run. Peer targeting, room IDs,
+   recipient delivery, lifecycle, inventory, and membership actions are absent.
+   This is a protocol boundary, not hostile same-user OS isolation.
 
 3. **named-pipe / socket access control**
    A successful transport connection grants no authority. On Windows, requests proceed only after the kernel-reported peer process is pinned and verified against exactly one live pane job and generation. A future POSIX transport must establish an equivalent peer-identity boundary before becoming a product claim.
@@ -538,7 +569,24 @@ Format:
 
 Every record carries an event type and timestamp. Event-specific metadata may add session/actor/target identity, request or route IDs, lifecycle state, action/phase/result, and delivery counts.
 
-Terminal output and routed-message content remain available only through the live runtime and desktop event path. `session_output` is not written to audit; routed-message content is replaced with `[content omitted]`. The PTY host carries split UTF-8 code points across reads, then the exact-run mode-2004 scanner consumes that same incrementally decoded stream before renderer sanitization, coalescing, or shedding. The desktop bridge holds at most 512 queued events. Lifecycle and control events use lossless bounded backpressure; only already-sanitized `session_output` display events may be shed under saturation. Every such loss produces a visible, run-scoped gap notice before the next surviving event (or at drain), and renderer terminal-control parsing remains synchronized. Live terminal history can therefore be incomplete under sustained renderer pressure; full output fidelity under saturation is not claimed. Any future room-history surface needs an explicit bounded in-memory retention contract and gap indication rather than silently turning the audit into a content store.
+Terminal output and message content remain available only through the live
+runtime and desktop event path. `session_output` is not written to audit;
+routed and room-message content is replaced with `[content omitted]`. Room
+definitions/membership persist separately, while every room feed is bounded to
+512 events / 16 MiB in memory and every page to 64 events / 2 MiB, with epoch
+reset and eviction gaps explicit. The renderer retains only the active room's
+same-sized feed window and reloads inactive rooms from the supervisor.
+
+The PTY host carries split UTF-8 code points across reads, then the exact-run
+mode-2004 scanner consumes that same incrementally decoded stream before
+renderer sanitization, coalescing, or shedding. The desktop bridge holds at
+most 512 queued events. Lifecycle and control events use lossless bounded
+backpressure; only already-sanitized `session_output` display events may be
+shed under saturation. Every such loss produces a visible, run-scoped gap
+notice before the next surviving event (or at drain), and renderer
+terminal-control parsing remains synchronized. Live terminal history can
+therefore be incomplete under sustained renderer pressure; full output
+fidelity under saturation is not claimed.
 
 ## 12.1 Multi-instance identity
 
@@ -561,7 +609,10 @@ At minimum the architecture must support:
 - output throttling when an agent floods the pane
 - fail-closed behavior for malformed or unaffiliated sideband requests
 - reconnecting the UI without dropping supervised sessions
-- serializing room delivery and lifecycle metadata in the audit log even when multiple agents emit concurrently
+- serializing room feed append/publication so cursor order is identical in the
+  renderer and metadata audit even when multiple agents post concurrently
+- refusing room deletion while delivery is in flight and recording truthful
+  partial per-recipient outcomes without retry
 
 ## 14. Reuse of current bridge code
 

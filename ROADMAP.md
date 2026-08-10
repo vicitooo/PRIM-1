@@ -11,13 +11,17 @@ Today the project is:
 - a Tauri desktop app with an ordered, persistent set of `SessionId`-keyed tabs
 - built-in Claude Code, Codex, Grok, Prime Agent (`wsl:Ubuntu`), and Generic Terminal session drivers
 - native Windows workspace/per-session directory selection, typed Ubuntu paths for Prime, and visible permission profiles
-- in-process operator session controls, plus a pane-local Windows sideband limited to self ping/wait/input/key
+- in-process operator session/room controls, plus a pane-local Windows sideband
+  limited to self ping/wait/input/key and membership-derived room read/post
+- explicit one-room-per-session `RoomId` membership, a bounded memory-only feed,
+  feed-only Post, and explicit one-member / Send All delivery
 
 Today the project is **not yet**:
 
 - a user-extensible arbitrary-program/driver product
 - a freely rearrangeable multi-pane workspace manager
-- an explicit `RoomId` chat/feed product
+- production-accepted for exact final-child room delivery and two-room / 3+
+  isolation (the implementation exists; the artifact matrix remains open)
 - a validated Linux/macOS product
 
 That distinction matters. The current session model is generic, but the driver
@@ -25,7 +29,7 @@ catalog, room model, and layout system remain deliberately bounded.
 
 ## 2. Near-term product goal
 
-Finish the persistent-session daily-driver proof first.
+Finish the persistent-session and explicit-room daily-driver proof.
 
 That means:
 
@@ -36,8 +40,11 @@ That means:
 - stable restart/resume expectations
 - clear limitation list
 - repeatable validation flow
+- two simultaneous rooms / at least three members with exact recipient,
+  isolation, ordering, partial-failure, and receiver-oracle evidence
 
-The point is to prove the safe tabbed runtime before adding rooms or custom drivers.
+The point is to prove the safe tabbed runtime and small explicit room model
+before adding custom drivers or richer layouts.
 
 ## 3. Future development themes
 
@@ -90,9 +97,10 @@ Examples:
 ### 3.4 Multi-instance addressing
 
 The current model has stable internal `SessionId` values, duplicate display
-labels, repeated same-driver workers, and deterministic UUID-derived pane
-aliases. Labels never carry authority. It does not yet support named workspace
-ownership or `RoomId` membership.
+labels, repeated same-driver workers, deterministic UUID-derived pane aliases,
+and explicit one-room-per-session `RoomId` membership. Labels never carry
+authority. It does not yet support named workspace ownership or multi-room
+membership.
 
 Future addressing must support:
 
@@ -130,8 +138,9 @@ Cross-platform completion requires:
 The current wrapper is strongest at:
 
 - operator-controlled start/stop/restart
-- persistent ordered session definitions and one-recipient routing core
-- pane-local self input and supported key actions
+- persistent ordered session and room definitions
+- explicit feed-only post and one-member / Send All room delivery
+- pane-local self input/key plus membership-derived room read/post
 
 Future control improvements:
 
@@ -175,11 +184,12 @@ It is acceptable for the current proof to keep a small built-in driver catalog a
 
 ## 5. Sequencing rule
 
-Build in this order:
+Build and admit in this order:
 
 1. finish and dogfood persistent flat session tabs
 2. prove normal/unsafe launch behavior with real harnesses
-3. add explicit `RoomId` membership and feed semantics
+3. prove explicit `RoomId` membership/feed and addressed delivery on the exact
+   production artifact
 4. add richer simultaneous-pane/workspace layouts only when the flat model proves insufficient
 5. validate Linux/macOS
 6. add intelligent outage handling before treating the system as an unattended operations runtime

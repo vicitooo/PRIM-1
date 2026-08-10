@@ -2,9 +2,9 @@
 
 PRIM-1 is desktop-first. Lifecycle, ordered session inventory, native directory
 selection, and session-definition management are available only through the
-desktop UI and its in-process Tauri commands. The current tab UI exposes no room
-or message composer. There is no master credential file or external operator
-backdoor.
+desktop UI and its in-process Tauri commands. Room creation, membership,
+recipient delivery, and the visible composer are desktop actions. There is no
+master credential file or external operator backdoor.
 
 ## Pane-local control helper
 
@@ -15,6 +15,8 @@ authorized supervised pane. Its complete action set is:
 - `wait_quiet`
 - `input`
 - `key`
+- `room_read`
+- `room_post`
 
 The endpoint must be a nonblank `PRIM1_CONTROL_PLANE_ENDPOINT`. The explicit
 `-Endpoint` parameter exists only so isolated named-pipe tests can supply a fake
@@ -31,6 +33,8 @@ $env:PRIM1_CONTROL_PLANE_ENDPOINT = '\\.\pipe\<pane-endpoint>'
 .\scripts\control-plane.ps1 -Action input -Session $env:PRIM1_PANE_IDENTITY -ContentFile 'D:\tmp\prompt.txt'
 .\scripts\control-plane.ps1 -Action key -Session $env:PRIM1_PANE_IDENTITY -Key enter
 .\scripts\control-plane.ps1 -Action wait_quiet -Session $env:PRIM1_PANE_IDENTITY -QuietSec 2 -TimeoutSec 10
+.\scripts\control-plane.ps1 -Action room_read -Quiet -PassThruJson
+.\scripts\control-plane.ps1 -Action room_post -Content 'Status from this pane'
 ```
 
 `input` writes raw text and does not press Enter. Use a following `key` action
@@ -39,12 +43,17 @@ model completion. Timeout responses exit `124`; ordinary failures exit `1`.
 `-PassThruJson` and `-OutRequestIdFile` preserve the minimal response and request
 correlation without exposing a runtime snapshot.
 
-The helper never reads `control-plane.json`, `PRIM1_PANE_CREDENTIALS`, or a
-bearer token. It does not implement list, lifecycle, delivery, events, signals,
-routing, or session-definition management.
+`room_read` and `room_post` derive the room, membership, and sender from the
+kernel-bound caller. They accept no `RoomId`, sender, peer target, recipient, or
+delivery authority. A room post writes no PTY; a newly joined pane reads only
+its join event and later traffic, with explicit gaps after eviction/restart.
 
-`-ContentFile` is decoded as strict UTF-8 and preserves source line endings and
-trailing whitespace. `wait_quiet` accepts `QuietSec` 1–60 and `TimeoutSec`
+The helper never reads `control-plane.json`, `PRIM1_PANE_CREDENTIALS`, or a
+bearer token. It does not implement list, lifecycle, recipient delivery,
+arbitrary routing, signals, or session/room-definition management.
+
+`-ContentFile` for `input` or `room_post` is decoded as strict UTF-8 and
+preserves source line endings and trailing whitespace. `wait_quiet` accepts `QuietSec` 1–60 and `TimeoutSec`
 1–300, with `QuietSec` no greater than `TimeoutSec`; the supervisor enforces the
 same bounds.
 

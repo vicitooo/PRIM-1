@@ -43,6 +43,10 @@ Current script-level coverage:
   - validates `scripts/control-plane.ps1 -OutRequestIdFile`
   - validates environment endpoint resolution, explicit test endpoints, `agent-key.ps1`, and legacy-action rejection
 
+- `tests/control-plane-server-identity.ps1`
+  - proves the client authenticates the exact named-pipe server PID and creation FILETIME before sending request bytes
+  - verifies PID and creation-time mismatch each send zero bytes
+
 - `tests/control-plane-wait.ps1`
   - validates `scripts/control-plane.ps1 -Action wait_quiet`
   - verifies named-pipe transport preserves the minimal tokenless request/response payload
@@ -52,3 +56,12 @@ Current script-level coverage:
   - validates the client-side 60-second quiet-window and 300-second total-wait caps; matching server-side bounds are covered by supervisor tests
   - checks `timed_out: true` returns exit code `124`
   - checks the `TIMED OUT: <message>` banner in both normal and `-Quiet` modes
+
+- `tests/control-plane-room.ps1`
+  - validates tokenless `room_read` / `room_post` request shapes against a real named pipe
+  - proves the script carries no caller-supplied `RoomId`, sender, peer, or recipient authority
+  - checks paired cursor validation and strict UTF-8 Unicode, embedded CRLF, and trailing-newline fidelity for feed posts
+
+- `tests/run-all-regression.ps1`
+  - proves the eight-suite aggregate runner reports one failing suite without hiding seven passes
+  - proves a missing native exit code fails all eight suites closed

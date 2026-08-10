@@ -47,54 +47,80 @@ whose driver and cwd namespace disagree fails startup without rewrite.
 
 The production operator routing boundary accepts exactly one `recipient_id` and
 content. The desktop derives `from = "operator"`; callers cannot supply
-provenance, scope, names, or a recipient list. The current flat-tab UI exposes no
-message composer, so this remains a one-recipient backend boundary until
-explicit `RoomId` membership is implemented. There is no unknown-target, name,
-multi-recipient, or broadcast fallback.
+provenance, scope, names, or a recipient list. The visible room composer uses a
+separate typed `RoomId` request with either one member `SessionId` or explicit
+`all`; there is no unknown-target, name-derived, implicit, or all-session
+broadcast fallback.
 
-The tokenless pane sideband exposes no route operation. Future pane room traffic
-must derive identity from the connected process job and explicit `RoomId`
-membership; a caller-supplied name is never authority.
+The tokenless pane sideband exposes no recipient-delivery operation. Its
+`room_read` and `room_post` requests carry neither `RoomId` nor sender: the
+supervisor derives the exact live caller, current room membership, join floor,
+and sender `SessionId` from the connected process job. A caller-supplied name is
+never room authority.
 
-## 4. Future room/feed envelope
+## 4. Room/feed envelope
 
-This envelope is the target shape for explicit RoomId-scoped feed entries after
-`RoomId` membership exists. Stable `SessionId`/`RunId` identity is implemented;
-the feed and room registry are not. This is not the current pane-local sideband
-schema and its `from` field is never caller authority.
+The private room catalog atomically persists ordered `RoomId`, label, member
+`SessionId` values, and a nonzero membership revision. Feed epoch, sequence,
+messages, delivery results, and cursor state are process-memory only and reset
+on restart. Corrupt, structurally invalid, or unknown catalog versions fail
+startup without rewrite.
+
+Each room owns a random process-lifetime epoch and monotonic sequence. Its feed
+retains at most 512 events and 16 MiB; reads return at most 64 events and 2 MiB
+per page. A stale epoch or evicted range returns an explicit gap. The desktop
+retains only the active room's same-sized bounded display window and reloads an
+inactive room from the authoritative supervisor feed when selected.
 
 Example:
 
 ```json
 {
-  "id": "uuid",
-  "type": "chat_message",
-  "from": "claude",
-  "to": "codex",
-  "scope": "direct",
-  "created_at": "2026-04-14T22:00:00Z",
-  "content": "Please review the last change.",
-  "metadata": {
-    "request_id": null,
-    "reply_to": null
-  }
+  "schema_version": 1,
+  "room_id": "uuid",
+  "cursor": { "epoch": "uuid", "sequence": 14 },
+  "item": {
+    "kind": "message",
+    "message_id": "uuid",
+    "sender": { "kind": "session", "session_id": "uuid" },
+    "content": "Please review the last change.",
+    "recipient_ids": [],
+    "membership_revision": 3
+  },
+  "timestamp": "2026-08-11T02:00:00Z"
 }
 ```
+
+Feed events and pages carry `schema_version: 1`; an unsupported version fails
+closed rather than being interpreted as a known shape. `recipient_ids: []` is
+feed-only. An addressed message records the exact
+recipient snapshot plus separate `pending` then `written` / `failed` delivery
+items. UI emission is never a model receipt.
+
+Room membership belongs to the durable session definition, not to one live
+run: closed members remain members, while delivery requires every selected
+recipient to have a compatible live run at whole-message preflight. A dormant
+zero- or one-member room remains visible until explicitly deleted. Every room
+member can read an addressed message from the shared feed even when only one
+member was selected for PTY delivery. The operator is not a room member, so
+**Send All** means every member in the pinned revision; pane sideband callers
+can read/post only their current room and cannot request delivery.
 
 ## 5. Current typed surfaces
 
 - In-process operator actions own `SessionId`-addressed create, rename, reorder,
   closed-only delete, lifecycle, input, inventory, resize, native cwd selection,
-  typed Prime Linux cwd selection, typed permission changes, and singular direct
-  routing for admitted native drivers.
-- The pane-local sideband owns only self `ping`, `wait_quiet`, `send_input`, and
-  `send_key`.
-- Runtime telemetry owns structured lifecycle, delivery, heartbeat, alert, and
-  metadata-only dispatch events.
+  typed Prime Linux cwd selection, and typed permission changes.
+- In-process room actions own room catalog/membership mutations, operator feed
+  posts, and explicit one-member / Send All delivery for admitted native drivers.
+- The pane-local sideband owns self `ping`, `wait_quiet`, `send_input`,
+  `send_key`, plus membership-derived `room_read` and feed-only `room_post`.
+- Runtime telemetry owns structured session/room catalog, room feed, lifecycle,
+  delivery, heartbeat, alert, and metadata-only dispatch events.
 
 Spawn, restart, close, and arbitrary command execution are not pane messages.
-Future room feed entries begin with `chat_message`; any additional type requires
-a new explicit contract and authority model.
+Room feed item kinds are `message`, `membership`, and `delivery`. Any additional
+kind requires a new explicit contract and authority model.
 
 ## 6. Visible injection contract
 
@@ -233,11 +259,14 @@ Restart flow:
 
 ## 9. Permission contract
 
-Current pane authority is deliberately narrower than the future room model:
+Current pane authority is deliberately narrower than operator room authority:
 
 - the supervisor derives the caller from live process-job membership and run generation
-- the pane-local sideband action set is fixed to self `ping`, `wait_quiet`, `send_input`, and `send_key`
-- pane callers have no room, peer, inventory, or lifecycle action
+- the pane-local sideband action set is fixed to self `ping`, `wait_quiet`,
+  `send_input`, `send_key`, membership-derived `room_read`, and feed-only
+  `room_post`
+- pane callers cannot supply `RoomId`, sender, peer, recipient, delivery,
+  inventory, membership, or lifecycle authority
 - Prime/WSL callers have no pane-sideband surface; the native Job-derived caller
   proof cannot identify Linux tasks and no bearer fallback exists
 - operator lifecycle, input, resize, and routing authority remains inside the desktop process and targets stable `SessionId` values
@@ -263,12 +292,21 @@ Content-retention rules:
 - every shed output event is counted in a visible, run-scoped gap warning emitted before the next surviving event or when the queue drains; terminal-control parser state is advanced before shedding
 - terminal output under sustained renderer saturation may be incomplete; PRIM-1 does not claim byte fidelity across an output-gap warning
 - `routed_message` retains addressing, scope, identity, and timestamp metadata; its durable `content` value is `[content omitted]`
+- room catalog and membership events retain IDs, labels, order/revision, and
+  timestamps; room-feed message content is replaced with `[content omitted]`
+  while membership and per-recipient delivery status remain metadata
 - `session_work_state.detail` is omitted from the durable projection
 - `desktop-events.jsonl` contains desktop-process diagnostics, not terminal or conversation content
 - desktop diagnostic appends are serialized across command and event threads so each JSONL record remains an independent parseable line
 - a PTY-write or route-delivery receipt proves runtime handling only; model understanding and task completion require an independent live or artifact-based oracle
 
-The pane-local sideband supports only `ping`, `wait_quiet`, `send_input`, and `send_key`. Its endpoint and a successful connection are transport facts, not credentials. On Windows, caller authority is derived by pinning the kernel-reported named-pipe client process and verifying its live pane job and generation, never from a bearer or info file. Lifecycle, inventory, room, and routing operations remain in-process desktop actions.
+The pane-local sideband supports `ping`, `wait_quiet`, `send_input`, `send_key`,
+`room_read`, and `room_post`. Its endpoint and a successful connection are
+transport facts, not credentials. On Windows, caller authority is derived by
+pinning the kernel-reported named-pipe client process and verifying its live
+pane job and generation, never from a bearer or info file. Room read/post then
+derive membership and sender under the same lock; lifecycle, inventory,
+membership, and recipient delivery remain in-process desktop actions.
 
 `dispatch_attempt` records the pre-write target state for pane input/key requests and in-process operator delivery/routing that passed whole-request validation and recipient preflight. It is diagnostic metadata, not an idle gate, model-reaction ACK, or completion signal.
 
@@ -296,6 +334,15 @@ In-process operator route requests expose delivery metadata:
   `phase: "failed"` outcome
 - a failed outcome records the PTY-writer-reported prefix byte count accepted
   before failure; no automatic retry is allowed after an uncertain partial write
+
+Room delivery first resolves one membership revision and preflights every
+selected exact run before appending the message or writing any PTY. The feed
+then records one immutable message, `pending` for every selected recipient, and
+one `written` or `failed` result per recipient. Membership changes after that
+commit affect the next message, not the pinned delivery plan. Delivery attempts
+are serialized through each exact run's FIFO input gate; room-feed append and
+publication are serialized so cursor order cannot differ from renderer/audit
+order. A room cannot be deleted while any of its deliveries is in flight.
 
 Auto-restart-on-stall rules:
 

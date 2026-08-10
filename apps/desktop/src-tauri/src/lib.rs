@@ -15,8 +15,11 @@ use std::{
 };
 
 use shared_types::{
-    ChooseSessionWorkingDirectoryRequest, CreateSessionRequest, DeleteSessionRequest,
-    MoveSessionRequest, OperatorRouteMessageRequest, RenameSessionRequest, RestartSessionRequest,
+    AddRoomMemberRequest, ChooseSessionWorkingDirectoryRequest, CreateRoomRequest,
+    CreateSessionRequest, DeleteRoomRequest, DeleteSessionRequest, DeliverRoomMessageRequest,
+    MoveRoomRequest, MoveSessionRequest, OperatorRouteMessageRequest, PostRoomMessageRequest,
+    ReadRoomFeedRequest, RemoveRoomMemberRequest, RenameRoomRequest, RenameSessionRequest,
+    RestartSessionRequest, RoomDeliveryResult, RoomFeedPage, RoomPostResult, RoomSnapshot,
     RunEventIdentity, RuntimeSnapshot, SendInputRequest, SessionId, SessionSnapshot,
     SetSessionLinuxWorkingDirectoryRequest, SetSessionPermissionRequest, StartSessionRequest,
     StopSessionRequest,
@@ -794,6 +797,136 @@ fn delete_session(
         })
 }
 
+#[tauri::command]
+fn create_room(
+    state: State<'_, DesktopState>,
+    request: CreateRoomRequest,
+) -> Result<RoomSnapshot, String> {
+    state.supervisor.create_room(request).map_err(|error| {
+        state
+            .diagnostics
+            .log("error", "create_room_failed", error.to_string());
+        error.to_string()
+    })
+}
+
+#[tauri::command]
+fn rename_room(
+    state: State<'_, DesktopState>,
+    request: RenameRoomRequest,
+) -> Result<RoomSnapshot, String> {
+    state.supervisor.rename_room(request).map_err(|error| {
+        state
+            .diagnostics
+            .log("error", "rename_room_failed", error.to_string());
+        error.to_string()
+    })
+}
+
+#[tauri::command]
+fn move_room(
+    state: State<'_, DesktopState>,
+    request: MoveRoomRequest,
+) -> Result<RuntimeSnapshot, String> {
+    state.supervisor.move_room(request).map_err(|error| {
+        state
+            .diagnostics
+            .log("error", "move_room_failed", error.to_string());
+        error.to_string()
+    })
+}
+
+#[tauri::command]
+fn add_room_member(
+    state: State<'_, DesktopState>,
+    request: AddRoomMemberRequest,
+) -> Result<RoomSnapshot, String> {
+    state.supervisor.add_room_member(request).map_err(|error| {
+        state
+            .diagnostics
+            .log("error", "add_room_member_failed", error.to_string());
+        error.to_string()
+    })
+}
+
+#[tauri::command]
+fn remove_room_member(
+    state: State<'_, DesktopState>,
+    request: RemoveRoomMemberRequest,
+) -> Result<RoomSnapshot, String> {
+    state
+        .supervisor
+        .remove_room_member(request)
+        .map_err(|error| {
+            state
+                .diagnostics
+                .log("error", "remove_room_member_failed", error.to_string());
+            error.to_string()
+        })
+}
+
+#[tauri::command]
+fn delete_room(state: State<'_, DesktopState>, request: DeleteRoomRequest) -> Result<(), String> {
+    state.supervisor.delete_room(request).map_err(|error| {
+        state
+            .diagnostics
+            .log("error", "delete_room_failed", error.to_string());
+        error.to_string()
+    })
+}
+
+#[tauri::command]
+fn read_room_feed(
+    state: State<'_, DesktopState>,
+    request: ReadRoomFeedRequest,
+) -> Result<RoomFeedPage, String> {
+    state.supervisor.read_room_feed(request).map_err(|error| {
+        state
+            .diagnostics
+            .log("error", "read_room_feed_failed", error.to_string());
+        error.to_string()
+    })
+}
+
+#[tauri::command]
+fn post_room_message(
+    state: State<'_, DesktopState>,
+    request: PostRoomMessageRequest,
+) -> Result<RoomPostResult, String> {
+    state
+        .supervisor
+        .post_room_message(request)
+        .map_err(|error| {
+            state
+                .diagnostics
+                .log("error", "post_room_message_failed", error.to_string());
+            error.to_string()
+        })
+}
+
+#[tauri::command]
+async fn deliver_room_message(
+    state: State<'_, DesktopState>,
+    request: DeliverRoomMessageRequest,
+) -> Result<RoomDeliveryResult, String> {
+    let supervisor = state.supervisor.clone();
+    let diagnostics = state.diagnostics.clone();
+    match tauri::async_runtime::spawn_blocking(move || supervisor.deliver_room_message(request))
+        .await
+    {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(error)) => {
+            diagnostics.log("error", "deliver_room_message_failed", error.to_string());
+            Err(error.to_string())
+        }
+        Err(error) => {
+            let message = format!("room delivery worker failed: {error}");
+            diagnostics.log("error", "deliver_room_message_failed", &message);
+            Err(message)
+        }
+    }
+}
+
 fn pick_directory(app: &AppHandle, title: &str) -> Result<Option<PathBuf>, String> {
     app.dialog()
         .file()
@@ -1485,6 +1618,15 @@ pub fn run(startup: StartupConfig) {
             set_session_permission_profile,
             move_session,
             delete_session,
+            create_room,
+            rename_room,
+            move_room,
+            add_room_member,
+            remove_room_member,
+            delete_room,
+            read_room_feed,
+            post_room_message,
+            deliver_room_message,
             send_input,
             route_message,
             resize_session,

@@ -17,6 +17,7 @@ import {
   reconcileSessionSnapshot,
   registerRuntimeEventsBeforeBootstrap,
   retireRendererSession,
+  type RoomRuntimeEvent,
   type PendingBuffer,
   type RuntimeEventContext,
 } from "./runtime-events";
@@ -38,13 +39,31 @@ import {
   unsafePermissionWarning,
   type SessionTabsState,
 } from "./session-tabs";
+import {
+  appendRoomFeedEvent as reconcileRoomFeedEvent,
+  retainRoomFeedWindow,
+} from "./room-feed";
 import "./styles.css";
 import type {
+  AddRoomMemberRequest,
   ChooseSessionWorkingDirectoryRequest,
+  CreateRoomRequest,
+  DeleteRoomRequest,
   DeleteSessionRequest,
+  DeliverRoomMessageRequest,
   DriverKind,
+  MoveRoomRequest,
   MoveSessionRequest,
   PermissionProfile,
+  PostRoomMessageRequest,
+  ReadRoomFeedRequest,
+  RemoveRoomMemberRequest,
+  RenameRoomRequest,
+  RoomDeliveryResult,
+  RoomFeedCursor,
+  RoomFeedEvent,
+  RoomFeedPage,
+  RoomSnapshot,
   RenameSessionRequest,
   RuntimeEvent,
   RuntimeSnapshot,
@@ -214,6 +233,55 @@ app.innerHTML = `
         </div>
         <div class="system-terminal" id="system-terminal"></div>
         <span class="card-ctrl-chip" aria-hidden="true">CTRL</span>
+      </article>
+
+      <article class="room-card panel" id="room-card">
+        <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
+        <div class="card-head room-card-head">
+          <div class="card-title">
+            <span class="card-icon icon-room" aria-hidden="true"></span>
+            <h2>Room feed</h2>
+          </div>
+          <div class="room-toolbar">
+            <select id="room-select" aria-label="Active room"></select>
+            <button type="button" id="new-room">New</button>
+            <button type="button" class="ghost" id="rename-room">Rename</button>
+            <button type="button" class="ghost" id="move-room-left" aria-label="Move room left">←</button>
+            <button type="button" class="ghost" id="move-room-right" aria-label="Move room right">→</button>
+            <button type="button" class="ghost danger" id="delete-room">Delete</button>
+          </div>
+        </div>
+        <form id="room-create-form" class="room-create-form" hidden>
+          <label><span>Room label <small>optional</small></span><input id="room-label" maxlength="128" autocomplete="off" /></label>
+          <fieldset>
+            <legend>Select at least two sessions</legend>
+            <div id="room-member-choices" class="room-member-choices"></div>
+          </fieldset>
+          <p id="room-create-error" class="session-form-error" role="alert" hidden></p>
+          <div class="room-form-actions">
+            <button type="submit" class="primary">Create room</button>
+            <button type="button" class="ghost" id="cancel-room-create">Cancel</button>
+          </div>
+        </form>
+        <div id="room-empty" class="room-empty">
+          <p>No rooms yet. Create one from existing sessions; no harness will be started or replaced.</p>
+        </div>
+        <div id="room-content" class="room-content" hidden>
+          <div class="room-members-row">
+            <div id="room-members" class="room-members" aria-label="Room members"></div>
+            <select id="room-add-member-select" aria-label="Session to add"></select>
+            <button type="button" id="room-add-member">Add member</button>
+          </div>
+          <div id="room-feed" class="room-feed" role="log" aria-live="polite"></div>
+          <label class="room-composer-label" for="room-message">Message</label>
+          <textarea id="room-message" rows="3" maxlength="1048576" placeholder="Post to the shared feed or deliver explicitly…"></textarea>
+          <div class="room-composer-actions">
+            <button type="button" id="room-post">Post to feed</button>
+            <select id="room-recipient" aria-label="Room delivery recipients"></select>
+            <button type="button" class="primary" id="room-send">Send</button>
+          </div>
+          <p id="room-status" class="room-status" aria-live="polite"></p>
+        </div>
       </article>
 
     </section>
@@ -415,6 +483,28 @@ const saveSessionButton = must<HTMLButtonElement>("#save-session");
 const zeroSession = must<HTMLElement>("#zero-session");
 const zeroWorkspace = must<HTMLElement>("#zero-workspace");
 const zeroNewSession = must<HTMLButtonElement>("#zero-new-session");
+const roomSelect = must<HTMLSelectElement>("#room-select");
+const newRoomButton = must<HTMLButtonElement>("#new-room");
+const renameRoomButton = must<HTMLButtonElement>("#rename-room");
+const moveRoomLeftButton = must<HTMLButtonElement>("#move-room-left");
+const moveRoomRightButton = must<HTMLButtonElement>("#move-room-right");
+const deleteRoomButton = must<HTMLButtonElement>("#delete-room");
+const roomCreateForm = must<HTMLFormElement>("#room-create-form");
+const roomLabelInput = must<HTMLInputElement>("#room-label");
+const roomMemberChoices = must<HTMLDivElement>("#room-member-choices");
+const roomCreateError = must<HTMLElement>("#room-create-error");
+const cancelRoomCreate = must<HTMLButtonElement>("#cancel-room-create");
+const roomEmpty = must<HTMLElement>("#room-empty");
+const roomContent = must<HTMLElement>("#room-content");
+const roomMembers = must<HTMLDivElement>("#room-members");
+const roomAddMemberSelect = must<HTMLSelectElement>("#room-add-member-select");
+const roomAddMemberButton = must<HTMLButtonElement>("#room-add-member");
+const roomFeed = must<HTMLDivElement>("#room-feed");
+const roomMessage = must<HTMLTextAreaElement>("#room-message");
+const roomPostButton = must<HTMLButtonElement>("#room-post");
+const roomRecipient = must<HTMLSelectElement>("#room-recipient");
+const roomSendButton = must<HTMLButtonElement>("#room-send");
+const roomStatus = must<HTMLElement>("#room-status");
 const snapshotById = new Map<string, SessionSnapshot>();
 let latestSnapshotRequest = 0;
 
@@ -426,6 +516,14 @@ const runtimePath = must<HTMLElement>("#runtime-path");
 let tabState: SessionTabsState = { order: [], activeId: null };
 let activeCopySurface: CopySurface = null;
 let workspacePreference = "";
+let roomSnapshots: RoomSnapshot[] = [];
+let activeRoomId: string | null = null;
+const roomFeedEvents = new Map<string, RoomFeedEvent[]>();
+const roomFeedCursors = new Map<string, RoomFeedCursor>();
+const queuedRoomFeedEvents = new Map<string, RoomFeedEvent[]>();
+const initializedRoomFeeds = new Set<string>();
+const loadingRoomFeeds = new Set<string>();
+const roomFeedReloadRequired = new Set<string>();
 let sessionFormMode: SessionFormMode | null = null;
 let sessionFormPending = false;
 let primeDefaultRequest = 0;
@@ -621,6 +719,7 @@ function loadSavedTheme(): ThemeName {
 applyTheme(loadSavedTheme());
 
 wireSessionUi();
+wireRoomUi();
 wireControls();
 wireResize();
 wireTerminalShortcuts();
@@ -647,6 +746,9 @@ const runtimeEventContext: RuntimeEventContext = {
   },
   setControlEndpoint(endpoint) {
     controlEndpoint.textContent = endpoint;
+  },
+  handleRoomEvent(event) {
+    handleRoomRuntimeEvent(event);
   },
 };
 
@@ -690,6 +792,7 @@ function applySnapshot(snapshot: RuntimeSnapshot, preferredSessionId?: string): 
 
   workspacePreference = snapshot.workspace_preference;
   syncPaneInventory(snapshot.sessions, preferredSessionId);
+  syncRoomInventory(snapshot.rooms);
   syncSessionForm();
   controlEndpoint.textContent = snapshot.control_plane?.endpoint ?? "starting...";
   auditPath.textContent = snapshot.audit_log_path;
@@ -701,6 +804,351 @@ function applySnapshot(snapshot: RuntimeSnapshot, preferredSessionId?: string): 
     }
   }
   completeInitialRunEventReconciliation(runtimeEventContext);
+}
+
+function handleRoomRuntimeEvent(event: RoomRuntimeEvent): void {
+  if (event.event === "room_feed_event") {
+    acceptLiveRoomFeedEvent(event.feed_event);
+    return;
+  }
+  if (event.schema_version !== 1) {
+    writeSystem(
+      "warn",
+      `unsupported room event schema ${event.schema_version}; refreshing authoritative room state`,
+    );
+  }
+  void refreshSnapshot(tabState.activeId ?? undefined).catch((error) =>
+    writeSystem("error", `room inventory refresh failed: ${String(error)}`),
+  );
+}
+
+function syncRoomInventory(incoming: RoomSnapshot[]): void {
+  roomSnapshots = incoming;
+  const liveIds = new Set(incoming.map((room) => room.room_id));
+  for (const roomId of Array.from(roomFeedEvents.keys())) {
+    if (!liveIds.has(roomId)) {
+      roomFeedEvents.delete(roomId);
+      roomFeedCursors.delete(roomId);
+      queuedRoomFeedEvents.delete(roomId);
+      initializedRoomFeeds.delete(roomId);
+      loadingRoomFeeds.delete(roomId);
+      roomFeedReloadRequired.delete(roomId);
+    }
+  }
+  if (!activeRoomId || !liveIds.has(activeRoomId)) {
+    activeRoomId = incoming[0]?.room_id ?? null;
+  }
+  discardInactiveRoomFeedState();
+  renderRoomUi();
+  if (activeRoomId) {
+    void initializeRoomFeed(activeRoomId);
+  }
+}
+
+function activeRoom(): RoomSnapshot | null {
+  return roomSnapshots.find((room) => room.room_id === activeRoomId) ?? null;
+}
+
+function discardInactiveRoomFeedState(): void {
+  for (const roomId of new Set([
+    ...roomFeedEvents.keys(),
+    ...roomFeedCursors.keys(),
+    ...queuedRoomFeedEvents.keys(),
+    ...initializedRoomFeeds,
+    ...roomFeedReloadRequired,
+  ])) {
+    if (roomId === activeRoomId) {
+      continue;
+    }
+    roomFeedEvents.delete(roomId);
+    roomFeedCursors.delete(roomId);
+    queuedRoomFeedEvents.delete(roomId);
+    initializedRoomFeeds.delete(roomId);
+    roomFeedReloadRequired.delete(roomId);
+  }
+}
+
+function acceptLiveRoomFeedEvent(event: RoomFeedEvent): void {
+  if (event.schema_version !== 1) {
+    writeSystem(
+      "warn",
+      `unsupported room feed schema ${event.schema_version}; event ignored`,
+    );
+    return;
+  }
+  if (event.room_id !== activeRoomId) {
+    return;
+  }
+  if (!initializedRoomFeeds.has(event.room_id)) {
+    const queued = queuedRoomFeedEvents.get(event.room_id) ?? [];
+    const bounded = retainRoomFeedWindow([...queued, event]);
+    if (bounded.length < queued.length + 1) {
+      const firstDrop = !roomFeedReloadRequired.has(event.room_id);
+      roomFeedReloadRequired.add(event.room_id);
+      if (firstDrop) {
+        writeSystem(
+          "warn",
+          `room ${shortSessionId(event.room_id)} bootstrap queue reached its bounded window; reloading the authoritative feed`,
+        );
+      }
+    }
+    queuedRoomFeedEvents.set(event.room_id, bounded);
+    if (bounded.length === 0) {
+      writeSystem(
+        "warn",
+        `room ${shortSessionId(event.room_id)} emitted an event too large for the renderer feed window`,
+      );
+    }
+    return;
+  }
+  if (!appendRoomFeedEvent(event)) {
+    const queued = queuedRoomFeedEvents.get(event.room_id) ?? [];
+    queued.push(event);
+    queuedRoomFeedEvents.set(event.room_id, queued);
+    initializedRoomFeeds.delete(event.room_id);
+    void initializeRoomFeed(event.room_id, true);
+  }
+}
+
+function appendRoomFeedEvent(event: RoomFeedEvent): boolean {
+  const cursor = roomFeedCursors.get(event.room_id);
+  const events = roomFeedEvents.get(event.room_id) ?? [];
+  const result = reconcileRoomFeedEvent(event.room_id, events, cursor, event);
+  if (result.status === "duplicate") {
+    return true;
+  }
+  if (result.status !== "accepted") {
+    return false;
+  }
+  roomFeedEvents.set(event.room_id, result.events);
+  roomFeedCursors.set(event.room_id, result.cursor);
+  if (activeRoomId === event.room_id) {
+    renderRoomFeed(result.events);
+  }
+  return true;
+}
+
+async function initializeRoomFeed(roomId: string, force = false): Promise<void> {
+  if ((!force && initializedRoomFeeds.has(roomId)) || loadingRoomFeeds.has(roomId)) {
+    return;
+  }
+  loadingRoomFeeds.add(roomId);
+  try {
+    let cursor: RoomFeedCursor | null = null;
+    const events: RoomFeedEvent[] = [];
+    for (;;) {
+      const page: RoomFeedPage = await command<RoomFeedPage>("read_room_feed", {
+        request: {
+          room_id: roomId,
+          cursor,
+        } satisfies ReadRoomFeedRequest,
+      });
+      if (page.schema_version !== 1) {
+        throw new Error(`unsupported room feed schema ${page.schema_version}`);
+      }
+      if (page.gap) {
+        const range =
+          page.gap.from_sequence === null
+            ? "a prior feed epoch"
+            : `events ${page.gap.from_sequence}–${page.gap.through_sequence}`;
+        writeSystem(
+          "warn",
+          `room ${shortSessionId(roomId)} feed gap: ${range} unavailable (${page.gap.reason})`,
+        );
+        if (activeRoomId === roomId) {
+          roomStatus.textContent = `Feed gap: ${range} unavailable.`;
+          roomStatus.dataset.level = "warn";
+        }
+      }
+      events.push(...page.events);
+      cursor = page.cursor;
+      if (!page.has_more) {
+        break;
+      }
+    }
+    if (activeRoomId !== roomId) {
+      return;
+    }
+    roomFeedEvents.set(roomId, retainRoomFeedWindow(events));
+    if (cursor) {
+      roomFeedCursors.set(roomId, cursor);
+    }
+    initializedRoomFeeds.add(roomId);
+    const queued = (queuedRoomFeedEvents.get(roomId) ?? []).sort(
+      (left, right) => left.cursor.sequence - right.cursor.sequence,
+    );
+    queuedRoomFeedEvents.delete(roomId);
+    let needsReload = roomFeedReloadRequired.delete(roomId);
+    for (const event of queued) {
+      if (!appendRoomFeedEvent(event)) {
+        needsReload = true;
+        break;
+      }
+    }
+    if (activeRoomId === roomId) {
+      renderRoomFeed(roomFeedEvents.get(roomId) ?? []);
+    }
+    if (needsReload) {
+      initializedRoomFeeds.delete(roomId);
+      queueMicrotask(() => void initializeRoomFeed(roomId, true));
+    }
+  } catch (error) {
+    if (activeRoomId === roomId) {
+      roomStatus.textContent = `Room feed unavailable: ${String(error)}`;
+      roomStatus.dataset.level = "error";
+    }
+    writeSystem("error", `room feed read failed: ${String(error)}`);
+  } finally {
+    loadingRoomFeeds.delete(roomId);
+  }
+}
+
+function renderRoomUi(): void {
+  const selected = activeRoom();
+  roomSelect.replaceChildren();
+  if (roomSnapshots.length === 0) {
+    const option = document.createElement("option");
+    option.textContent = "No rooms";
+    option.value = "";
+    roomSelect.append(option);
+  } else {
+    for (const room of roomSnapshots) {
+      const option = document.createElement("option");
+      option.value = room.room_id;
+      option.textContent = `${room.label} · ${shortSessionId(room.room_id)}`;
+      roomSelect.append(option);
+    }
+    roomSelect.value = selected?.room_id ?? roomSnapshots[0].room_id;
+  }
+  roomEmpty.hidden = selected !== null || !roomCreateForm.hidden;
+  roomContent.hidden = selected === null || !roomCreateForm.hidden;
+  const roomIndex = selected
+    ? roomSnapshots.findIndex((room) => room.room_id === selected.room_id)
+    : -1;
+  roomSelect.disabled = roomSnapshots.length === 0;
+  renameRoomButton.disabled = selected === null;
+  deleteRoomButton.disabled = selected === null;
+  moveRoomLeftButton.disabled = roomIndex <= 0;
+  moveRoomRightButton.disabled = roomIndex < 0 || roomIndex >= roomSnapshots.length - 1;
+  if (!selected) {
+    roomMembers.replaceChildren();
+    roomFeed.replaceChildren();
+    return;
+  }
+  renderRoomMembers(selected);
+  renderRoomRecipientOptions(selected);
+  renderRoomFeed(roomFeedEvents.get(selected.room_id) ?? []);
+  roomSendButton.disabled = selected.member_ids.length < 2;
+}
+
+function renderRoomMembers(room: RoomSnapshot): void {
+  roomMembers.replaceChildren();
+  for (const sessionId of room.member_ids) {
+    const chip = document.createElement("span");
+    chip.className = "room-member-chip";
+    const label = document.createElement("span");
+    label.textContent = `${paneLabel(sessionId)} · ${shortSessionId(sessionId)}`;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "room-member-remove";
+    remove.textContent = "×";
+    remove.title = `Remove ${paneLabel(sessionId)} from ${room.label}`;
+    remove.addEventListener("click", () => void removeRoomMember(room.room_id, sessionId));
+    chip.append(label, remove);
+    roomMembers.append(chip);
+  }
+
+  const occupied = new Set(roomSnapshots.flatMap((candidate) => candidate.member_ids));
+  const eligible = Array.from(snapshotById.values()).filter(
+    (session) => !occupied.has(session.session_id),
+  );
+  roomAddMemberSelect.replaceChildren();
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = eligible.length === 0 ? "No eligible sessions" : "Add session…";
+  roomAddMemberSelect.append(placeholder);
+  for (const session of eligible) {
+    const option = document.createElement("option");
+    option.value = session.session_id;
+    option.textContent = `${session.label} · ${shortSessionId(session.session_id)}`;
+    roomAddMemberSelect.append(option);
+  }
+  roomAddMemberButton.disabled = eligible.length === 0;
+}
+
+function renderRoomRecipientOptions(room: RoomSnapshot): void {
+  const previous = roomRecipient.value;
+  roomRecipient.replaceChildren();
+  const all = document.createElement("option");
+  all.value = "all";
+  all.textContent = `Send to all ${room.member_ids.length} members`;
+  roomRecipient.append(all);
+  for (const sessionId of room.member_ids) {
+    const option = document.createElement("option");
+    option.value = sessionId;
+    option.textContent = `Send to ${paneLabel(sessionId)}`;
+    roomRecipient.append(option);
+  }
+  if (Array.from(roomRecipient.options).some((option) => option.value === previous)) {
+    roomRecipient.value = previous;
+  }
+}
+
+function renderRoomFeed(events: RoomFeedEvent[]): void {
+  roomFeed.replaceChildren();
+  if (events.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "room-feed-empty";
+    empty.textContent = "No room traffic yet. Posts appear here without prompting any harness.";
+    roomFeed.append(empty);
+    return;
+  }
+  if (events[0].cursor.sequence > 1) {
+    const bounded = document.createElement("p");
+    bounded.className = "room-feed-empty";
+    bounded.textContent = `Earlier room traffic is outside the bounded live window (first visible #${events[0].cursor.sequence}).`;
+    roomFeed.append(bounded);
+  }
+  for (const event of events) {
+    roomFeed.append(roomFeedEntry(event));
+  }
+  roomFeed.scrollTop = roomFeed.scrollHeight;
+}
+
+function roomFeedEntry(event: RoomFeedEvent): HTMLElement {
+  const entry = document.createElement("article");
+  entry.className = `room-feed-entry room-feed-${event.item.kind}`;
+  entry.dataset.sequence = String(event.cursor.sequence);
+  const meta = document.createElement("div");
+  meta.className = "room-feed-meta";
+  const sequence = `#${event.cursor.sequence}`;
+  if (event.item.kind === "message") {
+    const sender =
+      event.item.sender.kind === "operator"
+        ? "Operator"
+        : paneLabel(event.item.sender.session_id);
+    const recipients = event.item.recipient_ids.length === 0
+      ? "feed only"
+      : event.item.recipient_ids.map(paneLabel).join(", ");
+    meta.textContent = `${sequence} ${sender} · ${recipients} · ${event.item.message_id.slice(0, 8)}`;
+    const body = document.createElement("pre");
+    body.textContent = event.item.content;
+    entry.append(meta, body);
+  } else if (event.item.kind === "membership") {
+    meta.textContent = `${sequence} ${paneLabel(event.item.session_id)} ${event.item.action} · revision ${event.item.membership_revision}`;
+    entry.append(meta);
+  } else {
+    const partial = event.item.bytes_written > 0 ? ` · ${event.item.bytes_written} bytes` : "";
+    meta.textContent = `${sequence} ${paneLabel(event.item.recipient_id)} · ${event.item.status}${partial}`;
+    entry.append(meta);
+    if (event.item.error) {
+      const error = document.createElement("p");
+      error.className = "room-feed-error";
+      error.textContent = event.item.error;
+      entry.append(error);
+    }
+  }
+  return entry;
 }
 
 function applyCommandSessionSnapshot(snapshot: SessionSnapshot): void {
@@ -1602,6 +2050,265 @@ async function deleteSession(sessionId: string): Promise<void> {
       "session closed, but the inventory refresh failed: " + String(error),
     );
   }
+}
+
+function openRoomCreateForm(): void {
+  roomCreateForm.hidden = false;
+  roomLabelInput.value = "";
+  roomCreateError.hidden = true;
+  roomCreateError.textContent = "";
+  roomMemberChoices.replaceChildren();
+  for (const session of snapshotById.values()) {
+    const occupied = roomSnapshots.some((room) => room.member_ids.includes(session.session_id));
+    const label = document.createElement("label");
+    label.className = "room-member-choice";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.value = session.session_id;
+    checkbox.disabled = occupied;
+    const text = document.createElement("span");
+    text.textContent = `${session.label} · ${driverLabel(session.driver)} · ${shortSessionId(session.session_id)}${occupied ? " · already in a room" : ""}`;
+    label.append(checkbox, text);
+    roomMemberChoices.append(label);
+  }
+  renderRoomUi();
+  roomLabelInput.focus();
+}
+
+function closeRoomCreateForm(): void {
+  roomCreateForm.hidden = true;
+  roomCreateError.hidden = true;
+  renderRoomUi();
+}
+
+async function createRoomFromForm(): Promise<void> {
+  const memberIds = Array.from(
+    roomMemberChoices.querySelectorAll<HTMLInputElement>('input[type="checkbox"]:checked'),
+  ).map((checkbox) => checkbox.value);
+  if (memberIds.length < 2) {
+    roomCreateError.textContent = "Select at least two sessions.";
+    roomCreateError.hidden = false;
+    return;
+  }
+  const label = roomLabelInput.value.trim();
+  try {
+    const room = await command<RoomSnapshot>("create_room", {
+      request: {
+        label: label || null,
+        member_ids: memberIds,
+      } satisfies CreateRoomRequest,
+    });
+    activeRoomId = room.room_id;
+    closeRoomCreateForm();
+    await refreshSnapshot(tabState.activeId ?? undefined);
+  } catch (error) {
+    roomCreateError.textContent = `Create room failed: ${String(error)}`;
+    roomCreateError.hidden = false;
+  }
+}
+
+async function renameActiveRoom(): Promise<void> {
+  const room = activeRoom();
+  if (!room) {
+    return;
+  }
+  const label = window.prompt("Room label", room.label);
+  if (label === null || label === room.label) {
+    return;
+  }
+  try {
+    await command<RoomSnapshot>("rename_room", {
+      request: { room_id: room.room_id, label } satisfies RenameRoomRequest,
+    });
+    await refreshSnapshot(tabState.activeId ?? undefined);
+  } catch (error) {
+    setRoomStatus(`Rename failed: ${String(error)}`, "error");
+  }
+}
+
+async function moveActiveRoom(delta: -1 | 1): Promise<void> {
+  const room = activeRoom();
+  if (!room) {
+    return;
+  }
+  const index = roomSnapshots.findIndex((candidate) => candidate.room_id === room.room_id);
+  const newIndex = index + delta;
+  if (newIndex < 0 || newIndex >= roomSnapshots.length) {
+    return;
+  }
+  try {
+    const snapshot = await command<RuntimeSnapshot>("move_room", {
+      request: { room_id: room.room_id, new_index: newIndex } satisfies MoveRoomRequest,
+    });
+    applySnapshot(snapshot, tabState.activeId ?? undefined);
+  } catch (error) {
+    setRoomStatus(`Move failed: ${String(error)}`, "error");
+  }
+}
+
+async function deleteActiveRoom(): Promise<void> {
+  const room = activeRoom();
+  if (!room) {
+    return;
+  }
+  if (!window.confirm(`Delete room "${room.label}"? Its bounded in-memory feed will be discarded.`)) {
+    return;
+  }
+  try {
+    await command<void>("delete_room", {
+      request: { room_id: room.room_id } satisfies DeleteRoomRequest,
+    });
+    await refreshSnapshot(tabState.activeId ?? undefined);
+  } catch (error) {
+    setRoomStatus(`Delete failed: ${String(error)}`, "error");
+  }
+}
+
+async function addSelectedRoomMember(): Promise<void> {
+  const room = activeRoom();
+  const sessionId = roomAddMemberSelect.value;
+  if (!room || !sessionId) {
+    return;
+  }
+  try {
+    await command<RoomSnapshot>("add_room_member", {
+      request: {
+        room_id: room.room_id,
+        session_id: sessionId,
+      } satisfies AddRoomMemberRequest,
+    });
+    await refreshSnapshot(tabState.activeId ?? undefined);
+  } catch (error) {
+    setRoomStatus(`Add member failed: ${String(error)}`, "error");
+  }
+}
+
+async function removeRoomMember(roomId: string, sessionId: string): Promise<void> {
+  try {
+    await command<RoomSnapshot>("remove_room_member", {
+      request: { room_id: roomId, session_id: sessionId } satisfies RemoveRoomMemberRequest,
+    });
+    await refreshSnapshot(tabState.activeId ?? undefined);
+  } catch (error) {
+    setRoomStatus(`Remove member failed: ${String(error)}`, "error");
+  }
+}
+
+async function postActiveRoomMessage(): Promise<void> {
+  const room = activeRoom();
+  const content = roomMessage.value;
+  if (!room || !content.trim()) {
+    setRoomStatus("Enter a message before posting.", "warn");
+    return;
+  }
+  roomPostButton.disabled = true;
+  roomSendButton.disabled = true;
+  try {
+    await command("post_room_message", {
+      request: { room_id: room.room_id, content } satisfies PostRoomMessageRequest,
+    });
+    if (activeRoomId === room.room_id) {
+      if (roomMessage.value === content) {
+        roomMessage.value = "";
+      }
+      setRoomStatus("Posted to the room feed; no harness was prompted.", "info");
+    } else {
+      writeSystem("info", `Posted to room ${room.label}; no harness was prompted.`);
+    }
+  } catch (error) {
+    if (activeRoomId === room.room_id) {
+      setRoomStatus(`Post failed: ${String(error)}`, "error");
+    } else {
+      writeSystem("error", `Post to room ${room.label} failed: ${String(error)}`);
+    }
+  } finally {
+    roomPostButton.disabled = false;
+    roomSendButton.disabled = (activeRoom()?.member_ids.length ?? 0) < 2;
+  }
+}
+
+async function deliverActiveRoomMessage(): Promise<void> {
+  const room = activeRoom();
+  const content = roomMessage.value;
+  if (!room || !content.trim()) {
+    setRoomStatus("Enter a message before sending.", "warn");
+    return;
+  }
+  if (room.member_ids.length < 2) {
+    setRoomStatus("Room delivery requires at least two members.", "warn");
+    return;
+  }
+  const recipients = roomRecipient.value === "all"
+    ? ({ kind: "all" } as const)
+    : ({ kind: "one", session_id: roomRecipient.value } as const);
+  roomPostButton.disabled = true;
+  roomSendButton.disabled = true;
+  try {
+    const result = await command<RoomDeliveryResult>("deliver_room_message", {
+      request: {
+        room_id: room.room_id,
+        recipients,
+        content,
+      } satisfies DeliverRoomMessageRequest,
+    });
+    const resultMessage = result.failures.length === 0
+      ? `PTY write completed for ${result.written_count}/${result.recipient_count}; model receipt remains unconfirmed.`
+      : `${result.written_count}/${result.recipient_count} PTY writes completed; ${result.failures.length} failed. See feed details.`;
+    if (activeRoomId === room.room_id) {
+      if (roomMessage.value === content) {
+        roomMessage.value = "";
+      }
+      setRoomStatus(resultMessage, result.failures.length === 0 ? "info" : "error");
+    } else {
+      writeSystem(
+        result.failures.length === 0 ? "info" : "error",
+        `Room ${room.label}: ${resultMessage}`,
+      );
+    }
+  } catch (error) {
+    if (activeRoomId === room.room_id) {
+      setRoomStatus(`Send failed before delivery: ${String(error)}`, "error");
+    } else {
+      writeSystem(
+        "error",
+        `Send to room ${room.label} failed before delivery: ${String(error)}`,
+      );
+    }
+  } finally {
+    roomPostButton.disabled = false;
+    roomSendButton.disabled = (activeRoom()?.member_ids.length ?? 0) < 2;
+  }
+}
+
+function setRoomStatus(message: string, level: "info" | "warn" | "error"): void {
+  roomStatus.textContent = message;
+  roomStatus.dataset.level = level;
+}
+
+function wireRoomUi(): void {
+  newRoomButton.addEventListener("click", openRoomCreateForm);
+  cancelRoomCreate.addEventListener("click", closeRoomCreateForm);
+  roomCreateForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void createRoomFromForm();
+  });
+  roomSelect.addEventListener("change", () => {
+    activeRoomId = roomSelect.value || null;
+    discardInactiveRoomFeedState();
+    roomStatus.textContent = "";
+    roomStatus.dataset.level = "info";
+    renderRoomUi();
+    if (activeRoomId) {
+      void initializeRoomFeed(activeRoomId);
+    }
+  });
+  renameRoomButton.addEventListener("click", () => void renameActiveRoom());
+  moveRoomLeftButton.addEventListener("click", () => void moveActiveRoom(-1));
+  moveRoomRightButton.addEventListener("click", () => void moveActiveRoom(1));
+  deleteRoomButton.addEventListener("click", () => void deleteActiveRoom());
+  roomAddMemberButton.addEventListener("click", () => void addSelectedRoomMember());
+  roomPostButton.addEventListener("click", () => void postActiveRoomMessage());
+  roomSendButton.addEventListener("click", () => void deliverActiveRoomMessage());
 }
 
 function wireSessionUi(): void {

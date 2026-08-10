@@ -230,13 +230,13 @@ button, input, select, textarea { font: inherit; }
 }
 
 /* Hover lift */
-.terminal-card, .system-card, .session-editor, .zero-session {
+.terminal-card, .system-card, .room-card, .session-editor, .zero-session {
   transition:
     box-shadow var(--duration-smooth) var(--easing),
     border-color var(--duration-smooth) ease;
 }
 
-.terminal-card:hover, .system-card:hover, .session-editor:hover, .zero-session:hover {
+.terminal-card:hover, .system-card:hover, .room-card:hover, .session-editor:hover, .zero-session:hover {
   border-color: var(--bronze);
   box-shadow:
     inset 0 0 0 1px rgba(0, 0, 0, 0.6),
@@ -384,7 +384,7 @@ button, input, select, textarea { font: inherit; }
    CARDS — generic
    ══════════════════════════════════════ */
 
-.terminal-card, .system-card, .session-editor, .zero-session {
+.terminal-card, .system-card, .room-card, .session-editor, .zero-session {
   padding: 0.85rem 1.0rem;
   display: flex;
   flex-direction: column;
@@ -667,7 +667,7 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
   max-height: 100vh;
   padding: 0.7rem;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) minmax(250px, 0.38fr);
+  grid-template-rows: auto minmax(0, 1fr) minmax(320px, 0.42fr);
   gap: 0.7rem;
   overflow: hidden;
 }
@@ -987,11 +987,223 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
 .bottom-grid {
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(0, 1fr);
+  grid-template-columns: minmax(320px, 0.8fr) minmax(520px, 1.2fr);
   gap: 0.7rem;
 }
 
 .system-card { position: relative; }
+
+.room-card {
+  position: relative;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.room-card-head {
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.room-toolbar {
+  min-width: 0;
+  margin-left: auto;
+  display: flex;
+  align-items: stretch;
+  gap: 0.3rem;
+}
+
+.room-toolbar select {
+  min-width: 150px;
+  max-width: 240px;
+}
+
+.room-toolbar button {
+  padding-inline: 0.55rem;
+}
+
+.room-create-form,
+.room-content {
+  min-height: 0;
+  flex: 1;
+  margin-top: 0.55rem;
+}
+
+.room-create-form {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.7fr) minmax(300px, 1.3fr);
+  gap: 0.55rem;
+  overflow: auto;
+}
+
+.room-create-form > label,
+.room-create-form fieldset {
+  min-width: 0;
+}
+
+.room-create-form label > span,
+.room-create-form legend,
+.room-composer-label {
+  color: var(--copper-hot);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.room-create-form fieldset {
+  margin: 0;
+  padding: 0.45rem;
+  border: 1px solid var(--frame);
+}
+
+.room-member-choices {
+  max-height: 90px;
+  overflow: auto;
+  display: grid;
+  gap: 0.25rem;
+}
+
+.room-member-choice {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--text-secondary);
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 10px;
+}
+
+.room-member-choice input {
+  width: auto;
+}
+
+.room-form-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.4rem;
+}
+
+.room-empty {
+  flex: 1;
+  display: grid;
+  place-items: center;
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+.room-content {
+  display: grid;
+  grid-template-rows: auto minmax(74px, 1fr) auto auto auto;
+  gap: 0.4rem;
+}
+
+.room-members-row,
+.room-composer-actions {
+  min-width: 0;
+  display: flex;
+  align-items: stretch;
+  gap: 0.35rem;
+}
+
+.room-members {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  overflow-x: auto;
+}
+
+.room-member-chip {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--frame);
+  color: var(--text-secondary);
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 9px;
+}
+
+.room-member-chip > span {
+  padding: 0.3rem 0.45rem;
+}
+
+.room-member-remove {
+  min-width: 24px;
+  padding: 0.25rem;
+  border-width: 0 0 0 1px;
+  clip-path: none;
+}
+
+#room-add-member-select {
+  max-width: 160px;
+}
+
+.room-feed {
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid var(--frame-inner);
+  background: var(--bg-inset);
+  padding: 0.35rem;
+}
+
+.room-feed-entry {
+  padding: 0.35rem 0.45rem;
+  border-bottom: 1px solid var(--frame-soft);
+}
+
+.room-feed-entry:last-child {
+  border-bottom: 0;
+}
+
+.room-feed-meta,
+.room-feed-empty,
+.room-feed-error,
+.room-status {
+  margin: 0;
+  color: var(--text-secondary);
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 9px;
+  line-height: 1.35;
+}
+
+.room-feed-entry pre {
+  margin: 0.25rem 0 0;
+  color: var(--text-primary);
+  font: 11px/1.35 "JetBrains Mono", Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.room-feed-error,
+.room-status[data-level="error"] {
+  color: var(--red-bright);
+}
+
+.room-status[data-level="warn"] {
+  color: var(--copper-hot);
+}
+
+.room-composer-label {
+  align-self: end;
+}
+
+.room-card textarea {
+  min-height: 52px;
+  resize: vertical;
+}
+
+.room-composer-actions select {
+  min-width: 180px;
+  flex: 1;
+}
+
+.room-create-form[hidden],
+.room-empty[hidden],
+.room-content[hidden] {
+  display: none !important;
+}
 
 /* CTRL chip — bottom-right of the system card */
 .card-ctrl-chip {
@@ -1499,6 +1711,18 @@ textarea:focus-visible {
     min-height: 260px;
   }
 
+  .room-card {
+    min-height: 520px;
+  }
+
+  .room-create-form {
+    grid-template-columns: 1fr;
+  }
+
+  .room-form-actions {
+    grid-column: 1;
+  }
+
   :root { --corner: 44px; }
 }
 
@@ -1549,6 +1773,7 @@ textarea:focus-visible {
 
   .terminal-card,
   .system-card,
+  .room-card,
   .session-editor,
   .zero-session {
     padding: 0.75rem 0.85rem;
@@ -1583,5 +1808,19 @@ textarea:focus-visible {
   .terminal-head,
   .terminal-actions {
     gap: 0.35rem;
+  }
+
+  .room-toolbar,
+  .room-members-row,
+  .room-composer-actions {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .room-toolbar select,
+  .room-composer-actions select,
+  #room-add-member-select {
+    max-width: none;
+    flex: 1 1 180px;
   }
 }

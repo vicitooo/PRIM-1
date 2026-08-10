@@ -101,21 +101,21 @@ V1 is a **local desktop app/runtime**, not:
 V1 should feel like:
 
 - one local app
-- multiple live terminal panes
-- one shared room
+- an ordered set of explicit terminal sessions
+- one active terminal surface with retained inactive buffers
+- zero or more explicit rooms, with at most one active room membership per session
 - one supervisor in charge
 
 ## 5. V1 scope lock
 
 V1 includes:
 
-- one supervised Claude instance
-- one supervised Codex instance
-- the operator in the room
-- direct messages
-- room broadcast
+- repeated supervised Claude, Codex, Grok, Prime, or Generic Terminal sessions
+- stable `SessionId` / `RunId` / `RoomId` authority
+- feed-only room posts
+- explicit one-member or Send All room delivery
 - supervisor-controlled restart/close
-- audit log
+- metadata-only audit log
 - basic health/liveness
 
 V1 excludes:
@@ -131,13 +131,14 @@ V1 excludes:
 
 The first real use case is:
 
-- **live three-way coding**
+- **Victor's local multi-harness daily-driver environment**
 
 That means:
 
-- the operator talks to Claude and Codex in the same app
-- Claude and Codex can message each other through the supervisor
-- all communication is visible in real time
+- the operator works in one or more faithful native harness terminals
+- selected sessions join explicit rooms without exposing private terminal history
+- feed posts and recipient delivery are distinct visible actions
+- all room traffic and delivery state is visible in real time
 
 This is the first product shape to optimize for.
 
@@ -145,7 +146,7 @@ This is the first product shape to optimize for.
 
 Mandatory in early implementation:
 
-- per-agent working-directory whitelist
+- backend-qualified, identity-revalidated working-directory selection
 - per-agent capability whitelist
 - IPC access control
 - supervisor-only lifecycle authority
@@ -156,25 +157,21 @@ Deferred:
 - remote auth
 - multi-user permissions
 
-## 8. Migration decision
+## 8. External collaboration boundary
 
-The existing bridge is not replaced on day one.
-
-Plan:
-
-- keep the existing bridge operational
-- build `PRIM-1` in parallel
-- only decide migration/cutover after the room MVP works
+Agent Bus remains an independent advisory/collaboration tool. It is not embedded
+as PRIM-1 transport and cannot substitute for native room, PTY, or receiver
+evidence. PRIM-1 sessions use only the supervisor-owned runtime paths.
 
 ## 9. Open decisions that remain
 
-These are still open and must be closed in Phase 0:
+These remain later product decisions rather than implementation defaults:
 
-1. exact Rust PTY/ConPTY library choice
-2. exact Rust-side named pipe / Unix socket library choice
-3. exact Claude resume semantics under supervisor restart
-4. cost budget ceiling
-5. whether current interactive Claude Code has any usable external event-stream hook
+1. supported logical resume semantics across desktop restart
+2. cost budget ceiling and surfaced telemetry
+3. user-extensible driver packaging and trust model
+4. richer simultaneous-pane layouts
+5. native Linux/macOS product support
 
 ## 10. Decision guardrail
 
@@ -184,4 +181,3 @@ A decision should only be changed if:
 
 - Phase 0 proves it unworkable, or
 - the replacement clearly reduces total project risk and rewrite cost
-

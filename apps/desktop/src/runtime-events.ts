@@ -58,7 +58,22 @@ export interface RuntimeEventContext {
   writeToPane: (sessionId: string, chunk: string) => boolean;
   applyPaneSnapshot: (sessionId: string, snapshot: SessionSnapshot) => void;
   setControlEndpoint: (endpoint: string) => void;
+  handleRoomEvent?: (event: RoomRuntimeEvent) => void;
 }
+
+export type RoomRuntimeEvent = Extract<
+  RuntimeEvent,
+  {
+    event:
+      | "room_created"
+      | "room_renamed"
+      | "room_moved"
+      | "room_member_added"
+      | "room_member_removed"
+      | "room_deleted"
+      | "room_feed_event";
+  }
+>;
 
 export type RunDerivedRuntimeEvent = Extract<
   RuntimeEvent,
@@ -717,6 +732,19 @@ export function handleRuntimeEvent(
         `session deleted: ${event.label} (${event.session_id.slice(0, 8)})`,
       );
       ctx.refreshSnapshotFromEvent();
+      break;
+    case "room_created":
+    case "room_renamed":
+    case "room_moved":
+    case "room_member_added":
+    case "room_member_removed":
+    case "room_deleted":
+    case "room_feed_event":
+      if (ctx.handleRoomEvent) {
+        ctx.handleRoomEvent(event);
+      } else {
+        ctx.writeSystem("warn", `room event ignored before room UI attachment: ${event.event}`);
+      }
       break;
     case "system_log":
       ctx.writeSystem(event.level, event.message);

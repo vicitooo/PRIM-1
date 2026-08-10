@@ -1,6 +1,6 @@
 param(
   [Parameter(Mandatory = $true)]
-  [ValidateSet("ping", "wait_quiet", "input", "key")]
+  [ValidateSet("ping", "wait_quiet", "input", "key", "room_read", "room_post")]
   [string]$Action,
 
   [string]$Session,
@@ -10,6 +10,8 @@ param(
   [string]$ContentFile,
   [int]$QuietSec,
   [int]$TimeoutSec,
+  [string]$CursorEpoch,
+  [Nullable[UInt64]]$CursorSequence,
   [string]$Endpoint,
   [string]$OutRequestIdFile,
   [switch]$PassThruJson,
@@ -221,10 +223,21 @@ function Write-AtomicText {
   Move-Item -LiteralPath $tmpPath -Destination $Path -Force
 }
 
-if ($Action -eq "input") {
+if ($Action -in @("input", "room_post")) {
   $Content = Resolve-InputContent -InlineContent $Content -ContentFilePath $ContentFile
 } elseif ($ContentFile) {
-  throw "-ContentFile is only supported for -Action input"
+  throw "-ContentFile is only supported for -Action input or room_post"
+}
+
+if ($Action -in @("room_read", "room_post")) {
+  if ($Session) { throw "$Action derives room membership from the calling pane; -Session is not accepted" }
+  if ($Key) { throw "$Action does not accept -Key" }
+}
+if ($Action -eq "room_read" -and -not [string]::IsNullOrEmpty($Content)) {
+  throw "room_read does not accept -Content"
+}
+if ($Action -ne "room_read" -and ($CursorEpoch -or $null -ne $CursorSequence)) {
+  throw "cursor parameters are supported only for -Action room_read"
 }
 
 $resolvedEndpoint = Resolve-Prim1ControlPlaneEndpoint -Endpoint $Endpoint
@@ -274,6 +287,30 @@ $payload = switch ($Action) {
       key = $Key
     }
   }
+  "room_read" {
+    if ([string]::IsNullOrEmpty($CursorEpoch) -xor ($null -eq $CursorSequence)) {
+      throw "room_read requires -CursorEpoch and -CursorSequence together"
+    }
+    $request = [ordered]@{ kind = "room_read" }
+    if (-not [string]::IsNullOrEmpty($CursorEpoch)) {
+      [guid]$parsedCursorEpoch = [guid]::Empty
+      if (-not [guid]::TryParse($CursorEpoch, [ref]$parsedCursorEpoch)) {
+        throw "room_read requires -CursorEpoch to be a UUID"
+      }
+      $request.cursor = [ordered]@{
+        epoch = $parsedCursorEpoch.ToString()
+        sequence = [uint64]$CursorSequence
+      }
+    }
+    $request
+  }
+  "room_post" {
+    if ([string]::IsNullOrEmpty($Content)) { throw "room_post requires -Content or -ContentFile" }
+    [ordered]@{
+      kind = "room_post"
+      content = $Content
+    }
+  }
 }
 
 $json = $payload | ConvertTo-Json -Depth 4 -Compress
@@ -320,7 +357,7 @@ if ($OutRequestIdFile -and $parsed.request_id) {
 if ($Quiet) {
   $jsonOutput = $null
   if ($PassThruJson) {
-    $jsonOutput = $parsed | ConvertTo-Json -Depth 6 -Compress
+    $jsonOutput = $parsed | ConvertTo-Json -Depth 10 -Compress
   }
 
   if ($parsed.timed_out) {
@@ -343,12 +380,12 @@ if ($Quiet) {
 if ($parsed.timed_out) {
   Write-Host ("TIMED OUT: " + $parsed.message)
   if ($PassThruJson) {
-    $parsed | ConvertTo-Json -Depth 6 -Compress
+    $parsed | ConvertTo-Json -Depth 10 -Compress
   }
   exit 124
 }
 
-$parsed | ConvertTo-Json -Depth 6
+$parsed | ConvertTo-Json -Depth 10
 
 if (-not $parsed.ok) {
   exit 1

@@ -110,6 +110,38 @@ function makeContext(runEventsInitialized = true): RuntimeEventContext & {
 }
 
 describe("runtime-events exhaustiveness default arm", () => {
+  it("forwards room feed events to the dedicated ID-scoped room gate", () => {
+    const ctx = makeContext();
+    const handleRoomEvent = vi.fn();
+    ctx.handleRoomEvent = handleRoomEvent;
+    const event: RuntimeEvent = {
+      event: "room_feed_event",
+      feed_event: {
+        schema_version: 1,
+        room_id: "33333333-3333-3333-3333-333333333333",
+        cursor: {
+          epoch: "44444444-4444-4444-4444-444444444444",
+          sequence: 1,
+        },
+        item: {
+          kind: "message",
+          message_id: "55555555-5555-5555-5555-555555555555",
+          sender: { kind: "operator" },
+          content: "room content",
+          recipient_ids: [],
+          membership_revision: 1,
+        },
+        timestamp: "2026-08-11T00:00:00Z",
+      },
+    };
+
+    handleRuntimeEvent(event, ctx);
+
+    expect(handleRoomEvent).toHaveBeenCalledOnce();
+    expect(handleRoomEvent).toHaveBeenCalledWith(event);
+    expect(ctx.writeSystem).not.toHaveBeenCalled();
+  });
+
   it("every supervisor telemetry variant is handled explicitly", () => {
     const timestamp = "2026-04-22T12:00:00Z";
     const events: RuntimeEvent[] = [

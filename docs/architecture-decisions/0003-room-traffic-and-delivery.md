@@ -45,14 +45,20 @@ This gives the operator visibility but cannot support harness-to-harness collabo
 - Once writes begin, recipient results are independently visible. A later OS or harness failure may leave an honest partial success because a delivered prompt cannot be rolled back. PRIM-1 never automatically retries a logical message.
 - Deliveries to one run are FIFO and atomic with respect to operator input and other logical submissions. No global ordering across independent runs is claimed.
 - Pending, written, accepted, and failed are distinct where the harness can prove them. A pre-delivery UI/event emission is never labeled delivered.
-- Kernel-derived pane authority can post/read only its authorized rooms and deliver only to eligible members. Operator authority may explicitly deliver across rooms; session-to-session cross-room delivery requires a separate explicit grant and is never implied by membership. Unknown sender, unknown target, stale run, and unauthorized cross-room requests fail closed.
+- Kernel-derived pane authority can post/read only its authorized room. The first
+  sideband slice exposes no recipient delivery at all; any later pane delivery
+  must target eligible members through a separate explicit grant. Operator
+  authority may explicitly deliver to current room members. Unknown sender,
+  unknown target, stale run, and unauthorized cross-room requests fail closed.
 - Two rooms with identical labels remain isolated by `RoomId`.
 - Feed retention is separate from active visibility. The accepted first slice uses a bounded, authorized in-memory feed with explicit cursor-gap behavior. With retention off, the durable audit stores metadata/status but no message content or content-derived hash; existing historical audit files remain readable legacy evidence and are not rewritten.
 
 ## Consequences
 
 - Current automatic/defensive room broadcast and semantic chunking are characterized with negative controls, then deleted.
-- Harnesses opt into collaboration through explicit read/post/deliver operations instead of having ordinary assistant output scraped and relayed.
+- Harnesses opt into collaboration through explicit sideband read/post instead
+  of having ordinary assistant output scraped and relayed; recipient delivery
+  is an explicit operator action in the first slice.
 - The operator can see exactly which content was merely posted, which recipients were addressed, and what each delivery proved.
 - Multi-member rooms do not force every message through every model.
 

@@ -53,7 +53,7 @@ $actionValidateSet = @(
     Where-Object { $_ -is [System.Management.Automation.ValidateSetAttribute] } |
     Select-Object -First 1
 )
-Assert-Equal ($actionValidateSet[0].ValidValues -join ",") "ping,wait_quiet,input,key" "The script action surface must stay closed to the four pane-local actions."
+Assert-Equal ($actionValidateSet[0].ValidValues -join ",") "ping,wait_quiet,input,key,room_read,room_post" "The script action surface must stay closed to the six pane-local actions."
 Assert-True (-not $controlPlaneCommand.Parameters.ContainsKey("InfoFile")) "Legacy InfoFile discovery must not remain callable."
 Assert-True (-not $controlPlaneCommand.Parameters.ContainsKey("RequireIdle")) "Legacy idle compatibility must not remain callable."
 

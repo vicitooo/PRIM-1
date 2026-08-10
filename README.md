@@ -15,9 +15,10 @@ A local multi-agent runtime for terminal-first AI tools. PRIM-1 hosts CLI agents
 - **Qualified working directories** — Windows sessions use native folder pickers whose selections are qualified before persistence and revalidated before spawn. Prime uses an explicit Ubuntu path; the backend qualifies its canonical path and device/inode identity, and the create form prefills the qualified Ubuntu home.
 - **Explicit permission posture** — Claude Code, Codex, and Grok default to their normal approval/sandbox modes. Their measured bypass modes are available only through a visibly selected `Unsafe` profile; Generic Terminal and Prime support `Normal` only.
 - **Direct launch** — drivers launch qualified executables without `cmd.exe`, `.cmd` shims, renderer arguments, or source-checkout access. Labels and metacharacters are never interpreted as shell syntax.
-- **Structured routing core** — the in-process supervisor retains one-recipient `SessionId` routing with exact-run framing checks, but the Gate-4 tab UI intentionally exposes no message composer or pseudo-room. Visible room messaging waits for explicit `RoomId` membership. PTY-write receipts do not prove final-child byte fidelity, model receipt, or task completion.
-- **Pane-local sideband** — an authorized supervised pane gets a narrow named-pipe surface for `ping`, `wait_quiet`, raw `input`, and PTY `key` actions. Operator lifecycle, routing, rooms, and inventory remain in the desktop UI.
-- **Append-only metadata audit** at `<runtime-dir>/audit/YYYY-MM-DD.jsonl` for lifecycle, authorization, dispatch, delivery, and session-definition receipts. Terminal output is not persisted; routed-message content is stored as `[content omitted]`.
+- **Explicit rooms** — a separate atomic catalog stores ordered `RoomId` definitions, labels, membership, and membership revisions. Room content stays in a bounded 512-event / 16 MiB in-memory feed with explicit cursor gaps; it is never restored after process restart.
+- **Deliberate room traffic** — **Post** appends to the shared feed without prompting a harness. **Send** targets one member or explicitly all members through the existing exact-run framing path, with whole-recipient preflight and truthful per-recipient pending/written/failed receipts. Prime remains raw-terminal-only.
+- **Pane-local sideband** — an authorized supervised pane gets a narrow named-pipe surface for `ping`, `wait_quiet`, raw `input`, PTY `key`, and membership-derived room `read` / `post`. The pane cannot supply a `RoomId`, sender, peer target, lifecycle action, or recipient delivery.
+- **Append-only metadata audit** at `<runtime-dir>/audit/YYYY-MM-DD.jsonl` for lifecycle, authorization, dispatch, delivery, session-definition, and room receipts. Terminal output is not persisted; routed and room-message content is stored as `[content omitted]`.
 
 ## Prerequisites
 
@@ -65,6 +66,10 @@ the narrow PowerShell helper can address that pane through its injected endpoint
 # Write raw input, then submit it
 ./scripts/control-plane.ps1 -Action input -Session $env:PRIM1_PANE_IDENTITY -Content 'status'
 ./scripts/control-plane.ps1 -Action key -Session $env:PRIM1_PANE_IDENTITY -Key enter
+
+# Read or post the calling pane's current room (RoomId and sender are derived)
+./scripts/control-plane.ps1 -Action room_read -Quiet -PassThruJson
+./scripts/control-plane.ps1 -Action room_post -Content 'Status from this pane'
 ```
 
 Full operator surface is documented in [CONTROL-SURFACE.md](CONTROL-SURFACE.md).
@@ -123,6 +128,11 @@ only ordered session intent and the workspace preference—not process IDs,
 content. A corrupt or unknown catalog version fails startup visibly and is never
 silently replaced with defaults.
 
+The private room catalog is `<runtime-dir>/room-catalog-v1.json`. It stores only
+ordered `RoomId`, label, member `SessionId` values, and membership revision.
+Feed messages, delivery errors, and cursors are process-memory state only. A
+corrupt or unknown room catalog also fails startup without rewrite.
+
 Product scripts never discover control authority through the runtime directory. The
 control helper requires `PRIM1_CONTROL_PLANE_ENDPOINT`; an explicit `-Endpoint`
 override exists only for isolated named-pipe tests. Direct audit readers continue
@@ -136,7 +146,7 @@ to use the runtime-directory resolver, including roots containing spaces.
 4. Explicit API/script calls are the primary command channel. stdout parsing is secondary.
 5. Idle and stuck are different states and must be handled differently.
 6. The runtime is generic across terminal-first CLIs, not hardcoded to Claude/Codex.
-7. The next messaging milestone is explicit `RoomId` membership; autonomous orchestration layers on top.
+7. Room membership is explicit and `RoomId`-keyed. Feed posts never imply PTY delivery; one-member and Send All delivery are separate visible actions. Autonomous orchestration remains a later layer.
 
 ## Documentation
 

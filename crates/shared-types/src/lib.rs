@@ -9,7 +9,12 @@ pub fn now_rfc3339() -> String {
 pub type SessionGeneration = u64;
 pub type SessionId = Uuid;
 pub type RunId = Uuid;
+pub type RoomId = Uuid;
+pub type MessageId = Uuid;
+pub type RoomRevision = u64;
+pub type RoomSequence = u64;
 pub const SESSION_EVENT_SCHEMA_VERSION: u32 = 1;
+pub const ROOM_EVENT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct RunEventIdentity {
@@ -175,6 +180,109 @@ pub struct SessionSnapshot {
     pub last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct RoomFeedCursor {
+    pub epoch: Uuid,
+    pub sequence: RoomSequence,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RoomSnapshot {
+    pub room_id: RoomId,
+    pub label: String,
+    pub member_ids: Vec<SessionId>,
+    pub membership_revision: RoomRevision,
+    pub feed_epoch: Uuid,
+    pub feed_oldest_sequence: RoomSequence,
+    pub feed_next_sequence: RoomSequence,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomMembershipAction {
+    Joined,
+    Removed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomDeliveryStatus {
+    Pending,
+    Written,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RoomMessageSender {
+    Operator {},
+    Session { session_id: SessionId },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RoomFeedItem {
+    Message {
+        message_id: MessageId,
+        sender: RoomMessageSender,
+        content: String,
+        recipient_ids: Vec<SessionId>,
+        membership_revision: RoomRevision,
+    },
+    Membership {
+        action: RoomMembershipAction,
+        session_id: SessionId,
+        membership_revision: RoomRevision,
+    },
+    Delivery {
+        message_id: MessageId,
+        recipient_id: SessionId,
+        status: RoomDeliveryStatus,
+        bytes_written: usize,
+        error: Option<String>,
+        run_id: Option<RunId>,
+        generation: Option<SessionGeneration>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RoomFeedEvent {
+    pub schema_version: u32,
+    pub room_id: RoomId,
+    pub cursor: RoomFeedCursor,
+    pub item: RoomFeedItem,
+    pub timestamp: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomFeedGapReason {
+    Evicted,
+    EpochReset,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RoomFeedGap {
+    pub reason: RoomFeedGapReason,
+    pub from_sequence: Option<RoomSequence>,
+    pub through_sequence: Option<RoomSequence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RoomFeedPage {
+    pub schema_version: u32,
+    pub room_id: RoomId,
+    pub cursor: RoomFeedCursor,
+    pub gap: Option<RoomFeedGap>,
+    pub events: Vec<RoomFeedEvent>,
+    pub has_more: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ControlPlaneStatus {
@@ -200,6 +308,8 @@ impl From<&ControlPlaneStatus> for ControlPlaneSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeSnapshot {
     pub sessions: Vec<SessionSnapshot>,
+    #[serde(default)]
+    pub rooms: Vec<RoomSnapshot>,
     pub workspace_preference: String,
     pub control_plane: Option<ControlPlaneSnapshot>,
     pub runtime_dir: String,
@@ -212,6 +322,105 @@ pub struct RuntimeSnapshot {
 pub struct OperatorRouteMessageRequest {
     pub recipient_id: SessionId,
     pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CreateRoomRequest {
+    #[serde(default)]
+    pub label: Option<String>,
+    pub member_ids: Vec<SessionId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RenameRoomRequest {
+    pub room_id: RoomId,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MoveRoomRequest {
+    pub room_id: RoomId,
+    pub new_index: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteRoomRequest {
+    pub room_id: RoomId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AddRoomMemberRequest {
+    pub room_id: RoomId,
+    pub session_id: SessionId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RemoveRoomMemberRequest {
+    pub room_id: RoomId,
+    pub session_id: SessionId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PostRoomMessageRequest {
+    pub room_id: RoomId,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RoomRecipientSelection {
+    One { session_id: SessionId },
+    All {},
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeliverRoomMessageRequest {
+    pub room_id: RoomId,
+    pub recipients: RoomRecipientSelection,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReadRoomFeedRequest {
+    pub room_id: RoomId,
+    #[serde(default)]
+    pub cursor: Option<RoomFeedCursor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RoomPostResult {
+    pub room_id: RoomId,
+    pub message_id: MessageId,
+    pub cursor: RoomFeedCursor,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RoomDeliveryFailure {
+    pub recipient_id: SessionId,
+    pub bytes_written: usize,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RoomDeliveryResult {
+    pub room_id: RoomId,
+    pub message_id: MessageId,
+    pub cursor: RoomFeedCursor,
+    pub recipient_count: usize,
+    pub written_count: usize,
+    pub failures: Vec<RoomDeliveryFailure>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -428,6 +637,48 @@ pub enum RuntimeEvent {
         label: String,
         timestamp: String,
     },
+    RoomCreated {
+        schema_version: u32,
+        room: RoomSnapshot,
+        timestamp: String,
+    },
+    RoomRenamed {
+        schema_version: u32,
+        room_id: RoomId,
+        old_label: String,
+        new_label: String,
+        timestamp: String,
+    },
+    RoomMoved {
+        schema_version: u32,
+        room_id: RoomId,
+        old_index: usize,
+        new_index: usize,
+        timestamp: String,
+    },
+    RoomMemberAdded {
+        schema_version: u32,
+        room_id: RoomId,
+        session_id: SessionId,
+        membership_revision: RoomRevision,
+        timestamp: String,
+    },
+    RoomMemberRemoved {
+        schema_version: u32,
+        room_id: RoomId,
+        session_id: SessionId,
+        membership_revision: RoomRevision,
+        timestamp: String,
+    },
+    RoomDeleted {
+        schema_version: u32,
+        room_id: RoomId,
+        label: String,
+        timestamp: String,
+    },
+    RoomFeedEvent {
+        feed_event: RoomFeedEvent,
+    },
     RoutedMessage {
         id: Uuid,
         from: String,
@@ -501,6 +752,13 @@ pub enum SidebandRequest {
         name: String,
         key: ControlKey,
     },
+    RoomRead {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<RoomFeedCursor>,
+    },
+    RoomPost {
+        content: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -508,6 +766,8 @@ pub enum SidebandRequest {
 pub enum SidebandResponsePayload {
     WaitQuiet { quiet_duration_ms: u64 },
     WaitQuietTimeout { last_output_age_ms: u64 },
+    RoomFeed { page: RoomFeedPage },
+    RoomPost { result: RoomPostResult },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -730,6 +990,19 @@ mod tests {
                     "key": "enter",
                 }),
             ),
+            (
+                SidebandRequest::RoomRead { cursor: None },
+                json!({ "kind": "room_read" }),
+            ),
+            (
+                SidebandRequest::RoomPost {
+                    content: "future only".into(),
+                },
+                json!({
+                    "kind": "room_post",
+                    "content": "future only",
+                }),
+            ),
         ];
 
         for (request, expected) in cases {
@@ -795,6 +1068,90 @@ mod tests {
                 "legacy variant {kind} unexpectedly decoded"
             );
         }
+    }
+
+    #[test]
+    fn pane_room_sideband_rejects_room_and_sender_authority_fields() {
+        let room_id = RoomId::new_v4();
+        let session_id = SessionId::new_v4();
+        for request in [
+            json!({
+                "kind": "room_read",
+                "room_id": room_id,
+            }),
+            json!({
+                "kind": "room_post",
+                "room_id": room_id,
+                "content": "hello",
+            }),
+            json!({
+                "kind": "room_post",
+                "sender": { "kind": "session", "session_id": session_id },
+                "content": "hello",
+            }),
+        ] {
+            assert!(serde_json::from_value::<SidebandRequest>(request).is_err());
+        }
+    }
+
+    #[test]
+    fn room_requests_and_events_are_strict_id_bearing_shapes() {
+        let room_id = RoomId::new_v4();
+        let session_id = SessionId::new_v4();
+        let create: CreateRoomRequest = serde_json::from_value(json!({
+            "label": "Research",
+            "member_ids": [session_id, SessionId::new_v4()],
+        }))
+        .unwrap();
+        assert_eq!(create.label.as_deref(), Some("Research"));
+        assert!(
+            serde_json::from_value::<CreateRoomRequest>(json!({
+                "label": "Research",
+                "member_ids": [session_id, SessionId::new_v4()],
+                "member_names": ["claude", "codex"]
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<DeliverRoomMessageRequest>(json!({
+                "room_id": room_id,
+                "recipients": { "kind": "all" },
+                "content": "hello",
+                "sender": "operator"
+            }))
+            .is_err()
+        );
+
+        let feed_event = RoomFeedEvent {
+            schema_version: ROOM_EVENT_SCHEMA_VERSION,
+            room_id,
+            cursor: RoomFeedCursor {
+                epoch: Uuid::new_v4(),
+                sequence: 4,
+            },
+            item: RoomFeedItem::Message {
+                message_id: MessageId::new_v4(),
+                sender: RoomMessageSender::Operator {},
+                content: "hello".into(),
+                recipient_ids: vec![session_id],
+                membership_revision: 2,
+            },
+            timestamp: "2026-08-11T00:00:00Z".into(),
+        };
+        let event = RuntimeEvent::RoomFeedEvent {
+            feed_event: feed_event.clone(),
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["event"], "room_feed_event");
+        assert_eq!(
+            value["feed_event"]["schema_version"],
+            ROOM_EVENT_SCHEMA_VERSION
+        );
+        assert_eq!(value["feed_event"]["room_id"], json!(room_id));
+        assert_eq!(
+            serde_json::from_value::<RuntimeEvent>(value).unwrap(),
+            event
+        );
     }
 
     #[test]

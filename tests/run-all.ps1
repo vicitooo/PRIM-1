@@ -14,6 +14,7 @@
     5. tests/control-plane-server-identity.ps1 (named-pipe server authenticity)
     6. tests/control-plane-wait.ps1        (PowerShell wait harness)
     7. tests/control-plane-timeouts.ps1   (PowerShell timeout harness)
+    8. tests/control-plane-room.ps1       (kernel-derived room request shapes)
 
   Uses direct invocation with fail-closed $LASTEXITCODE capture. Output is only
   shown on failure unless -Verbose is set.
@@ -115,6 +116,10 @@ $results += Invoke-Suite -Name "control-plane wait" -Block {
 
 $results += Invoke-Suite -Name "control-plane timeouts" -Block {
   & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scriptRoot "control-plane-timeouts.ps1")
+}
+
+$results += Invoke-Suite -Name "control-plane room" -Block {
+  & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scriptRoot "control-plane-room.ps1")
 }
 
 $totalMs = [int](((Get-Date) - $start).TotalMilliseconds)

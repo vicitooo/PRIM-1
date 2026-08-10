@@ -55,6 +55,72 @@ export interface SessionSnapshot {
   last_error: string | null;
 }
 
+export interface RoomFeedCursor {
+  epoch: string;
+  sequence: number;
+}
+
+export interface RoomSnapshot {
+  room_id: string;
+  label: string;
+  member_ids: string[];
+  membership_revision: number;
+  feed_epoch: string;
+  feed_oldest_sequence: number;
+  feed_next_sequence: number;
+}
+
+export type RoomMessageSender =
+  | { kind: "operator" }
+  | { kind: "session"; session_id: string };
+
+export type RoomFeedItem =
+  | {
+      kind: "message";
+      message_id: string;
+      sender: RoomMessageSender;
+      content: string;
+      recipient_ids: string[];
+      membership_revision: number;
+    }
+  | {
+      kind: "membership";
+      action: "joined" | "removed";
+      session_id: string;
+      membership_revision: number;
+    }
+  | {
+      kind: "delivery";
+      message_id: string;
+      recipient_id: string;
+      status: "pending" | "written" | "failed";
+      bytes_written: number;
+      error: string | null;
+      run_id: string | null;
+      generation: number | null;
+    };
+
+export interface RoomFeedEvent {
+  schema_version: number;
+  room_id: string;
+  cursor: RoomFeedCursor;
+  item: RoomFeedItem;
+  timestamp: string;
+}
+
+export interface RoomFeedPage {
+  schema_version: number;
+  room_id: string;
+  cursor: RoomFeedCursor;
+  gap: {
+    reason: "evicted" | "epoch_reset";
+    from_sequence: number | null;
+    through_sequence: number | null;
+  } | null;
+  events: RoomFeedEvent[];
+  has_more: boolean;
+}
+
 export interface ControlPlaneSnapshot {
   transport: string;
   endpoint: string;
@@ -62,6 +128,7 @@ export interface ControlPlaneSnapshot {
 
 export interface RuntimeSnapshot {
   sessions: SessionSnapshot[];
+  rooms: RoomSnapshot[];
   workspace_preference: string;
   control_plane: ControlPlaneSnapshot | null;
   runtime_dir: string;
@@ -122,6 +189,76 @@ export interface MoveSessionRequest {
 
 export interface DeleteSessionRequest {
   session_id: string;
+}
+
+export interface CreateRoomRequest {
+  label?: string | null;
+  member_ids: string[];
+}
+
+export interface RenameRoomRequest {
+  room_id: string;
+  label: string;
+}
+
+export interface MoveRoomRequest {
+  room_id: string;
+  new_index: number;
+}
+
+export interface DeleteRoomRequest {
+  room_id: string;
+}
+
+export interface AddRoomMemberRequest {
+  room_id: string;
+  session_id: string;
+}
+
+export interface RemoveRoomMemberRequest {
+  room_id: string;
+  session_id: string;
+}
+
+export interface ReadRoomFeedRequest {
+  room_id: string;
+  cursor?: RoomFeedCursor | null;
+}
+
+export interface PostRoomMessageRequest {
+  room_id: string;
+  content: string;
+}
+
+export type RoomRecipientSelection =
+  | { kind: "one"; session_id: string }
+  | { kind: "all" };
+
+export interface DeliverRoomMessageRequest {
+  room_id: string;
+  recipients: RoomRecipientSelection;
+  content: string;
+}
+
+export interface RoomPostResult {
+  room_id: string;
+  message_id: string;
+  cursor: RoomFeedCursor;
+}
+
+export interface RoomDeliveryFailure {
+  recipient_id: string;
+  bytes_written: number;
+  error: string;
+}
+
+export interface RoomDeliveryResult {
+  room_id: string;
+  message_id: string;
+  cursor: RoomFeedCursor;
+  recipient_count: number;
+  written_count: number;
+  failures: RoomDeliveryFailure[];
 }
 
 export interface SendInputRequest {
@@ -230,6 +367,55 @@ export type RuntimeEvent =
       session_id: string;
       label: string;
       timestamp: string;
+    }
+  | {
+      event: "room_created";
+      schema_version: number;
+      room: RoomSnapshot;
+      timestamp: string;
+    }
+  | {
+      event: "room_renamed";
+      schema_version: number;
+      room_id: string;
+      old_label: string;
+      new_label: string;
+      timestamp: string;
+    }
+  | {
+      event: "room_moved";
+      schema_version: number;
+      room_id: string;
+      old_index: number;
+      new_index: number;
+      timestamp: string;
+    }
+  | {
+      event: "room_member_added";
+      schema_version: number;
+      room_id: string;
+      session_id: string;
+      membership_revision: number;
+      timestamp: string;
+    }
+  | {
+      event: "room_member_removed";
+      schema_version: number;
+      room_id: string;
+      session_id: string;
+      membership_revision: number;
+      timestamp: string;
+    }
+  | {
+      event: "room_deleted";
+      schema_version: number;
+      room_id: string;
+      label: string;
+      timestamp: string;
+    }
+  | {
+      event: "room_feed_event";
+      feed_event: RoomFeedEvent;
     }
   | {
       event: "routed_message";
