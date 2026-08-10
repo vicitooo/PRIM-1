@@ -146,7 +146,9 @@ Work-state events:
 - allowed work states: `idle`, `thinking`, `tool_call`, `blocked`, `error_loop`
 - each event carries a nested `RunEventIdentity` (`SessionId`, `RunId`, generation, monotonic sequence), the current session label, state, optional detail, optional previous state, and timestamp
 - events are transition-based; repeated output in the same work state updates supervisor memory but does not emit another audit event
-- output quiescence can transition a session back to `idle`
+- output quiescence can transition a session back to `idle`; driver-specific
+  silence windows must exceed measured periodic repaint cadence (Grok Build
+  1.0.0 uses five seconds for its observed roughly 2.1-second repaint loop)
 - repeated blocked observations with the same detail can escalate to `error_loop`
 - process exit is never inferred from terminal text; PTY closure/error, OS process state, and job membership own process lifecycle truth
 - `closed` means the exact per-run owned process job was proved empty; PTY EOF,

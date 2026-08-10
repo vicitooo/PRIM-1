@@ -7142,7 +7142,10 @@ fn quiesce_threshold(driver: DriverKind) -> Option<Duration> {
     let threshold = match driver {
         DriverKind::Claude => Duration::from_secs(3),
         DriverKind::Codex => Duration::from_secs(2),
-        DriverKind::Grok => Duration::from_secs(2),
+        // Grok Build 1.0.0 repaints its full-screen TUI about every 2.1s while
+        // idle. Keep the silence window above that measured cadence so a
+        // repaint cannot churn lifecycle Idle -> Ready metadata.
+        DriverKind::Grok => Duration::from_secs(5),
         DriverKind::GenericTerminal => Duration::from_secs(5),
     };
 
@@ -10070,6 +10073,57 @@ mod tests {
             assert!(
                 Instant::now() < deadline,
                 "idle event was not emitted in time"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn grok_idle_repaint_cadence_cannot_cross_the_quiesce_threshold() {
+        assert_eq!(
+            quiesce_threshold(DriverKind::Grok),
+            Some(Duration::from_secs(5))
+        );
+        let supervisor = test_supervisor();
+        install_synthetic_running_session(&supervisor, "codex", DriverKind::Grok);
+        let grok_alias = test_session_alias(&supervisor, "codex");
+        let events = Arc::new(Mutex::new(Vec::<RuntimeEvent>::new()));
+        let captured = events.clone();
+        supervisor.set_event_sink(move |event| {
+            captured.lock().push(event);
+        });
+
+        handle_current_pty_event(
+            &supervisor,
+            "codex",
+            0,
+            PtyEvent::Output("measured full-screen repaint".into()),
+        );
+        thread::sleep(Duration::from_millis(2_400));
+
+        assert!(
+            !events.lock().iter().any(|event| matches!(
+                event,
+                RuntimeEvent::SessionState { session, state, .. }
+                    if session == &grok_alias && *state == LifecycleState::Idle
+            )),
+            "Grok's measured ~2.1s repaint cadence must not produce Idle/Ready churn"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            if events.lock().iter().any(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::SessionState { session, state, .. }
+                        if session == &grok_alias && *state == LifecycleState::Idle
+                )
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Grok did not become Idle after the measured five-second silence window"
             );
             thread::sleep(Duration::from_millis(50));
         }
