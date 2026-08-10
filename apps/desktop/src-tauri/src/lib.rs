@@ -607,12 +607,13 @@ fn start_session(
         .supervisor
         .start_session_by_id(request.session_id)
         .map_err(|error| {
+            let detail = format!("{error:#}");
             state.diagnostics.log(
                 "error",
                 "start_session_failed",
-                format!("{}: {}", request.session_id, error),
+                format!("{}: {detail}", request.session_id),
             );
-            error.to_string()
+            detail
         })
 }
 
@@ -653,12 +654,13 @@ fn restart_session(
         .supervisor
         .restart_session_by_id(request.session_id)
         .map_err(|error| {
+            let detail = format!("{error:#}");
             state.diagnostics.log(
                 "error",
                 "restart_session_failed",
-                format!("{}: {}", request.session_id, error),
+                format!("{}: {detail}", request.session_id),
             );
-            error.to_string()
+            detail
         })
 }
 

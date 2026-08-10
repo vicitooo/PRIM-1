@@ -4800,7 +4800,7 @@ impl SupervisorHandle {
                     } else {
                         LifecycleState::Failed
                     };
-                    slot.last_error = (!superseded).then(|| error.to_string());
+                    slot.last_error = (!superseded).then(|| format!("{error:#}"));
                     slot.last_real_output_at = None;
                     reset_work_state_locked(slot);
                     let identity = ensure_run_event_capacity(slot, 1)
@@ -4823,11 +4823,11 @@ impl SupervisorHandle {
                     },
                     message: if superseded {
                         format!(
-                            "Discarded failed spawn for superseded {} session: {error}",
+                            "Discarded failed spawn for superseded {} session: {error:#}",
                             snapshot.label
                         )
                     } else {
-                        format!("Failed to start {}: {error}", snapshot.label)
+                        format!("Failed to start {}: {error:#}", snapshot.label)
                     },
                     timestamp: now_rfc3339(),
                 });
@@ -6944,8 +6944,16 @@ fn resolve_driver_executable(driver: DriverKind) -> Result<ResolvedLaunchProgram
 
 fn find_direct_executable(names: &[&str]) -> Result<String> {
     let search_path = std::env::var_os("PATH").ok_or_else(|| anyhow!("PATH is not set"))?;
-    for directory in std::env::split_paths(&search_path) {
-        for name in names {
+    find_direct_executable_on_path(names, &search_path)
+}
+
+fn find_direct_executable_on_path(names: &[&str], search_path: &std::ffi::OsStr) -> Result<String> {
+    // `names` is an ordered preference list. Search every PATH directory for
+    // the preferred executable before considering a fallback. On Windows this
+    // keeps the built-in powershell.exe ahead of Store/App Execution Alias
+    // pwsh.exe entries that cannot be launched in the session job.
+    for name in names {
+        for directory in std::env::split_paths(search_path) {
             let candidate = directory.join(name);
             let Ok(metadata) = fs::metadata(&candidate) else {
                 continue;
@@ -14372,6 +14380,84 @@ mod tests {
                 .expect("ordered shutdown must release the prepared endpoint");
             drop(replacement);
         });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn direct_executable_resolution_honors_name_preference_before_path_order() {
+        let root = tempfile::tempdir().expect("create executable-resolution fixture");
+        let early = root.path().join("early");
+        let late = root.path().join("late");
+        fs::create_dir_all(&early).unwrap();
+        fs::create_dir_all(&late).unwrap();
+        fs::write(early.join("pwsh.exe"), b"fixture").unwrap();
+        fs::write(late.join("powershell.exe"), b"fixture").unwrap();
+        let search_path = std::env::join_paths([&early, &late]).unwrap();
+
+        let resolved = find_direct_executable_on_path(
+            &["powershell.exe", "pwsh.exe"],
+            search_path.as_os_str(),
+        )
+        .expect("resolve preferred executable");
+        let expected = child_process_path(
+            &fs::canonicalize(late.join("powershell.exe")).expect("qualify preferred fixture"),
+        )
+        .to_path_buf();
+
+        assert_eq!(PathBuf::from(resolved), expected);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn production_generic_terminal_starts_the_preferred_direct_powershell() {
+        let root = tempfile::tempdir().expect("create production terminal fixture");
+        let supervisor = empty_test_supervisor_with_root(root.path().to_path_buf());
+        supervisor.set_executable_resolver_for_tests(Arc::new(HostDriverExecutableResolver));
+        let events = capture_runtime_events(&supervisor);
+        let session = create_test_session(
+            &supervisor,
+            "Production terminal",
+            DriverKind::GenericTerminal,
+            shared_types::PermissionProfile::Normal,
+        );
+
+        let started = supervisor
+            .start_session_by_id(session.session_id)
+            .expect("spawn the production-resolved Generic terminal");
+        assert_eq!(started.lifecycle_state, LifecycleState::Ready);
+        supervisor
+            .send_input(SendInputRequest {
+                session_id: session.session_id,
+                input: "\u{1b}[1;1RWrite-Output ([string]::Concat('PRIM1_','GENERIC_','READY'))\r"
+                    .into(),
+            })
+            .expect("release ConPTY startup and run the terminal probe");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let output = events
+                .lock()
+                .iter()
+                .filter_map(|event| match event {
+                    RuntimeEvent::SessionOutput {
+                        identity, chunk, ..
+                    } if identity.session_id == session.session_id => Some(chunk.as_str()),
+                    _ => None,
+                })
+                .collect::<String>();
+            if output.contains("PRIM1_GENERIC_READY") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "production Generic terminal did not execute the probe; output: {output:?}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        supervisor
+            .shutdown()
+            .expect("terminate the production Generic terminal");
     }
 
     #[cfg(windows)]
