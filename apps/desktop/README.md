@@ -15,7 +15,7 @@ This app is the first real UI shell for `PRIM-1`.
 - lets the operator route direct or room messages
 - exposes start / restart / stop controls for each session
 - listens to the supervisor event bus in real time
-- writes desktop-process diagnostics to `.runtime/desktop-events.jsonl`
+- writes process diagnostics to `<runtime-dir>/desktop-events.jsonl`; this file is not a terminal transcript or message-content record
 
 ## Run
 

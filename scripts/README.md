@@ -14,7 +14,7 @@ Scripts should wrap the control plane, not bypass the supervisor.
 ## Current scripts
 
 - `control-plane.ps1`
-  Windows helper for the first MVP. Reads `.runtime/control-plane.json`, connects to the supervisor named pipe, and issues:
+  Windows helper for the first MVP. Resolves `<runtime-dir>/control-plane.json`, connects to the supervisor named pipe, and issues:
   - `ping`
   - `list`
   - `start`
@@ -43,17 +43,17 @@ Example:
 .\scripts\control-plane.ps1 -Action deliver -Session claude -Content "Multi-line`nmessage body"
 .\scripts\control-plane.ps1 -Action route -From operator -To codex -Content "status ping" -RequireIdle
 .\scripts\control-plane.ps1 -Action wait_quiet -Session claude -QuietSec 2 -TimeoutSec 10
-.\scripts\control-plane.ps1 -Action events_since -CursorFile ".runtime\cursors\outside-supervisor.json" -MaxEvents 200 -MaxWaitSeconds 15 -IncludeKinds "routed_message","route_delivery","dispatch_attempt","session_state","system_log","sideband_request_lifecycle" -OutCursorFile ".runtime\cursors\outside-supervisor.json"
+.\scripts\agent-events.ps1 -Consumer outside-supervisor -MaxEvents 200 -MaxWaitSeconds 15
 .\scripts\control-plane.ps1 -Action route -From operator -To claude -Content "status ping" -Quiet -PassThruJson -OutRequestIdFile ".runtime\last-request-id.txt"
 ```
 
 Notes:
 
-- mailbox fallback keeps a 10-second response window by default
+- transport is named-pipe-only and fails closed when the pipe cannot be reached
 - `start` accepts `-ExtraArgs <string[]>` for per-launch CLI arguments such as `--resume <session-id>`; the supervisor appends them to the cloned launch definition and writes them to the `start_session` audit lifecycle entry
-- `deliver` and `wait_quiet` honor `-TimeoutSec` for longer mailbox-backed waits when needed
+- `wait_quiet` honors `-TimeoutSec` and the client keeps a longer matching named-pipe read budget
 - `events_since` always emits structured JSON and never routes through `-Quiet`
-- `events_since` extends pipe/mailbox waits to `MaxWaitSeconds + 5`
+- `events_since` extends the named-pipe read budget beyond `MaxWaitSeconds`
 - `-PassThruJson` keeps quiet message output and appends the full sideband response JSON
 - `-OutRequestIdFile` writes the raw `request_id` string when the response carries one
 - `-RequireIdle` and `-AllowBusy` are supported for `input`, `key`, `deliver`, and `route`; default mode matches `-AllowBusy`, while `-RequireIdle` aborts before PTY write when `dispatch_attempt.overlap` is true
@@ -67,15 +67,6 @@ Example:
 
 ```powershell
 .\scripts\agent-route.ps1 -From codex -To claude -Content "Reply with exactly: CLAUDE ACK"
-```
-
-- `agent-ping.ps1`
-  Token-based smoke-test helper for agents. Builds the exact reply prompt for the target and routes it through the supervisor.
-
-Example:
-
-```powershell
-.\scripts\agent-ping.ps1 -From codex -To claude -Token CLAUDE_ACK
 ```
 
 - `agent-key.ps1`
@@ -107,7 +98,7 @@ Example:
 ```
 
 - `agent-events.ps1`
-  Outside-supervisor convenience wrapper over `control-plane.ps1 -Action events_since`. Uses `.runtime/cursors/<consumer>.json`, starts from `null` on first run, writes `next_cursor` back atomically, and prints one compressed JSON line per event. Default signal events include route receipts, dispatch attempts, dispatch template warnings, pane signals, session lifecycle, session work-state, supervisor heartbeats/alerts, system logs, sideband lifecycle, and request ACK events.
+  Outside-supervisor convenience wrapper over `control-plane.ps1 -Action events_since`. Uses `<runtime-dir>/cursors/<consumer>.json`, starts from `null` on first run, writes `next_cursor` back atomically, and prints one compressed JSON line per event. Its defaults cover delivery receipts, dispatch attempts, session lifecycle/work state, supervisor health, system logs, sideband lifecycle, and request ACK metadata. It does not provide terminal output or routed-message content.
 
 Example:
 
@@ -116,47 +107,24 @@ Example:
 ```
 
 - `agent-events-summary.py`
-  Human-readable summary helper for the receipt/signal event families emitted by the control plane. Reads a JSONL audit log directly, or `events_since` JSON from stdin. Groups `route_delivery` phases into one logical route line and summarizes overlap-only `dispatch_attempt`, `dispatch_template_warning`, `pane_signal`, `session_work_state`, `supervisor_heartbeat`, `supervisor_alert`, `request_ack`, `request_ack_timeout`, and failed/timed-out sideband lifecycle events.
+  Human-readable summary helper for durable metadata emitted by the control plane. Reads a JSONL audit log directly, or `events_since` JSON from stdin. Groups `route_delivery` phases into one logical route line and summarizes overlap-only `dispatch_attempt`, session lifecycle/work state, `supervisor_heartbeat`, `supervisor_alert`, `request_ack`, `request_ack_timeout`, `dispatch_no_reaction`, and failed/timed-out sideband lifecycle events.
 
 Examples:
 
 ```powershell
-python .\scripts\agent-events-summary.py --audit-log ".runtime\audit\2026-05-17.jsonl"
-python .\scripts\agent-events-summary.py --audit-log ".runtime\audit\2026-05-17.jsonl" --task-id smoke-task-418
-python .\scripts\agent-events-summary.py --audit-log ".runtime\audit\2026-05-17.jsonl" --fail-on alert,blocked,failed,timeout
+. .\scripts\runtime-paths.ps1
+$auditLog = Join-Path (Resolve-Prim1RuntimeDirectory) "audit\2026-05-17.jsonl"
+python .\scripts\agent-events-summary.py --audit-log $auditLog
+python .\scripts\agent-events-summary.py --audit-log $auditLog --fail-on alert,blocked,failed,timeout
 .\scripts\control-plane.ps1 -Action events_since -MaxEvents 200 | python .\scripts\agent-events-summary.py --events-since-stdin
 ```
 
 Runtime env vars used by the wrapper defaults:
 
+- `PRIM1_RUNTIME_DIR`: override the product runtime directory used by scripts
 - `PRIM1_HEARTBEAT_INTERVAL_SECS`: supervisor heartbeat interval in seconds; default `1800`
 - `PRIM1_AUTO_RESTART_ON_STALL`: comma-separated session allowlist for stall auto-restart, for example `claude,codex`; default empty/off
 - `PRIM1_AUTO_RESTART_STALL_THRESHOLD_SECS`: blocked/error-loop threshold before auto-restart; default `600`
 
-- `new-smoke-token.ps1`
-  Generates a unique `SMOKE-XXXXXXXX` token plus a UTC-timestamped handshake file path.
-
-Example:
-
-```powershell
-.\scripts\new-smoke-token.ps1
-```
-
-- `handshake-route.ps1`
-  Canonical builder/router for handshake messages so agents stop hand-writing fragile preambles and status lines.
-
-Example:
-
-```powershell
-.\scripts\handshake-route.ps1 -Actor claude -Action start -Token "SMOKE-1A2B3C4D" -Path "<repo-root>\.runtime\smoke\handshake-20260415T120000Z-SMOKE-1A2B3C4D.txt"
-.\scripts\handshake-route.ps1 -Actor codex -Action ready -Token "SMOKE-1A2B3C4D"
-```
-
-- `handshake-watchdog.ps1`
-  External handshake timeout watcher. Polls the audit log and routes a canonical timeout FAIL if the run stalls without a terminal marker.
-
-Example:
-
-```powershell
-.\scripts\handshake-watchdog.ps1 -Token "SMOKE-1A2B3C4D"
-```
+- `runtime-paths.ps1`
+  Canonical dot-sourced resolver for PowerShell product scripts. Explicit `-InfoFile` values win; `PRIM1_RUNTIME_DIR` overrides the platform default. Windows defaults to `%LOCALAPPDATA%\io.prim1.runtime\runtime`; macOS resolves to `~/Library/Application Support/io.prim1.runtime/runtime`; Linux resolves below `${XDG_DATA_HOME:-~/.local/share}/io.prim1.runtime/runtime`. The latter two mappings describe path behavior, not validated release support.

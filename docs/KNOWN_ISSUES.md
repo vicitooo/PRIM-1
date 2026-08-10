@@ -21,6 +21,12 @@ If you upgrade either CLI and observe regressions (PTY behavior, startup timing,
 
 These are documented runtime behaviors that callers should know. Each is on the roadmap to be hidden behind a wrapper abstraction; until then, callers compensate.
 
+### Control-plane pane scoping is not yet a same-user security boundary
+
+The current Windows control plane uses bearer files under the current user's app-local runtime directory. Current-user ACLs exclude other OS users, but Claude, Codex, and other native panes run as the same Windows user and can read the master or peer bearer files. Target checks therefore prevent accidental misuse; they do not yet isolate a hostile same-user pane. A restart can also replace a pane generation after authorization but before a queued write, and two concurrent desktop starts can race while publishing randomized endpoints.
+
+The production boundary remains blocked until bearer authority is removed, named-pipe callers are derived from the kernel and bound to one live PTY process job plus generation at mutation time, and a stable per-user desktop singleton is held. Prime/WSL sideband access remains unclaimed until an empirical Windows/WSL boundary test proves a secure channel or a supervisor-owned proxy is added. Do not treat current DACLs, bearer redaction, or endpoint randomization as peer isolation.
+
 ### Multi-line content submission
 
 `control-plane.ps1 -Action input` with multi-line content (`-Content` containing `\n`, or `-ContentFile <path>` for files with newlines) does not reliably submit on Claude Code's TUI. The text renders in the input buffer but the TUI may not accept it as a complete turn.
@@ -39,21 +45,9 @@ Codex CLI's TUI has a content-length threshold above which pasted content is sta
 
 **Workaround:** After restart on Codex, check `lifecycle_state` via `-Action list`; re-issue `start` if state is `Closed`.
 
-### Audit-event count is not a health signal
+### Durable audit is metadata-only
 
-The audit log emits a `session_output` event per output chunk from the PTY. TUI animation (cursor blink, spinner frames, status bar redraws) produces these continuously regardless of whether the underlying CLI is doing real work. Counting `session_output` events as a "is the agent active?" proxy will report idle panes as busy.
-
-**Workaround:** Use `lifecycle_state` from `-Action list`, the existence of expected output artifacts on disk, and `routed_message` events from the pane (which only fire when the agent actually sends a routed message) as the canonical signals.
-
-### MSYS pipe buffering on `tail | awk` (Windows Git Bash)
-
-On Windows Git Bash, the pipeline `tail -F audit.jsonl | awk '/pattern/ {...}'` buffers output for minutes before lines propagate. Each side of the pipe must be wrapped in `stdbuf -oL` to enforce line-buffered stdout:
-
-```bash
-stdbuf -oL tail -F -n 0 .runtime/audit/$(date +%F).jsonl | stdbuf -oL awk '...'
-```
-
-PowerShell `Get-Content -Wait` does not have this issue.
+The durable audit intentionally excludes terminal output and routed-message content. Use the live desktop panes to inspect conversation content; use audit events for lifecycle, authorization, dispatch, and delivery receipts only. A receipt proves that the supervisor wrote to a pane, not that the model understood or completed the request.
 
 ## Roadmap items tracked publicly
 

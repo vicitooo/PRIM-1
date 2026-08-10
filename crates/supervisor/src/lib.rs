@@ -4,7 +4,7 @@ use std::{
     io::{BufRead, BufReader as StdBufReader, Read, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicU64, Ordering},
         mpsc,
     },
@@ -20,20 +20,26 @@ use pty_host::{
     AgentLiveness, ConcretePtySession, PtyEvent, PtyEventHandler, PtyExitStatus, PtySession,
 };
 use shared_types::{
-    AlertSeverity, ControlKey, ControlPlaneStatus, DeliverMessageRequest, DriverKind, EnvVar,
-    EventCursor, EventFilter, HeartbeatSessionSummary, LaunchSpec, LifecycleState, LogLevel,
-    MessageScope, PaneSignalType, RouteDeliveryPhase, RouteMessageRequest, RuntimeEvent,
-    RuntimeSnapshot, SendInputRequest, SessionDefinition, SessionExitReason, SessionGeneration,
-    SessionSnapshot, SidebandPhase, SidebandRequest, SidebandResponse, SidebandResponsePayload,
-    SupervisorAlertType, WaitQuietRequest, WorkState, now_rfc3339,
+    AlertSeverity, ControlKey, ControlPlaneSnapshot, ControlPlaneStatus, DeliverMessageRequest,
+    DriverKind, EnvVar, EventCursor, EventFilter, HeartbeatSessionSummary, LaunchSpec,
+    LifecycleState, LogLevel, MessageScope, PaneSignalType, RouteDeliveryPhase,
+    RouteMessageRequest, RuntimeEvent, RuntimeSnapshot, SendInputRequest, SessionDefinition,
+    SessionExitReason, SessionGeneration, SessionSnapshot, SidebandPhase, SidebandRequest,
+    SidebandResponse, SidebandResponsePayload, SupervisorAlertType, WaitQuietRequest, WorkState,
+    now_rfc3339,
 };
-use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 type EventSink = Arc<dyn Fn(RuntimeEvent) + Send + Sync>;
 
 const CONTROL_PLANE_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const CONTROL_PLANE_PROBE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+const SIDEBAND_FRAME_MAX_BYTES: usize = 8 * 1024 * 1024;
+const SIDEBAND_FRAME_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const SIDEBAND_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+const SIDEBAND_MAX_CONNECTIONS: usize = 64;
 const DEFAULT_REACTION_WINDOW_SECS: u64 = 12;
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 1800;
 const DEFAULT_AUTO_RESTART_STALL_THRESHOLD_SECS: u64 = 600;
@@ -94,6 +100,11 @@ impl SidebandTimeouts {
             SidebandRequest::PaneSignal { .. } => Duration::from_secs(5),
         }
     }
+}
+
+struct AuthorizedLifecycleRequest {
+    request: SidebandRequest,
+    target_session: String,
 }
 
 #[derive(Debug, Clone)]
@@ -205,7 +216,7 @@ struct SupervisorAlertEvent {
 }
 
 struct PaneSignalRecord {
-    token: String,
+    session: String,
     task_id: String,
     signal_type: PaneSignalType,
     summary: String,
@@ -247,33 +258,6 @@ impl PtySpawner for ConcretePtySpawner {
     }
 }
 
-trait MailboxFs: Send + Sync {
-    fn read_to_string(&self, path: &Path) -> std::io::Result<String>;
-    fn write(&self, path: &Path, contents: &[u8]) -> std::io::Result<()>;
-    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()>;
-    fn remove_file(&self, path: &Path) -> std::io::Result<()>;
-}
-
-struct StdMailboxFs;
-
-impl MailboxFs for StdMailboxFs {
-    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
-        fs::read_to_string(path)
-    }
-
-    fn write(&self, path: &Path, contents: &[u8]) -> std::io::Result<()> {
-        fs::write(path, contents)
-    }
-
-    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
-        fs::rename(from, to)
-    }
-
-    fn remove_file(&self, path: &Path) -> std::io::Result<()> {
-        fs::remove_file(path)
-    }
-}
-
 // Exploration Finding 10 showed that very long routed messages could arrive
 // truncated inside Claude's queued-message rendering even though the audit log
 // still held the full routed_message payload. Keeping each Claude-targeted
@@ -288,7 +272,6 @@ const CODEX_ROUTED_MESSAGE_MAX_CHARS: usize = 800;
 pub struct SupervisorConfig {
     pub working_root: PathBuf,
     pub runtime_dir: PathBuf,
-    pub peer_slash_commands_allowed: bool,
     pub cross_pair_room_broadcast: bool,
     pub heartbeat_interval: Option<Duration>,
     pub auto_restart_on_stall_sessions: Option<Vec<String>>,
@@ -983,10 +966,9 @@ struct SupervisorInner {
     control_plane: RwLock<Option<ControlPlaneStatus>>,
     token_bindings: Mutex<HashMap<String, Option<String>>>,
     session_control_planes: Mutex<HashMap<String, ControlPlaneStatus>>,
-    peer_slash_commands_allowed: bool,
+    retired_sensitive_values: Mutex<HashSet<String>>,
     cross_pair_room_broadcast: bool,
     pty_spawner: RwLock<Arc<dyn PtySpawner>>,
-    mailbox_fs: RwLock<Arc<dyn MailboxFs>>,
     background_runtime: Arc<tokio::runtime::Runtime>,
     events_seq: AtomicU64,
     events_watch: tokio::sync::watch::Sender<u64>,
@@ -998,8 +980,6 @@ struct SupervisorInner {
     reaction_window: Duration,
     auto_restart_on_stall: AutoRestartOnStallConfig,
     auto_restart_history: Mutex<HashMap<String, AutoRestartHistory>>,
-    #[cfg(test)]
-    last_detached_worker: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1023,9 +1003,741 @@ pub struct SupervisorHandle {
     inner: Arc<SupervisorInner>,
 }
 
+#[derive(Clone)]
+pub struct RendererEventProjector {
+    inner: Weak<SupervisorInner>,
+}
+
+pub struct RendererOutputRedactor {
+    inner: Weak<SupervisorInner>,
+    carried_suffix: String,
+    sensitive_values: Vec<String>,
+}
+
+impl RendererEventProjector {
+    pub fn project(&self, event: RuntimeEvent) -> RuntimeEvent {
+        let Some(inner) = self.inner.upgrade() else {
+            return RuntimeEvent::SystemLog {
+                level: LogLevel::Warn,
+                message: "runtime event unavailable after supervisor shutdown".into(),
+                timestamp: now_rfc3339(),
+            };
+        };
+
+        project_runtime_event(event, &control_plane_sensitive_values(&inner))
+    }
+
+    pub fn output_redactor(&self) -> RendererOutputRedactor {
+        RendererOutputRedactor {
+            inner: self.inner.clone(),
+            carried_suffix: String::new(),
+            sensitive_values: Vec::new(),
+        }
+    }
+}
+
+fn project_runtime_event(event: RuntimeEvent, sensitive_values: &[String]) -> RuntimeEvent {
+    let mut value = match serde_json::to_value(event) {
+        Ok(value) => value,
+        Err(_) => {
+            return RuntimeEvent::SystemLog {
+                level: LogLevel::Warn,
+                message: "runtime event unavailable because projection failed".into(),
+                timestamp: now_rfc3339(),
+            };
+        }
+    };
+    redact_json_strings(&mut value, sensitive_values);
+    serde_json::from_value(value).unwrap_or_else(|_| RuntimeEvent::SystemLog {
+        level: LogLevel::Warn,
+        message: "runtime event unavailable because projection failed".into(),
+        timestamp: now_rfc3339(),
+    })
+}
+
+impl RendererOutputRedactor {
+    pub fn push(&mut self, chunk: &str) -> String {
+        self.refresh_sensitive_values();
+        let mut output = std::mem::take(&mut self.carried_suffix);
+        output.push_str(chunk);
+        redact_terminal_text(&mut output, &self.sensitive_values);
+
+        let carry_start = terminal_carry_start(&output, &self.sensitive_values);
+        self.carried_suffix = output.split_off(carry_start);
+        output
+    }
+
+    pub fn finish(mut self) -> String {
+        self.refresh_sensitive_values();
+        let mut output = std::mem::take(&mut self.carried_suffix);
+        redact_terminal_text(&mut output, &self.sensitive_values);
+
+        if let Some(prefix_start) = terminal_sensitive_prefix_start(&output, &self.sensitive_values)
+        {
+            output.truncate(prefix_start);
+            output.push_str("[redacted]");
+        } else if let Some(incomplete_start) = terminal_visible_projection(&output).incomplete_start
+        {
+            output.truncate(incomplete_start);
+        }
+        output
+    }
+
+    fn refresh_sensitive_values(&mut self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        self.sensitive_values
+            .extend(control_plane_sensitive_values(&inner));
+        self.sensitive_values.retain(|value| !value.is_empty());
+        self.sensitive_values
+            .sort_by_key(|value| std::cmp::Reverse(value.len()));
+        self.sensitive_values.dedup();
+    }
+}
+
+fn control_plane_sensitive_values(inner: &SupervisorInner) -> Vec<String> {
+    let mut values = Vec::new();
+    if let Some(status) = inner.control_plane.read().as_ref() {
+        values.push(status.token.clone());
+        values.push(status.info_path.clone());
+    }
+    for status in inner.session_control_planes.lock().values() {
+        values.push(status.token.clone());
+        values.push(status.info_path.clone());
+    }
+    values.extend(inner.retired_sensitive_values.lock().iter().cloned());
+    values.retain(|value| !value.is_empty());
+    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    values.dedup();
+    values
+}
+
+fn redact_json_strings(value: &mut serde_json::Value, sensitive_values: &[String]) {
+    match value {
+        serde_json::Value::String(text) => {
+            for sensitive in sensitive_values {
+                if text.contains(sensitive) {
+                    *text = text.replace(sensitive, "[redacted]");
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_json_strings(value, sensitive_values);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for value in fields.values_mut() {
+                redact_json_strings(value, sensitive_values);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+#[derive(Debug, Default)]
+struct TerminalVisibleProjection {
+    text: String,
+    raw_spans: Vec<(usize, usize)>,
+    incomplete_start: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalControlScan {
+    NotControl,
+    Complete(usize),
+    Incomplete,
+}
+
+fn redact_terminal_text(text: &mut String, sensitive_values: &[String]) {
+    for sensitive in sensitive_values.iter().filter(|value| !value.is_empty()) {
+        if text.contains(sensitive) {
+            *text = text.replace(sensitive, "[redacted]");
+        }
+    }
+
+    let projection = terminal_visible_projection(text);
+    let mut raw_matches = Vec::<(usize, usize)>::new();
+
+    for sensitive in sensitive_values.iter().filter(|value| !value.is_empty()) {
+        for (visible_start, _) in projection.text.match_indices(sensitive) {
+            let visible_end = visible_start + sensitive.len();
+            let Some((raw_start, _)) = projection.raw_spans.get(visible_start).copied() else {
+                continue;
+            };
+            let Some((_, raw_end)) = projection.raw_spans.get(visible_end - 1).copied() else {
+                continue;
+            };
+            raw_matches.push((raw_start, raw_end));
+        }
+    }
+
+    if raw_matches.is_empty() {
+        return;
+    }
+
+    raw_matches.sort_unstable();
+    let mut merged = Vec::<(usize, usize)>::with_capacity(raw_matches.len());
+    for (start, end) in raw_matches {
+        if let Some((_, previous_end)) = merged.last_mut()
+            && start < *previous_end
+        {
+            *previous_end = (*previous_end).max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+
+    let mut redacted = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for (start, end) in merged {
+        redacted.push_str(&text[cursor..start]);
+        redacted.push_str("[redacted]");
+        cursor = end;
+    }
+    redacted.push_str(&text[cursor..]);
+    *text = redacted;
+}
+
+fn terminal_carry_start(text: &str, sensitive_values: &[String]) -> usize {
+    let projection = terminal_visible_projection(text);
+    let sensitive_start =
+        terminal_sensitive_prefix_start_from_projection(&projection, sensitive_values);
+    sensitive_start
+        .into_iter()
+        .chain(projection.incomplete_start)
+        .min()
+        .unwrap_or(text.len())
+}
+
+fn terminal_sensitive_prefix_start(text: &str, sensitive_values: &[String]) -> Option<usize> {
+    let projection = terminal_visible_projection(text);
+    terminal_sensitive_prefix_start_from_projection(&projection, sensitive_values)
+}
+
+fn terminal_sensitive_prefix_start_from_projection(
+    projection: &TerminalVisibleProjection,
+    sensitive_values: &[String],
+) -> Option<usize> {
+    let max_proper_prefix_len = sensitive_values
+        .iter()
+        .map(String::len)
+        .max()
+        .unwrap_or(0)
+        .saturating_sub(1);
+    if max_proper_prefix_len == 0 {
+        return None;
+    }
+
+    let earliest_candidate = projection.text.len().saturating_sub(max_proper_prefix_len);
+    projection
+        .text
+        .char_indices()
+        .filter(|(index, _)| *index >= earliest_candidate)
+        .find_map(|(index, _)| {
+            let suffix = &projection.text[index..];
+            sensitive_values
+                .iter()
+                .any(|sensitive| suffix.len() < sensitive.len() && sensitive.starts_with(suffix))
+                .then(|| projection.raw_spans[index].0)
+        })
+}
+
+fn terminal_visible_projection(text: &str) -> TerminalVisibleProjection {
+    let mut projection = TerminalVisibleProjection::default();
+    let mut index = 0;
+
+    while index < text.len() {
+        match scan_terminal_control(text, index) {
+            TerminalControlScan::Complete(end) => index = end,
+            TerminalControlScan::Incomplete => {
+                projection.incomplete_start = Some(index);
+                break;
+            }
+            TerminalControlScan::NotControl => {
+                let character = text[index..]
+                    .chars()
+                    .next()
+                    .expect("index remains on a character boundary");
+                let raw_end = index + character.len_utf8();
+                projection.text.push(character);
+                projection
+                    .raw_spans
+                    .extend((0..character.len_utf8()).map(|_| (index, raw_end)));
+                index = raw_end;
+            }
+        }
+    }
+
+    projection
+}
+
+fn scan_terminal_control(text: &str, start: usize) -> TerminalControlScan {
+    let bytes = text.as_bytes();
+    let byte = bytes[start];
+
+    if byte == 0x1b {
+        let Some(introducer) = bytes.get(start + 1).copied() else {
+            return TerminalControlScan::Incomplete;
+        };
+        return match introducer {
+            b'[' => scan_csi(bytes, start + 2),
+            b']' => scan_string_control(bytes, start + 2, true),
+            b'P' | b'X' | b'^' | b'_' => scan_string_control(bytes, start + 2, false),
+            0x20..=0x2f => scan_escape_intermediates(bytes, start + 2),
+            _ => TerminalControlScan::Complete((start + 2).min(bytes.len())),
+        };
+    }
+
+    let character = text[start..]
+        .chars()
+        .next()
+        .expect("start remains on a character boundary");
+    let character_end = start + character.len_utf8();
+    match character {
+        '\u{009b}' => scan_csi(bytes, character_end),
+        '\u{009d}' => scan_string_control(bytes, character_end, true),
+        '\u{0090}' | '\u{0098}' | '\u{009e}' | '\u{009f}' => {
+            scan_string_control(bytes, character_end, false)
+        }
+        '\u{009c}' => TerminalControlScan::Complete(character_end),
+        character if character.is_control() || is_zero_width_format(character) => {
+            TerminalControlScan::Complete(character_end)
+        }
+        _ => TerminalControlScan::NotControl,
+    }
+}
+
+fn scan_csi(bytes: &[u8], mut index: usize) -> TerminalControlScan {
+    while let Some(byte) = bytes.get(index).copied() {
+        index += 1;
+        if (0x40..=0x7e).contains(&byte) {
+            return TerminalControlScan::Complete(index);
+        }
+    }
+    TerminalControlScan::Incomplete
+}
+
+fn scan_escape_intermediates(bytes: &[u8], mut index: usize) -> TerminalControlScan {
+    while let Some(byte) = bytes.get(index).copied() {
+        index += 1;
+        if (0x30..=0x7e).contains(&byte) {
+            return TerminalControlScan::Complete(index);
+        }
+    }
+    TerminalControlScan::Incomplete
+}
+
+fn scan_string_control(
+    bytes: &[u8],
+    mut index: usize,
+    bell_terminates: bool,
+) -> TerminalControlScan {
+    while index < bytes.len() {
+        if bell_terminates && bytes[index] == 0x07 {
+            return TerminalControlScan::Complete(index + 1);
+        }
+        if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'\\') {
+            return TerminalControlScan::Complete(index + 2);
+        }
+        if bytes[index..].starts_with("\u{009c}".as_bytes()) {
+            return TerminalControlScan::Complete(index + '\u{009c}'.len_utf8());
+        }
+        index += 1;
+    }
+    TerminalControlScan::Incomplete
+}
+
+fn is_zero_width_format(character: char) -> bool {
+    matches!(
+        character,
+        '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}'
+    )
+}
+
+fn audit_event_projection(event: &RuntimeEvent, inner: &SupervisorInner) -> Option<RuntimeEvent> {
+    let event = match event {
+        RuntimeEvent::SessionOutput { .. } => return None,
+        RuntimeEvent::RoutedMessage {
+            id,
+            from,
+            to,
+            scope,
+            timestamp,
+            ..
+        } => RuntimeEvent::RoutedMessage {
+            id: *id,
+            from: from.clone(),
+            to: to.clone(),
+            scope: *scope,
+            content: "[content omitted]".into(),
+            timestamp: timestamp.clone(),
+        },
+        RuntimeEvent::PaneSignal {
+            request_id,
+            session,
+            signal_type,
+            timestamp,
+            ..
+        } => RuntimeEvent::PaneSignal {
+            request_id: request_id.clone(),
+            session: session.clone(),
+            task_id: String::new(),
+            signal_type: *signal_type,
+            summary: String::new(),
+            artifact_paths: Vec::new(),
+            commit_sha: None,
+            timestamp: timestamp.clone(),
+        },
+        RuntimeEvent::SessionWorkState {
+            session,
+            state,
+            previous_state,
+            timestamp,
+            ..
+        } => RuntimeEvent::SessionWorkState {
+            session: session.clone(),
+            state: *state,
+            detail: None,
+            previous_state: *previous_state,
+            timestamp: timestamp.clone(),
+        },
+        RuntimeEvent::SidebandRequestLifecycle {
+            request_id,
+            action,
+            session,
+            phase,
+            error,
+            elapsed_ms,
+            timestamp,
+            ..
+        } => RuntimeEvent::SidebandRequestLifecycle {
+            request_id: request_id.clone(),
+            action: action.clone(),
+            session: session.clone(),
+            extra_args: Vec::new(),
+            phase: *phase,
+            error: error.clone(),
+            elapsed_ms: *elapsed_ms,
+            timestamp: timestamp.clone(),
+        },
+        event => event.clone(),
+    };
+
+    Some(project_runtime_event(
+        event,
+        &control_plane_sensitive_values(inner),
+    ))
+}
+
+fn remove_revoked_credential_files(statuses: &[ControlPlaneStatus]) -> Result<()> {
+    let mut failure_count = 0_usize;
+    for status in statuses {
+        let path = Path::new(&status.info_path);
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                failure_count += 1;
+                eprintln!(
+                    "failed to remove revoked credential file {}: {error}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    if failure_count == 0 {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "failed to remove {failure_count} revoked credential file(s)"
+        ))
+    }
+}
+
+fn remove_legacy_disk_mailbox(runtime_dir: &Path) -> Result<()> {
+    let path = runtime_dir.join("sideband");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect legacy disk mailbox: {}", path.display())
+            });
+        }
+    };
+
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        fs::remove_file(&path).or_else(|file_error| {
+            fs::remove_dir(&path).map_err(|directory_error| {
+                std::io::Error::other(format!(
+                    "file removal failed: {file_error}; directory removal failed: {directory_error}"
+                ))
+            })
+        })
+    } else {
+        fs::remove_dir_all(&path)
+    }
+    .with_context(|| format!("failed to remove legacy disk mailbox: {}", path.display()))
+}
+
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("private file path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create private file directory: {}",
+            parent.display()
+        )
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("private file path has no UTF-8 file name"))?;
+    let temp_path = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+
+    let result = (|| -> Result<()> {
+        fs::write(&temp_path, contents).with_context(|| {
+            format!(
+                "failed to write private temporary file: {}",
+                temp_path.display()
+            )
+        })?;
+        restrict_path_to_current_user(&temp_path, false)?;
+        replace_file_atomically(&temp_path, path)?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+#[cfg(windows)]
+fn replace_file_atomically(source: &Path, destination: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source_wide = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination_wide = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let moved = unsafe {
+        MoveFileExW(
+            source_wide.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "failed to atomically replace private file {}",
+                destination.display()
+            )
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file_atomically(source: &Path, destination: &Path) -> Result<()> {
+    fs::rename(source, destination).with_context(|| {
+        format!(
+            "failed to atomically replace private file {}",
+            destination.display()
+        )
+    })
+}
+
+#[cfg(windows)]
+struct LocalSecurityDescriptor(windows_sys::Win32::Security::PSECURITY_DESCRIPTOR);
+
+#[cfg(windows)]
+impl LocalSecurityDescriptor {
+    fn as_ptr(&self) -> windows_sys::Win32::Security::PSECURITY_DESCRIPTOR {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for LocalSecurityDescriptor {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::LocalFree(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn current_user_sid_string() -> Result<String> {
+    use std::{mem, ptr};
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, HANDLE},
+        Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser},
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+
+    struct TokenHandle(HANDLE);
+    impl Drop for TokenHandle {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    let mut token = ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to open current process token");
+    }
+    let token = TokenHandle(token);
+
+    let mut required = 0_u32;
+    unsafe {
+        GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &mut required);
+    }
+    if required == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to measure current process token user");
+    }
+    let word_count = (required as usize).div_ceil(mem::size_of::<usize>());
+    let mut token_user_buffer = vec![0_usize; word_count];
+    if unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            token_user_buffer.as_mut_ptr().cast(),
+            required,
+            &mut required,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to read current process token user");
+    }
+    let token_user = unsafe { &*(token_user_buffer.as_ptr().cast::<TOKEN_USER>()) };
+
+    let mut sid_text = ptr::null_mut();
+    if unsafe {
+        windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW(
+            token_user.User.Sid,
+            &mut sid_text,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error()).context("failed to render current user SID");
+    }
+    let sid_text_guard = LocalSecurityDescriptor(sid_text.cast());
+    let sid_len = (0..)
+        .take_while(|index| unsafe { *sid_text.add(*index) } != 0)
+        .count();
+    let sid = String::from_utf16(unsafe { std::slice::from_raw_parts(sid_text, sid_len) })
+        .context("current user SID was not valid UTF-16")?;
+    drop(sid_text_guard);
+    Ok(sid)
+}
+
+#[cfg(windows)]
+fn current_user_only_security_descriptor(
+    ace_flags: &str,
+    access_rights: &str,
+) -> Result<LocalSecurityDescriptor> {
+    use std::ptr;
+    use windows_sys::Win32::Security::{
+        Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1},
+        PSECURITY_DESCRIPTOR,
+    };
+
+    let sddl = format!(
+        "D:P(A;{ace_flags};{access_rights};;;{})",
+        current_user_sid_string()?
+    );
+    let sddl_wide = sddl
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl_wide.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            ptr::null_mut(),
+        )
+    };
+    if converted == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to build current-user-only security descriptor");
+    }
+    Ok(LocalSecurityDescriptor(descriptor))
+}
+
+#[cfg(windows)]
+fn restrict_path_to_current_user(path: &Path, is_directory: bool) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SetFileSecurityW,
+    };
+
+    let descriptor =
+        current_user_only_security_descriptor(if is_directory { "OICI" } else { "" }, "FA")?;
+    let path_wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let applied = unsafe {
+        SetFileSecurityW(
+            path_wide.as_ptr(),
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            descriptor.as_ptr(),
+        )
+    };
+    if applied == 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "failed to apply current-user-only permissions to {}",
+                path.display()
+            )
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn restrict_path_to_current_user(path: &Path, is_directory: bool) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = if is_directory { 0o700 } else { 0o600 };
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_mode(mode);
+    fs::set_permissions(path, permissions).with_context(|| {
+        format!(
+            "failed to apply current-user-only permissions to {}",
+            path.display()
+        )
+    })
+}
+
 impl SupervisorHandle {
     pub fn new(config: SupervisorConfig) -> Result<Self> {
         fs::create_dir_all(&config.runtime_dir).context("failed to create runtime directory")?;
+        restrict_path_to_current_user(&config.runtime_dir, true)?;
+        remove_legacy_disk_mailbox(&config.runtime_dir)?;
         let audit = AuditLog::new(&config.runtime_dir)?;
         let background_runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -1069,10 +1781,9 @@ impl SupervisorHandle {
                 control_plane: RwLock::new(None),
                 token_bindings: Mutex::new(HashMap::new()),
                 session_control_planes: Mutex::new(HashMap::new()),
-                peer_slash_commands_allowed: config.peer_slash_commands_allowed,
+                retired_sensitive_values: Mutex::new(HashSet::new()),
                 cross_pair_room_broadcast: config.cross_pair_room_broadcast,
                 pty_spawner: RwLock::new(Arc::new(ConcretePtySpawner)),
-                mailbox_fs: RwLock::new(Arc::new(StdMailboxFs)),
                 background_runtime: Arc::new(background_runtime),
                 events_seq: AtomicU64::new(0),
                 events_watch,
@@ -1084,8 +1795,6 @@ impl SupervisorHandle {
                 reaction_window,
                 auto_restart_on_stall,
                 auto_restart_history: Mutex::new(HashMap::new()),
-                #[cfg(test)]
-                last_detached_worker: Mutex::new(None),
             }),
         };
         handle.start_supervisor_heartbeat_task();
@@ -1094,6 +1803,12 @@ impl SupervisorHandle {
 
     pub fn runtime_dir(&self) -> &Path {
         &self.inner.runtime_dir
+    }
+
+    pub fn renderer_event_projector(&self) -> RendererEventProjector {
+        RendererEventProjector {
+            inner: Arc::downgrade(&self.inner),
+        }
     }
 
     pub fn audit_log_path(&self) -> PathBuf {
@@ -1822,21 +2537,21 @@ impl SupervisorHandle {
     ) -> Result<PaneSignalWritePaths> {
         let task_id = normalized_required_field("task_id", signal.task_id)?;
         let summary = normalized_required_field("summary", signal.summary)?;
-        let session = self.resolve_pane_signal_session(&signal.token)?;
+        let session = signal.session;
         let now = Utc::now();
         let timestamp = now.to_rfc3339();
         let signal_type_name = pane_signal_type_name(signal.signal_type);
-        let safe_task_id = pane_signal_filename_component(&task_id);
+        let safe_request_id = pane_signal_filename_component(request_id);
         let signal_path = self.runtime_dir().join("signals").join(format!(
             "{}__{}__{}.json",
-            safe_task_id,
+            safe_request_id,
             signal_type_name,
             pane_signal_file_timestamp(now)
         ));
         let legacy_touch_path = self
             .runtime_dir()
             .join("dispatch-triggers")
-            .join(format!("{safe_task_id}.{signal_type_name}"));
+            .join(format!("{safe_request_id}.{signal_type_name}"));
         let event = RuntimeEvent::PaneSignal {
             request_id: request_id.to_string(),
             session,
@@ -1847,7 +2562,9 @@ impl SupervisorHandle {
             commit_sha: signal.commit_sha,
             timestamp,
         };
-        let payload = format!("{}\n", serde_json::to_string_pretty(&event)?);
+        let persisted_event = audit_event_projection(&event, self.inner.as_ref())
+            .expect("pane signal metadata projection should always be retained");
+        let payload = format!("{}\n", serde_json::to_string_pretty(&persisted_event)?);
 
         write_atomic_bytes(&signal_path, payload.as_bytes()).with_context(|| {
             format!(
@@ -2173,26 +2890,6 @@ impl SupervisorHandle {
         *self.inner.pty_spawner.write() = spawner;
     }
 
-    #[cfg(test)]
-    fn set_mailbox_fs_for_tests(&self, mailbox_fs: Arc<dyn MailboxFs>) {
-        *self.inner.mailbox_fs.write() = mailbox_fs;
-    }
-
-    #[cfg(test)]
-    fn set_last_detached_worker_receiver(&self, receiver: std::sync::mpsc::Receiver<()>) {
-        *self.inner.last_detached_worker.lock() = Some(receiver);
-    }
-
-    #[cfg(test)]
-    fn test_wait_for_last_worker(&self, timeout: Duration) -> bool {
-        self.inner
-            .last_detached_worker
-            .lock()
-            .take()
-            .and_then(|receiver| receiver.recv_timeout(timeout).ok())
-            .is_some()
-    }
-
     pub fn snapshot(&self) -> RuntimeSnapshot {
         self.refresh_session_liveness();
         let mut sessions = self
@@ -2203,10 +2900,16 @@ impl SupervisorHandle {
             .map(SessionSlot::snapshot)
             .collect::<Vec<_>>();
         sessions.sort_by(|left, right| left.name.cmp(&right.name));
+        let control_plane = self
+            .inner
+            .control_plane
+            .read()
+            .as_ref()
+            .map(ControlPlaneSnapshot::from);
 
         RuntimeSnapshot {
             sessions,
-            control_plane: self.inner.control_plane.read().clone(),
+            control_plane,
             runtime_dir: self.runtime_dir().display().to_string(),
             audit_log_path: self.audit_log_path().display().to_string(),
             generated_at: now_rfc3339(),
@@ -2243,8 +2946,9 @@ impl SupervisorHandle {
     }
 
     pub fn shutdown(&self) -> Result<()> {
-        let ptys = {
+        let (ptys, revoked_credentials) = {
             let mut slots = self.inner.slots.lock();
+            let revoked_credentials = self.revoke_all_control_plane_credentials_in_memory();
             let mut ptys = Vec::new();
             for (name, slot) in slots.iter_mut() {
                 cancel_quiesce_timer_locked(slot);
@@ -2259,7 +2963,7 @@ impl SupervisorHandle {
                     ptys.push((name.clone(), pty));
                 }
             }
-            ptys
+            (ptys, revoked_credentials)
         };
 
         for (name, pty) in ptys {
@@ -2272,6 +2976,8 @@ impl SupervisorHandle {
             }
             drop(pty);
         }
+
+        remove_revoked_credential_files(&revoked_credentials)?;
 
         Ok(())
     }
@@ -2314,7 +3020,7 @@ impl SupervisorHandle {
             return Err(anyhow!("cannot rename the main pair"));
         }
 
-        let snapshots = {
+        let (snapshots, revoked_credentials) = {
             let mut slots = self.inner.slots.lock();
             validate_pair_name(new_name)?;
             ensure_pair_name_available(&slots, new_name)?;
@@ -2341,6 +3047,11 @@ impl SupervisorHandle {
             let [new_claude_definition, new_codex_definition] =
                 pair_session_definitions(new_name, &working_dir);
 
+            let revoked_credentials = self.revoke_session_credentials_in_memory(&[
+                old_claude_name.clone(),
+                old_codex_name.clone(),
+            ]);
+
             let old_claude_slot = slots
                 .remove(&old_claude_name)
                 .expect("validated pair slot disappeared during rename");
@@ -2355,14 +3066,18 @@ impl SupervisorHandle {
 
             slots.insert(new_claude_slot.definition.name.clone(), new_claude_slot);
             slots.insert(new_codex_slot.definition.name.clone(), new_codex_slot);
-            snapshots
+            (snapshots, revoked_credentials)
         };
+
+        let cleanup_result = remove_revoked_credential_files(&revoked_credentials);
 
         self.emit(RuntimeEvent::PairRenamed {
             old_name: old_name.to_string(),
             new_name: new_name.to_string(),
             timestamp: now_rfc3339(),
         });
+
+        cleanup_result?;
 
         Ok(snapshots)
     }
@@ -2397,7 +3112,7 @@ impl SupervisorHandle {
             self.stop_session_at(&session_name, generation)?;
         }
 
-        {
+        let revoked_credentials = {
             let mut slots = self.inner.slots.lock();
             let claude_slot = slots
                 .get(&claude_name)
@@ -2411,21 +3126,29 @@ impl SupervisorHandle {
                 ));
             }
 
+            let revoked_credentials = self
+                .revoke_session_credentials_in_memory(&[claude_name.clone(), codex_name.clone()]);
+
             slots.remove(&claude_name);
             slots.remove(&codex_name);
-        }
+            revoked_credentials
+        };
+
+        let cleanup_result = remove_revoked_credential_files(&revoked_credentials);
 
         self.emit(RuntimeEvent::PairDeleted {
             name: name.to_string(),
             timestamp: now_rfc3339(),
         });
 
+        cleanup_result?;
+
         Ok(())
     }
 
     fn stop_session_at(&self, name: &str, expected: SessionGeneration) -> Result<SessionSnapshot> {
         self.refresh_session_liveness();
-        let (pty, stop_intent, process_id) = {
+        let (pty, stop_intent, process_id, revoked_credentials) = {
             let mut slots = self.inner.slots.lock();
             let slot = slots
                 .get_mut(name)
@@ -2437,6 +3160,8 @@ impl SupervisorHandle {
                 ));
             }
 
+            let revoked_credentials =
+                self.revoke_session_credentials_in_memory(&[name.to_string()]);
             cancel_quiesce_timer_locked(slot);
             let pty = slot.running.take().and_then(|running| running.pty);
             let process_id = slot.process_id;
@@ -2454,8 +3179,10 @@ impl SupervisorHandle {
             slot.last_activity_at = Some(now_rfc3339());
             slot.last_real_output_at = None;
             reset_work_state_locked(slot);
-            (pty, stop_intent, process_id)
+            (pty, stop_intent, process_id, revoked_credentials)
         };
+
+        let credential_cleanup_result = remove_revoked_credential_files(&revoked_credentials);
 
         let mut exit_status = None;
         let mut exit_poll_error = None;
@@ -2548,6 +3275,7 @@ impl SupervisorHandle {
             reason: "session stopped".into(),
             timestamp,
         });
+        credential_cleanup_result?;
         Ok(snapshot)
     }
 
@@ -2639,11 +3367,16 @@ impl SupervisorHandle {
                 Ok(snapshot)
             }
             Err(error) => {
-                let mut slots = self.inner.slots.lock();
-                let slot = slots
-                    .get_mut(name)
-                    .expect("session disappeared during start_session_at failure");
-                if slot.generation == expected {
+                let (snapshot, revoked_credentials) = {
+                    let mut slots = self.inner.slots.lock();
+                    let slot = slots
+                        .get_mut(name)
+                        .expect("session disappeared during start_session_at failure");
+                    if slot.generation != expected {
+                        return Err(error);
+                    }
+                    let revoked_credentials =
+                        self.revoke_session_credentials_in_memory(&[name.to_string()]);
                     slot.running = None;
                     slot.process_id = None;
                     slot.state = LifecycleState::Failed;
@@ -2651,18 +3384,22 @@ impl SupervisorHandle {
                     slot.last_real_output_at = None;
                     reset_work_state_locked(slot);
                     let snapshot = slot.snapshot();
-                    drop(slots);
-                    self.emit(RuntimeEvent::SystemLog {
-                        level: LogLevel::Error,
-                        message: format!("Failed to start {}: {error}", snapshot.title),
-                        timestamp: now_rfc3339(),
-                    });
-                    self.emit(RuntimeEvent::SessionState {
-                        session: snapshot.name.clone(),
-                        state: snapshot.lifecycle_state,
-                        reason: "spawn failed".into(),
-                        timestamp: now_rfc3339(),
-                    });
+                    (snapshot, revoked_credentials)
+                };
+                let cleanup_result = remove_revoked_credential_files(&revoked_credentials);
+                self.emit(RuntimeEvent::SystemLog {
+                    level: LogLevel::Error,
+                    message: format!("Failed to start {}: {error}", snapshot.title),
+                    timestamp: now_rfc3339(),
+                });
+                self.emit(RuntimeEvent::SessionState {
+                    session: snapshot.name.clone(),
+                    state: snapshot.lifecycle_state,
+                    reason: "spawn failed".into(),
+                    timestamp: now_rfc3339(),
+                });
+                if let Err(cleanup_error) = cleanup_result {
+                    return Err(error.context(cleanup_error));
                 }
                 Err(error)
             }
@@ -3086,6 +3823,13 @@ impl SupervisorHandle {
     }
 
     pub fn start_control_plane(&self) -> Result<ControlPlaneStatus> {
+        self.start_control_plane_at(None)
+    }
+
+    fn start_control_plane_at(
+        &self,
+        endpoint_override: Option<String>,
+    ) -> Result<ControlPlaneStatus> {
         if let Some(existing) = self.inner.control_plane.read().clone() {
             return Ok(existing);
         }
@@ -3100,7 +3844,7 @@ impl SupervisorHandle {
             ));
         }
 
-        let endpoint = control_plane_endpoint();
+        let endpoint = endpoint_override.unwrap_or_else(control_plane_endpoint);
         let status = ControlPlaneStatus {
             transport: control_plane_transport().into(),
             endpoint: endpoint.clone(),
@@ -3108,24 +3852,31 @@ impl SupervisorHandle {
             info_path: info_path.display().to_string(),
         };
 
-        fs::write(&info_path, serde_json::to_string_pretty(&status)?)
-            .context("failed to persist control plane info file")?;
+        let activation = prepare_control_plane_thread(self.clone(), status.clone())?;
+        write_private_file(
+            &info_path,
+            serde_json::to_string_pretty(&status)?.as_bytes(),
+        )
+        .context("failed to persist control plane credentials")?;
 
         *self.inner.control_plane.write() = Some(status.clone());
         self.inner
             .token_bindings
             .lock()
             .insert(status.token.clone(), None);
+        if activation.send(()).is_err() {
+            self.inner.control_plane.write().take();
+            self.inner.token_bindings.lock().remove(&status.token);
+            let _ = fs::remove_file(&info_path);
+            return Err(anyhow!(
+                "control plane listener stopped before credential activation"
+            ));
+        }
         self.emit(RuntimeEvent::ControlPlaneReady {
             endpoint: status.endpoint.clone(),
             transport: status.transport.clone(),
-            info_path: status.info_path.clone(),
             timestamp: now_rfc3339(),
         });
-
-        spawn_control_plane_thread(self.clone(), status.clone());
-        spawn_sideband_mailbox_thread(self.clone());
-
         Ok(status)
     }
 
@@ -3186,6 +3937,7 @@ impl SupervisorHandle {
         let mut log_events = Vec::new();
         let mut exit_events = Vec::new();
         let mut terminal_reactions = Vec::new();
+        let mut revoked_credentials = Vec::new();
 
         {
             let mut slots = self.inner.slots.lock();
@@ -3257,6 +4009,9 @@ impl SupervisorHandle {
                     fallback_reason,
                     &fallback_error,
                 );
+                revoked_credentials.extend(
+                    self.revoke_session_credentials_in_memory(std::slice::from_ref(session_name)),
+                );
                 slot.running = None;
                 slot.process_id = None;
                 slot.state = closed_state;
@@ -3290,6 +4045,14 @@ impl SupervisorHandle {
                 });
                 terminal_reactions.push((session_name.clone(), Instant::now()));
             }
+        }
+
+        if let Err(error) = remove_revoked_credential_files(&revoked_credentials) {
+            log_events.push(RuntimeEvent::SystemLog {
+                level: LogLevel::Error,
+                message: error.to_string(),
+                timestamp: now_rfc3339(),
+            });
         }
 
         for (session, observed_at) in terminal_reactions {
@@ -3455,6 +4218,7 @@ impl SupervisorHandle {
                 let timestamp = now_rfc3339();
                 let observed_at = Instant::now();
                 let mut exit_event = None;
+                let mut revoked_credentials = Vec::new();
                 {
                     let mut slots = self.inner.slots.lock();
                     if let Some(slot) = slots.get_mut(session_name) {
@@ -3467,6 +4231,8 @@ impl SupervisorHandle {
                             SessionExitReason::ProcessDisappeared,
                             "session output closed before exit status was available",
                         );
+                        revoked_credentials =
+                            self.revoke_session_credentials_in_memory(&[session_name.to_string()]);
                         slot.running = None;
                         slot.process_id = None;
                         slot.state = LifecycleState::Closed;
@@ -3483,6 +4249,13 @@ impl SupervisorHandle {
                             timestamp.clone(),
                         ));
                     }
+                }
+                if let Err(error) = remove_revoked_credential_files(&revoked_credentials) {
+                    self.emit(RuntimeEvent::SystemLog {
+                        level: LogLevel::Error,
+                        message: error.to_string(),
+                        timestamp: now_rfc3339(),
+                    });
                 }
                 self.resolve_dispatch_reactions_for_session(
                     session_name,
@@ -3503,12 +4276,15 @@ impl SupervisorHandle {
                 let timestamp = now_rfc3339();
                 let observed_at = Instant::now();
                 let mut exit_event = None;
+                let mut revoked_credentials = Vec::new();
                 {
                     let mut slots = self.inner.slots.lock();
                     if let Some(slot) = slots.get_mut(session_name) {
                         let process_id = slot.process_id;
                         let classification =
                             classify_pty_error_exit(&error, slot.stop_intent.take());
+                        revoked_credentials =
+                            self.revoke_session_credentials_in_memory(&[session_name.to_string()]);
                         slot.state = LifecycleState::Failed;
                         slot.last_error = classification.last_error.clone();
                         slot.running = None;
@@ -3525,6 +4301,13 @@ impl SupervisorHandle {
                             timestamp.clone(),
                         ));
                     }
+                }
+                if let Err(cleanup_error) = remove_revoked_credential_files(&revoked_credentials) {
+                    self.emit(RuntimeEvent::SystemLog {
+                        level: LogLevel::Error,
+                        message: cleanup_error.to_string(),
+                        timestamp: now_rfc3339(),
+                    });
                 }
                 self.resolve_dispatch_reactions_for_session(
                     session_name,
@@ -3549,6 +4332,7 @@ impl SupervisorHandle {
         }
     }
 
+    #[cfg(test)]
     fn apply_sideband_request(&self, request: SidebandRequest) -> SidebandResponse {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -3583,6 +4367,43 @@ impl SupervisorHandle {
         None
     }
 
+    fn authorize_lifecycle_request(
+        &self,
+        request: SidebandRequest,
+    ) -> Result<AuthorizedLifecycleRequest> {
+        let (token, target_session) = match &request {
+            SidebandRequest::StartSession { token, name, .. }
+            | SidebandRequest::StopSession { token, name }
+            | SidebandRequest::RestartSession { token, name } => (token.as_str(), name.clone()),
+            _ => return Err(anyhow!("request is not a lifecycle action")),
+        };
+
+        if self.inner.control_plane.read().is_none() {
+            return Err(anyhow!("control plane not ready"));
+        }
+
+        let binding = self
+            .inner
+            .token_bindings
+            .lock()
+            .get(token)
+            .cloned()
+            .ok_or_else(|| anyhow!("invalid control plane token"))?;
+
+        if let Some(bound_session) = binding.as_deref()
+            && bound_session != target_session
+        {
+            return Err(anyhow!(
+                "lifecycle action: pane-bound token cannot target other sessions"
+            ));
+        }
+
+        Ok(AuthorizedLifecycleRequest {
+            request,
+            target_session,
+        })
+    }
+
     fn sideband_response_from_outcome(&self, outcome: Result<String>) -> SidebandResponse {
         match outcome {
             Ok(message) => SidebandResponse {
@@ -3604,31 +4425,35 @@ impl SupervisorHandle {
         }
     }
 
-    fn apply_lifecycle_request_at(
-        &self,
-        request: SidebandRequest,
-        expected_generation: Option<SessionGeneration>,
-    ) -> SidebandResponse {
-        if let Some(response) = self.validate_sideband_request(request.token()) {
-            return response;
+    fn rejected_sideband_response(message: impl Into<String>) -> SidebandResponse {
+        SidebandResponse {
+            ok: false,
+            message: message.into(),
+            snapshot: None,
+            timed_out: false,
+            payload: None,
+            request_id: None,
         }
+    }
 
-        let outcome = match (request, expected_generation) {
-            (
-                SidebandRequest::StartSession {
-                    name, extra_args, ..
-                },
-                Some(expected),
-            ) => self
-                .start_session_at(&name, expected, extra_args)
+    fn apply_authorized_lifecycle_request_at(
+        &self,
+        authorized: AuthorizedLifecycleRequest,
+        expected_generation: SessionGeneration,
+    ) -> SidebandResponse {
+        let outcome = match authorized.request {
+            SidebandRequest::StartSession {
+                name, extra_args, ..
+            } => self
+                .start_session_at(&name, expected_generation, extra_args)
                 .map(|_| format!("started {name}")),
-            (SidebandRequest::StopSession { name, .. }, Some(expected)) => self
-                .stop_session_at(&name, expected)
+            SidebandRequest::StopSession { name, .. } => self
+                .stop_session_at(&name, expected_generation)
                 .map(|_| format!("stopped {name}")),
-            (SidebandRequest::RestartSession { name, .. }, Some(expected)) => self
-                .restart_session_at(&name, expected)
+            SidebandRequest::RestartSession { name, .. } => self
+                .restart_session_at(&name, expected_generation)
                 .map(|_| format!("restarted {name}")),
-            (other, _) => return self.apply_sideband_request(other),
+            _ => unreachable!("authorized lifecycle request contained a non-lifecycle action"),
         };
 
         self.sideband_response_from_outcome(outcome)
@@ -3724,22 +4549,19 @@ impl SupervisorHandle {
                 content,
                 require_idle,
             } => {
+                let from = match self.authorize_deliver_message(&token, &name) {
+                    Ok(from) => from,
+                    Err(error) => return Self::rejected_sideband_response(error.to_string()),
+                };
                 tokio::task::yield_now().await;
-                self.validate_deliver_message_token(&token, &name)
-                    .and_then(|_| {
-                        let from = self.dispatch_actor_for_token(&token)?;
-                        let request = DeliverMessageRequest { name, content };
-                        match ack_context.as_ref() {
-                            Some(context) => self.deliver_message_with_request_ack(
-                                request,
-                                context,
-                                &from,
-                                require_idle,
-                            ),
-                            None => self.deliver_message_inner(request, None, &from, require_idle),
-                        }
-                    })
-                    .map(|_| "delivered".into())
+                let request = DeliverMessageRequest { name, content };
+                match ack_context.as_ref() {
+                    Some(context) => {
+                        self.deliver_message_with_request_ack(request, context, &from, require_idle)
+                    }
+                    None => self.deliver_message_inner(request, None, &from, require_idle),
+                }
+                .map(|_| "delivered".into())
             }
             SidebandRequest::SendInput {
                 token,
@@ -3747,22 +4569,19 @@ impl SupervisorHandle {
                 input,
                 require_idle,
             } => {
+                let from = match self.authorize_session_action(&token, &name) {
+                    Ok(from) => from,
+                    Err(error) => return Self::rejected_sideband_response(error.to_string()),
+                };
                 tokio::task::yield_now().await;
-                self.validate_session_action_token(&token, &name)
-                    .and_then(|_| {
-                        let from = self.dispatch_actor_for_token(&token)?;
-                        let request = SendInputRequest { name, input };
-                        match ack_context.as_ref() {
-                            Some(context) => self.send_input_with_request_ack(
-                                request,
-                                context,
-                                &from,
-                                require_idle,
-                            ),
-                            None => self.send_input(request),
-                        }
-                    })
-                    .map(|_| "input sent".into())
+                let request = SendInputRequest { name, input };
+                match ack_context.as_ref() {
+                    Some(context) => {
+                        self.send_input_with_request_ack(request, context, &from, require_idle)
+                    }
+                    None => self.send_input(request),
+                }
+                .map(|_| "input sent".into())
             }
             SidebandRequest::SendKey {
                 token,
@@ -3770,43 +4589,43 @@ impl SupervisorHandle {
                 key,
                 require_idle,
             } => {
+                let from = match self.authorize_session_action(&token, &name) {
+                    Ok(from) => from,
+                    Err(error) => return Self::rejected_sideband_response(error.to_string()),
+                };
                 tokio::task::yield_now().await;
-                self.validate_session_action_token(&token, &name)
-                    .and_then(|_| match ack_context.as_ref() {
-                        Some(context) => {
-                            let from = self.dispatch_actor_for_token(&token)?;
-                            self.send_control_key_with_request_ack(
-                                &name,
-                                key,
-                                context,
-                                &from,
-                                require_idle,
-                            )
-                        }
-                        None => self.send_control_key(&name, key),
-                    })
-                    .map(|_| format!("key {:?} sent", key))
+                match ack_context.as_ref() {
+                    Some(context) => self.send_control_key_with_request_ack(
+                        &name,
+                        key,
+                        context,
+                        &from,
+                        require_idle,
+                    ),
+                    None => self.send_control_key(&name, key),
+                }
+                .map(|_| format!("key {:?} sent", key))
             }
             SidebandRequest::RouteMessage {
                 token,
                 mut request,
                 require_idle,
             } => {
+                let bound_sender = match self.resolve_route_sender_identity(&token) {
+                    Ok(bound_sender) => bound_sender,
+                    Err(error) => return Self::rejected_sideband_response(error.to_string()),
+                };
+                if let Some(name) = bound_sender {
+                    request.from = name;
+                }
                 tokio::task::yield_now().await;
-                self.resolve_route_sender_identity(&token)
-                    .map(|bound| {
-                        if let Some(name) = bound {
-                            request.from = name;
-                        }
-                        request
-                    })
-                    .and_then(|req| match ack_context.as_ref() {
-                        Some(context) => {
-                            self.route_message_with_request_ack(req, context, require_idle)
-                        }
-                        None => self.route_message_inner(req, None, require_idle),
-                    })
-                    .map(|_| "message routed".into())
+                match ack_context.as_ref() {
+                    Some(context) => {
+                        self.route_message_with_request_ack(request, context, require_idle)
+                    }
+                    None => self.route_message_inner(request, None, require_idle),
+                }
+                .map(|_| "message routed".into())
             }
             SidebandRequest::PaneSignal {
                 token,
@@ -3816,10 +4635,14 @@ impl SupervisorHandle {
                 artifact_paths,
                 commit_sha,
             } => {
+                let session = match self.resolve_pane_signal_session(&token) {
+                    Ok(session) => session,
+                    Err(error) => return Self::rejected_sideband_response(error.to_string()),
+                };
                 let result = self.record_pane_signal(
                     request_id,
                     PaneSignalRecord {
-                        token,
+                        session,
                         task_id,
                         signal_type,
                         summary,
@@ -3850,9 +4673,11 @@ impl SupervisorHandle {
                 };
             }
             SidebandRequest::CreatePair { token, name } => {
+                if let Err(error) = self.validate_master_token(&token) {
+                    return Self::rejected_sideband_response(error.to_string());
+                }
                 tokio::task::yield_now().await;
-                self.validate_master_token(&token)
-                    .and_then(|_| self.create_pair(&name))
+                self.create_pair(&name)
                     .map(|snapshots| format!("created pair '{name}' ({} slots)", snapshots.len()))
             }
             lifecycle => {
@@ -3947,22 +4772,23 @@ impl SupervisorHandle {
         session: Option<&str>,
         extra_args: &[String],
     ) -> SidebandResponse {
-        if let Err(error) = validate_extra_args(start_session_extra_args_of(&request)) {
+        let authorized = match self.authorize_lifecycle_request(request) {
+            Ok(authorized) => authorized,
+            Err(error) => return Self::rejected_sideband_response(error.to_string()),
+        };
+
+        if let Err(error) = validate_extra_args(start_session_extra_args_of(&authorized.request)) {
             return self.sideband_response_from_outcome(Err(error));
         }
 
-        let expected_generation = match session {
-            Some(name) => match self.bump_session_generation(name) {
-                Ok(expected) => Some(expected),
-                Err(error) => return self.sideband_response_from_outcome(Err(error)),
-            },
-            None => None,
+        let expected_generation = match self.bump_session_generation(&authorized.target_session) {
+            Ok(expected) => expected,
+            Err(error) => return self.sideband_response_from_outcome(Err(error)),
         };
 
         let handle = self.clone();
-        let lifecycle_request = request.clone();
         let mut worker = tokio::task::spawn_blocking(move || {
-            handle.apply_lifecycle_request_at(lifecycle_request, expected_generation)
+            handle.apply_authorized_lifecycle_request_at(authorized, expected_generation)
         });
         let slow_warn_at = budget / 2;
         let started = Instant::now();
@@ -4117,12 +4943,15 @@ impl SupervisorHandle {
             self.handle_session_work_state_side_effects(session, *state);
         }
 
-        let appended = match self.inner.audit.append(&event) {
-            Ok(()) => true,
-            Err(error) => {
-                eprintln!("audit log failure: {error}");
-                false
-            }
+        let appended = match audit_event_projection(&event, &self.inner) {
+            Some(audit_event) => match self.inner.audit.append(&audit_event) {
+                Ok(()) => true,
+                Err(error) => {
+                    eprintln!("audit log failure: {error}");
+                    false
+                }
+            },
+            None => false,
         };
 
         if appended {
@@ -4143,7 +4972,7 @@ impl SupervisorHandle {
     ) -> Result<SessionDefinition> {
         let mut prepared = definition.clone();
 
-        if let Some(status) = self.ensure_session_control_plane_status(&definition.name)? {
+        if let Some(status) = self.rotate_session_control_plane_status(&definition.name)? {
             prepared.env.push(EnvVar {
                 key: "PRIM1_PANE_IDENTITY".into(),
                 value: definition.name.clone(),
@@ -4157,7 +4986,7 @@ impl SupervisorHandle {
         Ok(prepared)
     }
 
-    fn ensure_session_control_plane_status(
+    fn rotate_session_control_plane_status(
         &self,
         session_name: &str,
     ) -> Result<Option<ControlPlaneStatus>> {
@@ -4170,37 +4999,86 @@ impl SupervisorHandle {
             .join(format!("control-plane-{session_name}.json"));
         let info_path_text = info_path.display().to_string();
 
-        let status = {
-            let mut statuses = self.inner.session_control_planes.lock();
-            statuses
-                .entry(session_name.to_string())
-                .or_insert_with(|| {
-                    let status = ControlPlaneStatus {
-                        transport: control_plane.transport.clone(),
-                        endpoint: control_plane.endpoint.clone(),
-                        token: Uuid::new_v4().to_string(),
-                        info_path: info_path_text.clone(),
-                    };
-                    self.inner
-                        .token_bindings
-                        .lock()
-                        .insert(status.token.clone(), Some(session_name.to_string()));
-                    status
-                })
-                .clone()
+        let mut statuses = self.inner.session_control_planes.lock();
+        let existing = statuses.get(session_name).cloned();
+        let status = ControlPlaneStatus {
+            transport: control_plane.transport.clone(),
+            endpoint: control_plane.endpoint.clone(),
+            token: Uuid::new_v4().to_string(),
+            info_path: info_path_text,
         };
 
-        fs::write(&info_path, serde_json::to_string_pretty(&status)?).with_context(|| {
-            format!(
-                "failed to persist session control plane info file {}",
+        let payload = serde_json::to_string_pretty(&status)?;
+        if let Err(error) = write_private_file(&info_path, payload.as_bytes()) {
+            eprintln!(
+                "failed to persist session credentials at {}: {error}",
                 info_path.display()
-            )
-        })?;
+            );
+            return Err(anyhow!("failed to persist session credentials"));
+        }
+
+        let mut bindings = self.inner.token_bindings.lock();
+        if let Some(existing) = existing {
+            bindings.remove(&existing.token);
+            self.inner
+                .retired_sensitive_values
+                .lock()
+                .extend([existing.token, existing.info_path]);
+        }
+        bindings.insert(status.token.clone(), Some(session_name.to_string()));
+        statuses.insert(session_name.to_string(), status.clone());
+        drop(bindings);
+        drop(statuses);
 
         Ok(Some(status))
     }
 
-    fn validate_session_action_token(&self, token: &str, target_session: &str) -> Result<()> {
+    fn revoke_session_credentials_in_memory(
+        &self,
+        session_names: &[String],
+    ) -> Vec<ControlPlaneStatus> {
+        let mut statuses = self.inner.session_control_planes.lock();
+        let mut bindings = self.inner.token_bindings.lock();
+        let mut retired = self.inner.retired_sensitive_values.lock();
+        let mut revoked = Vec::new();
+
+        for session_name in session_names {
+            if let Some(status) = statuses.remove(session_name) {
+                bindings.remove(&status.token);
+                retired.extend([status.token.clone(), status.info_path.clone()]);
+                revoked.push(status);
+            }
+        }
+        drop(retired);
+        drop(bindings);
+        drop(statuses);
+        revoked
+    }
+
+    fn revoke_all_control_plane_credentials_in_memory(&self) -> Vec<ControlPlaneStatus> {
+        let session_names = self
+            .inner
+            .session_control_planes
+            .lock()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut revoked = self.revoke_session_credentials_in_memory(&session_names);
+
+        let master = self.inner.control_plane.write().take();
+        if let Some(status) = master.as_ref() {
+            self.inner.token_bindings.lock().remove(&status.token);
+            self.inner
+                .retired_sensitive_values
+                .lock()
+                .extend([status.token.clone(), status.info_path.clone()]);
+        }
+        revoked.extend(master);
+        self.inner.token_bindings.lock().clear();
+        revoked
+    }
+
+    fn authorize_session_action(&self, token: &str, target_session: &str) -> Result<String> {
         let binding = self
             .inner
             .token_bindings
@@ -4209,19 +5087,21 @@ impl SupervisorHandle {
             .cloned()
             .ok_or_else(|| anyhow!("invalid control plane token"))?;
 
-        if self.inner.peer_slash_commands_allowed {
-            return Ok(());
-        }
-
-        if let Some(bound_session) = binding
+        if let Some(bound_session) = binding.as_deref()
             && bound_session != target_session
         {
             return Err(anyhow!(
-                "peer slash commands are disabled by this wrapper's policy (PRIM1_PEER_SLASH_COMMANDS_ALLOWED=0)"
+                "session action: pane-bound token cannot target other sessions"
             ));
         }
 
-        Ok(())
+        Ok(binding.unwrap_or_else(|| "operator".into()))
+    }
+
+    #[cfg(test)]
+    fn validate_session_action_token(&self, token: &str, target_session: &str) -> Result<()> {
+        self.authorize_session_action(token, target_session)
+            .map(drop)
     }
 
     fn validate_master_token(&self, token: &str) -> Result<()> {
@@ -4254,18 +5134,6 @@ impl SupervisorHandle {
         Ok(binding)
     }
 
-    fn dispatch_actor_for_token(&self, token: &str) -> Result<String> {
-        let binding = self
-            .inner
-            .token_bindings
-            .lock()
-            .get(token)
-            .cloned()
-            .ok_or_else(|| anyhow!("invalid control plane token"))?;
-
-        Ok(binding.unwrap_or_else(|| "operator".into()))
-    }
-
     fn resolve_pane_signal_session(&self, token: &str) -> Result<String> {
         let binding = self
             .inner
@@ -4278,7 +5146,7 @@ impl SupervisorHandle {
         Ok(binding.unwrap_or_else(|| "supervisor".into()))
     }
 
-    fn validate_deliver_message_token(&self, token: &str, target_session: &str) -> Result<()> {
+    fn authorize_deliver_message(&self, token: &str, target_session: &str) -> Result<String> {
         let binding = self
             .inner
             .token_bindings
@@ -4287,7 +5155,7 @@ impl SupervisorHandle {
             .cloned()
             .ok_or_else(|| anyhow!("invalid control plane token"))?;
 
-        if let Some(bound_session) = binding
+        if let Some(bound_session) = binding.as_deref()
             && bound_session != target_session
         {
             return Err(anyhow!(
@@ -4295,7 +5163,13 @@ impl SupervisorHandle {
             ));
         }
 
-        Ok(())
+        Ok(binding.unwrap_or_else(|| "operator".into()))
+    }
+
+    #[cfg(test)]
+    fn validate_deliver_message_token(&self, token: &str, target_session: &str) -> Result<()> {
+        self.authorize_deliver_message(token, target_session)
+            .map(drop)
     }
 
     fn prepare_delivery_for_session(
@@ -4456,7 +5330,12 @@ fn process_id_is_running(process_id: u32) -> bool {
     unsafe { libc::kill(process_id as i32, 0) == 0 }
 }
 
-fn spawn_control_plane_thread(handle: SupervisorHandle, status: ControlPlaneStatus) {
+fn prepare_control_plane_thread(
+    handle: SupervisorHandle,
+    status: ControlPlaneStatus,
+) -> Result<mpsc::SyncSender<()>> {
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    let (activation_tx, activation_rx) = mpsc::sync_channel::<()>(1);
     thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -4465,437 +5344,45 @@ fn spawn_control_plane_thread(handle: SupervisorHandle, status: ControlPlaneStat
         {
             Ok(runtime) => runtime,
             Err(error) => {
+                let _ = ready_tx.send(Err(format!(
+                    "failed to create control plane runtime: {error}"
+                )));
                 eprintln!("failed to create control plane runtime: {error}");
                 return;
             }
         };
 
         #[cfg(windows)]
-        let result = runtime.block_on(run_windows_pipe_server(handle, status));
+        let result = runtime.block_on(run_windows_pipe_server(
+            handle,
+            status,
+            ready_tx,
+            activation_rx,
+        ));
 
         #[cfg(unix)]
-        let result = runtime.block_on(run_unix_socket_server(handle, status));
+        let result = runtime.block_on(run_unix_socket_server(
+            handle,
+            status,
+            ready_tx,
+            activation_rx,
+        ));
 
         if let Err(error) = result {
             eprintln!("control plane failed: {error}");
         }
     });
-}
 
-fn spawn_sideband_mailbox_thread(handle: SupervisorHandle) {
-    let runtime_dir = handle.runtime_dir().to_path_buf();
-    thread::spawn(move || {
-        let sideband_dir = runtime_dir.join("sideband");
-        let inbox_dir = sideband_dir.join("inbox");
-        let outbox_dir = sideband_dir.join("outbox");
-        let processed_dir = sideband_dir.join("processed");
-
-        if let Err(error) = fs::create_dir_all(&inbox_dir) {
-            eprintln!("failed to create sideband inbox: {error}");
-            return;
+    match ready_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(())) => Ok(activation_tx),
+        Ok(Err(error)) => Err(anyhow!(error)),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err(anyhow!("timed out preparing control plane listener"))
         }
-        if let Err(error) = fs::create_dir_all(&outbox_dir) {
-            eprintln!("failed to create sideband outbox: {error}");
-            return;
-        }
-        if let Err(error) = fs::create_dir_all(&processed_dir) {
-            eprintln!("failed to create sideband archive: {error}");
-            return;
-        }
-
-        loop {
-            let mut requests = match fs::read_dir(&inbox_dir) {
-                Ok(entries) => entries
-                    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-                    .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
-                    .collect::<Vec<_>>(),
-                Err(error) => {
-                    eprintln!("failed to read sideband inbox: {error}");
-                    thread::sleep(Duration::from_millis(200));
-                    continue;
-                }
-            };
-
-            requests.sort();
-
-            for request_path in requests {
-                if let Err(error) = process_sideband_mailbox_file(
-                    &handle,
-                    &request_path,
-                    &outbox_dir,
-                    &processed_dir,
-                ) {
-                    eprintln!(
-                        "failed to process sideband mailbox request {}: {error}",
-                        request_path.display()
-                    );
-                }
-            }
-
-            thread::sleep(Duration::from_millis(100));
-        }
-    });
-}
-
-fn process_sideband_mailbox_file(
-    handle: &SupervisorHandle,
-    request_path: &Path,
-    outbox_dir: &Path,
-    processed_dir: &Path,
-) -> Result<()> {
-    let mailbox_fs = handle.inner.mailbox_fs.read().clone();
-    let raw = mailbox_fs
-        .read_to_string(request_path)
-        .with_context(|| format!("failed to read mailbox request {}", request_path.display()))?;
-    let request = match decode_request(raw.trim()) {
-        Ok(request) => request,
-        Err(error) => {
-            let request_is_fresh = fs::metadata(request_path)
-                .ok()
-                .and_then(|metadata| metadata.modified().ok())
-                .and_then(|modified| modified.elapsed().ok())
-                .map(|elapsed| elapsed < Duration::from_millis(500))
-                .unwrap_or(false);
-
-            if request_is_fresh {
-                return Ok(());
-            }
-
-            let response = SidebandResponse {
-                ok: false,
-                message: format!("invalid sideband payload: {error}"),
-                snapshot: Some(handle.snapshot()),
-                timed_out: false,
-                payload: None,
-                request_id: None,
-            };
-            return write_and_archive_response(
-                handle,
-                request_path,
-                outbox_dir,
-                processed_dir,
-                &response,
-            );
-        }
-    };
-
-    let request_id = Uuid::new_v4().to_string();
-    let action = action_label_for(&request);
-    let session = session_name_of(&request);
-    let extra_args = start_session_extra_args_of(&request).to_vec();
-    let budget = SidebandTimeouts::budget(&request);
-    let started = Instant::now();
-
-    handle.emit_sideband_lifecycle(
-        &request_id,
-        action,
-        session,
-        &extra_args,
-        SidebandPhase::Started,
-        Duration::ZERO,
-    );
-
-    let mut response = match SidebandTimeouts::lane(&request) {
-        OpLane::Lifecycle => run_detached_with_timeout(
-            handle,
-            request.clone(),
-            budget,
-            &request_id,
-            action,
-            session,
-            &extra_args,
-        ),
-        OpLane::SideEffect => run_inline_with_timeout(
-            handle,
-            request.clone(),
-            budget,
-            &request_id,
-            action,
-            session,
-            &extra_args,
-        ),
-    };
-
-    response.request_id = Some(request_id.clone());
-
-    if !response.timed_out {
-        let phase = if response.ok {
-            SidebandPhase::Completed
-        } else {
-            SidebandPhase::Failed
-        };
-        let error = (!response.ok).then(|| response.message.clone());
-        handle.emit_sideband_lifecycle_with_error(SidebandLifecycleEvent {
-            request_id: &request_id,
-            action,
-            session,
-            extra_args: &extra_args,
-            phase,
-            elapsed: started.elapsed(),
-            error,
-        });
-    }
-
-    write_and_archive_response(handle, request_path, outbox_dir, processed_dir, &response)
-}
-
-fn run_detached_with_timeout(
-    handle: &SupervisorHandle,
-    request: SidebandRequest,
-    budget: Duration,
-    request_id: &str,
-    action: &str,
-    session: Option<&str>,
-    extra_args: &[String],
-) -> SidebandResponse {
-    if let Err(error) = validate_extra_args(start_session_extra_args_of(&request)) {
-        return handle.sideband_response_from_outcome(Err(error));
-    }
-
-    let expected_generation = match session {
-        Some(name) => match handle.bump_session_generation(name) {
-            Ok(expected) => Some(expected),
-            Err(error) => return handle.sideband_response_from_outcome(Err(error)),
-        },
-        None => None,
-    };
-
-    let (tx, rx) = std::sync::mpsc::channel();
-    #[cfg(test)]
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-
-    #[cfg(test)]
-    handle.set_last_detached_worker_receiver(done_rx);
-
-    let worker_handle = handle.clone();
-    thread::spawn(move || {
-        let response = worker_handle.apply_lifecycle_request_at(request, expected_generation);
-        let _ = tx.send(response);
-        #[cfg(test)]
-        let _ = done_tx.send(());
-    });
-
-    let slow_warn_at = budget / 2;
-    let started = Instant::now();
-    let mut warned = false;
-
-    loop {
-        let elapsed = started.elapsed();
-        let remaining = budget.saturating_sub(elapsed);
-        let tick = remaining.min(Duration::from_millis(500));
-        match rx.recv_timeout(tick) {
-            Ok(response) => return response,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                let elapsed = started.elapsed();
-                if !warned && elapsed >= slow_warn_at {
-                    warned = true;
-                    handle.emit_sideband_lifecycle(
-                        request_id,
-                        action,
-                        session,
-                        extra_args,
-                        SidebandPhase::SlowWarning,
-                        elapsed,
-                    );
-                }
-                if elapsed >= budget {
-                    let message = format!(
-                        "lifecycle op '{action}' timed out after {}ms",
-                        elapsed.as_millis()
-                    );
-                    handle.emit_sideband_lifecycle_with_error(SidebandLifecycleEvent {
-                        request_id,
-                        action,
-                        session,
-                        extra_args,
-                        phase: SidebandPhase::TimedOut,
-                        elapsed,
-                        error: Some(message.clone()),
-                    });
-                    return SidebandResponse {
-                        ok: false,
-                        message,
-                        snapshot: Some(handle.snapshot()),
-                        timed_out: true,
-                        payload: None,
-                        request_id: None,
-                    };
-                }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return SidebandResponse {
-                    ok: false,
-                    message: "lifecycle worker panicked".into(),
-                    snapshot: Some(handle.snapshot()),
-                    timed_out: false,
-                    payload: None,
-                    request_id: None,
-                };
-            }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(anyhow!("control plane listener stopped during startup"))
         }
     }
-}
-
-fn run_inline_with_timeout(
-    handle: &SupervisorHandle,
-    request: SidebandRequest,
-    budget: Duration,
-    request_id: &str,
-    action: &str,
-    session: Option<&str>,
-    extra_args: &[String],
-) -> SidebandResponse {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
-        .expect("failed to build inline side-effect runtime");
-    let started = Instant::now();
-    let slow_warn_at = budget / 2;
-    let handle_clone = handle.clone();
-    let request_clone = request.clone();
-    let ack_context = request_ack_context_for(request_id, action, &request);
-    let result = runtime.block_on(async move {
-        tokio::time::timeout(
-            budget,
-            handle_clone.apply_side_effect_request_async(request_clone, request_id, ack_context),
-        )
-        .await
-    });
-
-    let elapsed = started.elapsed();
-    if elapsed >= slow_warn_at {
-        handle.emit_sideband_lifecycle(
-            request_id,
-            action,
-            session,
-            extra_args,
-            SidebandPhase::SlowWarning,
-            elapsed,
-        );
-    }
-
-    match result {
-        Ok(response) => response,
-        Err(_) => {
-            let message = format!(
-                "side-effect op '{action}' timed out after {}ms (boundary pre-PTY-write unless documented otherwise)",
-                budget.as_millis()
-            );
-            handle.emit_sideband_lifecycle_with_error(SidebandLifecycleEvent {
-                request_id,
-                action,
-                session,
-                extra_args,
-                phase: SidebandPhase::TimedOut,
-                elapsed: budget,
-                error: Some(message.clone()),
-            });
-            SidebandResponse {
-                ok: false,
-                message,
-                snapshot: Some(handle.snapshot()),
-                timed_out: true,
-                payload: None,
-                request_id: None,
-            }
-        }
-    }
-}
-
-fn write_and_archive_response(
-    handle: &SupervisorHandle,
-    request_path: &Path,
-    outbox_dir: &Path,
-    processed_dir: &Path,
-    response: &SidebandResponse,
-) -> Result<()> {
-    let mailbox_fs = handle.inner.mailbox_fs.read().clone();
-    let file_name = request_path.file_name().with_context(|| {
-        format!(
-            "mailbox request missing file name: {}",
-            request_path.display()
-        )
-    })?;
-    let response_path = outbox_dir.join(file_name);
-    let temp_response_path = outbox_dir.join(format!("{}.tmp", file_name.to_string_lossy()));
-    let payload = format!("{}\n", encode_response(response)?);
-    let archived_request_path = processed_dir.join(file_name);
-
-    let mut last_error = None;
-    for _attempt in 0..3 {
-        let result: Result<()> = (|| {
-            mailbox_fs
-                .write(&temp_response_path, payload.as_bytes())
-                .with_context(|| {
-                    format!(
-                        "failed to write mailbox response {}",
-                        temp_response_path.display()
-                    )
-                })?;
-            mailbox_fs
-                .rename(&temp_response_path, &response_path)
-                .with_context(|| {
-                    format!(
-                        "failed to publish mailbox response {}",
-                        response_path.display()
-                    )
-                })?;
-            if archived_request_path.exists() {
-                mailbox_fs
-                    .remove_file(&archived_request_path)
-                    .with_context(|| {
-                        format!(
-                            "failed to clear archived mailbox request {}",
-                            archived_request_path.display()
-                        )
-                    })?;
-            }
-            mailbox_fs
-                .rename(request_path, &archived_request_path)
-                .with_context(|| {
-                    format!(
-                        "failed to archive mailbox request {}",
-                        request_path.display()
-                    )
-                })?;
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                last_error = Some(error);
-                let _ = mailbox_fs.remove_file(&temp_response_path);
-                thread::sleep(Duration::from_millis(50));
-            }
-        }
-    }
-
-    let error = last_error.expect("archive retries should record an error");
-    let poison_dir = request_path
-        .parent()
-        .with_context(|| format!("request path missing parent: {}", request_path.display()))?
-        .parent()
-        .with_context(|| format!("sideband inbox missing parent: {}", request_path.display()))?
-        .join("poison");
-    fs::create_dir_all(&poison_dir)
-        .with_context(|| format!("failed to create poison directory {}", poison_dir.display()))?;
-    let poison_path = poison_dir.join(format!(
-        "{}-{}",
-        now_rfc3339().replace(':', "-"),
-        file_name.to_string_lossy()
-    ));
-    mailbox_fs
-        .rename(request_path, &poison_path)
-        .with_context(|| {
-            format!(
-                "failed to poison mailbox request {}",
-                request_path.display()
-            )
-        })?;
-    fs::write(poison_path.with_extension("error"), format!("{error:#}\n"))
-        .with_context(|| format!("failed to write poison error {}", poison_path.display()))?;
-    Err(error)
 }
 
 fn build_launch_spec(definition: &SessionDefinition) -> shared_types::LaunchSpec {
@@ -5838,32 +6325,87 @@ fn control_plane_transport() -> &'static str {
 fn control_plane_endpoint() -> String {
     #[cfg(windows)]
     {
-        format!("{DEFAULT_ENDPOINT}-{}", std::process::id())
+        format!(
+            "{DEFAULT_ENDPOINT}-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        )
     }
 
     #[cfg(not(windows))]
     {
-        format!("{DEFAULT_ENDPOINT}-{}.sock", std::process::id())
+        format!(
+            "{DEFAULT_ENDPOINT}-{}-{}.sock",
+            std::process::id(),
+            Uuid::new_v4()
+        )
     }
+}
+
+#[cfg(windows)]
+fn create_windows_pipe_server(
+    endpoint: &str,
+    first_instance: bool,
+) -> Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+    use std::{mem, ptr};
+    use tokio::net::windows::named_pipe::ServerOptions;
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+
+    let descriptor = current_user_only_security_descriptor("", "GA")?;
+    let mut attributes = SECURITY_ATTRIBUTES {
+        nLength: mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.as_ptr(),
+        bInheritHandle: 0,
+    };
+    let mut options = ServerOptions::new();
+    options
+        .reject_remote_clients(true)
+        .first_pipe_instance(first_instance);
+    unsafe {
+        options.create_with_security_attributes_raw(endpoint, ptr::from_mut(&mut attributes).cast())
+    }
+    .with_context(|| format!("failed to create named pipe {endpoint}"))
 }
 
 #[cfg(windows)]
 async fn run_windows_pipe_server(
     handle: SupervisorHandle,
     status: ControlPlaneStatus,
+    ready: mpsc::SyncSender<Result<(), String>>,
+    activation: mpsc::Receiver<()>,
 ) -> Result<()> {
-    use tokio::net::windows::named_pipe::ServerOptions;
+    let first_server = match create_windows_pipe_server(&status.endpoint, true) {
+        Ok(server) => server,
+        Err(error) => {
+            let message = error.to_string();
+            let _ = ready.send(Err(message.clone()));
+            return Err(anyhow!(message));
+        }
+    };
+    ready
+        .send(Ok(()))
+        .map_err(|_| anyhow!("control plane startup receiver disconnected"))?;
+    if activation.recv().is_err() {
+        return Ok(());
+    }
 
+    let connection_slots = Arc::new(Semaphore::new(SIDEBAND_MAX_CONNECTIONS));
+    let mut prepared_server = Some(first_server);
     loop {
-        let server = ServerOptions::new()
-            .create(&status.endpoint)
-            .with_context(|| format!("failed to create named pipe {}", status.endpoint))?;
+        let server = match prepared_server.take() {
+            Some(server) => server,
+            None => create_windows_pipe_server(&status.endpoint, false)?,
+        };
         server
             .connect()
             .await
             .context("failed to connect named pipe")?;
+        let Some(connection_permit) = reserve_sideband_connection(&connection_slots) else {
+            continue;
+        };
         let handle_clone = handle.clone();
         tokio::spawn(async move {
+            let _connection_permit = connection_permit;
             if let Err(error) = handle_sideband_stream(handle_clone, server).await {
                 eprintln!("named pipe connection failed: {error}");
             }
@@ -5875,25 +6417,56 @@ async fn run_windows_pipe_server(
 async fn run_unix_socket_server(
     handle: SupervisorHandle,
     status: ControlPlaneStatus,
+    ready: mpsc::SyncSender<Result<(), String>>,
+    activation: mpsc::Receiver<()>,
 ) -> Result<()> {
     use tokio::net::UnixListener;
 
     let _ = fs::remove_file(&status.endpoint);
-    let listener = UnixListener::bind(&status.endpoint)
-        .with_context(|| format!("failed to bind unix socket {}", status.endpoint))?;
+    let listener = match UnixListener::bind(&status.endpoint) {
+        Ok(listener) => listener,
+        Err(error) => {
+            let message = format!("failed to bind unix socket {}: {error}", status.endpoint);
+            let _ = ready.send(Err(message.clone()));
+            return Err(anyhow!(message));
+        }
+    };
+    if let Err(error) = restrict_path_to_current_user(Path::new(&status.endpoint), false) {
+        let message = format!(
+            "failed to secure unix socket {}: {error:#}",
+            status.endpoint
+        );
+        let _ = ready.send(Err(message.clone()));
+        return Err(anyhow!(message));
+    }
+    ready
+        .send(Ok(()))
+        .map_err(|_| anyhow!("control plane startup receiver disconnected"))?;
+    if activation.recv().is_err() {
+        return Ok(());
+    }
 
+    let connection_slots = Arc::new(Semaphore::new(SIDEBAND_MAX_CONNECTIONS));
     loop {
         let (stream, _) = listener
             .accept()
             .await
             .context("failed to accept unix socket")?;
+        let Some(connection_permit) = reserve_sideband_connection(&connection_slots) else {
+            continue;
+        };
         let handle_clone = handle.clone();
         tokio::spawn(async move {
+            let _connection_permit = connection_permit;
             if let Err(error) = handle_sideband_stream(handle_clone, stream).await {
                 eprintln!("unix socket connection failed: {error}");
             }
         });
     }
+}
+
+fn reserve_sideband_connection(slots: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
+    slots.clone().try_acquire_owned().ok()
 }
 
 async fn handle_sideband_stream<Stream>(handle: SupervisorHandle, stream: Stream) -> Result<()>
@@ -5902,24 +6475,91 @@ where
 {
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .await
-        .context("failed to read sideband request")?;
-
-    let request = decode_request(line.trim()).context("invalid sideband payload")?;
+    let frame = read_sideband_frame(
+        &mut reader,
+        SIDEBAND_FRAME_MAX_BYTES,
+        SIDEBAND_FRAME_READ_TIMEOUT,
+    )
+    .await?;
+    let request = decode_request(&frame).context("invalid sideband payload")?;
     let response = handle.apply_sideband_request_async(request).await;
     let payload = format!("{}\n", encode_response(&response)?);
-    write_half
-        .write_all(payload.as_bytes())
-        .await
-        .context("failed to write sideband response")?;
-    write_half
-        .flush()
-        .await
-        .context("failed to flush sideband response")?;
+    write_sideband_response(
+        &mut write_half,
+        payload.as_bytes(),
+        SIDEBAND_RESPONSE_WRITE_TIMEOUT,
+    )
+    .await?;
     Ok(())
+}
+
+async fn write_sideband_response<Writer>(
+    writer: &mut Writer,
+    payload: &[u8],
+    timeout: Duration,
+) -> Result<()>
+where
+    Writer: AsyncWrite + Unpin,
+{
+    tokio::time::timeout(timeout, async {
+        writer
+            .write_all(payload)
+            .await
+            .context("failed to write sideband response")?;
+        writer
+            .flush()
+            .await
+            .context("failed to flush sideband response")?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .map_err(|_| anyhow!("sideband response write timed out"))?
+}
+
+async fn read_sideband_frame<Reader>(
+    reader: &mut Reader,
+    max_bytes: usize,
+    timeout: Duration,
+) -> Result<String>
+where
+    Reader: AsyncBufRead + Unpin,
+{
+    tokio::time::timeout(timeout, async {
+        let mut frame = Vec::new();
+        loop {
+            let available = reader
+                .fill_buf()
+                .await
+                .context("failed to read sideband request")?;
+            if available.is_empty() {
+                return Err(anyhow!("unterminated sideband request"));
+            }
+
+            let consumed = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map(|index| index + 1)
+                .unwrap_or(available.len());
+            if frame.len().saturating_add(consumed) > max_bytes {
+                return Err(anyhow!(
+                    "sideband request exceeds {max_bytes}-byte frame limit"
+                ));
+            }
+
+            frame.extend_from_slice(&available[..consumed]);
+            reader.consume(consumed);
+            if frame.last() == Some(&b'\n') {
+                frame.pop();
+                if frame.last() == Some(&b'\r') {
+                    frame.pop();
+                }
+                return String::from_utf8(frame)
+                    .map_err(|_| anyhow!("invalid UTF-8 sideband request"));
+            }
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("sideband request timed out before newline"))?
 }
 
 #[cfg(test)]
@@ -5930,10 +6570,108 @@ mod tests {
     use pty_host::PtySession as PtySessionTrait;
     use shared_types::{MessageScope, RouteMessageRequest, SidebandRequest};
     use std::{
-        collections::VecDeque,
+        collections::{BTreeSet, VecDeque},
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    #[cfg(windows)]
+    fn security_descriptor_sddl_for_path(path: &Path) -> String {
+        use std::{os::windows::ffi::OsStrExt, ptr};
+        use windows_sys::Win32::Security::{
+            Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT},
+            DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        };
+
+        let path_wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        let result = unsafe {
+            GetNamedSecurityInfoW(
+                path_wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(result, 0, "GetNamedSecurityInfoW failed for {path:?}");
+        security_descriptor_to_sddl(LocalSecurityDescriptor(descriptor))
+    }
+
+    #[cfg(windows)]
+    fn security_descriptor_sddl_for_handle(
+        handle: windows_sys::Win32::Foundation::HANDLE,
+    ) -> String {
+        use std::ptr;
+        use windows_sys::Win32::Security::{
+            Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT},
+            DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        };
+
+        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        let result = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_KERNEL_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(result, 0, "GetSecurityInfo failed");
+        security_descriptor_to_sddl(LocalSecurityDescriptor(descriptor))
+    }
+
+    #[cfg(windows)]
+    fn security_descriptor_to_sddl(descriptor: LocalSecurityDescriptor) -> String {
+        use std::ptr;
+        use windows_sys::Win32::Security::{
+            Authorization::{
+                ConvertSecurityDescriptorToStringSecurityDescriptorW, SDDL_REVISION_1,
+            },
+            DACL_SECURITY_INFORMATION,
+        };
+
+        let mut text = ptr::null_mut();
+        let mut len = 0_u32;
+        let converted = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor.as_ptr(),
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut text,
+                &mut len,
+            )
+        };
+        assert_ne!(converted, 0, "failed to convert security descriptor");
+        let text_guard = LocalSecurityDescriptor(text.cast());
+        let sddl = String::from_utf16(unsafe {
+            std::slice::from_raw_parts(text, len.saturating_sub(1) as usize)
+        })
+        .unwrap();
+        drop(text_guard);
+        sddl
+    }
+
+    #[cfg(windows)]
+    fn assert_current_user_only_sddl(sddl: &str, current_sid: &str) {
+        assert!(sddl.starts_with("D:P"), "DACL is not protected: {sddl}");
+        assert!(sddl.contains(current_sid), "current SID missing: {sddl}");
+        assert_eq!(sddl.matches("(A;").count(), 1, "unexpected ACE: {sddl}");
+        for broad_sid in [";;;WD)", ";;;BU)", ";;;AU)", ";;;IU)", ";;;BA)"] {
+            assert!(!sddl.contains(broad_sid), "broad ACE in DACL: {sddl}");
+        }
+    }
 
     #[derive(Clone, Copy)]
     enum MockKillBehavior {
@@ -6200,41 +6938,6 @@ mod tests {
         }
     }
 
-    struct FailingRenameMailboxFs {
-        rename_failures_remaining: AtomicUsize,
-    }
-
-    impl FailingRenameMailboxFs {
-        fn new(rename_failures: usize) -> Self {
-            Self {
-                rename_failures_remaining: AtomicUsize::new(rename_failures),
-            }
-        }
-    }
-
-    impl MailboxFs for FailingRenameMailboxFs {
-        fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
-            fs::read_to_string(path)
-        }
-
-        fn write(&self, path: &Path, contents: &[u8]) -> std::io::Result<()> {
-            fs::write(path, contents)
-        }
-
-        fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
-            if self.rename_failures_remaining.load(Ordering::SeqCst) > 0 {
-                self.rename_failures_remaining
-                    .fetch_sub(1, Ordering::SeqCst);
-                return Err(std::io::Error::other("synthetic rename failure"));
-            }
-            fs::rename(from, to)
-        }
-
-        fn remove_file(&self, path: &Path) -> std::io::Result<()> {
-            fs::remove_file(path)
-        }
-    }
-
     fn test_supervisor() -> SupervisorHandle {
         let root = std::env::temp_dir().join(format!("cli-master-wrapper-test-{}", Uuid::new_v4()));
         test_supervisor_with_root(root)
@@ -6244,25 +6947,6 @@ mod tests {
         SupervisorHandle::new(SupervisorConfig {
             working_root: root.clone(),
             runtime_dir: root.join("runtime"),
-            peer_slash_commands_allowed: false,
-            cross_pair_room_broadcast: false,
-            heartbeat_interval: None,
-            auto_restart_on_stall_sessions: None,
-            auto_restart_stall_threshold: None,
-            reaction_window: Some(Duration::from_millis(200)),
-        })
-        .unwrap()
-    }
-
-    fn test_supervisor_with_peer_slash_commands_allowed(allowed: bool) -> SupervisorHandle {
-        let root = std::env::temp_dir().join(format!(
-            "cli-master-wrapper-peer-policy-test-{}",
-            Uuid::new_v4()
-        ));
-        SupervisorHandle::new(SupervisorConfig {
-            working_root: root.clone(),
-            runtime_dir: root.join("runtime"),
-            peer_slash_commands_allowed: allowed,
             cross_pair_room_broadcast: false,
             heartbeat_interval: None,
             auto_restart_on_stall_sessions: None,
@@ -6280,7 +6964,6 @@ mod tests {
         SupervisorHandle::new(SupervisorConfig {
             working_root: root.clone(),
             runtime_dir: root.join("runtime"),
-            peer_slash_commands_allowed: false,
             cross_pair_room_broadcast: enabled,
             heartbeat_interval: None,
             auto_restart_on_stall_sessions: None,
@@ -6302,7 +6985,6 @@ mod tests {
         SupervisorHandle::new(SupervisorConfig {
             working_root: root.clone(),
             runtime_dir: root.join("runtime"),
-            peer_slash_commands_allowed: false,
             cross_pair_room_broadcast: false,
             heartbeat_interval,
             auto_restart_on_stall_sessions: auto_restart_sessions,
@@ -6507,10 +7189,91 @@ mod tests {
     fn session_token(supervisor: &SupervisorHandle, name: &str) -> String {
         supervisor.start_control_plane().unwrap();
         supervisor
-            .ensure_session_control_plane_status(name)
+            .rotate_session_control_plane_status(name)
             .unwrap()
             .unwrap()
             .token
+    }
+
+    fn arm_test_quiesce_timer(supervisor: &SupervisorHandle, name: &str) {
+        let generation = supervisor.current_generation(name).unwrap();
+        let handle = supervisor
+            .inner
+            .background_runtime
+            .spawn(std::future::pending::<()>());
+        let mut slots = supervisor.inner.slots.lock();
+        slots.get_mut(name).unwrap().quiesce_timer = Some(QuiesceTimer { generation, handle });
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct SlotMutationProbe {
+        definition: SessionDefinition,
+        state: LifecycleState,
+        work_state: WorkState,
+        work_state_observed: bool,
+        work_detail: Option<String>,
+        launch_banner_seen: bool,
+        work_error_observations: HashMap<String, Vec<Instant>>,
+        running: bool,
+        running_has_pty: bool,
+        generation: SessionGeneration,
+        stop_intent: Option<StopIntent>,
+        process_id: Option<u32>,
+        last_activity_at: Option<String>,
+        last_real_output_at: Option<Instant>,
+        last_route_from_session_at: Option<String>,
+        last_route_from_session_instant: Option<Instant>,
+        last_error: Option<String>,
+        quiesce_timer: Option<(SessionGeneration, bool)>,
+        stall_state_entered_at: Option<Instant>,
+        stall_state_entered_timestamp: Option<String>,
+        stall_detector: Option<(SessionGeneration, WorkState, Instant, bool)>,
+    }
+
+    fn slots_mutation_probe(supervisor: &SupervisorHandle) -> Vec<SlotMutationProbe> {
+        let slots = supervisor.inner.slots.lock();
+        let mut probes = slots
+            .values()
+            .map(|slot| SlotMutationProbe {
+                definition: slot.definition.clone(),
+                state: slot.state,
+                work_state: slot.work_state,
+                work_state_observed: slot.work_state_observed,
+                work_detail: slot.work_detail.clone(),
+                launch_banner_seen: slot.launch_banner_seen,
+                work_error_observations: slot.work_error_observations.clone(),
+                running: slot.running.is_some(),
+                running_has_pty: slot
+                    .running
+                    .as_ref()
+                    .and_then(|running| running.pty.as_ref())
+                    .is_some(),
+                generation: slot.generation,
+                stop_intent: slot.stop_intent,
+                process_id: slot.process_id,
+                last_activity_at: slot.last_activity_at.clone(),
+                last_real_output_at: slot.last_real_output_at,
+                last_route_from_session_at: slot.last_route_from_session_at.clone(),
+                last_route_from_session_instant: slot.last_route_from_session_instant,
+                last_error: slot.last_error.clone(),
+                quiesce_timer: slot
+                    .quiesce_timer
+                    .as_ref()
+                    .map(|timer| (timer.generation, timer.handle.is_finished())),
+                stall_state_entered_at: slot.stall_state_entered_at,
+                stall_state_entered_timestamp: slot.stall_state_entered_timestamp.clone(),
+                stall_detector: slot.stall_detector.as_ref().map(|detector| {
+                    (
+                        detector.generation,
+                        detector.state,
+                        detector.entered_at,
+                        detector.handle.is_finished(),
+                    )
+                }),
+            })
+            .collect::<Vec<_>>();
+        probes.sort_by(|left, right| left.definition.name.cmp(&right.definition.name));
+        probes
     }
 
     fn current_audit_file(supervisor: &SupervisorHandle) -> String {
@@ -6901,7 +7664,7 @@ mod tests {
     }
 
     #[test]
-    fn sideband_start_session_audit_records_extra_args() {
+    fn sideband_start_session_audit_omits_nonempty_extra_args_when_retention_is_off() {
         let supervisor = test_supervisor();
         let status = supervisor.start_control_plane().unwrap();
         let (pty, _, _) = reacting_pty_session(&supervisor, "codex", "Working 1s");
@@ -6926,10 +7689,7 @@ mod tests {
             })
             .expect("start_session lifecycle event not found");
 
-        assert_eq!(
-            started["extra_args"],
-            serde_json::json!(["--resume", "abc-123"])
-        );
+        assert!(started.get("extra_args").is_none());
     }
 
     #[test]
@@ -7560,6 +8320,21 @@ mod tests {
 
         assert_eq!(persisted.endpoint, status.endpoint);
         assert_eq!(persisted.token, status.token);
+        let snapshot_json = serde_json::to_value(&snapshot).unwrap();
+        assert!(snapshot_json.pointer("/control_plane/token").is_none());
+        assert!(snapshot_json.pointer("/control_plane/info_path").is_none());
+        assert!(!snapshot_json.to_string().contains(&status.token));
+        assert!(!snapshot_json.to_string().contains(&status.info_path));
+        assert_eq!(
+            snapshot_json
+                .pointer("/control_plane")
+                .and_then(serde_json::Value::as_object)
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["endpoint".to_string(), "transport".to_string()])
+        );
         assert_eq!(
             snapshot
                 .control_plane
@@ -7567,6 +8342,546 @@ mod tests {
                 .map(|item| item.endpoint.as_str()),
             Some(status.endpoint.as_str())
         );
+    }
+
+    #[test]
+    fn control_plane_ready_event_excludes_internal_credentials() {
+        let supervisor = test_supervisor();
+        let events = capture_runtime_events(&supervisor);
+
+        let status = supervisor.start_control_plane().unwrap();
+        let event_json = events
+            .lock()
+            .iter()
+            .find(|event| matches!(event, RuntimeEvent::ControlPlaneReady { .. }))
+            .map(|event| serde_json::to_value(event).unwrap())
+            .expect("control plane ready event");
+
+        assert!(event_json.pointer("/token").is_none());
+        assert!(event_json.pointer("/info_path").is_none());
+        assert!(!event_json.to_string().contains(&status.token));
+        assert!(!event_json.to_string().contains(&status.info_path));
+        assert_eq!(
+            event_json
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "endpoint".to_string(),
+                "event".to_string(),
+                "timestamp".to_string(),
+                "transport".to_string(),
+            ])
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn runtime_credentials_and_named_pipe_have_current_user_only_dacls() {
+        use std::os::windows::io::AsRawHandle;
+
+        let supervisor = test_supervisor();
+        let master = supervisor.start_control_plane().unwrap();
+        let pane = supervisor
+            .rotate_session_control_plane_status("claude")
+            .unwrap()
+            .unwrap();
+        let current_sid = current_user_sid_string().unwrap();
+
+        for path in [
+            supervisor.runtime_dir(),
+            Path::new(&master.info_path),
+            Path::new(&pane.info_path),
+        ] {
+            assert_current_user_only_sddl(&security_descriptor_sddl_for_path(path), &current_sid);
+        }
+
+        let endpoint = format!(r"\\.\pipe\prim1-acl-test-{}", Uuid::new_v4());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let server = create_windows_pipe_server(&endpoint, true).unwrap();
+        assert_current_user_only_sddl(
+            &security_descriptor_sddl_for_handle(server.as_raw_handle().cast()),
+            &current_sid,
+        );
+        assert!(create_windows_pipe_server(&endpoint, true).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn control_plane_start_fails_closed_when_pipe_name_is_squatted() {
+        let endpoint = format!(r"\\.\pipe\prim1-squat-test-{}", Uuid::new_v4());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let _squatter = create_windows_pipe_server(&endpoint, true).unwrap();
+        let supervisor = test_supervisor();
+        let info_path = supervisor.runtime_dir().join("control-plane.json");
+
+        let error = supervisor
+            .start_control_plane_at(Some(endpoint))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("failed to create named pipe"));
+        assert!(!info_path.exists());
+        assert!(supervisor.inner.control_plane.read().is_none());
+        assert!(supervisor.inner.token_bindings.lock().is_empty());
+    }
+
+    #[test]
+    fn renderer_event_projection_redacts_master_and_pane_credentials() {
+        let supervisor = test_supervisor();
+        let master = supervisor.start_control_plane().unwrap();
+        let pane = supervisor
+            .rotate_session_control_plane_status("claude")
+            .unwrap()
+            .unwrap();
+        let raw = RuntimeEvent::SystemLog {
+            level: LogLevel::Error,
+            message: format!(
+                "master={} master_path={} pane={} pane_path={}",
+                master.token, master.info_path, pane.token, pane.info_path
+            ),
+            timestamp: now_rfc3339(),
+        };
+
+        let projected = supervisor.renderer_event_projector().project(raw);
+        let projected_json = serde_json::to_string(&projected).unwrap();
+
+        for secret in [master.token, master.info_path, pane.token, pane.info_path] {
+            assert!(!projected_json.contains(&secret));
+        }
+        assert_eq!(projected_json.matches("[redacted]").count(), 4);
+    }
+
+    #[test]
+    fn renderer_output_redactor_blocks_every_secret_split_and_rotation_race() {
+        let supervisor = test_supervisor();
+        let master = supervisor.start_control_plane().unwrap();
+        let first_pane = supervisor
+            .rotate_session_control_plane_status("claude")
+            .unwrap()
+            .unwrap();
+        let projector = supervisor.renderer_event_projector();
+
+        for secret in [
+            master.token.clone(),
+            master.info_path.clone(),
+            first_pane.token.clone(),
+            first_pane.info_path.clone(),
+        ] {
+            let mut one_chunk = projector.output_redactor();
+            let one_chunk_output = [one_chunk.push(&secret), one_chunk.finish()].concat();
+            assert!(!one_chunk_output.contains(&secret));
+            assert_eq!(one_chunk_output, "[redacted]");
+
+            for control_wrapped in [
+                format!("\x1b]0;{secret}\x07ordinary"),
+                format!("\x1bP{secret}\x1b\\ordinary"),
+            ] {
+                let mut control_redactor = projector.output_redactor();
+                let output = [
+                    control_redactor.push(&control_wrapped),
+                    control_redactor.finish(),
+                ]
+                .concat();
+                assert!(!output.contains(&secret));
+                assert!(output.contains("[redacted]"));
+            }
+
+            for split in secret
+                .char_indices()
+                .map(|(index, _)| index)
+                .filter(|index| *index > 0)
+            {
+                let mut redactor = projector.output_redactor();
+                let output = [
+                    redactor.push(&secret[..split]),
+                    redactor.push(&secret[split..]),
+                    redactor.finish(),
+                ]
+                .concat();
+                assert!(!output.contains(&secret), "secret leaked at split {split}");
+                assert_eq!(output, "[redacted]", "wrong output at split {split}");
+
+                let ansi_interleaved = format!("{}\x1b[31m{}", &secret[..split], &secret[split..]);
+                let mut ansi_redactor = projector.output_redactor();
+                let ansi_output = [
+                    ansi_redactor.push(&ansi_interleaved),
+                    ansi_redactor.finish(),
+                ]
+                .concat();
+                assert_eq!(
+                    ansi_output, "[redacted]",
+                    "ANSI-interleaved secret leaked at split {split}"
+                );
+
+                let mut split_ansi_redactor = projector.output_redactor();
+                let split_ansi_output = [
+                    split_ansi_redactor.push(&format!("{}\x1b", &secret[..split])),
+                    split_ansi_redactor.push("[31"),
+                    split_ansi_redactor.push(&format!("m{}", &secret[split..])),
+                    split_ansi_redactor.finish(),
+                ]
+                .concat();
+                assert_eq!(
+                    split_ansi_output, "[redacted]",
+                    "chunk-split ANSI secret leaked at split {split}"
+                );
+
+                let mut split_dcs_redactor = projector.output_redactor();
+                let split_dcs_output = [
+                    split_dcs_redactor.push(&format!("\x1bP{}", &secret[..split])),
+                    split_dcs_redactor.push(&format!("{}\x1b", &secret[split..])),
+                    split_dcs_redactor.push("\\ordinary"),
+                    split_dcs_redactor.finish(),
+                ]
+                .concat();
+                assert!(!split_dcs_output.contains(&secret));
+                assert!(split_dcs_output.contains("[redacted]"));
+            }
+
+            let mut partial = projector.output_redactor();
+            let partial_len = secret
+                .char_indices()
+                .nth(secret.chars().count() / 2)
+                .map(|(index, _)| index)
+                .unwrap_or(secret.len());
+            let partial_output = [partial.push(&secret[..partial_len]), partial.finish()].concat();
+            assert_eq!(partial_output, "[redacted]");
+        }
+
+        let mut harmless_ansi = projector.output_redactor();
+        let harmless_output = [
+            harmless_ansi.push("\x1b[31mordinary output\x1b[0m"),
+            harmless_ansi.finish(),
+        ]
+        .concat();
+        assert_eq!(harmless_output, "\x1b[31mordinary output\x1b[0m");
+
+        let split = first_pane.token.len() / 2;
+        let mut delayed = projector.output_redactor();
+        assert!(delayed.push(&first_pane.token[..split]).is_empty());
+        let second_pane = supervisor
+            .rotate_session_control_plane_status("claude")
+            .unwrap()
+            .unwrap();
+        let output = [delayed.push(&first_pane.token[split..]), delayed.finish()].concat();
+        assert_eq!(output, "[redacted]");
+        assert!(!output.contains(&first_pane.token));
+        assert_ne!(first_pane.token, second_pane.token);
+    }
+
+    #[test]
+    fn audit_and_events_since_exclude_content_and_every_control_plane_secret() {
+        let supervisor = test_supervisor();
+        let master = supervisor.start_control_plane().unwrap();
+        let pane = supervisor
+            .rotate_session_control_plane_status("claude")
+            .unwrap()
+            .unwrap();
+        let cursor = supervisor.current_eof_cursor().unwrap();
+        let secrets = [
+            master.token.clone(),
+            master.info_path.clone(),
+            pane.token.clone(),
+            pane.info_path.clone(),
+        ];
+        let joined = secrets.join("|");
+        let timestamp = now_rfc3339();
+
+        supervisor.emit(RuntimeEvent::SessionOutput {
+            session: "codex".into(),
+            chunk: joined.clone(),
+            synthetic: false,
+            timestamp: timestamp.clone(),
+        });
+        supervisor.emit(RuntimeEvent::RoutedMessage {
+            id: Uuid::new_v4(),
+            from: "claude".into(),
+            to: "codex".into(),
+            scope: MessageScope::Direct,
+            content: joined.clone(),
+            timestamp: timestamp.clone(),
+        });
+        supervisor.emit(RuntimeEvent::PaneSignal {
+            request_id: "audit-secret-pane".into(),
+            session: "claude".into(),
+            task_id: joined.clone(),
+            signal_type: PaneSignalType::Progress,
+            summary: joined.clone(),
+            artifact_paths: vec![joined.clone()],
+            commit_sha: Some(joined.clone()),
+            timestamp: timestamp.clone(),
+        });
+        supervisor.emit(RuntimeEvent::SessionWorkState {
+            session: "claude".into(),
+            state: WorkState::Thinking,
+            detail: Some(joined.clone()),
+            previous_state: Some(WorkState::Idle),
+            timestamp: timestamp.clone(),
+        });
+        supervisor.emit(RuntimeEvent::SidebandRequestLifecycle {
+            request_id: "audit-secret-lifecycle".into(),
+            action: "start_session".into(),
+            session: Some("claude".into()),
+            extra_args: vec![joined.clone()],
+            phase: SidebandPhase::Failed,
+            error: Some(joined),
+            elapsed_ms: 1,
+            timestamp,
+        });
+
+        let response = supervisor.apply_sideband_request(SidebandRequest::EventsSince {
+            token: pane.token.clone(),
+            cursor: Some(cursor),
+            max_events: Some(100),
+            max_wait_seconds: Some(0),
+            filter: None,
+        });
+        let (events, _, _, _) = unwrap_events_since(response);
+        let events_json = serde_json::to_string(&events).unwrap();
+        let raw_audit = fs::read_to_string(supervisor.audit_log_path()).unwrap();
+        for secret in &secrets {
+            let encoded = serde_json::to_string(secret).unwrap();
+            let escaped = &encoded[1..encoded.len() - 1];
+            assert!(!events_json.contains(escaped));
+            assert!(!raw_audit.contains(escaped));
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::SessionOutput { .. }))
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RoutedMessage { content, .. } if content == "[content omitted]"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::PaneSignal {
+                task_id,
+                summary,
+                artifact_paths,
+                commit_sha: None,
+                ..
+            } if task_id.is_empty() && summary.is_empty() && artifact_paths.is_empty()
+        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::SessionWorkState { detail: None, .. }))
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SidebandRequestLifecycle { extra_args, error: Some(error), .. }
+                if extra_args.is_empty() && !error.contains(&pane.token)
+        )));
+    }
+
+    #[test]
+    fn pane_credential_persistence_failure_is_safe_and_transactional() {
+        let supervisor = test_supervisor();
+        supervisor.start_control_plane().unwrap();
+        let credential_path = supervisor.runtime_dir().join("control-plane-claude.json");
+        fs::create_dir_all(&credential_path).unwrap();
+        let token_count_before = supervisor.inner.token_bindings.lock().len();
+
+        let error = supervisor
+            .rotate_session_control_plane_status("claude")
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "failed to persist session credentials");
+        assert!(
+            !error
+                .to_string()
+                .contains(&credential_path.display().to_string())
+        );
+        assert_eq!(
+            supervisor.inner.token_bindings.lock().len(),
+            token_count_before
+        );
+        assert!(
+            !supervisor
+                .inner
+                .session_control_planes
+                .lock()
+                .contains_key("claude")
+        );
+    }
+
+    #[test]
+    fn rotating_pane_credentials_revokes_prior_token_and_keeps_it_redactable() {
+        let supervisor = test_supervisor();
+        let first = supervisor
+            .rotate_session_control_plane_status("claude")
+            .unwrap();
+        assert!(first.is_none());
+        supervisor.start_control_plane().unwrap();
+        let first = supervisor
+            .rotate_session_control_plane_status("claude")
+            .unwrap()
+            .unwrap();
+        let second = supervisor
+            .rotate_session_control_plane_status("claude")
+            .unwrap()
+            .unwrap();
+
+        assert_ne!(first.token, second.token);
+        assert!(
+            !supervisor
+                .inner
+                .token_bindings
+                .lock()
+                .contains_key(&first.token)
+        );
+        assert_eq!(
+            supervisor
+                .inner
+                .token_bindings
+                .lock()
+                .get(&second.token)
+                .cloned(),
+            Some(Some("claude".into()))
+        );
+        let response = supervisor.apply_sideband_request(SidebandRequest::StopSession {
+            token: first.token.clone(),
+            name: "claude".into(),
+        });
+        assert!(!response.ok);
+        assert_eq!(response.message, "invalid control plane token");
+
+        let projected = supervisor
+            .renderer_event_projector()
+            .project(RuntimeEvent::SystemLog {
+                level: LogLevel::Error,
+                message: format!("retired={} retired_path={}", first.token, first.info_path),
+                timestamp: now_rfc3339(),
+            });
+        let projected_json = serde_json::to_string(&projected).unwrap();
+        assert!(!projected_json.contains(&first.token));
+        assert!(!projected_json.contains(&first.info_path));
+    }
+
+    #[test]
+    fn stop_rename_delete_and_shutdown_revoke_credentials() {
+        let supervisor = test_supervisor();
+        let master = supervisor.start_control_plane().unwrap();
+
+        let claude = supervisor
+            .rotate_session_control_plane_status("claude")
+            .unwrap()
+            .unwrap();
+        let stop_response = supervisor.apply_sideband_request(SidebandRequest::StopSession {
+            token: claude.token.clone(),
+            name: "claude".into(),
+        });
+        assert!(stop_response.ok, "{}", stop_response.message);
+        assert!(
+            !supervisor
+                .inner
+                .token_bindings
+                .lock()
+                .contains_key(&claude.token)
+        );
+        assert!(!Path::new(&claude.info_path).exists());
+
+        supervisor.create_pair("foo").unwrap();
+        let foo = supervisor
+            .rotate_session_control_plane_status("foo-claude")
+            .unwrap()
+            .unwrap();
+        supervisor.rename_pair("foo", "bar").unwrap();
+        assert!(
+            !supervisor
+                .inner
+                .token_bindings
+                .lock()
+                .contains_key(&foo.token)
+        );
+        assert!(!Path::new(&foo.info_path).exists());
+
+        let bar = supervisor
+            .rotate_session_control_plane_status("bar-claude")
+            .unwrap()
+            .unwrap();
+        supervisor.delete_pair("bar").unwrap();
+        assert!(
+            !supervisor
+                .inner
+                .token_bindings
+                .lock()
+                .contains_key(&bar.token)
+        );
+        assert!(!Path::new(&bar.info_path).exists());
+
+        let codex = supervisor
+            .rotate_session_control_plane_status("codex")
+            .unwrap()
+            .unwrap();
+        supervisor.shutdown().unwrap();
+        assert!(supervisor.inner.control_plane.read().is_none());
+        assert!(supervisor.inner.token_bindings.lock().is_empty());
+        assert!(supervisor.inner.session_control_planes.lock().is_empty());
+        assert!(!Path::new(&master.info_path).exists());
+        assert!(!Path::new(&codex.info_path).exists());
+    }
+
+    #[test]
+    fn credential_cleanup_failure_cannot_skip_pty_termination_or_truthful_state() {
+        let supervisor = test_supervisor();
+        supervisor.start_control_plane().unwrap();
+        let pane = supervisor
+            .rotate_session_control_plane_status("codex")
+            .unwrap()
+            .unwrap();
+        let credential_path = PathBuf::from(&pane.info_path);
+        let (pty, _, kill_count) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
+        let events = capture_runtime_events(&supervisor);
+        fs::remove_file(&credential_path).unwrap();
+        fs::create_dir(&credential_path).unwrap();
+
+        let error = supervisor.stop_session("codex").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "failed to remove 1 revoked credential file(s)"
+        );
+        assert_eq!(kill_count.load(Ordering::SeqCst), 1);
+        assert!(
+            !supervisor
+                .inner
+                .token_bindings
+                .lock()
+                .contains_key(&pane.token)
+        );
+        let slots = supervisor.inner.slots.lock();
+        let slot = slots.get("codex").unwrap();
+        assert_eq!(slot.state, LifecycleState::Closed);
+        assert!(slot.running.is_none());
+        assert!(slot.process_id.is_none());
+        drop(slots);
+        assert!(events.lock().iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SessionExit { session, .. } if session == "codex"
+        )));
+        assert!(events.lock().iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SessionState {
+                session,
+                state: LifecycleState::Closed,
+                ..
+            } if session == "codex"
+        )));
+        fs::remove_dir(&credential_path).unwrap();
     }
 
     #[test]
@@ -7578,6 +8893,26 @@ mod tests {
 
         assert_eq!(first.endpoint, second.endpoint);
         assert_eq!(first.token, second.token);
+    }
+
+    #[test]
+    fn startup_removes_legacy_disk_mailbox_and_control_plane_does_not_recreate_it() {
+        let root = std::env::temp_dir().join(format!(
+            "cli-master-wrapper-mailbox-removal-test-{}",
+            Uuid::new_v4()
+        ));
+        let runtime_dir = root.join("runtime");
+        let legacy_inbox = runtime_dir.join("sideband").join("inbox");
+        let sentinel = "PRIM1_MAILBOX_SENTINEL_7F4C2D0B";
+        fs::create_dir_all(&legacy_inbox).unwrap();
+        fs::write(legacy_inbox.join(format!("{sentinel}.json")), sentinel).unwrap();
+
+        let supervisor = test_supervisor_with_root(root);
+        assert!(!runtime_dir.join("sideband").exists());
+
+        supervisor.start_control_plane().unwrap();
+        thread::sleep(Duration::from_millis(150));
+        assert!(!runtime_dir.join("sideband").exists());
     }
 
     fn wait_for_live_probe(status: &ControlPlaneStatus) {
@@ -7648,94 +8983,6 @@ mod tests {
     }
 
     #[test]
-    fn mailbox_request_processing_writes_response_and_archives_request() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let sideband_dir = supervisor.runtime_dir().join("sideband-test-success");
-        let inbox_dir = sideband_dir.join("inbox");
-        let outbox_dir = sideband_dir.join("outbox");
-        let processed_dir = sideband_dir.join("processed");
-        fs::create_dir_all(&inbox_dir).unwrap();
-        fs::create_dir_all(&outbox_dir).unwrap();
-        fs::create_dir_all(&processed_dir).unwrap();
-
-        let request_path = inbox_dir.join("ping.json");
-        fs::write(
-            &request_path,
-            encode_request(&SidebandRequest::Ping {
-                token: status.token.clone(),
-            })
-            .unwrap(),
-        )
-        .unwrap();
-
-        process_sideband_mailbox_file(&supervisor, &request_path, &outbox_dir, &processed_dir)
-            .unwrap();
-
-        let response =
-            decode_response(&fs::read_to_string(outbox_dir.join("ping.json")).unwrap()).unwrap();
-        assert!(response.ok);
-        assert_eq!(response.message, "pong");
-        assert!(processed_dir.join("ping.json").exists());
-        assert!(!request_path.exists());
-    }
-
-    #[test]
-    fn mailbox_request_processing_returns_error_for_invalid_payload() {
-        let supervisor = test_supervisor();
-        let sideband_dir = supervisor.runtime_dir().join("sideband-test-invalid");
-        let inbox_dir = sideband_dir.join("inbox");
-        let outbox_dir = sideband_dir.join("outbox");
-        let processed_dir = sideband_dir.join("processed");
-        fs::create_dir_all(&inbox_dir).unwrap();
-        fs::create_dir_all(&outbox_dir).unwrap();
-        fs::create_dir_all(&processed_dir).unwrap();
-
-        let request_path = inbox_dir.join("invalid.json");
-        fs::write(&request_path, "{not json}").unwrap();
-        thread::sleep(Duration::from_millis(600));
-
-        process_sideband_mailbox_file(&supervisor, &request_path, &outbox_dir, &processed_dir)
-            .unwrap();
-
-        let response =
-            decode_response(&fs::read_to_string(outbox_dir.join("invalid.json")).unwrap()).unwrap();
-        assert!(!response.ok);
-        assert!(response.message.contains("invalid sideband payload"));
-    }
-
-    #[test]
-    fn mailbox_request_processing_accepts_bom_prefixed_payload() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let sideband_dir = supervisor.runtime_dir().join("sideband-test-bom");
-        let inbox_dir = sideband_dir.join("inbox");
-        let outbox_dir = sideband_dir.join("outbox");
-        let processed_dir = sideband_dir.join("processed");
-        fs::create_dir_all(&inbox_dir).unwrap();
-        fs::create_dir_all(&outbox_dir).unwrap();
-        fs::create_dir_all(&processed_dir).unwrap();
-
-        let request_path = inbox_dir.join("ping.json");
-        let raw = format!(
-            "\u{feff}{}",
-            encode_request(&SidebandRequest::Ping {
-                token: status.token.clone(),
-            })
-            .unwrap()
-        );
-        fs::write(&request_path, raw).unwrap();
-
-        process_sideband_mailbox_file(&supervisor, &request_path, &outbox_dir, &processed_dir)
-            .unwrap();
-
-        let response =
-            decode_response(&fs::read_to_string(outbox_dir.join("ping.json")).unwrap()).unwrap();
-        assert!(response.ok);
-        assert_eq!(response.message, "pong");
-    }
-
-    #[test]
     fn apply_sideband_request_rejects_invalid_token() {
         let supervisor = test_supervisor();
         let status = supervisor.start_control_plane().unwrap();
@@ -7746,6 +8993,189 @@ mod tests {
 
         assert!(!response.ok);
         assert_eq!(response.message, "invalid control plane token");
+    }
+
+    #[test]
+    fn async_lifecycle_denial_rejects_invalid_token_without_mutation() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let (spawner, specs) = CapturingPtySpawner::new(Vec::new());
+        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+        arm_test_quiesce_timer(&supervisor, "claude");
+        install_stale_running_session(&supervisor, "codex");
+        let slots_before = slots_mutation_probe(&supervisor);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        for token in [String::new(), " ".into(), format!("{}-wrong", status.token)] {
+            let response = runtime.block_on(supervisor.run_detached_with_timeout_async(
+                SidebandRequest::StartSession {
+                    token,
+                    name: "claude".into(),
+                    extra_args: Vec::new(),
+                },
+                Duration::from_secs(1),
+                "req-invalid-async",
+                "start_session",
+                Some("claude"),
+                &[],
+            ));
+
+            assert!(!response.ok);
+            assert_eq!(response.message, "invalid control plane token");
+            assert!(response.snapshot.is_none());
+            assert_eq!(slots_mutation_probe(&supervisor), slots_before);
+        }
+        assert!(specs.lock().is_empty());
+    }
+
+    #[test]
+    fn async_lifecycle_denial_rejects_peer_token_without_mutation() {
+        let supervisor = test_supervisor();
+        let claude_token = session_token(&supervisor, "claude");
+        let (spawner, specs) = CapturingPtySpawner::new(Vec::new());
+        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+        arm_test_quiesce_timer(&supervisor, "codex");
+        let slots_before = slots_mutation_probe(&supervisor);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let response = runtime.block_on(supervisor.run_detached_with_timeout_async(
+            SidebandRequest::StartSession {
+                token: claude_token,
+                name: "codex".into(),
+                extra_args: Vec::new(),
+            },
+            Duration::from_secs(1),
+            "req-peer-async",
+            "start_session",
+            Some("codex"),
+            &[],
+        ));
+
+        assert!(!response.ok);
+        assert_eq!(
+            response.message,
+            "lifecycle action: pane-bound token cannot target other sessions"
+        );
+        assert!(response.snapshot.is_none());
+        assert_eq!(slots_mutation_probe(&supervisor), slots_before);
+        assert!(specs.lock().is_empty());
+    }
+
+    #[test]
+    fn async_lifecycle_accepts_pane_token_for_its_own_session() {
+        let supervisor = test_supervisor();
+        let claude_token = session_token(&supervisor, "claude");
+        let generation_before = supervisor.current_generation("claude").unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let response = runtime.block_on(supervisor.run_detached_with_timeout_async(
+            SidebandRequest::StopSession {
+                token: claude_token,
+                name: "claude".into(),
+            },
+            Duration::from_secs(1),
+            "req-own-async",
+            "stop_session",
+            Some("claude"),
+            &[],
+        ));
+
+        assert!(response.ok, "{}", response.message);
+        assert_eq!(response.message, "stopped claude");
+        assert_eq!(
+            supervisor.current_generation("claude"),
+            Some(generation_before + 1)
+        );
+    }
+
+    #[test]
+    fn async_lifecycle_ingress_rejects_peer_without_slot_mutation() {
+        let supervisor = test_supervisor();
+        let claude_token = session_token(&supervisor, "claude");
+        let (spawner, specs) = CapturingPtySpawner::new(Vec::new());
+        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+        arm_test_quiesce_timer(&supervisor, "codex");
+        install_stale_running_session(&supervisor, "codex");
+        let slots_before = slots_mutation_probe(&supervisor);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let response = runtime.block_on(supervisor.apply_sideband_request_async(
+            SidebandRequest::StartSession {
+                token: claude_token,
+                name: "codex".into(),
+                extra_args: Vec::new(),
+            },
+        ));
+
+        assert!(!response.ok);
+        assert_eq!(
+            response.message,
+            "lifecycle action: pane-bound token cannot target other sessions"
+        );
+        assert!(response.snapshot.is_none());
+        assert_eq!(slots_mutation_probe(&supervisor), slots_before);
+        assert!(specs.lock().is_empty());
+    }
+
+    #[test]
+    fn pipe_lifecycle_ingress_rejects_invalid_token_without_slot_mutation() {
+        let supervisor = test_supervisor();
+        let status = supervisor.start_control_plane().unwrap();
+        let (spawner, specs) = CapturingPtySpawner::new(Vec::new());
+        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+        arm_test_quiesce_timer(&supervisor, "claude");
+        install_stale_running_session(&supervisor, "codex");
+        let slots_before = slots_mutation_probe(&supervisor);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        let response = runtime.block_on(async {
+            let (client, server) = tokio::io::duplex(4096);
+            let handle = supervisor.clone();
+            let request_payload = format!(
+                "{}\n",
+                encode_request(&SidebandRequest::StartSession {
+                    token: format!("{}-wrong", status.token),
+                    name: "claude".into(),
+                    extra_args: Vec::new(),
+                })
+                .unwrap()
+            );
+            let server_task =
+                tokio::spawn(async move { handle_sideband_stream(handle, server).await });
+            let (read_half, mut write_half) = tokio::io::split(client);
+            write_half
+                .write_all(request_payload.as_bytes())
+                .await
+                .unwrap();
+            write_half.flush().await.unwrap();
+            let mut reader = BufReader::new(read_half);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            server_task.await.unwrap().unwrap();
+            decode_response(line.trim()).unwrap()
+        });
+
+        assert!(!response.ok);
+        assert_eq!(response.message, "invalid control plane token");
+        assert!(response.snapshot.is_none());
+        assert_eq!(slots_mutation_probe(&supervisor), slots_before);
+        assert!(specs.lock().is_empty());
     }
 
     #[test]
@@ -7783,8 +9213,8 @@ mod tests {
     }
 
     #[test]
-    fn pane_bound_send_input_rejects_peer_target_when_lockdown_is_on() {
-        let supervisor = test_supervisor_with_peer_slash_commands_allowed(false);
+    fn pane_bound_send_input_rejects_peer_target() {
+        let supervisor = test_supervisor();
         let claude_token = session_token(&supervisor, "claude");
 
         let error = supervisor
@@ -7793,13 +9223,13 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "peer slash commands are disabled by this wrapper's policy (PRIM1_PEER_SLASH_COMMANDS_ALLOWED=0)"
+            "session action: pane-bound token cannot target other sessions"
         );
     }
 
     #[test]
-    fn pane_bound_send_input_allows_same_session_when_lockdown_is_on() {
-        let supervisor = test_supervisor_with_peer_slash_commands_allowed(false);
+    fn pane_bound_send_input_allows_same_session() {
+        let supervisor = test_supervisor();
         let claude_token = session_token(&supervisor, "claude");
 
         supervisor
@@ -7808,13 +9238,123 @@ mod tests {
     }
 
     #[test]
-    fn master_token_bypasses_peer_lockdown() {
-        let supervisor = test_supervisor_with_peer_slash_commands_allowed(false);
+    fn master_token_can_target_any_session() {
+        let supervisor = test_supervisor();
         let status = supervisor.start_control_plane().unwrap();
 
         supervisor
             .validate_session_action_token(&status.token, "codex")
             .unwrap();
+    }
+
+    #[test]
+    fn side_effect_scope_denials_precede_snapshot_and_all_slot_mutation() {
+        for action in ["deliver_message", "send_input", "send_key", "create_pair"] {
+            let supervisor = test_supervisor();
+            let claude_token = session_token(&supervisor, "claude");
+            install_stale_running_session(&supervisor, "claude");
+            arm_test_quiesce_timer(&supervisor, "claude");
+            let (codex_pty, codex_send_count, _) =
+                mock_pty_session(None, MockKillBehavior::Immediate);
+            install_mock_running_session(&supervisor, "codex", DriverKind::Codex, codex_pty);
+            let (spawner, spawn_specs) = CapturingPtySpawner::new(Vec::new());
+            supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+            let slots_before = slots_mutation_probe(&supervisor);
+
+            let request = match action {
+                "deliver_message" => SidebandRequest::DeliverMessage {
+                    token: claude_token,
+                    name: "codex".into(),
+                    content: "must not be delivered".into(),
+                    require_idle: false,
+                },
+                "send_input" => SidebandRequest::SendInput {
+                    token: claude_token,
+                    name: "codex".into(),
+                    input: "must not be sent".into(),
+                    require_idle: false,
+                },
+                "send_key" => SidebandRequest::SendKey {
+                    token: claude_token,
+                    name: "codex".into(),
+                    key: ControlKey::Enter,
+                    require_idle: false,
+                },
+                "create_pair" => SidebandRequest::CreatePair {
+                    token: claude_token,
+                    name: "unauthorised".into(),
+                },
+                _ => unreachable!(),
+            };
+
+            let response = supervisor.apply_sideband_request(request);
+            let expected_message = match action {
+                "deliver_message" => {
+                    "deliver_message: pane-bound token cannot target other sessions; use route_message instead"
+                }
+                "send_input" | "send_key" => {
+                    "session action: pane-bound token cannot target other sessions"
+                }
+                "create_pair" => {
+                    "create_pair: pane-bound tokens are not authorised; master token required"
+                }
+                _ => unreachable!(),
+            };
+
+            assert!(!response.ok, "{action} unexpectedly succeeded");
+            assert_eq!(response.message, expected_message, "wrong {action} error");
+            assert!(response.snapshot.is_none(), "{action} exposed a snapshot");
+            assert_eq!(
+                slots_mutation_probe(&supervisor),
+                slots_before,
+                "{action} mutated slots before rejection"
+            );
+            assert_eq!(codex_send_count.load(Ordering::SeqCst), 0);
+            assert!(spawn_specs.lock().is_empty());
+            assert!(!supervisor.runtime_dir().join("signals").exists());
+        }
+    }
+
+    #[test]
+    fn pane_token_dispatches_own_input_key_and_delivery_only() {
+        for action in ["deliver_message", "send_input", "send_key"] {
+            let supervisor = test_supervisor();
+            let claude_token = session_token(&supervisor, "claude");
+            let (claude_pty, send_count, _) =
+                reacting_pty_session(&supervisor, "claude", "Working 1s");
+            install_mock_running_session(&supervisor, "claude", DriverKind::Claude, claude_pty);
+
+            let request = match action {
+                "deliver_message" => SidebandRequest::DeliverMessage {
+                    token: claude_token,
+                    name: "claude".into(),
+                    content: "authorised delivery".into(),
+                    require_idle: false,
+                },
+                "send_input" => SidebandRequest::SendInput {
+                    token: claude_token,
+                    name: "claude".into(),
+                    input: "authorised input".into(),
+                    require_idle: false,
+                },
+                "send_key" => SidebandRequest::SendKey {
+                    token: claude_token,
+                    name: "claude".into(),
+                    key: ControlKey::Enter,
+                    require_idle: false,
+                },
+                _ => unreachable!(),
+            };
+
+            let response = supervisor.apply_sideband_request(request);
+            assert!(response.ok, "{action} failed: {}", response.message);
+            let expected_writes = if action == "deliver_message" { 2 } else { 1 };
+            assert_eq!(
+                send_count.load(Ordering::SeqCst),
+                expected_writes,
+                "wrong write count for {action}"
+            );
+        }
     }
 
     #[test]
@@ -8008,7 +9548,7 @@ mod tests {
                 .file_name()
                 .unwrap()
                 .to_string_lossy()
-                .starts_with("task-418__done__")
+                .starts_with(&format!("{request_id}__done__"))
         );
         assert!(
             legacy_touch_path.exists(),
@@ -8017,7 +9557,7 @@ mod tests {
         );
         assert_eq!(
             legacy_touch_path.file_name().unwrap().to_string_lossy(),
-            "task-418.done"
+            format!("{request_id}.done")
         );
 
         let signals = pane_signal_events(&events);
@@ -8046,7 +9586,23 @@ mod tests {
 
         let persisted: RuntimeEvent =
             serde_json::from_str(&fs::read_to_string(signal_path).unwrap()).unwrap();
-        assert_eq!(persisted, signals[0]);
+        assert!(matches!(
+            persisted,
+            RuntimeEvent::PaneSignal {
+                request_id: persisted_request_id,
+                session,
+                task_id,
+                signal_type: PaneSignalType::Done,
+                summary,
+                artifact_paths,
+                commit_sha: None,
+                ..
+            } if persisted_request_id == request_id
+                && session == "codex"
+                && task_id.is_empty()
+                && summary.is_empty()
+                && artifact_paths.is_empty()
+        ));
     }
 
     #[test]
@@ -8978,6 +10534,15 @@ mod tests {
     #[test]
     fn pty_closed_clean_exit_emits_session_exit() {
         let supervisor = test_supervisor();
+        let codex_token = session_token(&supervisor, "codex");
+        let credential_path = supervisor
+            .inner
+            .session_control_planes
+            .lock()
+            .get("codex")
+            .unwrap()
+            .info_path
+            .clone();
         let (pty, _, _) = mock_pty_session_with_exit_status(
             Some(1201),
             Some(pty_exit_status(0, None, true)),
@@ -9039,6 +10604,46 @@ mod tests {
             .unwrap()
             .snapshot();
         assert_eq!(slot.last_error, None);
+        assert!(
+            !supervisor
+                .inner
+                .token_bindings
+                .lock()
+                .contains_key(&codex_token)
+        );
+        assert!(!Path::new(&credential_path).exists());
+        let response =
+            supervisor.apply_sideband_request(SidebandRequest::Ping { token: codex_token });
+        assert!(!response.ok);
+        assert_eq!(response.message, "invalid control plane token");
+    }
+
+    #[test]
+    fn failed_spawn_revokes_new_pane_credentials() {
+        let supervisor = test_supervisor();
+        supervisor.start_control_plane().unwrap();
+        supervisor.set_pty_spawner_for_tests(Arc::new(QueuePtySpawner::new(Vec::new())));
+        let credential_path = supervisor.runtime_dir().join("control-plane-claude.json");
+
+        let error = supervisor.start_session("claude", Vec::new()).unwrap_err();
+
+        assert!(error.to_string().contains("no queued PTY sessions"));
+        assert!(
+            !supervisor
+                .inner
+                .session_control_planes
+                .lock()
+                .contains_key("claude")
+        );
+        assert!(
+            supervisor
+                .inner
+                .token_bindings
+                .lock()
+                .values()
+                .all(|binding| binding.as_deref() != Some("claude"))
+        );
+        assert!(!credential_path.exists());
     }
 
     #[test]
@@ -9339,6 +10944,11 @@ mod tests {
     #[test]
     fn liveness_pruning_without_exit_status_emits_process_disappeared() {
         let supervisor = test_supervisor();
+        supervisor.start_control_plane().unwrap();
+        let pane = supervisor
+            .rotate_session_control_plane_status("codex")
+            .unwrap()
+            .unwrap();
         let (pty, _, _) =
             mock_pty_session_with_exit_status(Some(u32::MAX), None, MockKillBehavior::Immediate);
         install_mock_running_session_with_process_id(
@@ -9377,11 +10987,24 @@ mod tests {
             .unwrap()
             .snapshot();
         assert_eq!(slot.last_error, Some("process no longer running".into()));
+        assert!(
+            !supervisor
+                .inner
+                .token_bindings
+                .lock()
+                .contains_key(&pane.token)
+        );
+        assert!(!Path::new(&pane.info_path).exists());
     }
 
     #[test]
     fn pty_error_emits_session_exit_and_last_error() {
         let supervisor = test_supervisor();
+        supervisor.start_control_plane().unwrap();
+        let pane = supervisor
+            .rotate_session_control_plane_status("codex")
+            .unwrap()
+            .unwrap();
         let (pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
         install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
         let events = capture_runtime_events(&supervisor);
@@ -9407,58 +11030,14 @@ mod tests {
             .unwrap()
             .snapshot();
         assert_eq!(slot.last_error, Some("pipe broke".into()));
-    }
-
-    #[test]
-    fn sideband_lifecycle_events_emitted_for_mailbox_ping() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let events = Arc::new(Mutex::new(Vec::<RuntimeEvent>::new()));
-        let captured = events.clone();
-        supervisor.set_event_sink(move |event| {
-            captured.lock().push(event);
-        });
-
-        let sideband_dir = supervisor.runtime_dir().join("sideband-test-lifecycle");
-        let inbox_dir = sideband_dir.join("inbox");
-        let outbox_dir = sideband_dir.join("outbox");
-        let processed_dir = sideband_dir.join("processed");
-        fs::create_dir_all(&inbox_dir).unwrap();
-        fs::create_dir_all(&outbox_dir).unwrap();
-        fs::create_dir_all(&processed_dir).unwrap();
-
-        let request_path = inbox_dir.join("ping.json");
-        fs::write(
-            &request_path,
-            encode_request(&SidebandRequest::Ping {
-                token: status.token.clone(),
-            })
-            .unwrap(),
-        )
-        .unwrap();
-
-        process_sideband_mailbox_file(&supervisor, &request_path, &outbox_dir, &processed_dir)
-            .unwrap();
-
-        let lifecycle_events = events
-            .lock()
-            .iter()
-            .filter_map(|event| match event {
-                RuntimeEvent::SidebandRequestLifecycle {
-                    request_id,
-                    action,
-                    phase,
-                    ..
-                } => Some((request_id.clone(), action.clone(), *phase)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(lifecycle_events.len(), 2);
-        assert_eq!(lifecycle_events[0].1, "ping");
-        assert_eq!(lifecycle_events[0].2, SidebandPhase::Started);
-        assert_eq!(lifecycle_events[1].2, SidebandPhase::Completed);
-        assert_eq!(lifecycle_events[0].0, lifecycle_events[1].0);
+        assert!(
+            !supervisor
+                .inner
+                .token_bindings
+                .lock()
+                .contains_key(&pane.token)
+        );
+        assert!(!Path::new(&pane.info_path).exists());
     }
 
     #[test]
@@ -9529,6 +11108,204 @@ mod tests {
         assert_eq!(lifecycle_events[0].2, SidebandPhase::Started);
         assert_eq!(lifecycle_events[1].2, SidebandPhase::Completed);
         assert_eq!(lifecycle_events[0].0, lifecycle_events[1].0);
+    }
+
+    #[test]
+    fn sideband_pipe_rejects_malformed_payload_without_slot_mutation() {
+        let supervisor = test_supervisor();
+        let slots_before = slots_mutation_probe(&supervisor);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        let error = runtime.block_on(async {
+            let (mut client, server) = tokio::io::duplex(4096);
+            let handle = supervisor.clone();
+            let server_task =
+                tokio::spawn(async move { handle_sideband_stream(handle, server).await });
+            client.write_all(b"{not json}\n").await.unwrap();
+            client.flush().await.unwrap();
+
+            tokio::time::timeout(Duration::from_secs(1), server_task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err()
+        });
+
+        assert!(error.to_string().contains("invalid sideband payload"));
+        assert_eq!(slots_mutation_probe(&supervisor), slots_before);
+    }
+
+    #[test]
+    fn sideband_frame_reader_enforces_size_termination_utf8_and_deadline() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let mut exact_frame = b"{}".to_vec();
+            exact_frame.resize(SIDEBAND_FRAME_MAX_BYTES - 1, b' ');
+            exact_frame.push(b'\n');
+            let mut exact_reader = BufReader::new(exact_frame.as_slice());
+            let decoded = read_sideband_frame(
+                &mut exact_reader,
+                SIDEBAND_FRAME_MAX_BYTES,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+            assert_eq!(decoded.len(), SIDEBAND_FRAME_MAX_BYTES - 1);
+
+            let mut oversized_frame = b"{}".to_vec();
+            oversized_frame.resize(SIDEBAND_FRAME_MAX_BYTES, b' ');
+            oversized_frame.extend_from_slice(b"X\n");
+            let mut oversized_reader = BufReader::new(oversized_frame.as_slice());
+            let error = read_sideband_frame(
+                &mut oversized_reader,
+                SIDEBAND_FRAME_MAX_BYTES,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("sideband request exceeds {SIDEBAND_FRAME_MAX_BYTES}-byte frame limit")
+            );
+
+            let mut unterminated_reader = BufReader::new(&b"{}"[..]);
+            let error = read_sideband_frame(
+                &mut unterminated_reader,
+                SIDEBAND_FRAME_MAX_BYTES,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.to_string(), "unterminated sideband request");
+
+            let invalid_utf8 = [0xff, b'\n'];
+            let mut invalid_utf8_reader = BufReader::new(invalid_utf8.as_slice());
+            let error = read_sideband_frame(
+                &mut invalid_utf8_reader,
+                SIDEBAND_FRAME_MAX_BYTES,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.to_string(), "invalid UTF-8 sideband request");
+
+            let (mut incomplete_client, incomplete_server) = tokio::io::duplex(64);
+            incomplete_client.write_all(b"{").await.unwrap();
+            let mut incomplete_reader = BufReader::new(incomplete_server);
+            let error = read_sideband_frame(
+                &mut incomplete_reader,
+                SIDEBAND_FRAME_MAX_BYTES,
+                Duration::from_millis(20),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "sideband request timed out before newline"
+            );
+        });
+    }
+
+    #[test]
+    fn sideband_stream_admits_required_payload_sizes_before_authorization() {
+        let supervisor = test_supervisor();
+        supervisor.start_control_plane().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let payloads = [
+                "x".repeat(1024),
+                "x".repeat(64 * 1024),
+                "x".repeat(1024 * 1024),
+                "\0".repeat(1024 * 1024),
+            ];
+            for content in payloads {
+                let request_payload = format!(
+                    "{}\n",
+                    encode_request(&SidebandRequest::DeliverMessage {
+                        token: "forged-token".into(),
+                        name: "claude".into(),
+                        content,
+                        require_idle: false,
+                    })
+                    .unwrap()
+                );
+                assert!(request_payload.len() <= SIDEBAND_FRAME_MAX_BYTES);
+
+                let capacity = 16 * 1024;
+                let (client, server) = tokio::io::duplex(capacity);
+                let handle = supervisor.clone();
+                let server_task =
+                    tokio::spawn(async move { handle_sideband_stream(handle, server).await });
+                let (read_half, mut write_half) = tokio::io::split(client);
+                let writer = tokio::spawn(async move {
+                    write_half
+                        .write_all(request_payload.as_bytes())
+                        .await
+                        .unwrap();
+                    write_half.flush().await.unwrap();
+                });
+
+                let mut response_reader = BufReader::new(read_half);
+                let mut response_line = String::new();
+                response_reader.read_line(&mut response_line).await.unwrap();
+                writer.await.unwrap();
+                server_task.await.unwrap().unwrap();
+
+                let response = decode_response(response_line.trim()).unwrap();
+                assert!(!response.ok);
+                assert_eq!(response.message, "invalid control plane token");
+                assert!(response.snapshot.is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn sideband_response_write_has_a_deadline() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        let error = runtime.block_on(async {
+            let (_reader, writer) = tokio::io::duplex(1);
+            let (_read_half, mut write_half) = tokio::io::split(writer);
+            write_sideband_response(
+                &mut write_half,
+                b"response larger than the unread one-byte pipe",
+                Duration::from_millis(20),
+            )
+            .await
+            .unwrap_err()
+        });
+
+        assert_eq!(error.to_string(), "sideband response write timed out");
+    }
+
+    #[test]
+    fn sideband_connection_limit_refuses_excess_and_recovers_capacity() {
+        let slots = Arc::new(Semaphore::new(SIDEBAND_MAX_CONNECTIONS));
+        let mut permits = (0..SIDEBAND_MAX_CONNECTIONS)
+            .map(|_| reserve_sideband_connection(&slots).expect("capacity unexpectedly exhausted"))
+            .collect::<Vec<_>>();
+
+        assert!(reserve_sideband_connection(&slots).is_none());
+        permits.pop();
+        assert!(reserve_sideband_connection(&slots).is_some());
     }
 
     #[test]
@@ -10001,9 +11778,12 @@ mod tests {
         install_mock_running_session(&supervisor, "claude", DriverKind::Claude, old_pty);
         let (new_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
         supervisor.set_pty_spawner_for_tests(Arc::new(QueuePtySpawner::new(vec![new_pty])));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
 
-        let response = run_detached_with_timeout(
-            &supervisor,
+        let response = runtime.block_on(supervisor.run_detached_with_timeout_async(
             SidebandRequest::StopSession {
                 token: status.token.clone(),
                 name: "claude".into(),
@@ -10013,7 +11793,7 @@ mod tests {
             "stop_session",
             Some("claude"),
             &[],
-        );
+        ));
         assert!(response.timed_out);
         wait_until(Duration::from_secs(1), || {
             let slots = supervisor.inner.slots.lock();
@@ -10025,7 +11805,9 @@ mod tests {
 
         let snapshot = supervisor.start_session("claude", Vec::new()).unwrap();
         assert_eq!(snapshot.lifecycle_state, LifecycleState::Ready);
-        assert!(supervisor.test_wait_for_last_worker(Duration::from_secs(1)));
+        wait_until(Duration::from_secs(1), || {
+            old_kill_count.load(Ordering::SeqCst) >= 1
+        });
         assert_eq!(supervisor.current_generation("claude"), Some(2));
         assert!(old_kill_count.load(Ordering::SeqCst) >= 1);
 
@@ -10046,9 +11828,12 @@ mod tests {
             gate.clone(),
             vec![first_pty, second_pty],
         )));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
 
-        let response = run_detached_with_timeout(
-            &supervisor,
+        let response = runtime.block_on(supervisor.run_detached_with_timeout_async(
             SidebandRequest::StartSession {
                 token: status.token.clone(),
                 name: "claude".into(),
@@ -10059,7 +11844,7 @@ mod tests {
             "start_session",
             Some("claude"),
             &[],
-        );
+        ));
         assert!(response.timed_out);
 
         let snapshot = supervisor.start_session("claude", Vec::new()).unwrap();
@@ -10071,7 +11856,9 @@ mod tests {
             cvar.notify_all();
         }
 
-        assert!(supervisor.test_wait_for_last_worker(Duration::from_secs(1)));
+        wait_until(Duration::from_secs(1), || {
+            first_kill_count.load(Ordering::SeqCst) == 1
+        });
         assert_eq!(first_kill_count.load(Ordering::SeqCst), 1);
         assert_eq!(supervisor.current_generation("claude"), Some(2));
 
@@ -10079,65 +11866,6 @@ mod tests {
         let slot = slots.get("claude").unwrap();
         assert_eq!(slot.state, LifecycleState::Ready);
         assert_eq!(slot.generation, 2);
-    }
-
-    #[test]
-    fn mailbox_poison_queue_catches_rename_failure() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        supervisor.set_mailbox_fs_for_tests(Arc::new(FailingRenameMailboxFs::new(3)));
-        let sideband_dir = supervisor.runtime_dir().join("sideband-test-poison");
-        let inbox_dir = sideband_dir.join("inbox");
-        let outbox_dir = sideband_dir.join("outbox");
-        let processed_dir = sideband_dir.join("processed");
-        fs::create_dir_all(&inbox_dir).unwrap();
-        fs::create_dir_all(&outbox_dir).unwrap();
-        fs::create_dir_all(&processed_dir).unwrap();
-
-        let request_path = inbox_dir.join("ping.json");
-        fs::write(
-            &request_path,
-            encode_request(&SidebandRequest::Ping {
-                token: status.token.clone(),
-            })
-            .unwrap(),
-        )
-        .unwrap();
-
-        let error =
-            process_sideband_mailbox_file(&supervisor, &request_path, &outbox_dir, &processed_dir)
-                .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("failed to publish mailbox response")
-        );
-
-        let poison_dir = sideband_dir.join("poison");
-        let poison_entries = fs::read_dir(&poison_dir)
-            .unwrap()
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .collect::<Vec<_>>();
-        assert!(
-            poison_entries
-                .iter()
-                .any(|path| path.extension().and_then(|ext| ext.to_str()) != Some("error"))
-        );
-        assert!(
-            poison_entries
-                .iter()
-                .any(|path| path.extension().and_then(|ext| ext.to_str()) == Some("error"))
-        );
-    }
-
-    #[test]
-    fn pane_bound_send_key_allows_peer_target_when_lockdown_is_off() {
-        let supervisor = test_supervisor_with_peer_slash_commands_allowed(true);
-        let claude_token = session_token(&supervisor, "claude");
-
-        supervisor
-            .validate_session_action_token(&claude_token, "codex")
-            .unwrap();
     }
 
     #[test]
@@ -10228,7 +11956,7 @@ mod tests {
             } if from == "claude"
                 && to == "codex"
                 && *scope == MessageScope::Direct
-                && content == "hi"
+                && content == "[content omitted]"
         ));
     }
 
@@ -10278,7 +12006,7 @@ mod tests {
             } if from == "operator"
                 && to == "claude"
                 && *scope == MessageScope::Direct
-                && content == "hi"
+                && content == "[content omitted]"
         ));
     }
 

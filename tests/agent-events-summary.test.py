@@ -1,7 +1,9 @@
 import json
+import os
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -12,32 +14,10 @@ SCRIPT = ROOT / "scripts" / "agent-events-summary.py"
 def write_fixture(path: Path) -> None:
     events = [
         {
-            "event": "pane_signal",
-            "request_id": "req-signal-done",
-            "session": "codex",
-            "task_id": "smoke",
-            "signal_type": "done",
-            "summary": "finished",
-            "artifact_paths": [],
-            "commit_sha": None,
-            "timestamp": "2026-05-17T20:00:00.123456700+00:00",
-        },
-        {
-            "event": "pane_signal",
-            "request_id": "req-signal-blocked",
-            "session": "claude",
-            "task_id": "smoke",
-            "signal_type": "blocked",
-            "summary": "needs operator",
-            "artifact_paths": [],
-            "commit_sha": None,
-            "timestamp": "2026-05-17T20:00:01+00:00",
-        },
-        {
             "event": "session_work_state",
             "session": "codex",
             "state": "thinking",
-            "detail": "Working 12s",
+            "detail": None,
             "previous_state": "idle",
             "timestamp": "2026-05-17T20:00:01.500000+00:00",
         },
@@ -210,6 +190,13 @@ def write_fixture(path: Path) -> None:
             "timestamp": "2026-05-17T20:00:10+00:00",
         },
         {
+            "event": "dispatch_no_reaction",
+            "request_id": "req-no-reaction-123456",
+            "session": "codex",
+            "action": "deliver_message",
+            "timestamp": "2026-05-17T20:00:10.100000+00:00",
+        },
+        {
             "event": "supervisor_heartbeat",
             "wrapper_pid": 4242,
             "uptime_secs": 1800,
@@ -256,19 +243,6 @@ def write_fixture(path: Path) -> None:
             "timestamp": "2026-05-17T20:00:10.400000+00:00",
         },
         {
-            "event": "dispatch_template_warning",
-            "request_id": "req-template-123456",
-            "session": "claude",
-            "detected_patterns": [],
-            "missing_patterns": [
-                "pane_signal",
-                "control-plane.ps1 -Action signal",
-                "task_id",
-            ],
-            "severity": "info",
-            "timestamp": "2026-05-17T20:00:10.500000+00:00",
-        },
-        {
             "event": "sideband_request_lifecycle",
             "request_id": "req-failed-123456",
             "action": "send_input",
@@ -282,13 +256,14 @@ def write_fixture(path: Path) -> None:
     path.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
 
 
-def run_summary(*args, input_text=None):
+def run_summary(*args, input_text=None, env=None):
     return subprocess.run(
         [sys.executable, str(SCRIPT), *args],
         input=input_text,
         text=True,
         capture_output=True,
         cwd=ROOT,
+        env=env,
     )
 
 
@@ -300,9 +275,6 @@ def test_fixture_summary_and_fail_on():
         result = run_summary("--audit-log", str(fixture))
         assert result.returncode == 0, result.stderr
         out = result.stdout
-        assert "pane_signal" in out
-        assert "type=done" in out
-        assert "type=blocked" in out
         assert "work_state" in out
         assert "idle->thinking" in out
         assert "session_exit" in out
@@ -317,12 +289,11 @@ def test_fixture_summary_and_fail_on():
         assert "req-disp" in out
         assert "req-dispatch-idle" not in out
         assert "ack_timeout" in out
+        assert "no_reaction" in out
         assert "heartbeat" in out
         assert "sessions=2 active=1" in out
         assert "supervisor_alert" in out
         assert "severity=critical" in out
-        assert "template_warning" in out
-        assert "pane_signal,control-plane.ps1 -Action signal,task_id" in out
         assert "lifecycle_failed" in out
 
         failed = run_summary("--audit-log", str(fixture), "--fail-on", "blocked,failed,timeout")
@@ -336,11 +307,6 @@ def test_filters_and_events_since_stdin():
         fixture = Path(tmp) / "audit.jsonl"
         write_fixture(fixture)
 
-        task_filtered = run_summary("--audit-log", str(fixture), "--task-id", "smoke")
-        assert task_filtered.returncode == 0
-        assert "pane_signal" in task_filtered.stdout
-        assert "route_delivery" not in task_filtered.stdout
-
         request_filtered = run_summary("--audit-log", str(fixture), "--request-id", "req-ack-123456")
         assert request_filtered.returncode == 0
         assert "request_ack" in request_filtered.stdout
@@ -349,7 +315,6 @@ def test_filters_and_events_since_stdin():
         events = {"events": [json.loads(line) for line in fixture.read_text(encoding="utf-8").splitlines()]}
         stdin_result = run_summary("--events-since-stdin", input_text=json.dumps(events))
         assert stdin_result.returncode == 0
-        assert "pane_signal" in stdin_result.stdout
         assert "session_exit" in stdin_result.stdout
         assert "route_delivery" in stdin_result.stdout
         assert "supervisor_alert" in stdin_result.stdout
@@ -362,7 +327,7 @@ def test_error_loop_work_state_counts_as_blocked():
                 "event": "session_work_state",
                 "session": "codex",
                 "state": "error_loop",
-                "detail": "usage_limit",
+                "detail": None,
                 "previous_state": "blocked",
                 "timestamp": "2026-05-17T20:00:01.500000+00:00",
             }
@@ -380,7 +345,24 @@ def test_error_loop_work_state_counts_as_blocked():
     assert "blocked->error_loop" in result.stdout
 
 
+def test_default_runtime_override_with_spaces():
+    with tempfile.TemporaryDirectory(prefix="prim1 runtime ") as tmp:
+        audit_dir = Path(tmp) / "audit"
+        audit_dir.mkdir(parents=True)
+        fixture = audit_dir / f"{datetime.now(timezone.utc).date().isoformat()}.jsonl"
+        write_fixture(fixture)
+        env = os.environ.copy()
+        env["PRIM1_RUNTIME_DIR"] = tmp
+        env.pop("PRIM1_AUDIT_DIR", None)
+
+        result = run_summary(env=env)
+
+        assert result.returncode == 0, result.stderr
+        assert "route_delivery" in result.stdout
+
+
 if __name__ == "__main__":
     test_fixture_summary_and_fail_on()
     test_filters_and_events_since_stdin()
     test_error_loop_work_state_counts_as_blocked()
+    test_default_runtime_override_with_spaces()

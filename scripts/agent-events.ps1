@@ -3,7 +3,7 @@ param(
   [string]$CursorFile,
   [int]$MaxEvents = 200,
   [int]$MaxWaitSeconds = 15,
-  [string[]]$IncludeKinds = @("routed_message", "route_delivery", "dispatch_attempt", "dispatch_template_warning", "pane_signal", "session_state", "session_exit", "session_work_state", "supervisor_heartbeat", "supervisor_alert", "system_log", "sideband_request_lifecycle", "request_ack", "request_ack_timeout"),
+  [string[]]$IncludeKinds = @("route_delivery", "dispatch_attempt", "session_state", "session_exit", "session_work_state", "supervisor_heartbeat", "supervisor_alert", "system_log", "sideband_request_lifecycle", "request_ack", "request_ack_timeout", "dispatch_no_reaction"),
   [string[]]$IncludeSessions,
   [string[]]$IncludeScopes,
   [string]$InfoFile
@@ -31,9 +31,11 @@ function Write-AtomicText {
 
 $scriptRoot = Split-Path -Parent $PSCommandPath
 $controlPlaneScript = Join-Path $scriptRoot "control-plane.ps1"
+. (Join-Path $scriptRoot "runtime-paths.ps1")
 
 if (-not $CursorFile) {
-  $CursorFile = Join-Path $scriptRoot "..\\.runtime\\cursors\\$Consumer.json"
+  $runtimeDir = Resolve-Prim1RuntimeDirectory
+  $CursorFile = Join-Path $runtimeDir "cursors\$Consumer.json"
 }
 
 if (-not (Test-Path -LiteralPath $CursorFile)) {

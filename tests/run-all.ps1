@@ -3,20 +3,19 @@
   PRIM-1 deterministic control-script test runner.
 
 .DESCRIPTION
-  Runs the following legacy deterministic and live control-script suites in
+  Runs the following deterministic and live control-script suites in
   order. This is not the complete production gate; Rust, TypeScript, packaging,
   browser, privacy, process, harness-admission, and performance verification are
-  aggregated separately.
-    1. tools/tests/test_watcher.py       (Python unit tests)
-    2. tests/agent-events-summary.test.py (Python fixture tests)
-    3. tests/handshake-helpers.ps1       (PowerShell helper tests)
-    4. tests/control-plane-content-file.ps1 (PowerShell content-file harness)
-    5. tests/control-plane-request-id.ps1 (PowerShell request-id helper harness)
-    6. tests/control-plane-deliver-wait.ps1 (PowerShell deliver/wait harness)
-    7. tests/control-plane-timeouts.ps1  (PowerShell timeout harness)
-    8. tests/routing-stress-sequential.ps1  (live transport stress, requires
+    aggregated separately.
+    1. tests/runtime-paths.ps1           (PowerShell path resolver tests)
+    2. tests/agent-events-summary.test.py (metadata summary fixture tests)
+    3. tests/control-plane-content-file.ps1 (PowerShell content-file harness)
+    4. tests/control-plane-request-id.ps1 (PowerShell request-id helper harness)
+    5. tests/control-plane-deliver-wait.ps1 (PowerShell deliver/wait harness)
+    6. tests/control-plane-timeouts.ps1   (PowerShell timeout harness)
+    7. tests/routing-stress-sequential.ps1  (live receipt stress, requires
                                              wrapper + panes running)
-    9. scripts/health-check.ps1          (live runtime state check)
+    8. scripts/health-check.ps1           (live runtime state check)
 
   Uses direct invocation with fail-closed $LASTEXITCODE capture. Output is only
   shown on failure unless -Verbose is set.
@@ -107,16 +106,12 @@ Write-Host ""
 $results = @()
 $start = Get-Date
 
-$results += Invoke-Suite -Name "watcher unit tests" -Block {
-  & python tools/tests/test_watcher.py
+$results += Invoke-Suite -Name "runtime path resolver" -Block {
+  & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scriptRoot "runtime-paths.ps1")
 }
 
 $results += Invoke-Suite -Name "agent events summary" -Block {
   & python (Join-Path $scriptRoot "agent-events-summary.test.py")
-}
-
-$results += Invoke-Suite -Name "handshake helpers" -Block {
-  & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scriptRoot "handshake-helpers.ps1")
 }
 
 $results += Invoke-Suite -Name "control-plane content file" -Block {
@@ -135,7 +130,7 @@ $results += Invoke-Suite -Name "control-plane timeouts" -Block {
   & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scriptRoot "control-plane-timeouts.ps1")
 }
 
-$results += Invoke-Suite -Name "routing stress sequential" -Live -Block {
+$results += Invoke-Suite -Name "routing receipt stress" -Live -Block {
   & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scriptRoot "routing-stress-sequential.ps1") -Count 5
 }
 

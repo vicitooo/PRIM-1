@@ -1,19 +1,17 @@
 <#
 .SYNOPSIS
   PRIM-1 wrapper health check — wrapper process, panes, control plane,
-  watcher, audit log, credentials, and recent error surface in one command.
+  metadata audit, credentials, and recent error surface in one command.
 
 .DESCRIPTION
   Reports a structured view of PRIM-1 runtime health. Intended as the
-  single-command operator check before long-running sessions or as part of
-  an autonomous heartbeat loop.
+  single-command operator check before long-running sessions.
 
   Exit codes:
     0   all checks passed or only informational notes
     1   at least one hard failure (wrapper down, control-plane unreachable,
         audit log unwritable, or panes in error state)
-    2   warnings only (watcher down, stale activity, per-session creds
-        missing but wrapper and panes otherwise healthy)
+    2   warnings only, with wrapper and control plane otherwise reachable
 
 .PARAMETER Json
   Emit the full health report as compact JSON instead of human-readable text.
@@ -22,26 +20,30 @@
 .PARAMETER Quiet
   Only emit FAIL and WARN lines. Suppress OK lines and the summary header.
   Combines with -Json to produce nothing when everything is OK.
+
+.PARAMETER InfoFile
+  Explicit master control-plane credential file. Its parent directory is also
+  used for audit health checks. When omitted, the shared runtime resolver
+  applies PRIM1_RUNTIME_DIR and then the platform default.
 #>
 param(
   [switch]$Json,
-  [switch]$Quiet
+  [switch]$Quiet,
+  [string]$InfoFile
 )
 
 $scriptRoot = Split-Path -Parent $PSCommandPath
-$wrapperRoot = (Resolve-Path (Join-Path $scriptRoot "..")).Path
-$runtimeDir = Join-Path $wrapperRoot ".runtime"
+. (Join-Path $scriptRoot "runtime-paths.ps1")
+$masterInfoFile = Resolve-Prim1ControlPlaneInfoFile -InfoFile $InfoFile
+$runtimeDir = Split-Path -Parent $masterInfoFile
 $controlPlaneScript = Join-Path $scriptRoot "control-plane.ps1"
-$masterInfoFile = Join-Path $runtimeDir "control-plane.json"
 $auditDir = Join-Path $runtimeDir "audit"
-$watcherLog = Join-Path $runtimeDir "watcher.log"
 
 $report = [ordered]@{
   timestamp = (Get-Date).ToUniversalTime().ToString("o")
   wrapper = $null
   panes = @()
   control_plane = $null
-  watcher = $null
   audit_log = $null
   credentials = $null
   overall = "unknown"
@@ -83,7 +85,6 @@ if (Test-Path -LiteralPath $masterInfoFile) {
     $report.credentials = [ordered]@{
       master_info_file = $masterInfoFile
       endpoint = $masterCreds.endpoint
-      token_prefix = if ($masterCreds.token) { $masterCreds.token.Substring(0, 8) + "..." } else { $null }
       per_session = @{}
     }
     foreach ($pane in @("claude", "codex")) {
@@ -93,17 +94,16 @@ if (Test-Path -LiteralPath $masterInfoFile) {
           $paneCreds = Get-Content -LiteralPath $paneInfo -Raw | ConvertFrom-Json
           $report.credentials.per_session[$pane] = [ordered]@{
             info_file = $paneInfo
-            token_prefix = if ($paneCreds.token) { $paneCreds.token.Substring(0, 8) + "..." } else { $null }
             distinct_from_master = ($paneCreds.token -ne $masterCreds.token)
           }
           if (-not $report.credentials.per_session[$pane].distinct_from_master) {
-            Add-Warning "per-session creds for '$pane' match master token — TASK-017 may be disabled"
+            Add-Warning "per-session credentials for '$pane' match the master token"
           }
         } catch {
           Add-Warning "per-session creds file for '$pane' exists but failed to parse"
         }
       } else {
-        Add-Note "per-session creds file for '$pane' not present (TASK-017 may be disabled or wrapper booted with PRIM1_PEER_SLASH_COMMANDS_ALLOWED=1)"
+        Add-Note "per-session credentials file for '$pane' is not present"
       }
     }
   } catch {
@@ -118,7 +118,7 @@ $cpResult = $null
 $cpError = $null
 if ($wrapperProc) {
   try {
-    $cpRaw = & powershell -NoProfile -ExecutionPolicy Bypass -File $controlPlaneScript -Action list 2>&1
+    $cpRaw = & powershell -NoProfile -ExecutionPolicy Bypass -File $controlPlaneScript -Action list -InfoFile $masterInfoFile 2>&1
     if ($LASTEXITCODE -eq 0) {
       $cpResult = $cpRaw | Out-String | ConvertFrom-Json
     } else {
@@ -178,56 +178,6 @@ if ($cpResult -and $cpResult.ok) {
   }
 }
 
-# ---- Watcher process ----
-$watcherProc = Get-CimInstance Win32_Process -Filter "Name like '%python%'" -ErrorAction SilentlyContinue |
-  Where-Object { $_.CommandLine -and $_.CommandLine -match "prim1-command-watcher" } |
-  Select-Object -First 1
-
-if ($watcherProc) {
-  $report.watcher = [ordered]@{
-    running = $true
-    pid = $watcherProc.ProcessId
-    command_line = $watcherProc.CommandLine
-    log_path = $watcherLog
-  }
-
-  if (Test-Path -LiteralPath $watcherLog) {
-    $logItem = Get-Item -LiteralPath $watcherLog
-    $logAgeSeconds = [int]((Get-Date) - $logItem.LastWriteTime).TotalSeconds
-    $report.watcher.log_mtime = $logItem.LastWriteTime.ToString("o")
-    $report.watcher.log_age_seconds = $logAgeSeconds
-    $report.watcher.log_size_bytes = $logItem.Length
-
-    try {
-      $tailLines = Get-Content -LiteralPath $watcherLog -Tail 50 -ErrorAction Stop
-      $dispatchCount = ($tailLines | ForEach-Object {
-        try {
-          $evt = $_ | ConvertFrom-Json
-          if ($evt.event -eq "continue_dispatched") { 1 }
-        } catch { }
-      } | Measure-Object).Count
-      $alertCount = ($tailLines | ForEach-Object {
-        try {
-          $evt = $_ | ConvertFrom-Json
-          if ($evt.event -eq "watcher_alert") { 1 }
-        } catch { }
-      } | Measure-Object).Count
-      $report.watcher.recent_continue_dispatched = $dispatchCount
-      $report.watcher.recent_alerts = $alertCount
-      if ($alertCount -gt 0) {
-        Add-Note "watcher has $alertCount recent alert event(s) in the last 50 log lines"
-      }
-    } catch {
-      Add-Warning "watcher log exists but tail read failed: $_"
-    }
-  } else {
-    Add-Note "watcher log file not yet created at $watcherLog"
-  }
-} else {
-  $report.watcher = @{ running = $false }
-  Add-Warning "watcher python process not running (self-slash /compact and /context will hang silently if fired)"
-}
-
 # ---- Audit log ----
 $today = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd")
 $auditPath = Join-Path $auditDir "$today.jsonl"
@@ -263,7 +213,7 @@ if (Test-Path -LiteralPath $auditPath) {
 
 # ---- Disk space ----
 try {
-  $drive = ($wrapperRoot -split ':')[0] + ':'
+  $drive = [System.IO.Path]::GetPathRoot($runtimeDir)
   $diskInfo = Get-PSDrive -Name $drive[0] -ErrorAction SilentlyContinue
   if ($diskInfo) {
     $freeGb = [math]::Round($diskInfo.Free / 1GB, 2)
@@ -333,15 +283,9 @@ if (-not $Quiet) {
     Write-Line "pane:$($pane.name)" "state=$($pane.lifecycle_state)  pid=$($pane.process_id)  running=$($pane.running)  $ageLabel" $color
   }
 
-  if ($report.watcher.running) {
-    $dispatchLabel = if ($report.watcher.recent_continue_dispatched -ne $null) { "recent_dispatches=$($report.watcher.recent_continue_dispatched)" } else { "no log yet" }
-    Write-Line "watcher" "PID $($report.watcher.pid)  $dispatchLabel  log_age=$($report.watcher.log_age_seconds)s" Green
-  } else {
-    Write-Line "watcher" "NOT RUNNING" Yellow
-  }
-
   if ($report.audit_log.exists) {
-    Write-Line "audit_log" "$($report.audit_log.size_bytes) bytes  last_write=$($report.audit_log.last_write_age_seconds)s ago  writable=$($report.audit_log.writable)" Green
+    $auditColor = if ($report.audit_log.writable) { "Green" } else { "Red" }
+    Write-Line "audit_log" "$($report.audit_log.size_bytes) bytes  last_write=$($report.audit_log.last_write_age_seconds)s ago  writable=$($report.audit_log.writable)" $auditColor
   } else {
     Write-Line "audit_log" "not yet created for today" Yellow
   }
@@ -354,7 +298,7 @@ if (-not $Quiet) {
   if ($report.credentials) {
     $perSessionKeys = @($report.credentials.per_session.Keys)
     $pslabel = if ($perSessionKeys.Count -gt 0) { "per_session=$($perSessionKeys -join ',')" } else { "per_session=none" }
-    Write-Line "credentials" "master=$($report.credentials.token_prefix)  $pslabel" Green
+    Write-Line "credentials" "master_file=present  $pslabel" Green
   }
 
   Write-Host ("-" * 70)

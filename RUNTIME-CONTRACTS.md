@@ -149,7 +149,6 @@ Supervisor default events:
 - `supervisor_alert` is the wrapper-owned operator attention channel; fields are `alert_type`, optional `request_id`, optional `session`, optional `action`, optional `last_work_state`, optional `last_session_state`, `message`, `severity`, and `timestamp`
 - alert types are `ack_timeout`, `session_stall_detected`, and `operator_attention`
 - alert severities are `info`, `warn`, and `critical`
-- `dispatch_template_warning` is emitted for `deliver_message` when dispatch content contains none of `pane_signal`, `control-plane.ps1 -Action signal`, or `task_id`; it is `severity: info` and does not block delivery
 
 Exit-cause events:
 
@@ -190,9 +189,9 @@ Default expectation:
 - agent can request actions on itself
 - cross-agent lifecycle requests require explicit policy
 
-## 10. Audit log contract
+## 10. Metadata audit contract
 
-Audit log is the source of truth for replay.
+The audit log is the source of truth for durable operational metadata. It is not a terminal transcript, message archive, or task-completion oracle.
 
 Format:
 
@@ -200,19 +199,18 @@ Format:
 - one event per line
 - rolling files by date
 
-Minimum fields:
+Every record carries an event type and timestamp. Event-specific metadata may add session/actor/target identity, request or route IDs, lifecycle/work state, action/phase/result, error classification, and delivery counts.
 
-- timestamp
-- event type
-- actor
-- target
-- session name
-- driver
-- lifecycle state
-- summary
-- result
+`session_work_state`, `session_exit`, `supervisor_heartbeat`, and `supervisor_alert` events are part of the metadata event stream. Work-state events are derived from driver classifiers, not from explicit pane requests. Exit events are derived from PTY exit status, requested-stop intent, PTY transport errors, and liveness pruning. Supervisor default events are emitted by wrapper policy so operators do not need separate heartbeat or ACK-timeout monitors.
 
-`session_work_state`, `session_exit`, `supervisor_heartbeat`, `supervisor_alert`, and `dispatch_template_warning` events are part of the default signal event stream. Work-state events are derived from driver classifiers, not from explicit pane requests. Exit events are derived from PTY exit status, requested-stop intent, PTY transport errors, and liveness pruning. Supervisor default events are emitted by wrapper policy so operators do not need separate heartbeat, ACK-timeout, or template-compliance monitors.
+Content-retention rules:
+
+- `session_output` is live-only and is never appended to the durable audit
+- `routed_message` retains addressing, scope, identity, and timestamp metadata; its durable `content` value is `[content omitted]`
+- `session_work_state.detail` is omitted from the durable projection
+- legacy `pane_signal` records retain only request/session/signal-type/timestamp metadata; task, summary, artifact, and commit fields are blanked
+- `desktop-events.jsonl` contains desktop-process diagnostics, not terminal or conversation content
+- a delivery or ACK receipt proves runtime handling only; model understanding and task completion require an independent live or artifact-based oracle
 
 Pane-bound sideband requests (`send_input`, `send_key`, `deliver_message`, `route_message`) must expose two correlated layers:
 
@@ -238,13 +236,6 @@ Dispatch gate modes:
 - `-RequireIdle` emits `dispatch_attempt` and aborts before the PTY write when `overlap: true`
 - aborted `-RequireIdle` route requests emit one `dispatch_attempt` per resolved recipient, then abort the entire route without partial delivery, `request_ack`, or `route_delivery`
 
-Dispatch template warning rules:
-
-- `deliver_message` scans the content for `pane_signal`, `control-plane.ps1 -Action signal`, or `task_id`
-- if none are present, it emits `dispatch_template_warning` with `detected_patterns: []`, all three entries in `missing_patterns`, and `severity: "info"`
-- if at least one marker is present, no warning is emitted
-- warnings are advisory only; delivery still proceeds
-
 Route sideband requests expose a third delivery-truth layer:
 
 - `route_delivery` records the resolved pane fan-out and each per-recipient write outcome, keyed by `request_id` and `route_id`
@@ -252,34 +243,7 @@ Route sideband requests expose a third delivery-truth layer:
 - every resolved pane recipient emits `phase: "written"` with `recipient`, `recipient_index`, `payload_part_count`, and `bytes_written`, or `phase: "failed"` with `error`
 - partial failure is non-transactional: successful recipient writes remain delivered and audited, and the route request returns an error naming the failed recipient(s)
 
-Pane signal sideband requests expose a first-class completion/liveness channel:
-
-- request kind: `pane_signal`
-- signal types: `done`, `blocked`, `yellow`, `heartbeat`, `progress`
-- pane-bound tokens resolve `session` from the credential binding; callers cannot spoof another pane name in the request payload
-- master/operator-token calls are allowed and record `session: "supervisor"`
-- every accepted signal emits a `pane_signal` audit event keyed by `request_id`
-- the canonical signal record is written before audit emission to `.runtime/signals/<task_id>__<signal_type>__<timestamp>.json`
-- the filename timestamp is UTC and filesystem-safe (`YYYYMMDDTHHMMSS.nnnnnnnnnZ`) because raw RFC3339 colons are invalid on Windows
-- `task_id` is sanitized for filenames; the original `task_id` remains in the JSON payload
-- canonical JSON contains the full `pane_signal` audit event payload:
-
-```json
-{
-  "event": "pane_signal",
-  "request_id": "uuid",
-  "session": "codex",
-  "task_id": "task-418",
-  "signal_type": "done",
-  "summary": "completed",
-  "artifact_paths": [],
-  "commit_sha": null,
-  "timestamp": "2026-05-17T00:00:00Z"
-}
-```
-
-- a legacy empty touch-file is also written at `.runtime/dispatch-triggers/<task_id>.<signal_type>` for existing watchers
-- legacy touch-file write failure emits a warning `system_log` but does not roll back or suppress the canonical JSON write path
+Legacy task-shaped `pane_signal` and `dispatch_template_warning` event kinds may still appear through backward-compatible control-plane calls. They are not part of the supported operator workflow or the default summary helpers, and they must not be treated as durable task state.
 
 Auto-restart-on-stall rules:
 

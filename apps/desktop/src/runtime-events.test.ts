@@ -1,9 +1,7 @@
 /**
  * Tests for runtime-events.ts.
  *
- * Layer 1 — 9 unit tests (sideband phases + exhaustiveness).
- * Locked via plan-v3.md verifier block: `unit_tests: 9 across 1 file
- * matching apps/desktop/src/runtime-events.test.ts`.
+ * Layer 1 — focused unit tests for sideband phases and event-contract exhaustiveness.
  */
 
 import { describe, expect, it, vi } from "vitest";
@@ -118,6 +116,119 @@ describe("runtime-events sideband handler", () => {
 });
 
 describe("runtime-events exhaustiveness default arm", () => {
+  it("every supervisor telemetry variant is handled explicitly", () => {
+    const timestamp = "2026-04-22T12:00:00Z";
+    const events: RuntimeEvent[] = [
+      {
+        event: "session_work_state",
+        session: "claude",
+        state: "thinking",
+        detail: null,
+        previous_state: "idle",
+        timestamp,
+      },
+      {
+        event: "supervisor_heartbeat",
+        wrapper_pid: 42,
+        uptime_secs: 10,
+        sessions: [],
+        timestamp,
+      },
+      {
+        event: "supervisor_alert",
+        alert_type: "operator_attention",
+        request_id: null,
+        session: null,
+        action: null,
+        last_work_state: null,
+        last_session_state: null,
+        message: "attention",
+        severity: "warn",
+        timestamp,
+      },
+      {
+        event: "dispatch_template_warning",
+        request_id: "req-1",
+        session: "claude",
+        detected_patterns: [],
+        missing_patterns: ["completion signal"],
+        severity: "info",
+        timestamp,
+      },
+      {
+        event: "route_delivery",
+        request_id: "req-1",
+        route_id: "route-1",
+        from: "claude",
+        logical_to: "codex",
+        scope: "direct",
+        recipient: "codex",
+        recipient_index: 0,
+        recipient_count: 1,
+        payload_part_count: 1,
+        phase: "written",
+        bytes_written: 5,
+        error: null,
+        timestamp,
+      },
+      {
+        event: "dispatch_attempt",
+        request_id: "req-1",
+        action: "route_message",
+        from: "claude",
+        target_session: "codex",
+        target_lifecycle_state_before: "ready",
+        target_work_state_before: "idle",
+        target_last_activity_at: timestamp,
+        last_route_from_target_at: null,
+        overlap: false,
+        reason: null,
+        timestamp,
+      },
+      {
+        event: "pane_signal",
+        request_id: "req-1",
+        session: "claude",
+        task_id: "legacy",
+        signal_type: "done",
+        summary: "complete",
+        artifact_paths: [],
+        commit_sha: null,
+        timestamp,
+      },
+      {
+        event: "request_ack",
+        request_id: "req-1",
+        session: "codex",
+        action: "send_input",
+        bytes_written: 5,
+        timestamp,
+      },
+      {
+        event: "request_ack_timeout",
+        request_id: "req-1",
+        session: "codex",
+        action: "send_input",
+        elapsed_ms: 1_000,
+        timestamp,
+      },
+      {
+        event: "dispatch_no_reaction",
+        request_id: "req-1",
+        session: "codex",
+        action: "send_input",
+        timestamp,
+      },
+    ];
+
+    for (const event of events) {
+      const ctx = makeContext();
+      handleRuntimeEvent(event, ctx);
+      const messages = ctx.writeSystem.mock.calls.map((call) => call[1] as string);
+      expect(messages.some((message) => message.includes("unhandled runtime event variant"))).toBe(false);
+    }
+  });
+
   it("unknown variant logs warn via default arm", () => {
     const ctx = makeContext();
     const fakeEvent = {

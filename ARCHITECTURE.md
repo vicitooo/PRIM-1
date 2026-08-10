@@ -325,7 +325,7 @@ If the UI crashes or is closed:
 
 - supervised agents may continue running
 - the supervisor continues logging and routing
-- reopening the UI should reattach to live sessions and replay recent log state
+- reopening the UI should reattach to live sessions and recover the current runtime snapshot
 
 This prevents the room from depending on one fragile window process.
 
@@ -433,7 +433,7 @@ What remains continuous:
 
 - supervisor daemon
 - session identity and state
-- audit history
+- metadata audit history
 - routing and health model
 
 What may come and go:
@@ -453,27 +453,18 @@ Recommended first implementation:
 
 This is separate from child-agent lifecycle and should be treated as part of the runtime envelope.
 
-## 12. Audit log and replay
+## 12. Metadata audit and live state
 
-The audit log is the source of truth for replay.
+The audit log is a durable operational ledger, not a transcript or room-replay store.
 
 Format:
 
 - JSONL, one structured event per line
 - rolling daily files
 
-Minimum fields:
+Every record carries an event type and timestamp. Event-specific metadata may add session/actor/target identity, request or route IDs, lifecycle state, action/phase/result, and delivery counts.
 
-- timestamp
-- event type
-- actor
-- target
-- session id
-- driver
-- payload summary
-- result
-
-Replay should read the audit log forward. A separate transcript system should not be invented unless the audit log proves insufficient.
+Terminal output and routed-message content remain available only through the live runtime and desktop event path. `session_output` is not written to audit; routed-message content is replaced with `[content omitted]`. Any future room-history surface needs an explicit bounded in-memory retention contract and gap indication rather than silently turning the audit into a content store.
 
 ## 12.1 Multi-instance identity
 
@@ -496,7 +487,7 @@ At minimum the architecture must support:
 - output throttling when an agent floods the pane
 - parse-and-drop behavior for malformed sideband messages
 - reconnecting the UI without dropping supervised sessions
-- serializing room/system events in the audit log even when multiple agents emit concurrently
+- serializing room delivery and lifecycle metadata in the audit log even when multiple agents emit concurrently
 
 ## 14. Reuse of current bridge code
 
@@ -508,7 +499,6 @@ Reusable parts:
 - partial Claude subprocess logic
 - archive and dispatch patterns
 - session registry concepts
-- watcher loop structure
 
 To be replaced:
 

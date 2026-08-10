@@ -100,6 +100,28 @@ export function handleRuntimeEvent(
       }
       break;
     }
+    case "session_work_state":
+      if (event.state === "blocked" || event.state === "error_loop") {
+        ctx.writeSystem(
+          event.state === "error_loop" ? "error" : "warn",
+          `${event.session} work state: ${event.state}${event.detail ? ` (${event.detail})` : ""}`,
+        );
+      }
+      break;
+    case "supervisor_heartbeat":
+      break;
+    case "supervisor_alert":
+      ctx.writeSystem(
+        event.severity === "critical" ? "error" : event.severity,
+        event.message,
+      );
+      break;
+    case "dispatch_template_warning":
+      ctx.writeSystem(
+        event.severity === "critical" ? "error" : event.severity,
+        `dispatch template warning for ${event.session}: missing ${event.missing_patterns.join(", ")}`,
+      );
+      break;
     case "pair_created":
       ctx.writeSystem("info", `pair created: ${event.name}`);
       ctx.refreshSnapshotFromEvent(event.name);
@@ -124,6 +146,32 @@ export function handleRuntimeEvent(
         `route ${event.from} -> ${event.to} (${event.scope}): ${event.content}`,
       );
       break;
+    case "route_delivery":
+      if (event.phase === "failed") {
+        ctx.writeSystem(
+          "error",
+          `route delivery failed${event.recipient ? ` for ${event.recipient}` : ""}`,
+        );
+      }
+      break;
+    case "dispatch_attempt":
+      if (event.overlap) {
+        ctx.writeSystem(
+          "warn",
+          `dispatch overlap for ${event.target_session}${event.reason ? ` (${event.reason})` : ""}`,
+        );
+      }
+      break;
+    case "pane_signal":
+      ctx.writeSystem(
+        event.signal_type === "blocked"
+          ? "error"
+          : event.signal_type === "yellow"
+            ? "warn"
+            : "info",
+        `${event.session}: ${event.signal_type}${event.summary ? ` — ${event.summary}` : ""}`,
+      );
+      break;
     case "control_plane_ready":
       ctx.setControlEndpoint(event.endpoint);
       ctx.writeSystem("info", `control plane ready: ${event.endpoint}`);
@@ -141,6 +189,20 @@ export function handleRuntimeEvent(
           `sideband ${event.action}${event.session ? ` (${event.session})` : ""}: ${event.phase} after ${event.elapsed_ms}ms [req=${event.request_id.slice(0, 8)}]`,
         );
       }
+      break;
+    case "request_ack":
+      break;
+    case "request_ack_timeout":
+      ctx.writeSystem(
+        "error",
+        `request acknowledgement timed out for ${event.session} (${event.action})`,
+      );
+      break;
+    case "dispatch_no_reaction":
+      ctx.writeSystem(
+        "warn",
+        `no reaction from ${event.session} after ${event.action}`,
+      );
       break;
     default: {
       const _exhaustive: never = event;

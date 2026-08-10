@@ -123,9 +123,24 @@ pub struct ControlPlaneStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ControlPlaneSnapshot {
+    pub transport: String,
+    pub endpoint: String,
+}
+
+impl From<&ControlPlaneStatus> for ControlPlaneSnapshot {
+    fn from(status: &ControlPlaneStatus) -> Self {
+        Self {
+            transport: status.transport.clone(),
+            endpoint: status.endpoint.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeSnapshot {
     pub sessions: Vec<SessionSnapshot>,
-    pub control_plane: Option<ControlPlaneStatus>,
+    pub control_plane: Option<ControlPlaneSnapshot>,
     pub runtime_dir: String,
     pub audit_log_path: String,
     pub generated_at: String,
@@ -416,7 +431,6 @@ pub enum RuntimeEvent {
     ControlPlaneReady {
         endpoint: String,
         transport: String,
-        info_path: String,
         timestamp: String,
     },
     SidebandRequestLifecycle {

@@ -38,42 +38,8 @@ param(
   [switch]$Quiet
 )
 
-function Invoke-MailboxFallback {
-  param(
-    [Parameter(Mandatory = $true)]
-    [string]$Payload,
-
-    [Parameter(Mandatory = $true)]
-    [string]$RuntimeDir,
-
-    [int]$TimeoutSec = 10
-  )
-
-  $sidebandRoot = Join-Path $RuntimeDir "sideband"
-  $inboxDir = Join-Path $sidebandRoot "inbox"
-  $outboxDir = Join-Path $sidebandRoot "outbox"
-  New-Item -ItemType Directory -Force -Path $inboxDir | Out-Null
-  New-Item -ItemType Directory -Force -Path $outboxDir | Out-Null
-
-  $requestId = [guid]::NewGuid().ToString()
-  $requestPath = Join-Path $inboxDir "$requestId.json"
-  $responsePath = Join-Path $outboxDir "$requestId.json"
-
-  $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-  [System.IO.File]::WriteAllText($requestPath, $Payload, $utf8NoBom)
-
-  $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
-  while ([DateTime]::UtcNow -lt $deadline) {
-    if (Test-Path -LiteralPath $responsePath) {
-      $raw = Get-Content -LiteralPath $responsePath -Raw
-      Remove-Item -LiteralPath $responsePath -Force -ErrorAction SilentlyContinue
-      return $raw
-    }
-    Start-Sleep -Milliseconds 100
-  }
-
-  throw "No response received from sideband mailbox."
-}
+$scriptRoot = Split-Path -Parent $PSCommandPath
+. (Join-Path $scriptRoot "runtime-paths.ps1")
 
 function Resolve-MessageContent {
   param(
@@ -241,17 +207,9 @@ if ($MaxWaitSeconds -lt 0) {
   throw "-MaxWaitSeconds must be >= 0"
 }
 
-if (-not $InfoFile -and $env:PRIM1_PANE_CREDENTIALS -and (Test-Path -LiteralPath $env:PRIM1_PANE_CREDENTIALS)) {
-  $InfoFile = $env:PRIM1_PANE_CREDENTIALS
-}
-
-if (-not $InfoFile) {
-  $scriptRoot = Split-Path -Parent $PSCommandPath
-  $InfoFile = Join-Path $scriptRoot "..\\.runtime\\control-plane.json"
-}
-
-$resolvedInfoFile = (Resolve-Path $InfoFile).Path
-$info = Get-Content $resolvedInfoFile | ConvertFrom-Json
+$InfoFile = Resolve-Prim1ControlPlaneInfoFile -InfoFile $InfoFile
+$resolvedInfoFile = (Resolve-Path -LiteralPath $InfoFile -ErrorAction Stop).Path
+$info = Get-Content -LiteralPath $resolvedInfoFile -Raw -ErrorAction Stop | ConvertFrom-Json
 
 if (-not $info.endpoint) {
   throw "Missing endpoint in $resolvedInfoFile"
@@ -381,38 +339,43 @@ $payload = switch ($Action) {
 }
 
 $json = $payload | ConvertTo-Json -Depth 8 -Compress
-$runtimeDir = Split-Path -Parent $resolvedInfoFile
 $response = $null
-$mailboxTimeoutSec = 10
-$pipeReadTimeoutSec = 5
-
-if ($TimeoutSec -gt 0 -and $Action -in @("deliver", "wait_quiet")) {
-  $mailboxTimeoutSec = $TimeoutSec
-}
-
-if ($Action -eq "events_since" -and $MaxWaitSeconds -gt 0) {
-  $mailboxTimeoutSec = $MaxWaitSeconds + 5
-  $pipeReadTimeoutSec = $MaxWaitSeconds + 5
+$pipeReadTimeoutSec = switch ($Action) {
+  "start"        { 65 }
+  "stop"         { 15 }
+  "restart"      { 75 }
+  "input"        { 25 }
+  "deliver"      { 25 }
+  "key"          { 25 }
+  "route"        { 35 }
+  "create-pair"  { 15 }
+  "signal"       { 10 }
+  "wait_quiet"   { $TimeoutSec + 10 }
+  "events_since" { $MaxWaitSeconds + 10 }
+  default         { 10 }
 }
 
 try {
   $pipe = [System.IO.Pipes.NamedPipeClientStream]::new(".", $pipeName, [System.IO.Pipes.PipeDirection]::InOut)
   try {
     $pipe.Connect(5000)
-    $pipe.ReadTimeout = $pipeReadTimeoutSec * 1000
     $writer = [System.IO.StreamWriter]::new($pipe)
     $writer.AutoFlush = $true
     $reader = [System.IO.StreamReader]::new($pipe)
 
     $writer.WriteLine($json)
-    $response = $reader.ReadLine()
+    $readTask = $reader.ReadLineAsync()
+    if (-not $readTask.Wait($pipeReadTimeoutSec * 1000)) {
+      throw "Control plane response timed out after $pipeReadTimeoutSec seconds."
+    }
+    $response = $readTask.GetAwaiter().GetResult()
   } finally {
     if ($pipe) {
       $pipe.Dispose()
     }
   }
 } catch {
-  $response = Invoke-MailboxFallback -Payload $json -RuntimeDir $runtimeDir -TimeoutSec $mailboxTimeoutSec
+  throw "Control plane named-pipe request failed: $($_.Exception.Message)"
 }
 
 if (-not $response) {

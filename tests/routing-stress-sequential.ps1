@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
   Sequential routing stress test — fire N routed messages back-to-back
-  from claude to codex and verify all N arrive in the audit log.
+  from claude to codex and verify metadata-only delivery receipts.
 
 .PARAMETER Count
   Number of messages to fire. Default 10.
@@ -9,21 +9,40 @@
 .PARAMETER Marker
   Unique marker prefix to make this run distinguishable from others.
   Default uses a timestamp.
+
+.PARAMETER InfoFile
+  Explicit control-plane credential file for fixture/live overrides. Its
+  parent directory anchors audit verification. When omitted, the shared
+  runtime resolver selects the product runtime directory.
 #>
 param(
   [int]$Count = 10,
-  [string]$Marker = ""
+  [string]$Marker = "",
+  [string]$InfoFile
 )
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+if ($Count -lt 1) {
+  throw "-Count must be at least 1"
+}
 
 if (-not $Marker) {
   $Marker = "STRESS-" + (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmss")
 }
 
 $scriptRoot = Split-Path -Parent $PSCommandPath
-$routeScript = Join-Path (Split-Path -Parent $scriptRoot) "scripts\agent-route.ps1"
-$auditLog = Join-Path (Split-Path -Parent $scriptRoot) ".runtime\audit"
-$today = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd")
-$auditFile = Join-Path $auditLog "$today.jsonl"
+$wrapperRoot = Split-Path -Parent $scriptRoot
+$routeScript = Join-Path $wrapperRoot "scripts\agent-route.ps1"
+. (Join-Path $wrapperRoot "scripts\runtime-paths.ps1")
+$runtimeDir = if ($InfoFile) {
+  Split-Path -Parent (Resolve-Prim1ControlPlaneInfoFile -InfoFile $InfoFile)
+} else {
+  Resolve-Prim1RuntimeDirectory
+}
+$auditLog = Join-Path $runtimeDir "audit"
+$startedAtUtc = [datetime]::UtcNow
 
 $start = Get-Date
 
@@ -32,11 +51,22 @@ Write-Host "firing $Count messages with marker prefix '$Marker' claude -> codex 
 $results = @()
 for ($i = 1; $i -le $Count; $i++) {
   $content = "$Marker-$i : concurrent routing stress test marker $i of $Count"
-  $output = & $routeScript -From claude -To codex -Scope direct -Content $content 2>&1
+  $output = @(& $routeScript -From claude -To codex -Scope direct -Content $content -InfoFile $InfoFile -PassThruJson 2>&1)
+  $exitCode = $LASTEXITCODE
+  $response = $null
+  foreach ($line in $output) {
+    try {
+      $candidate = ([string]$line) | ConvertFrom-Json -ErrorAction Stop
+      if ($candidate.request_id) {
+        $response = $candidate
+      }
+    } catch { }
+  }
   $results += [pscustomobject]@{
     Index = $i
-    ExitCode = $LASTEXITCODE
-    Output = $output
+    ExitCode = $exitCode
+    RequestId = if ($response) { [string]$response.request_id } else { $null }
+    Output = ($output -join [Environment]::NewLine)
   }
 }
 
@@ -51,57 +81,66 @@ if ($failedDispatch) {
   }
 }
 
-Write-Host "sleeping 2s for audit record settle..."
-Start-Sleep -Seconds 2
-
-Write-Host "scanning audit log for routed_message delivery records..."
-
-# Verification uses routed_message events as the authoritative transport record.
-# session_output is NOT used because it captures current-frame redraw state,
-# not scrollback — rapid-fire content scrolls past before a redraw chunk can
-# capture it, so session_output is an unreliable signal for message-content
-# verification at stress rates.
-
-$routedHits = 0
-$busyInputForwarded = 0
-$found = @{}
-for ($i = 1; $i -le $Count; $i++) { $found[$i] = $false }
-
-Select-String -Path $auditFile -Pattern $Marker -SimpleMatch | ForEach-Object {
-  try {
-    $j = $_.Line | ConvertFrom-Json
-  } catch { return }
-
-  if ($j.event -eq "routed_message" -and $j.content -and $j.content.Contains($Marker)) {
-    $routedHits++
-    for ($i = 1; $i -le $Count; $i++) {
-      if ($j.content.Contains("$Marker-$i ")) {
-        $found[$i] = $true
-      }
-    }
+$missingRequestId = $results | Where-Object { $_.ExitCode -eq 0 -and -not $_.RequestId }
+if ($missingRequestId) {
+  Write-Host "MISSING REQUEST IDS:" -ForegroundColor Red
+  foreach ($result in $missingRequestId) {
+    Write-Host "  msg $($result.Index): output=$($result.Output)"
   }
 }
 
-$foundCount = ($found.Values | Where-Object { $_ -eq $true }).Count
-$missing = @()
-for ($i = 1; $i -le $Count; $i++) {
-  if (-not $found[$i]) { $missing += $i }
+Write-Host "sleeping 1s for audit record settle..."
+Start-Sleep -Seconds 1
+
+Write-Host "scanning metadata audit for route_delivery receipts..."
+
+$endedAtUtc = [datetime]::UtcNow
+$auditFiles = @(
+  $startedAtUtc.ToString("yyyy-MM-dd")
+  $endedAtUtc.ToString("yyyy-MM-dd")
+) | Select-Object -Unique | ForEach-Object { Join-Path $auditLog "$_.jsonl" }
+$existingAuditFiles = @($auditFiles | Where-Object { Test-Path -LiteralPath $_ })
+if ($existingAuditFiles.Count -eq 0) {
+  Write-Host "AUDIT FILE NOT FOUND: $($auditFiles -join ', ')" -ForegroundColor Red
+  exit 1
+}
+
+$auditEvents = @(Get-Content -LiteralPath $existingAuditFiles | ForEach-Object {
+  try { $_ | ConvertFrom-Json -ErrorAction Stop } catch { }
+})
+$receiptFailures = @()
+$receiptPasses = 0
+
+foreach ($result in $results | Where-Object { $_.ExitCode -eq 0 -and $_.RequestId }) {
+  $events = @($auditEvents | Where-Object {
+    $_.event -eq "route_delivery" -and $_.request_id -eq $result.RequestId
+  })
+  $resolved = @($events | Where-Object { $_.phase -eq "resolved" })
+  $written = @($events | Where-Object { $_.phase -eq "written" -and $_.recipient -eq "codex" })
+  $failed = @($events | Where-Object { $_.phase -eq "failed" })
+
+  if ($resolved.Count -eq 1 -and
+      [int]$resolved[0].recipient_count -eq 1 -and
+      $written.Count -eq 1 -and
+      $failed.Count -eq 0) {
+    $receiptPasses++
+  } else {
+    $receiptFailures += "msg $($result.Index) request=$($result.RequestId) resolved=$($resolved.Count) written_to_codex=$($written.Count) failed=$($failed.Count)"
+  }
 }
 
 Write-Host ""
 Write-Host "=== RESULT ==="
-Write-Host "routed_message events matching marker: $routedHits"
-Write-Host "distinct message indexes found: $foundCount / $Count"
+Write-Host "successful dispatches: $($Count - @($failedDispatch).Count) / $Count"
+Write-Host "complete route_delivery receipts: $receiptPasses / $Count"
 
-if ($missing.Count -gt 0) {
-  Write-Host "MISSING MESSAGE INDEXES: $($missing -join ',')" -ForegroundColor Red
+if ($failedDispatch -or $missingRequestId -or $receiptFailures.Count -gt 0) {
+  foreach ($failure in $receiptFailures) {
+    Write-Host "RECEIPT FAILURE: $failure" -ForegroundColor Red
+  }
   exit 1
 }
 
-if ($routedHits -lt $Count) {
-  Write-Host "MESSAGE COUNT MISMATCH: expected $Count, got $routedHits" -ForegroundColor Red
-  exit 1
-}
-
-Write-Host "PASS: all $Count messages routed with distinct indexes" -ForegroundColor Green
+Write-Host "PASS: all $Count requests have one resolved and one written metadata receipt" -ForegroundColor Green
+Write-Host "NOTE: content fidelity requires the separate child-input/receiver-side oracle." -ForegroundColor Gray
 exit 0

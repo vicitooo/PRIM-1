@@ -25,7 +25,7 @@ These constraints should remain true while this work is designed and later imple
 - `send_input` remains the raw-bytes path.
 - `route_message` remains the wrapped sideband-visible path.
 - The embedded supervisor inside the Tauri desktop app remains the current runtime model.
-- Named pipe primary plus mailbox fallback remains the control-plane transport model.
+- The control plane uses a native named pipe on Windows and Unix socket on supported Unix targets; transport failure is explicit and there is no plaintext disk fallback.
 - Today's fixed Claude and Codex panes must continue to work without requiring any operator migration.
 
 ## Current State Inventory
@@ -185,12 +185,12 @@ There are two different concepts that should not be confused:
   - not re-checked on every action
 - pane-bound control-plane credentials
   - enforced by `validate_session_action_token`
-  - block peer slash-command injection when `PRIM1_PEER_SLASH_COMMANDS_ALLOWED=0`
+  - reject peer slash-command injection without a global bypass
   - master control-plane credentials still bypass pane binding
 
 Conclusion:
 
-- the wrapper already has a control authority model
+- the wrapper currently has a bearer-based compatibility policy, not a hostile same-user authority boundary
 - it does not yet have a strong launch-policy model for arbitrary binaries
 
 ## Gap Analysis

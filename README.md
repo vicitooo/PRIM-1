@@ -1,6 +1,6 @@
 # PRIM-1
 
-A local multi-agent runtime for terminal-first AI tools. PRIM-1 hosts CLI agents (currently Claude Code and Codex CLI) inside supervised pseudo-terminal panes in a Tauri desktop app, with structured peer-to-peer routing, a sideband control plane, and an append-only audit log of every routed message and lifecycle event.
+A local multi-agent runtime for terminal-first AI tools. PRIM-1 hosts CLI agents (currently Claude Code and Codex CLI) inside supervised pseudo-terminal panes in a Tauri desktop app, with structured peer-to-peer routing, a sideband control plane, and an append-only metadata audit of routing and lifecycle activity.
 
 **License:** Apache-2.0
 **Status:** Working runtime, in active development. Open-source, single-author personal project.
@@ -11,9 +11,9 @@ A local multi-agent runtime for terminal-first AI tools. PRIM-1 hosts CLI agents
 
 - **Supervisor-owned PTYs** — the Rust supervisor owns each agent's stdin / stdout / lifecycle. Agents cannot kill each other; only the supervisor restarts.
 - **Visible terminal UI** — every pane renders live via xterm.js. The operator sees agent output exactly as it happens.
-- **Structured routing** — agents can send each other direct messages (`-To codex -Scope direct`) or post to a shared room (`-To room -Scope room`). The supervisor stamps provenance (`[Direct message from claude]`) and logs each routed message.
+- **Structured routing** — agents can send each other direct messages (`-To codex -Scope direct`) or post to a shared room (`-To room -Scope room`). The supervisor stamps provenance (`[Direct message from claude]`) and records delivery metadata without retaining message content in the durable audit.
 - **Sideband control plane** — a local named pipe (Windows) / Unix socket exposes operator actions: `ping`, `list`, `start`, `stop`, `restart`, `input`, `key`, `route`, `deliver`, `events_since`, `wait_quiet`.
-- **Append-only audit log** at `.runtime/audit/YYYY-MM-DD.jsonl` capturing every event (session_state, session_output, routed_message, dispatch_attempt, sideband_request_lifecycle, request_ack/request_ack_timeout, system_log, pair_created/renamed/deleted).
+- **Append-only metadata audit** at `<runtime-dir>/audit/YYYY-MM-DD.jsonl` for lifecycle, authorization, dispatch, delivery, and pair-management receipts. Terminal output is not persisted; routed-message content is stored as `[content omitted]`.
 - **Dynamic pair management** — beyond the protected `main` pair (`claude` + `codex`), additional pairs can be created, renamed, and deleted at runtime. Pair-scoped room broadcasts by default.
 
 ## Prerequisites
@@ -62,8 +62,8 @@ For headless / scripted operation, use the PowerShell control plane:
 # Inspect state
 ./scripts/control-plane.ps1 -Action list
 
-# Tail recent audit events
-./scripts/control-plane.ps1 -Action events_since -CursorFile .runtime/cursors/me.json
+# Tail recent audit events with an app-local cursor
+./scripts/agent-events.ps1 -Consumer me
 ```
 
 Full operator surface is documented in [CONTROL-SURFACE.md](CONTROL-SURFACE.md).
@@ -74,7 +74,7 @@ PRIM-1 separates three concerns:
 
 1. **Visibility layer** — real PTYs owned by the supervisor; operators see live agent output verbatim.
 2. **Control layer** — a local named-pipe API for structured actions (send, spawn, restart, stop, route, ping). Not a stdout-parsing bridge.
-3. **Policy layer** — the supervisor decides what actions are allowed, when processes are restarted, and what sandbox / security boundaries apply (e.g., peer slash commands are disabled by default; pane-bound credentials only authorize self-action).
+3. **Policy layer** — the supervisor decides what actions are allowed and when processes are restarted. The current bearer-based pane scoping is a compatibility policy, not a same-Windows-user security boundary; see [Known issues](docs/KNOWN_ISSUES.md).
 
 The full architecture, including PTY ownership, drivers, the event bus, lifecycle states, and the audit schema, lives in [ARCHITECTURE.md](ARCHITECTURE.md) and [RUNTIME-CONTRACTS.md](RUNTIME-CONTRACTS.md).
 
@@ -96,7 +96,7 @@ docs/                     Design + planning documents
 
 ## Runtime configuration
 
-Environment variables modify runtime behavior. Set them in a gitignored `.env` at the repo root (loaded automatically at startup) or in your shell. Values containing spaces must be quoted in `.env`:
+Environment variables modify runtime behavior. Set them in your shell, in the explicit file named by `PRIM1_ENV_FILE`, or in a gitignored `.env` in the process startup directory (the executable directory is the final fallback). Values containing spaces must be quoted in `.env`:
 
 ```
 PRIM1_AGENT_WORKING_ROOT="C:/path/to/your working repo"
@@ -104,13 +104,18 @@ PRIM1_AGENT_WORKING_ROOT="C:/path/to/your working repo"
 
 | Variable | Purpose |
 |---|---|
-| `PRIM1_AGENT_WORKING_ROOT` | Absolute path used as `working_dir` for default-spawned agent panes. Set this to the directory whose `CLAUDE.md` / project context you want loaded. When unset, falls back to the parent directory of the wrapper repo (legacy heuristic; works only when the wrapper lives inside your working repo). |
+| `PRIM1_RUNTIME_DIR` | Explicit product runtime directory for desktop-adjacent scripts. Overrides the platform default without moving the source checkout. |
+| `PRIM1_ENV_FILE` | Explicit dotenv file. Relative paths resolve against the process startup directory; an explicit missing or malformed file fails startup. |
+| `PRIM1_AGENT_WORKING_ROOT` | Absolute path used as `working_dir` for default-spawned agent panes. Set this to the directory whose `CLAUDE.md` / project context you want loaded. When unset, the captured process startup directory is used exactly. |
 | `PRIM1_WRAPPER_ROOT` | Absolute path to the wrapper source tree, used for Claude's `--add-dir` so the Claude pane can read wrapper internals. When unset, falls back to `<working_dir>/<PRIM1_WRAPPER_DIRNAME or PRIM-1>`. |
 | `PRIM1_WRAPPER_DIRNAME` | Override the wrapper directory name used by the `PRIM1_WRAPPER_ROOT` fallback. Default: `PRIM-1`. |
-| `PRIM1_PEER_SLASH_COMMANDS_ALLOWED` | `1` / `true` — re-enable pane-bound `send_input` / `send_key` control over peer panes. Default off (panes can only control their own session). |
 | `PRIM1_CROSS_PAIR_ROOM_BROADCAST` | `1` / `true` — re-enable legacy cross-pair Room fan-out. Default off (pair-scoped). |
 
 Restart the wrapper after changing `.env` or environment variables — they are read at startup only.
+
+Product runtime state is outside the source checkout. On Windows, the desktop and product scripts default to `%LOCALAPPDATA%\io.prim1.runtime\runtime`. The shared script resolver also maps macOS to `~/Library/Application Support/io.prim1.runtime/runtime` and Linux to `${XDG_DATA_HOME:-~/.local/share}/io.prim1.runtime/runtime`; those mappings do not constitute a macOS or Linux release-support claim.
+
+An explicit `-InfoFile` always wins for scripts that accept one. `PRIM1_RUNTIME_DIR` then overrides the platform default. Inside a supervised pane, `PRIM1_PANE_CREDENTIALS` remains the narrower pane-scoped credential source rather than falling back to the master file. Explicit runtime and credential paths used by tests remain supported, including paths with spaces.
 
 ## Design rules
 
@@ -129,14 +134,13 @@ Restart the wrapper after changing `.env` or environment variables — they are 
 - [CONTROL-SURFACE.md](CONTROL-SURFACE.md) — operator + agent control surface (scripts, shortcuts, command reference)
 - [STACK-DECISIONS.md](STACK-DECISIONS.md) — locked technical decisions and scope boundaries
 - [ROADMAP.md](ROADMAP.md) — forward direction: generic terminals, dynamic panes, cross-platform
-- [instructions.md](instructions.md) — inter-agent handshake and routing protocol
 - [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) — current limitations and known bugs
 
 ## Security note
 
-PRIM-1 runs locally. The named-pipe control plane is access-token-gated (token written to `.runtime/control-plane.json` on startup, readable only by the launching user). Pane-bound credentials at `.runtime/control-plane-<pane>.json` further restrict which panes a sideband caller can act on.
+PRIM-1 runs locally. The current named-pipe control plane is access-token-gated, but all native harnesses run as the same Windows user and can read the app-local bearer files. Pane-bound credentials therefore reduce accidental cross-pane control; they do **not** yet enforce hostile same-user isolation. The pending production boundary is kernel-derived pipe-caller identity bound to the live pane process job and generation. Prime/WSL control-plane access is not claimed until that boundary has its own empirical transport test.
 
-Treat `.runtime/` as machine-local state. It is gitignored by default. Do not commit anything under `.runtime/`.
+Treat the app-local runtime directory as private machine-local state. The repo-local `.runtime/` directory remains gitignored for test environments and developer scratch files; it is no longer the product runtime default.
 
 ## Contributing
 
