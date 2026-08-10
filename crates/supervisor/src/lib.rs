@@ -7142,10 +7142,10 @@ fn quiesce_threshold(driver: DriverKind) -> Option<Duration> {
     let threshold = match driver {
         DriverKind::Claude => Duration::from_secs(3),
         DriverKind::Codex => Duration::from_secs(2),
-        // Grok Build 1.0.0 repaints its full-screen TUI about every 2.1s while
-        // idle. Keep the silence window above that measured cadence so a
-        // repaint cannot churn lifecycle Idle -> Ready metadata.
-        DriverKind::Grok => Duration::from_secs(5),
+        // Grok Build 1.0.0 continuously redraws its full-screen TUI at a
+        // variable cadence. Silence is therefore not an honest idle signal;
+        // its measured semantic markers own work-state transitions instead.
+        DriverKind::Grok => return None,
         DriverKind::GenericTerminal => Duration::from_secs(5),
     };
 
@@ -10079,11 +10079,8 @@ mod tests {
     }
 
     #[test]
-    fn grok_idle_repaint_cadence_cannot_cross_the_quiesce_threshold() {
-        assert_eq!(
-            quiesce_threshold(DriverKind::Grok),
-            Some(Duration::from_secs(5))
-        );
+    fn grok_repaints_use_semantic_work_state_without_lifecycle_quiescence() {
+        assert_eq!(quiesce_threshold(DriverKind::Grok), None);
         let supervisor = test_supervisor();
         install_synthetic_running_session(&supervisor, "codex", DriverKind::Grok);
         let grok_alias = test_session_alias(&supervisor, "codex");
@@ -10093,13 +10090,14 @@ mod tests {
             captured.lock().push(event);
         });
 
-        handle_current_pty_event(
-            &supervisor,
-            "codex",
-            0,
-            PtyEvent::Output("measured full-screen repaint".into()),
-        );
-        thread::sleep(Duration::from_millis(2_400));
+        for chunk in [
+            "◆ Thinking…",
+            "measured full-screen repaint",
+            "Worked for 6.3s",
+            "another measured full-screen repaint",
+        ] {
+            handle_current_pty_event(&supervisor, "codex", 0, PtyEvent::Output(chunk.into()));
+        }
 
         assert!(
             !events.lock().iter().any(|event| matches!(
@@ -10107,26 +10105,43 @@ mod tests {
                 RuntimeEvent::SessionState { session, state, .. }
                     if session == &grok_alias && *state == LifecycleState::Idle
             )),
-            "Grok's measured ~2.1s repaint cadence must not produce Idle/Ready churn"
+            "Grok's variable repaint cadence must not produce lifecycle Idle"
         );
-
-        let deadline = Instant::now() + Duration::from_secs(4);
-        loop {
-            if events.lock().iter().any(|event| {
-                matches!(
+        assert_eq!(
+            events
+                .lock()
+                .iter()
+                .filter(|event| matches!(
                     event,
                     RuntimeEvent::SessionState { session, state, .. }
-                        if session == &grok_alias && *state == LifecycleState::Idle
-                )
-            }) {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "Grok did not become Idle after the measured five-second silence window"
-            );
-            thread::sleep(Duration::from_millis(50));
-        }
+                        if session == &grok_alias && *state == LifecycleState::Ready
+                ))
+                .count(),
+            1,
+            "only the initial Busy -> Ready lifecycle transition is valid"
+        );
+        let work_states = events
+            .lock()
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::SessionWorkState { session, state, .. } if session == &grok_alias => {
+                    Some(*state)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(work_states, [WorkState::Thinking, WorkState::Idle]);
+        assert!(
+            supervisor
+                .inner
+                .slots
+                .lock()
+                .get("codex")
+                .unwrap()
+                .quiesce_timer
+                .is_none(),
+            "Grok output must never arm a lifecycle quiesce timer"
+        );
     }
 
     #[test]

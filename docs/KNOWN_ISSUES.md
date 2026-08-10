@@ -19,8 +19,9 @@ The wrapper drives external CLI tools whose UIs evolve. Known-good versions (val
 If you upgrade any CLI and observe regressions (PTY behavior, startup timing, prompt rendering, routing behavior after injected stdin, paste-threshold behavior), record the wrapper commit and every affected CLI version together. Upstream CLI changes can break wrapper assumptions independent of wrapper code.
 
 Grok Build 1.0.0 periodically repaints its full-screen TUI even while waiting at
-the prompt. PRIM-1 therefore uses a measured five-second Grok-only silence
-window for lifecycle `Idle`; semantic work-state markers remain independent.
+the prompt, and the measured cadence varies enough that silence cannot identify
+idleness. A live Grok run therefore remains lifecycle `Ready`; its measured
+semantic markers independently report `Idle`, `Thinking`, or `ToolCall`.
 
 ## Behavioral notes the wrapper does not yet abstract
 
