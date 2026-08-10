@@ -11,7 +11,7 @@ This app is the first real UI shell for `PRIM-1`.
 ## What it currently does
 
 - renders a backend-ordered, `SessionId`-keyed tab set for Claude Code, Codex,
-  and Generic Terminal sessions
+  Grok, and Generic Terminal sessions
 - retains inactive xterm buffers while showing one active terminal
 - renders a system log pane
 - exposes native workspace/cwd pickers, visible permission profiles, and

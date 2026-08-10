@@ -31,8 +31,8 @@ This distinction must stay explicit.
 
 Current product surface:
 
-- an atomically persisted, backend-ordered set of Claude Code, Codex, and
-  Generic Terminal session definitions
+- an atomically persisted, backend-ordered set of Claude Code, Codex, Grok,
+  and Generic Terminal session definitions
 - stable opaque `SessionId` authority across desktop lifecycle, input, resize,
   direct routing, renderer state, and run-event lineage; mutable labels are
   display-only
@@ -151,28 +151,30 @@ Each driver should define:
 - hard kill strategy
 - optional output parser hooks
 
-### 5.2 Initial drivers
+### 5.2 Built-in drivers
 
 - `claude_cli`
 - `codex_cli`
+- `grok_cli`
+- `generic_terminal`
 
 ### 5.3 Future drivers
 
 - `hermes_cli`
 - `openclaw_cli`
-- `generic_terminal`
 
 The generic terminal driver is important. It keeps the runtime from becoming product-specific.
 
 ### 5.4 Reality check on current implementation
 
-The runtime already has a generic-terminal driver concept, but the current app does not yet expose it as a first-class product feature.
+The desktop exposes a deliberately bounded built-in driver catalog rather than
+renderer-controlled programs or arguments.
 
 That means:
 
-- the architecture supports generic sessions
-- the current UI still hardcodes Claude and Codex
-- turning the app into a true universal wrapper is a product step still ahead of us
+- the session registry and lifecycle remain driver-agnostic
+- Claude Code, Codex, Grok, and Generic Terminal are explicit typed choices
+- user-extensible drivers remain a separate product step
 
 ## 6. Sideband control plane
 
@@ -272,7 +274,7 @@ On every operator route, the supervisor must:
 3. resolve the explicit recipient `SessionId` to one exact run
 4. preflight its framing before any write, including exact-run evidence that DEC private mode 2004 is enabled and that the driver has not observed a blocked/error-loop state for bracketed-paste drivers
 5. record pending metadata without retaining message content
-6. hold the recipient run-input permit, revalidate identity/generation/PTY/gate/mode/work-state, write the complete paste frame, wait the one-second compatibility interval measured against Claude Code 2.1.226 and Codex 0.147.0, then revalidate identity/generation/PTY/gate/work-state and write one Enter; paste mode may legitimately disable after the completed frame, while raw single-line drivers remain one PTY input
+6. hold the recipient run-input permit, revalidate identity/generation/PTY/gate/mode/work-state, write the complete paste frame, wait the one-second compatibility interval measured against Claude Code 2.1.226, Codex 0.147.0, and Grok Build 1.0.0, then revalidate identity/generation/PTY/gate/work-state and write one Enter; paste mode may legitimately disable after the completed frame, while raw single-line drivers remain one PTY input
 7. emit a written or failed receipt without claiming final-child or model receipt
 
 The desktop command runs this blocking supervisor operation on Tauri's blocking
@@ -286,8 +288,9 @@ delivery without blocking raw operator or pane-local input. The paste and Enter
 boundary is FIFO-serialized and rechecked twice. Output is not used as an
 acknowledgement because multiline input may stay
 invisible until Enter; each measured interval is version-sensitive compatibility
-behavior measured against Claude Code 2.1.226 and Codex 0.147.0, with no automatic
-retry after an uncertain outcome. The packaged real-harness byte oracle remains
+behavior measured against Claude Code 2.1.226, Codex 0.147.0, and Grok Build
+1.0.0, with no automatic retry after an uncertain outcome. The packaged
+real-harness byte oracle remains
 responsible for final-child fidelity and receiver receipt.
 
 ### 7.4 Addressing model
@@ -467,6 +470,8 @@ These are not deferred hardening tasks. They are mandatory from the first workin
 - Codex `Normal` launches directly with
   `--ask-for-approval on-request --sandbox workspace-write`; `Unsafe` adds only
   `--dangerously-bypass-approvals-and-sandbox`.
+- Grok `Normal` launches directly with `--permission-mode default`; `Unsafe`
+  changes only that value to `bypassPermissions`.
 - Generic Terminal accepts `Normal` only.
 
 These are visible harness permission profiles, not hostile same-user OS

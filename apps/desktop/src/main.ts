@@ -148,6 +148,7 @@ app.innerHTML = `
             <select id="session-driver">
               <option value="claude">Claude Code</option>
               <option value="codex">Codex</option>
+              <option value="grok">Grok Build</option>
               <option value="generic_terminal">Generic terminal</option>
             </select>
           </label>

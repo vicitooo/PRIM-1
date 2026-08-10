@@ -28,6 +28,7 @@ fn is_false(value: &bool) -> bool {
 pub enum DriverKind {
     Claude,
     Codex,
+    Grok,
     GenericTerminal,
 }
 

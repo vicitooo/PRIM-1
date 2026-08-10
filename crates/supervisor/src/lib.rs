@@ -3861,6 +3861,7 @@ impl SupervisorHandle {
         let label = request.label.unwrap_or_else(|| match request.driver {
             DriverKind::Claude => "Claude".into(),
             DriverKind::Codex => "Codex".into(),
+            DriverKind::Grok => "Grok".into(),
             DriverKind::GenericTerminal => "Terminal".into(),
         });
         validate_session_label(&label)?;
@@ -6911,6 +6912,7 @@ fn build_launch_spec(
         DriverKind::Codex => {
             driver_codex::launch_spec(definition, &resolved.program, &resolved.prefix_args)
         }
+        DriverKind::Grok => driver_grok::launch_spec(definition, &resolved.program),
         DriverKind::GenericTerminal => {
             let mut spec = driver_generic_terminal::launch_spec(definition, &resolved.program)?;
             spec.args.extend(resolved.prefix_args.clone());
@@ -6931,6 +6933,10 @@ fn resolve_driver_executable(driver: DriverKind) -> Result<ResolvedLaunchProgram
             prefix_args: Vec::new(),
         }),
         DriverKind::Codex => resolve_codex_executable(),
+        DriverKind::Grok => Ok(ResolvedLaunchProgram {
+            program: find_direct_executable(&[if cfg!(windows) { "grok.exe" } else { "grok" }])?,
+            prefix_args: Vec::new(),
+        }),
         DriverKind::GenericTerminal => Ok(ResolvedLaunchProgram {
             program: find_direct_executable(if cfg!(windows) {
                 &["powershell.exe", "pwsh.exe"]
@@ -7053,6 +7059,7 @@ fn classify_work_state_for_driver(
     match driver {
         DriverKind::Claude => driver_claude::classify_work_state(chunk),
         DriverKind::Codex => driver_codex::classify_work_state(chunk),
+        DriverKind::Grok => driver_grok::classify_work_state(chunk),
         DriverKind::GenericTerminal => None,
     }
 }
@@ -7135,6 +7142,7 @@ fn quiesce_threshold(driver: DriverKind) -> Option<Duration> {
     let threshold = match driver {
         DriverKind::Claude => Duration::from_secs(3),
         DriverKind::Codex => Duration::from_secs(2),
+        DriverKind::Grok => Duration::from_secs(2),
         DriverKind::GenericTerminal => Duration::from_secs(5),
     };
 
@@ -7255,7 +7263,7 @@ fn routed_message_payload(request: &RouteMessageRequest, behavior: SubmitBehavio
 
 fn routed_message_submit_behavior(driver: DriverKind) -> SubmitBehavior {
     match driver {
-        DriverKind::Claude | DriverKind::Codex => SubmitBehavior {
+        DriverKind::Claude | DriverKind::Codex | DriverKind::Grok => SubmitBehavior {
             sequence: "\r",
             framing: MessageFraming::BracketedPaste,
             submit_delay: BRACKETED_PASTE_SUBMIT_DELAY,
@@ -9419,6 +9427,10 @@ mod tests {
             routed_message_payload(&request, routed_message_submit_behavior(DriverKind::Codex)),
             expected
         );
+        assert_eq!(
+            routed_message_payload(&request, routed_message_submit_behavior(DriverKind::Grok)),
+            expected
+        );
     }
 
     #[test]
@@ -9439,7 +9451,7 @@ mod tests {
     #[test]
     fn harness_message_frame_is_content_faithful_before_observed_submit() {
         let content = "  alpha\r\n\tbeta 👩‍💻  ";
-        for driver in [DriverKind::Claude, DriverKind::Codex] {
+        for driver in [DriverKind::Claude, DriverKind::Codex, DriverKind::Grok] {
             let behavior = routed_message_submit_behavior(driver);
             validate_message_body(content).unwrap();
             validate_message_framing(content, behavior).unwrap();
@@ -10020,6 +10032,7 @@ mod tests {
             bracketed
         );
         assert_eq!(routed_message_submit_behavior(DriverKind::Codex), bracketed);
+        assert_eq!(routed_message_submit_behavior(DriverKind::Grok), bracketed);
         assert_eq!(
             routed_message_submit_behavior(DriverKind::GenericTerminal),
             SubmitBehavior {
@@ -15949,6 +15962,62 @@ mod tests {
         assert_eq!(restored.lifecycle_state, LifecycleState::Closed);
         assert!(!restored.running);
         assert_eq!(restored.run_id, None);
+    }
+
+    #[test]
+    fn grok_session_persists_and_uses_the_native_permission_contract() {
+        let root = tempfile::tempdir().expect("create Grok catalog root");
+        let supervisor = empty_test_supervisor_with_root(root.path().to_path_buf());
+        let (pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        let (spawner, specs) = CapturingPtySpawner::new(vec![pty]);
+        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+
+        let session = supervisor
+            .create_session(shared_types::CreateSessionRequest {
+                label: None,
+                driver: DriverKind::Grok,
+                permission_profile: shared_types::PermissionProfile::Normal,
+            })
+            .expect("create native Grok session");
+        assert_eq!(session.label, "Grok");
+        let session = supervisor
+            .set_permission_profile(session.session_id, shared_types::PermissionProfile::Unsafe)
+            .expect("select measured Grok unsafe profile");
+        assert_eq!(
+            session.permission_profile,
+            shared_types::PermissionProfile::Unsafe
+        );
+
+        supervisor
+            .start_session_by_id(session.session_id)
+            .expect("start captured Grok session");
+        let specs = specs.lock();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(
+            specs[0].args,
+            vec![
+                "--permission-mode",
+                "bypassPermissions",
+                "--cwd",
+                session.working_dir.as_str(),
+            ]
+        );
+        drop(specs);
+        supervisor
+            .stop_session_by_id(session.session_id)
+            .expect("stop captured Grok session");
+        drop(supervisor);
+
+        let reopened = SupervisorHandle::new(test_supervisor_config(root.path()))
+            .expect("reopen catalog containing Grok");
+        let restored = &reopened.snapshot().sessions[0];
+        assert_eq!(restored.session_id, session.session_id);
+        assert_eq!(restored.driver, DriverKind::Grok);
+        assert_eq!(
+            restored.permission_profile,
+            shared_types::PermissionProfile::Unsafe
+        );
+        assert_eq!(restored.lifecycle_state, LifecycleState::Closed);
     }
 
     #[test]

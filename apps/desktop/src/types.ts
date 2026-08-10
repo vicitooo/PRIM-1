@@ -1,4 +1,4 @@
-export type DriverKind = "claude" | "codex" | "generic_terminal";
+export type DriverKind = "claude" | "codex" | "grok" | "generic_terminal";
 export type PermissionProfile = "normal" | "unsafe";
 export type LifecycleState =
   | "starting"

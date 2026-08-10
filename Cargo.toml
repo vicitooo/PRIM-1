@@ -6,6 +6,7 @@ members = [
   "crates/driver-claude",
   "crates/driver-codex",
   "crates/driver-generic-terminal",
+  "crates/driver-grok",
   "crates/pty-host",
   "crates/shared-types",
   "crates/supervisor",

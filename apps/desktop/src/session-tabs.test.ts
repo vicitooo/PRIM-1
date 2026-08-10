@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   canUseUnsafePermission,
+  driverLabel,
   movedSessionOrder,
   newSessionFormDefaults,
   permissionProfileForDriver,
@@ -172,6 +173,9 @@ describe("permission profiles", () => {
 
   it("makes Unsafe explicit", () => {
     expect(unsafePermissionWarning("codex", "unsafe")).toContain("permission-bypass");
+    expect(canUseUnsafePermission("grok")).toBe(true);
+    expect(permissionProfileForDriver("grok", "unsafe")).toBe("unsafe");
+    expect(driverLabel("grok")).toBe("Grok Build");
     expect(unsafePermissionWarning("codex", "normal")).toBeNull();
   });
 });

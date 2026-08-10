@@ -667,6 +667,7 @@ pub fn expected_agent_image_name(driver: DriverKind, image_name: &str) -> bool {
             matches!(base.as_str(), "node.exe" | "node")
                 || (base.starts_with("claude") && (base.ends_with(".exe") || !base.contains('.')))
         }
+        DriverKind::Grok => matches!(base.as_str(), "grok.exe" | "grok"),
         DriverKind::GenericTerminal => false,
     }
 }
@@ -1044,6 +1045,10 @@ mod tests {
             DriverKind::Claude,
             r"C:\Program Files\Claude\claude-code.exe"
         ));
+        assert!(expected_agent_image_name(
+            DriverKind::Grok,
+            r"C:\Users\me\.grok\bin\grok.exe"
+        ));
         assert!(!expected_agent_image_name(
             DriverKind::Codex,
             r"C:\Windows\System32\cmd.exe"
@@ -1055,6 +1060,14 @@ mod tests {
         assert!(!expected_agent_image_name(
             DriverKind::GenericTerminal,
             "node.exe"
+        ));
+        assert!(!expected_agent_image_name(
+            DriverKind::Grok,
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+        ));
+        assert!(!expected_agent_image_name(
+            DriverKind::Grok,
+            r"C:\Users\me\.grok\bin\grok-helper.exe"
         ));
     }
 }

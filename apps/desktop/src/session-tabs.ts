@@ -237,6 +237,8 @@ export function driverLabel(driver: DriverKind): string {
       return "Claude Code";
     case "codex":
       return "Codex";
+    case "grok":
+      return "Grok Build";
     case "generic_terminal":
       return "Terminal";
   }

@@ -12,10 +12,11 @@ The wrapper drives external CLI tools whose UIs evolve. Known-good versions (val
 
 | CLI | Version |
 |---|---|
-| Claude Code | 2.1.109 |
-| Codex CLI | 0.120.0 |
+| Claude Code | 2.1.226 |
+| Codex CLI | 0.147.0 |
+| Grok Build | 1.0.0 (`3cd0d0cbce`) |
 
-If you upgrade either CLI and observe regressions (PTY behavior, startup timing, prompt rendering, routing behavior after injected stdin, paste-threshold behavior), record the wrapper commit + Claude version + Codex version together. Upstream CLI changes can break wrapper assumptions independent of wrapper code.
+If you upgrade any CLI and observe regressions (PTY behavior, startup timing, prompt rendering, routing behavior after injected stdin, paste-threshold behavior), record the wrapper commit and every affected CLI version together. Upstream CLI changes can break wrapper assumptions independent of wrapper code.
 
 ## Behavioral notes the wrapper does not yet abstract
 

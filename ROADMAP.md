@@ -9,7 +9,7 @@ Today the project is:
 
 - a Windows-first supervisor-owned PTY runtime
 - a Tauri desktop app with an ordered, persistent set of `SessionId`-keyed tabs
-- built-in Claude Code, Codex, and Generic Terminal session drivers
+- built-in Claude Code, Codex, Grok, and Generic Terminal session drivers
 - native workspace/per-session directory selection and visible permission profiles
 - in-process operator session controls, plus a pane-local Windows sideband limited to self ping/wait/input/key
 
@@ -43,7 +43,7 @@ The point is to prove the safe tabbed runtime before adding rooms or custom driv
 
 ### 3.1 User-extensible driver catalog
 
-The current registry can hold repeated Claude, Codex, and Generic Terminal
+The current registry can hold repeated Claude, Codex, Grok, and Generic Terminal
 sessions. A later product slice may support additional terminal-first CLIs.
 
 That implies:
