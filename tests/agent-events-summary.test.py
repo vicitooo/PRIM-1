@@ -146,14 +146,6 @@ def write_fixture(path: Path) -> None:
             "timestamp": "2026-05-17T20:00:08+00:00",
         },
         {
-            "event": "request_ack",
-            "request_id": "req-ack-123456",
-            "session": "codex",
-            "action": "send_input",
-            "bytes_written": 19,
-            "timestamp": "2026-05-17T20:00:09+00:00",
-        },
-        {
             "event": "dispatch_attempt",
             "request_id": "req-dispatch-idle",
             "action": "send_input",
@@ -182,21 +174,6 @@ def write_fixture(path: Path) -> None:
             "timestamp": "2026-05-17T20:00:09.500000+00:00",
         },
         {
-            "event": "request_ack_timeout",
-            "request_id": "req-timeout-123456",
-            "session": "codex",
-            "action": "deliver_message",
-            "elapsed_ms": 60000,
-            "timestamp": "2026-05-17T20:00:10+00:00",
-        },
-        {
-            "event": "dispatch_no_reaction",
-            "request_id": "req-no-reaction-123456",
-            "session": "codex",
-            "action": "deliver_message",
-            "timestamp": "2026-05-17T20:00:10.100000+00:00",
-        },
-        {
             "event": "supervisor_heartbeat",
             "wrapper_pid": 4242,
             "uptime_secs": 1800,
@@ -220,18 +197,6 @@ def write_fixture(path: Path) -> None:
         },
         {
             "event": "supervisor_alert",
-            "alert_type": "ack_timeout",
-            "request_id": "req-timeout-123456",
-            "session": "codex",
-            "action": "deliver_message",
-            "last_work_state": "blocked",
-            "last_session_state": "ready",
-            "message": "Dispatch deliver_message to codex didn't ACK in 60s; last work_state=blocked",
-            "severity": "warn",
-            "timestamp": "2026-05-17T20:00:10.300000+00:00",
-        },
-        {
-            "event": "supervisor_alert",
             "alert_type": "session_stall_detected",
             "request_id": None,
             "session": "codex",
@@ -242,24 +207,13 @@ def write_fixture(path: Path) -> None:
             "severity": "critical",
             "timestamp": "2026-05-17T20:00:10.400000+00:00",
         },
-        {
-            "event": "sideband_request_lifecycle",
-            "request_id": "req-failed-123456",
-            "action": "send_input",
-            "session": "no-such-pane",
-            "phase": "failed",
-            "error": "unknown session 'no-such-pane'",
-            "elapsed_ms": 0,
-            "timestamp": "2026-05-17T20:00:11+00:00",
-        },
     ]
     path.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
 
 
-def run_summary(*args, input_text=None, env=None):
+def run_summary(*args, env=None):
     return subprocess.run(
         [sys.executable, str(SCRIPT), *args],
-        input=input_text,
         text=True,
         capture_output=True,
         cwd=ROOT,
@@ -283,18 +237,14 @@ def test_fixture_summary_and_fail_on():
         assert "route_delivery" in out
         assert "2/2 written, 0 failed" in out
         assert "2/3 written, 1 failed: claude" in out
-        assert "request_ack" in out
         assert "dispatch_overlap" in out
         assert "target=codex" in out
         assert "req-disp" in out
         assert "req-dispatch-idle" not in out
-        assert "ack_timeout" in out
-        assert "no_reaction" in out
         assert "heartbeat" in out
         assert "sessions=2 active=1" in out
         assert "supervisor_alert" in out
         assert "severity=critical" in out
-        assert "lifecycle_failed" in out
 
         failed = run_summary("--audit-log", str(fixture), "--fail-on", "blocked,failed,timeout")
         assert failed.returncode == 1
@@ -302,44 +252,30 @@ def test_fixture_summary_and_fail_on():
         assert alert_failed.returncode == 1
 
 
-def test_filters_and_events_since_stdin():
+def test_request_filter():
     with tempfile.TemporaryDirectory() as tmp:
         fixture = Path(tmp) / "audit.jsonl"
         write_fixture(fixture)
 
-        request_filtered = run_summary("--audit-log", str(fixture), "--request-id", "req-ack-123456")
+        request_filtered = run_summary("--audit-log", str(fixture), "--request-id", "req-route-ok")
         assert request_filtered.returncode == 0
-        assert "request_ack" in request_filtered.stdout
-        assert "ack_timeout" not in request_filtered.stdout
-
-        events = {"events": [json.loads(line) for line in fixture.read_text(encoding="utf-8").splitlines()]}
-        stdin_result = run_summary("--events-since-stdin", input_text=json.dumps(events))
-        assert stdin_result.returncode == 0
-        assert "session_exit" in stdin_result.stdout
-        assert "route_delivery" in stdin_result.stdout
-        assert "supervisor_alert" in stdin_result.stdout
-
+        assert "route_delivery" in request_filtered.stdout
+        assert "route-part" not in request_filtered.stdout
 
 def test_error_loop_work_state_counts_as_blocked():
-    events = {
-        "events": [
-            {
-                "event": "session_work_state",
-                "session": "codex",
-                "state": "error_loop",
-                "detail": None,
-                "previous_state": "blocked",
-                "timestamp": "2026-05-17T20:00:01.500000+00:00",
-            }
-        ]
+    event = {
+        "event": "session_work_state",
+        "session": "codex",
+        "state": "error_loop",
+        "detail": None,
+        "previous_state": "blocked",
+        "timestamp": "2026-05-17T20:00:01.500000+00:00",
     }
 
-    result = run_summary(
-        "--events-since-stdin",
-        "--fail-on",
-        "blocked",
-        input_text=json.dumps(events),
-    )
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = Path(tmp) / "audit.jsonl"
+        fixture.write_text(json.dumps(event) + "\n", encoding="utf-8")
+        result = run_summary("--audit-log", str(fixture), "--fail-on", "blocked")
 
     assert result.returncode == 1
     assert "blocked->error_loop" in result.stdout
@@ -363,6 +299,6 @@ def test_default_runtime_override_with_spaces():
 
 if __name__ == "__main__":
     test_fixture_summary_and_fail_on()
-    test_filters_and_events_since_stdin()
+    test_request_filter()
     test_error_loop_work_state_counts_as_blocked()
     test_default_runtime_override_with_spaces()

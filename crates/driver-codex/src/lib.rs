@@ -1,11 +1,24 @@
-use shared_types::{DriverKind, LaunchSpec, SessionDefinition, WorkState};
+use std::path::Path;
+
+use shared_types::{LaunchSpec, LaunchSpecError, PermissionProfile, SessionDefinition, WorkState};
 
 pub fn classify_work_state(chunk: &str) -> Option<(WorkState, Option<String>)> {
     let normalized = strip_ansi_and_controls(chunk);
     let lower = normalized.to_ascii_lowercase();
 
-    if let Some(detail) = terminal_signature(&normalized, "codex") {
-        return Some((WorkState::Exited, Some(detail.into())));
+    if lower.contains("do you trust the contents of this directory?")
+        && lower.contains("yes, continue")
+        && lower.contains("press enter to continue")
+    {
+        return Some((WorkState::Blocked, Some("workspace_trust".into())));
+    }
+
+    if (lower.contains("would you like to run the following command?")
+        || lower.contains("do you want to allow codex to run this command?"))
+        && lower.contains("yes")
+        && lower.contains("no")
+    {
+        return Some((WorkState::Blocked, Some("approval_prompt".into())));
     }
 
     if lower.contains("choose a plan")
@@ -28,7 +41,7 @@ pub fn classify_work_state(chunk: &str) -> Option<(WorkState, Option<String>)> {
         return Some((WorkState::Blocked, Some("auth_refresh".into())));
     }
 
-    if lower.contains("usage limit") || lower.contains("hit your usage") {
+    if lower.contains("hit your usage") {
         return Some((WorkState::Blocked, Some("usage_limit".into())));
     }
     if lower.contains("rate limit") || lower.contains("429") {
@@ -63,31 +76,6 @@ pub fn classify_work_state(chunk: &str) -> Option<(WorkState, Option<String>)> {
     None
 }
 
-fn terminal_signature<'a>(chunk: &'a str, agent: &str) -> Option<&'a str> {
-    let lines = nonempty_trimmed_lines(chunk);
-
-    if lines
-        .iter()
-        .any(|line| is_command_not_found_line(line, agent))
-    {
-        return Some("command_not_found");
-    }
-    if lines.iter().any(|line| is_process_exited_line(line)) {
-        return Some("process_exited");
-    }
-    if lines.iter().any(|line| is_npm_cleanup_line(line)) {
-        return Some("npm_cleanup");
-    }
-    if lines.iter().any(|line| is_codex_launch_banner(line)) {
-        return Some("launch_banner");
-    }
-    if is_terminal_prompt_chunk(&lines, agent) {
-        return Some("shell_prompt");
-    }
-
-    None
-}
-
 fn strip_ansi_and_controls(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -116,95 +104,6 @@ fn strip_ansi_and_controls(input: &str) -> String {
     }
 
     output
-}
-
-fn nonempty_trimmed_lines(chunk: &str) -> Vec<&str> {
-    chunk
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect()
-}
-
-fn is_process_exited_line(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    lower.starts_with("[process exited")
-        || lower.starts_with("process exited")
-        || lower.starts_with("process terminated")
-}
-
-fn is_npm_cleanup_line(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    lower.starts_with("npm ")
-        && (lower.contains("cleanup")
-            || lower.contains("exit handler")
-            || lower.contains("failed to remove"))
-}
-
-fn is_command_not_found_line(line: &str, agent: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    lower.starts_with(&format!("{agent}: command not found"))
-        || lower.contains(&format!("'{agent}' is not recognized"))
-        || lower.contains(&format!("{agent}.cmd")) && lower.contains("not recognized")
-        || lower.contains(&format!("the term '{agent}' is not recognized"))
-}
-
-fn is_codex_launch_banner(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    (lower.starts_with("codex") || lower.contains("openai codex"))
-        && (lower.contains("cli") || lower.contains("codex"))
-}
-
-fn is_terminal_prompt_chunk(lines: &[&str], agent: &str) -> bool {
-    let Some(last) = lines.last() else {
-        return false;
-    };
-    if !is_shell_prompt_line(last) {
-        return false;
-    }
-    lines.len() == 1
-        || lines[..lines.len() - 1]
-            .iter()
-            .all(|line| is_terminal_context_line(line, agent))
-}
-
-fn is_terminal_context_line(line: &str, agent: &str) -> bool {
-    is_process_exited_line(line)
-        || is_npm_cleanup_line(line)
-        || is_command_not_found_line(line, agent)
-}
-
-fn is_shell_prompt_line(line: &str) -> bool {
-    let line = line.trim();
-    if line.is_empty() || line.len() > 180 || line.contains('`') {
-        return false;
-    }
-
-    if line == "$" || line == "#" {
-        return true;
-    }
-    if line.starts_with("PS ") && line.ends_with('>') {
-        return line.contains(":\\") || line.contains(":/");
-    }
-    if is_cmd_prompt_line(line) {
-        return true;
-    }
-    if (line.ends_with('$') || line.ends_with('#'))
-        && (line.contains('@') || line.contains(':') || line.contains("~/") || line.contains('/'))
-    {
-        return true;
-    }
-
-    false
-}
-
-fn is_cmd_prompt_line(line: &str) -> bool {
-    let bytes = line.as_bytes();
-    bytes.len() >= 4
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && (bytes[2] == b'\\' || bytes[2] == b'/')
-        && bytes[bytes.len() - 1] == b'>'
 }
 
 fn contains_working_timer(chunk: &str) -> bool {
@@ -244,100 +143,182 @@ fn extract_working_detail(chunk: &str) -> Option<String> {
     Some(detail.trim().to_string()).filter(|value| !value.is_empty())
 }
 
-pub fn default_session(working_dir: &str) -> SessionDefinition {
-    SessionDefinition {
-        name: "codex".into(),
-        title: "Codex".into(),
-        driver: DriverKind::Codex,
-        working_dir: working_dir.into(),
-        command: None,
-        args: vec![],
-        env: vec![],
-        auto_start: false,
+pub fn launch_spec(
+    definition: &SessionDefinition,
+    program: &str,
+    prefix_args: &[String],
+) -> Result<LaunchSpec, LaunchSpecError> {
+    validate_direct_program(program)?;
+
+    let mut args = prefix_args.to_vec();
+    match definition.permission_profile {
+        PermissionProfile::Normal => {
+            args.extend([
+                "--ask-for-approval".into(),
+                "on-request".into(),
+                "--sandbox".into(),
+                "workspace-write".into(),
+            ]);
+        }
+        PermissionProfile::Unsafe => {
+            args.push("--dangerously-bypass-approvals-and-sandbox".into());
+        }
     }
-}
+    args.extend([
+        "--no-alt-screen".into(),
+        "-C".into(),
+        definition.working_dir.clone(),
+    ]);
 
-pub fn launch_spec(definition: &SessionDefinition) -> LaunchSpec {
-    let (program, mut args) = if cfg!(windows) {
-        (
-            "cmd.exe".to_string(),
-            vec![
-                "/d".into(),
-                "/c".into(),
-                "codex.cmd".into(),
-                "--yolo".into(),
-                "--no-alt-screen".into(),
-                "-C".into(),
-                definition.working_dir.clone(),
-            ],
-        )
-    } else {
-        (
-            definition.command.clone().unwrap_or_else(|| "codex".into()),
-            vec![
-                "--yolo".into(),
-                "--no-alt-screen".into(),
-                "-C".into(),
-                definition.working_dir.clone(),
-            ],
-        )
-    };
-    args.extend(definition.args.clone());
-
-    LaunchSpec {
-        program,
+    Ok(LaunchSpec {
+        program: program.to_string(),
         args,
         working_dir: definition.working_dir.clone(),
-        env: definition.env.clone(),
-        display_name: definition.title.clone(),
+        env: Vec::new(),
+        display_name: definition.label.clone(),
+    })
+}
+
+fn validate_direct_program(program: &str) -> Result<(), LaunchSpecError> {
+    let path = Path::new(program);
+    if program.trim().is_empty() || !path.is_absolute() {
+        return Err(LaunchSpecError::ProgramNotQualified {
+            program: program.to_string(),
+        });
     }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(extension.as_str(), "cmd" | "bat" | "ps1")
+        || matches!(
+            file_name.as_str(),
+            "cmd.exe" | "powershell.exe" | "pwsh.exe"
+        )
+    {
+        return Err(LaunchSpecError::ShellMediatedProgram {
+            program: program.to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shared_types::{DriverKind, SessionId};
 
     #[cfg(windows)]
-    #[test]
-    fn windows_launch_spec_uses_cmd_shim_and_cwd_flag() {
-        let definition = default_session(r"D:\workspace");
-        let spec = launch_spec(&definition);
-
-        assert_eq!(spec.program, "cmd.exe");
-        assert_eq!(
-            spec.args,
-            vec![
-                "/d".to_string(),
-                "/c".to_string(),
-                "codex.cmd".to_string(),
-                "--yolo".to_string(),
-                "--no-alt-screen".to_string(),
-                "-C".to_string(),
-                r"D:\workspace".to_string(),
-            ]
-        );
-        assert_eq!(spec.working_dir, r"D:\workspace");
-        assert_eq!(spec.display_name, "Codex");
-    }
+    const WORKSPACE_ROOT: &str = r"D:\workspace & (qa)";
+    #[cfg(windows)]
+    const CODEX_EXECUTABLE: &str = r"C:\Program Files\OpenAI\codex.exe";
+    #[cfg(windows)]
+    const NODE_EXECUTABLE: &str = r"C:\Program Files\nodejs\node.exe";
+    #[cfg(windows)]
+    const CODEX_JS: &str =
+        r"C:\Users\example\AppData\Roaming\npm\node_modules\@openai\codex\bin\codex.js";
+    #[cfg(windows)]
+    const SHELL_SHIM: &str = r"C:\Users\example\AppData\Roaming\npm\codex.cmd";
 
     #[cfg(not(windows))]
-    #[test]
-    fn unix_launch_spec_uses_codex_binary_and_cwd_flag() {
-        let definition = default_session("/workspace");
-        let spec = launch_spec(&definition);
+    const WORKSPACE_ROOT: &str = "/workspace & (qa)";
+    #[cfg(not(windows))]
+    const CODEX_EXECUTABLE: &str = "/opt/openai/bin/codex";
+    #[cfg(not(windows))]
+    const NODE_EXECUTABLE: &str = "/usr/bin/node";
+    #[cfg(not(windows))]
+    const CODEX_JS: &str = "/opt/openai/lib/codex.js";
+    #[cfg(not(windows))]
+    const SHELL_SHIM: &str = "/tmp/codex.cmd";
 
-        assert_eq!(spec.program, "codex");
+    fn definition(permission_profile: PermissionProfile) -> SessionDefinition {
+        SessionDefinition {
+            session_id: SessionId::nil(),
+            alias: "session-00000000-0000-0000-0000-000000000000".into(),
+            label: "Codex & calc.exe".into(),
+            driver: DriverKind::Codex,
+            working_dir: WORKSPACE_ROOT.into(),
+            permission_profile,
+        }
+    }
+
+    #[test]
+    fn normal_native_launch_is_direct_and_omits_unsafe_mode() {
+        let definition = definition(PermissionProfile::Normal);
+        let spec = launch_spec(&definition, CODEX_EXECUTABLE, &[]).unwrap();
+
+        assert_eq!(spec.program, CODEX_EXECUTABLE);
         assert_eq!(
             spec.args,
             vec![
-                "--yolo".to_string(),
+                "--ask-for-approval".to_string(),
+                "on-request".to_string(),
+                "--sandbox".to_string(),
+                "workspace-write".to_string(),
                 "--no-alt-screen".to_string(),
                 "-C".to_string(),
-                "/workspace".to_string(),
+                WORKSPACE_ROOT.to_string(),
             ]
         );
-        assert_eq!(spec.working_dir, "/workspace");
-        assert_eq!(spec.display_name, "Codex");
+        assert_eq!(spec.working_dir, WORKSPACE_ROOT);
+        assert_eq!(spec.display_name, definition.label);
+        assert!(spec.env.is_empty());
+        assert!(
+            !spec
+                .args
+                .iter()
+                .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox")
+        );
+        assert!(!spec.args.iter().any(|arg| arg.contains("calc.exe")));
+    }
+
+    #[test]
+    fn unsafe_node_launch_preserves_prefix_and_adds_exactly_the_bypass_flag() {
+        let definition = definition(PermissionProfile::Unsafe);
+        let prefix_args = vec![CODEX_JS.to_string()];
+        let spec = launch_spec(&definition, NODE_EXECUTABLE, &prefix_args).unwrap();
+
+        assert_eq!(spec.program, NODE_EXECUTABLE);
+        assert_eq!(
+            spec.args,
+            vec![
+                CODEX_JS.to_string(),
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                "--no-alt-screen".to_string(),
+                "-C".to_string(),
+                WORKSPACE_ROOT.to_string(),
+            ]
+        );
+        assert_eq!(
+            spec.args
+                .iter()
+                .filter(|arg| *arg == "--dangerously-bypass-approvals-and-sandbox")
+                .count(),
+            1
+        );
+        assert!(!spec.args.iter().any(|arg| arg == "--ask-for-approval"));
+        assert!(!spec.args.iter().any(|arg| arg == "--sandbox"));
+    }
+
+    #[test]
+    fn relative_and_shell_mediated_programs_are_rejected() {
+        let definition = definition(PermissionProfile::Normal);
+        assert!(matches!(
+            launch_spec(&definition, "codex", &[]),
+            Err(LaunchSpecError::ProgramNotQualified { .. })
+        ));
+        assert!(matches!(
+            launch_spec(&definition, SHELL_SHIM, &[]),
+            Err(LaunchSpecError::ShellMediatedProgram { .. })
+        ));
     }
 
     #[test]
@@ -357,6 +338,31 @@ mod tests {
     #[test]
     fn classify_codex_blocked_patterns() {
         assert_eq!(
+            classify_work_state(
+                "Do you trust the contents of this directory?\n› 1. Yes, continue\n  2. No, exit\nPress enter to continue"
+            )
+            .unwrap(),
+            (WorkState::Blocked, Some("workspace_trust".into()))
+        );
+        assert_eq!(
+            classify_work_state(
+                "The documentation asks: Do you trust the contents of this directory?"
+            ),
+            None
+        );
+        assert_eq!(
+            classify_work_state(
+                "Would you like to run the following command?\n› 1. Yes, proceed (y)\n  2. Yes, and don't ask again\n  3. No, and tell Codex what to do differently (esc)"
+            )
+            .unwrap(),
+            (WorkState::Blocked, Some("approval_prompt".into()))
+        );
+        assert_eq!(
+            classify_work_state("Docs: Would you like to run the following command?"),
+            None,
+            "approval prose without live yes/no choices is not authoritative"
+        );
+        assert_eq!(
             classify_work_state("Create a plan? shift+tab use Plan mode").unwrap(),
             (WorkState::Blocked, Some("plan_mode_prompt".into()))
         );
@@ -371,6 +377,16 @@ mod tests {
             classify_work_state("You've hit your usage limit.").unwrap(),
             (WorkState::Blocked, Some("usage_limit".into()))
         );
+        for available_usage in [
+            "You have 1 usage limit reset available. Run /usage to use one.",
+            "Heads up, you have less than 10% of your weekly limit left. Run /status for details.",
+        ] {
+            assert_eq!(
+                classify_work_state(available_usage),
+                None,
+                "remaining capacity is not an exhausted usage limit: {available_usage}"
+            );
+        }
     }
 
     #[test]
@@ -385,23 +401,19 @@ mod tests {
     }
 
     #[test]
-    fn classify_codex_terminal_signatures_as_exited() {
+    fn terminal_text_cannot_claim_process_exit() {
+        for text in [
+            "\u{1b}[33mnpm warn cleanup Failed to remove some directories\u{1b}[0m\r\nPS C:\\Projects\\PRIM-1>",
+            "[process exited with code 0]",
+            "PS C:\\Projects\\PRIM-1>",
+            "Codex CLI v1.2.3",
+        ] {
+            assert_eq!(classify_work_state(text), None, "{text:?}");
+        }
+
         assert_eq!(
-            classify_work_state("\u{1b}[33mnpm warn cleanup Failed to remove some directories\u{1b}[0m\r\nPS C:\\Projects\\PRIM-1>")
-                .unwrap(),
-            (WorkState::Exited, Some("npm_cleanup".into()))
-        );
-        assert_eq!(
-            classify_work_state("[process exited with code 0]").unwrap(),
-            (WorkState::Exited, Some("process_exited".into()))
-        );
-        assert_eq!(
-            classify_work_state("PS C:\\Projects\\PRIM-1>").unwrap(),
-            (WorkState::Exited, Some("shell_prompt".into()))
-        );
-        assert_eq!(
-            classify_work_state("Codex CLI v1.2.3").unwrap(),
-            (WorkState::Exited, Some("launch_banner".into()))
+            classify_work_state("Codex CLI v1.2.3\n▌").unwrap().0,
+            WorkState::Idle
         );
     }
 

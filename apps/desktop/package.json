@@ -2,7 +2,7 @@
   "name": "prim1-desktop",
   "version": "0.1.0",
   "type": "module",
-  "description": "PRIM-1 desktop runtime — Tauri shell hosting supervised PTY panes for Claude Code + Codex CLI.",
+  "description": "PRIM-1 desktop runtime for persistent, supervised terminal-first agent sessions.",
   "author": "Victor Valtchev",
   "license": "Apache-2.0",
   "repository": {

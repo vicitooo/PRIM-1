@@ -1,4 +1,5 @@
 export type DriverKind = "claude" | "codex" | "generic_terminal";
+export type PermissionProfile = "normal" | "unsafe";
 export type LifecycleState =
   | "starting"
   | "ready"
@@ -19,23 +20,9 @@ export type WorkState =
   | "exited";
 export type AlertSeverity = "info" | "warn" | "critical";
 export type SupervisorAlertType =
-  | "ack_timeout"
-  | "dispatch_no_reaction"
   | "session_stall_detected"
   | "operator_attention";
 export type RouteDeliveryPhase = "resolved" | "written" | "failed";
-export type PaneSignalType =
-  | "done"
-  | "blocked"
-  | "yellow"
-  | "heartbeat"
-  | "progress";
-export type SidebandPhase =
-  | "started"
-  | "slow_warning"
-  | "timed_out"
-  | "completed"
-  | "failed";
 export type SessionExitReason =
   | "clean_exit"
   | "crash_exit"
@@ -44,12 +31,24 @@ export type SessionExitReason =
   | "pty_error"
   | "process_disappeared";
 
+export interface RunEventIdentity {
+  session_id: string;
+  run_id: string;
+  generation: number;
+  sequence: number;
+}
+
 export interface SessionSnapshot {
-  name: string;
-  title: string;
+  session_id: string;
+  alias: string;
+  label: string;
   driver: DriverKind;
+  permission_profile: PermissionProfile;
   lifecycle_state: LifecycleState;
   working_dir: string;
+  generation: number;
+  run_id: string | null;
+  run_event_sequence: number;
   process_id: number | null;
   running: boolean;
   last_activity_at: string | null;
@@ -63,6 +62,7 @@ export interface ControlPlaneSnapshot {
 
 export interface RuntimeSnapshot {
   sessions: SessionSnapshot[];
+  workspace_preference: string;
   control_plane: ControlPlaneSnapshot | null;
   runtime_dir: string;
   audit_log_path: string;
@@ -78,46 +78,55 @@ export interface HeartbeatSessionSummary {
 }
 
 export interface StartSessionRequest {
-  name: string;
-  extra_args?: string[];
+  session_id: string;
 }
 
 export interface StopSessionRequest {
-  name: string;
+  session_id: string;
 }
 
 export interface RestartSessionRequest {
-  name: string;
+  session_id: string;
 }
 
-export interface CreatePairRequest {
-  name: string;
+export interface CreateSessionRequest {
+  label?: string | null;
+  driver: DriverKind;
+  permission_profile: PermissionProfile;
 }
 
-export interface RenamePairRequest {
-  oldName: string;
-  newName: string;
+export interface RenameSessionRequest {
+  session_id: string;
+  label: string;
 }
 
-export interface DeletePairRequest {
-  name: string;
+export interface ChooseSessionWorkingDirectoryRequest {
+  session_id: string;
+}
+
+export interface SetSessionPermissionRequest {
+  session_id: string;
+  permission_profile: PermissionProfile;
+}
+
+export interface MoveSessionRequest {
+  session_id: string;
+  new_index: number;
+}
+
+export interface DeleteSessionRequest {
+  session_id: string;
 }
 
 export interface SendInputRequest {
-  name: string;
+  session_id: string;
   input: string;
-}
-
-export interface RouteMessageRequest {
-  from: string;
-  to: string;
-  scope: MessageScope;
-  content: string;
 }
 
 export type RuntimeEvent =
   | {
       event: "session_output";
+      identity: RunEventIdentity;
       session: string;
       chunk: string;
       synthetic: boolean;
@@ -125,6 +134,7 @@ export type RuntimeEvent =
     }
   | {
       event: "session_state";
+      identity: RunEventIdentity;
       session: string;
       state: LifecycleState;
       reason: string;
@@ -132,8 +142,8 @@ export type RuntimeEvent =
     }
   | {
       event: "session_exit";
+      identity: RunEventIdentity;
       session: string;
-      generation: number;
       process_id: number | null;
       exit_code: number | null;
       signal: number | null;
@@ -144,6 +154,7 @@ export type RuntimeEvent =
     }
   | {
       event: "session_work_state";
+      identity: RunEventIdentity;
       session: string;
       state: WorkState;
       detail: string | null;
@@ -170,28 +181,48 @@ export type RuntimeEvent =
       timestamp: string;
     }
   | {
-      event: "dispatch_template_warning";
-      request_id: string;
-      session: string;
-      detected_patterns: string[];
-      missing_patterns: string[];
-      severity: AlertSeverity;
+      event: "session_created";
+      schema_version: number;
+      session: SessionSnapshot;
       timestamp: string;
     }
   | {
-      event: "pair_created";
-      name: string;
+      event: "session_renamed";
+      schema_version: number;
+      session_id: string;
+      old_label: string;
+      new_label: string;
       timestamp: string;
     }
   | {
-      event: "pair_renamed";
-      old_name: string;
-      new_name: string;
+      event: "session_moved";
+      schema_version: number;
+      session_id: string;
+      old_index: number;
+      new_index: number;
       timestamp: string;
     }
   | {
-      event: "pair_deleted";
-      name: string;
+      event: "session_permission_changed";
+      schema_version: number;
+      session_id: string;
+      old_profile: PermissionProfile;
+      new_profile: PermissionProfile;
+      timestamp: string;
+    }
+  | {
+      event: "session_working_directory_changed";
+      schema_version: number;
+      session_id: string;
+      old_working_dir: string;
+      new_working_dir: string;
+      timestamp: string;
+    }
+  | {
+      event: "session_deleted";
+      schema_version: number;
+      session_id: string;
+      label: string;
       timestamp: string;
     }
   | {
@@ -234,17 +265,6 @@ export type RuntimeEvent =
       timestamp: string;
     }
   | {
-      event: "pane_signal";
-      request_id: string;
-      session: string;
-      task_id: string;
-      signal_type: PaneSignalType;
-      summary: string;
-      artifact_paths: string[];
-      commit_sha: string | null;
-      timestamp: string;
-    }
-  | {
       event: "system_log";
       level: LogLevel;
       message: string;
@@ -254,39 +274,5 @@ export type RuntimeEvent =
       event: "control_plane_ready";
       endpoint: string;
       transport: string;
-      timestamp: string;
-    }
-  | {
-      event: "sideband_request_lifecycle";
-      request_id: string;
-      action: string;
-      session: string | null;
-      extra_args?: string[];
-      phase: SidebandPhase;
-      error?: string;
-      elapsed_ms: number;
-      timestamp: string;
-    }
-  | {
-      event: "request_ack";
-      request_id: string;
-      session: string;
-      action: string;
-      bytes_written: number;
-      timestamp: string;
-    }
-  | {
-      event: "request_ack_timeout";
-      request_id: string;
-      session: string;
-      action: string;
-      elapsed_ms: number;
-      timestamp: string;
-    }
-  | {
-      event: "dispatch_no_reaction";
-      request_id: string;
-      session: string;
-      action: string;
       timestamp: string;
     };

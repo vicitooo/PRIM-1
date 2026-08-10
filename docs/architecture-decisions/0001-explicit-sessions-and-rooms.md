@@ -21,7 +21,7 @@ This preserves current internals but cannot honestly support arbitrary member co
 ### B. Add explicit identities and membership inside the current supervisor
 
 - Stable `SessionId`, per-process `RunId`, stable `RoomId`, explicit membership records.
-- `RunId` is an internal generation key needed to reject stale process events and credentials; it is not another operator-facing object.
+- `RunId` is an internal generation key needed to reject stale process events and run-bound authority; it is not another operator-facing object.
 - Display aliases remain compatibility input only.
 - Rooms reference existing sessions and never spawn by implication.
 - The supervisor remains the authority; the UI renders backend truth through a typed protocol.

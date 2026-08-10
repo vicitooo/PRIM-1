@@ -1,11 +1,11 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader as StdBufReader, Read, Write},
+    io::{BufReader as StdBufReader, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -14,19 +14,22 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, NaiveDate, Utc};
-use control_plane::{DEFAULT_ENDPOINT, decode_request, encode_request, encode_response};
-use parking_lot::{Mutex, RwLock};
+use control_plane::{DEFAULT_ENDPOINT, decode_request, encode_response};
+use parking_lot::{Condvar, Mutex, RwLock};
+#[cfg(windows)]
+use pty_host::PinnedProcess;
 use pty_host::{
     AgentLiveness, ConcretePtySession, PtyEvent, PtyEventHandler, PtyExitStatus, PtySession,
+    PtyWriteError,
 };
+use serde::{Deserialize, Serialize};
 use shared_types::{
-    AlertSeverity, ControlKey, ControlPlaneSnapshot, ControlPlaneStatus, DeliverMessageRequest,
-    DriverKind, EnvVar, EventCursor, EventFilter, HeartbeatSessionSummary, LaunchSpec,
-    LifecycleState, LogLevel, MessageScope, PaneSignalType, RouteDeliveryPhase,
-    RouteMessageRequest, RuntimeEvent, RuntimeSnapshot, SendInputRequest, SessionDefinition,
-    SessionExitReason, SessionGeneration, SessionSnapshot, SidebandPhase, SidebandRequest,
-    SidebandResponse, SidebandResponsePayload, SupervisorAlertType, WaitQuietRequest, WorkState,
-    now_rfc3339,
+    AlertSeverity, ControlKey, ControlPlaneSnapshot, ControlPlaneStatus, DriverKind, EnvVar,
+    HeartbeatSessionSummary, LaunchSpec, LifecycleState, LogLevel, MessageScope,
+    OperatorRouteMessageRequest, RouteDeliveryPhase, RunEventIdentity, RuntimeEvent,
+    RuntimeSnapshot, SendInputRequest, SessionDefinition, SessionExitReason, SessionGeneration,
+    SessionId, SessionSnapshot, SidebandRequest, SidebandResponse, SidebandResponsePayload,
+    SupervisorAlertType, WaitQuietRequest, WorkState, now_rfc3339,
 };
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -34,116 +37,403 @@ use uuid::Uuid;
 
 type EventSink = Arc<dyn Fn(RuntimeEvent) + Send + Sync>;
 
-const CONTROL_PLANE_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
-const CONTROL_PLANE_PROBE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+#[derive(Debug, Clone)]
+struct RouteMessageRequest {
+    from: String,
+    to: String,
+    scope: MessageScope,
+    content: String,
+}
+
 const SIDEBAND_FRAME_MAX_BYTES: usize = 8 * 1024 * 1024;
 const SIDEBAND_FRAME_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const SIDEBAND_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const SIDEBAND_MAX_CONNECTIONS: usize = 64;
-const DEFAULT_REACTION_WINDOW_SECS: u64 = 12;
+const SIDEBAND_WAIT_QUIET_MAX_QUIET_SECONDS: u32 = 60;
+const SIDEBAND_WAIT_QUIET_MAX_TIMEOUT_SECONDS: u32 = 300;
+const MESSAGE_BODY_MAX_BYTES: usize = 1024 * 1024;
+const BRACKETED_PASTE_START: &str = "\x1b[200~";
+const BRACKETED_PASTE_END: &str = "\x1b[201~";
+const BRACKETED_PASTE_SUBMIT_DELAY: Duration = Duration::from_secs(1);
+const TERMINAL_MODE_CONTROL_MAX_CHARS: u16 = 128;
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 1800;
 const DEFAULT_AUTO_RESTART_STALL_THRESHOLD_SECS: u64 = 600;
+const SESSION_STOP_KILL_TIMEOUT: Duration = Duration::from_secs(5);
 const AUTO_RESTART_WINDOW: Duration = Duration::from_secs(30 * 60);
 const AUTO_RESTART_MAX_PER_WINDOW: usize = 3;
-const DISPATCH_TEMPLATE_PATTERNS: [&str; 3] =
-    ["pane_signal", "control-plane.ps1 -Action signal", "task_id"];
 const RECENT_ROUTE_OVERLAP_WINDOW: Duration = Duration::from_secs(3);
-const PAIR_NAME_MAX_LEN: usize = 48;
-const RESERVED_PAIR_NAMES: [&str; 5] = ["main", "claude", "codex", "room", "operator"];
+const SESSION_LABEL_MAX_CHARS: usize = 128;
+const SESSION_CATALOG_SCHEMA_VERSION: u32 = 1;
+const SESSION_CATALOG_FILE_NAME: &str = "session-catalog-v1.json";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageFraming {
+    BracketedPaste,
+    RawSingleLine,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SubmitBehavior {
     sequence: &'static str,
-    delay: Duration,
-    flatten_payload: bool,
-    max_chunk_chars: Option<usize>,
+    framing: MessageFraming,
+    submit_delay: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OpLane {
-    Lifecycle,
-    SideEffect,
+enum RunInputSafety {
+    Raw,
+    RoutedSubmit,
+    BracketedPasteEnabled,
+}
+
+impl From<SubmitBehavior> for RunInputSafety {
+    fn from(behavior: SubmitBehavior) -> Self {
+        match behavior.framing {
+            MessageFraming::BracketedPaste => Self::BracketedPasteEnabled,
+            MessageFraming::RawSingleLine => Self::Raw,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BracketedPasteMode {
+    Unknown,
+    Enabled,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RunBinding {
+    session_id: Uuid,
+    run_id: Uuid,
+    generation: SessionGeneration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalStringKind {
+    Osc,
+    Dcs,
+    Sos,
+    Pm,
+    Apc,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum TerminalModeParserState {
+    #[default]
+    Ground,
+    Escape,
+    Csi(DecPrivateModeParser),
+    CsiDiscard,
+    String {
+        kind: TerminalStringKind,
+        chars_seen: u16,
+    },
+    StringDiscard {
+        kind: TerminalStringKind,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DecPrivateModeParser {
+    chars_seen: u16,
+    private_marker: bool,
+    current_parameter: Option<u32>,
+    contains_bracketed_paste: bool,
+    invalid: bool,
+}
+
+impl DecPrivateModeParser {
+    fn new() -> Self {
+        Self {
+            chars_seen: 0,
+            private_marker: false,
+            current_parameter: None,
+            contains_bracketed_paste: false,
+            invalid: false,
+        }
+    }
+
+    fn finish_parameter(&mut self) {
+        if self.current_parameter.take() == Some(2004) {
+            self.contains_bracketed_paste = true;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BracketedPasteRunState {
+    binding: Option<RunBinding>,
+    mode: BracketedPasteMode,
+    parser: TerminalModeParserState,
+}
+
+impl Default for BracketedPasteRunState {
+    fn default() -> Self {
+        Self {
+            binding: None,
+            mode: BracketedPasteMode::Unknown,
+            parser: TerminalModeParserState::Ground,
+        }
+    }
+}
+
+impl BracketedPasteRunState {
+    fn begin_run(&mut self, binding: RunBinding) {
+        self.binding = Some(binding);
+        self.mode = BracketedPasteMode::Unknown;
+        self.parser = TerminalModeParserState::Ground;
+    }
+
+    fn mode_for(self, binding: RunBinding) -> BracketedPasteMode {
+        if self.binding == Some(binding) {
+            self.mode
+        } else {
+            BracketedPasteMode::Unknown
+        }
+    }
+
+    fn observe_output(&mut self, binding: RunBinding, chunk: &str) {
+        if self.binding != Some(binding) {
+            return;
+        }
+        for character in chunk.chars() {
+            self.observe_character(character);
+        }
+    }
+
+    fn observe_character(&mut self, character: char) {
+        if self.observe_global_transition(character) {
+            return;
+        }
+
+        match self.parser {
+            TerminalModeParserState::Ground => self.observe_ground(character),
+            TerminalModeParserState::Escape => self.observe_escape(character),
+            TerminalModeParserState::Csi(mut csi) => {
+                csi.chars_seen = csi.chars_seen.saturating_add(1);
+                if csi.chars_seen > TERMINAL_MODE_CONTROL_MAX_CHARS {
+                    self.mode = BracketedPasteMode::Unknown;
+                    self.parser = TerminalModeParserState::CsiDiscard;
+                    self.observe_csi_discard(character);
+                    return;
+                }
+
+                if Self::is_c0_executable_or_del(character) {
+                    self.parser = TerminalModeParserState::Csi(csi);
+                    return;
+                }
+
+                match character {
+                    '\u{001b}' => {
+                        self.parser = TerminalModeParserState::Escape;
+                        return;
+                    }
+                    '?' if csi.chars_seen == 1 => csi.private_marker = true,
+                    '0'..='9' => {
+                        let digit = character as u32 - '0' as u32;
+                        csi.current_parameter = match csi.current_parameter {
+                            Some(value) => value
+                                .checked_mul(10)
+                                .and_then(|value| value.checked_add(digit)),
+                            None => Some(digit),
+                        };
+                        if csi.current_parameter.is_none() {
+                            csi.invalid = true;
+                        }
+                    }
+                    ';' => csi.finish_parameter(),
+                    'h' | 'l' => {
+                        csi.finish_parameter();
+                        if csi.private_marker && csi.contains_bracketed_paste && !csi.invalid {
+                            self.mode = if character == 'h' {
+                                BracketedPasteMode::Enabled
+                            } else {
+                                BracketedPasteMode::Disabled
+                            };
+                        }
+                        self.parser = TerminalModeParserState::Ground;
+                        return;
+                    }
+                    '\u{40}'..='\u{7e}' => {
+                        self.parser = TerminalModeParserState::Ground;
+                        return;
+                    }
+                    '\u{20}'..='\u{3f}' => csi.invalid = true,
+                    _ => {
+                        self.parser = TerminalModeParserState::Ground;
+                        return;
+                    }
+                }
+                self.parser = TerminalModeParserState::Csi(csi);
+            }
+            TerminalModeParserState::CsiDiscard => self.observe_csi_discard(character),
+            TerminalModeParserState::String { kind, chars_seen } => {
+                self.observe_string(character, kind, Some(chars_seen));
+            }
+            TerminalModeParserState::StringDiscard { kind } => {
+                self.observe_string(character, kind, None);
+            }
+        }
+    }
+
+    fn observe_global_transition(&mut self, character: char) -> bool {
+        self.parser = match character {
+            '\u{0018}'
+            | '\u{001a}'
+            | '\u{0080}'..='\u{008f}'
+            | '\u{0091}'..='\u{0097}'
+            | '\u{0099}'..='\u{009a}'
+            | '\u{009c}' => TerminalModeParserState::Ground,
+            '\u{009b}' => TerminalModeParserState::Csi(DecPrivateModeParser::new()),
+            '\u{009d}' => Self::terminal_string(TerminalStringKind::Osc),
+            '\u{0090}' => Self::terminal_string(TerminalStringKind::Dcs),
+            '\u{0098}' => Self::terminal_string(TerminalStringKind::Sos),
+            '\u{009e}' => Self::terminal_string(TerminalStringKind::Pm),
+            '\u{009f}' => Self::terminal_string(TerminalStringKind::Apc),
+            _ => return false,
+        };
+        true
+    }
+
+    fn observe_ground(&mut self, character: char) {
+        self.parser = match character {
+            '\u{001b}' => TerminalModeParserState::Escape,
+            _ => TerminalModeParserState::Ground,
+        };
+    }
+
+    fn observe_escape(&mut self, character: char) {
+        if Self::is_c0_executable_or_del(character) {
+            return;
+        }
+        self.parser = match character {
+            '[' => TerminalModeParserState::Csi(DecPrivateModeParser::new()),
+            ']' => Self::terminal_string(TerminalStringKind::Osc),
+            'P' => Self::terminal_string(TerminalStringKind::Dcs),
+            'X' => Self::terminal_string(TerminalStringKind::Sos),
+            '^' => Self::terminal_string(TerminalStringKind::Pm),
+            '_' => Self::terminal_string(TerminalStringKind::Apc),
+            '\u{001b}' => TerminalModeParserState::Escape,
+            _ => TerminalModeParserState::Ground,
+        };
+    }
+
+    fn observe_csi_discard(&mut self, character: char) {
+        if Self::is_c0_executable_or_del(character) {
+            return;
+        }
+        self.parser = match character {
+            '\u{001b}' => TerminalModeParserState::Escape,
+            '\u{40}'..='\u{7e}' => TerminalModeParserState::Ground,
+            _ => TerminalModeParserState::CsiDiscard,
+        };
+    }
+
+    fn observe_string(
+        &mut self,
+        character: char,
+        kind: TerminalStringKind,
+        chars_seen: Option<u16>,
+    ) {
+        match character {
+            '\u{0007}' if kind == TerminalStringKind::Osc => {
+                self.parser = TerminalModeParserState::Ground;
+            }
+            '\u{001b}' => self.parser = TerminalModeParserState::Escape,
+            _ => match chars_seen {
+                Some(chars_seen) => {
+                    let chars_seen = chars_seen.saturating_add(1);
+                    if chars_seen > TERMINAL_MODE_CONTROL_MAX_CHARS {
+                        self.parser = TerminalModeParserState::StringDiscard { kind };
+                    } else {
+                        self.parser = TerminalModeParserState::String { kind, chars_seen };
+                    }
+                }
+                None => self.parser = TerminalModeParserState::StringDiscard { kind },
+            },
+        }
+    }
+
+    fn terminal_string(kind: TerminalStringKind) -> TerminalModeParserState {
+        TerminalModeParserState::String {
+            kind,
+            chars_seen: 0,
+        }
+    }
+
+    fn is_c0_executable_or_del(character: char) -> bool {
+        matches!(
+            character,
+            '\u{0000}'..='\u{0017}'
+                | '\u{0019}'
+                | '\u{001c}'..='\u{001f}'
+                | '\u{007f}'
+        )
+    }
 }
 
 struct SidebandTimeouts;
 
 impl SidebandTimeouts {
-    fn lane(request: &SidebandRequest) -> OpLane {
-        match request {
-            SidebandRequest::CreatePair { .. } => OpLane::SideEffect,
-            SidebandRequest::StartSession { .. }
-            | SidebandRequest::StopSession { .. }
-            | SidebandRequest::RestartSession { .. } => OpLane::Lifecycle,
-            _ => OpLane::SideEffect,
-        }
-    }
-
-    fn budget(request: &SidebandRequest) -> Duration {
-        match request {
-            SidebandRequest::Ping { .. } => Duration::from_secs(2),
-            SidebandRequest::ListSessions { .. } => Duration::from_secs(2),
-            SidebandRequest::CreatePair { .. } => Duration::from_secs(10),
-            SidebandRequest::StartSession { .. } => Duration::from_secs(60),
-            SidebandRequest::StopSession { .. } => Duration::from_secs(10),
-            SidebandRequest::RestartSession { .. } => Duration::from_secs(70),
-            SidebandRequest::WaitQuiet {
-                timeout_seconds, ..
-            } => Duration::from_secs((*timeout_seconds as u64).saturating_add(5)),
-            SidebandRequest::EventsSince {
-                max_wait_seconds, ..
-            } => Duration::from_secs(max_wait_seconds.unwrap_or(0) as u64)
-                .saturating_add(Duration::from_secs(5)),
-            SidebandRequest::DeliverMessage { .. } => Duration::from_secs(20),
-            SidebandRequest::SendInput { .. } => Duration::from_secs(20),
-            SidebandRequest::SendKey { .. } => Duration::from_secs(20),
-            SidebandRequest::RouteMessage { .. } => Duration::from_secs(30),
-            SidebandRequest::PaneSignal { .. } => Duration::from_secs(5),
-        }
+    fn write_budget() -> Duration {
+        Duration::from_secs(20)
     }
 }
 
-struct AuthorizedLifecycleRequest {
-    request: SidebandRequest,
-    target_session: String,
+trait PaneProcess: Send + Sync {
+    fn pid(&self) -> u32;
+    fn is_alive(&self) -> Result<bool>;
+    fn belongs_to(&self, pty: &dyn PtySession) -> Result<bool>;
 }
 
-#[derive(Debug, Clone)]
-struct RequestAckContext {
-    request_id: String,
-    action: String,
+#[cfg(windows)]
+struct WindowsPaneProcess {
+    process: PinnedProcess,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct DispatchReactionKey {
-    request_id: String,
+#[cfg(windows)]
+impl WindowsPaneProcess {
+    fn open(process_id: u32) -> Result<Self> {
+        Ok(Self {
+            process: PinnedProcess::open(process_id)?,
+        })
+    }
+}
+
+#[cfg(windows)]
+impl PaneProcess for WindowsPaneProcess {
+    fn pid(&self) -> u32 {
+        self.process.pid()
+    }
+
+    fn is_alive(&self) -> Result<bool> {
+        self.process.is_alive()
+    }
+
+    fn belongs_to(&self, pty: &dyn PtySession) -> Result<bool> {
+        pty.contains_process(&self.process)
+    }
+}
+
+#[derive(Clone)]
+struct PaneCaller {
     session: String,
+    session_id: Uuid,
+    generation: SessionGeneration,
+    run_id: Uuid,
+    process: Arc<dyn PaneProcess>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DispatchReactionOutcome {
-    Reacted,
-    Terminal,
-}
-
-struct PendingDispatchReaction {
-    baseline: Instant,
-    sender: mpsc::Sender<DispatchReactionOutcome>,
-}
-
-struct DispatchReactionWaiter {
-    key: DispatchReactionKey,
-    receiver: mpsc::Receiver<DispatchReactionOutcome>,
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct AutoRestartOnStallConfig {
-    allowed_sessions: HashSet<String>,
+    allowed_sessions: RwLock<HashSet<SessionId>>,
     threshold: Duration,
 }
 
 impl AutoRestartOnStallConfig {
-    fn enabled_for(&self, session: &str) -> bool {
-        self.allowed_sessions.contains(session)
+    fn enabled_for(&self, session_id: SessionId) -> bool {
+        self.allowed_sessions.read().contains(&session_id)
     }
 }
 
@@ -155,19 +445,21 @@ struct AutoRestartHistory {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AutoRestartReservation {
-    Reserved,
+    Reserved(Instant),
     CapReached,
     Disabled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StallAlertSnapshot {
+    session_id: SessionId,
     last_work_state: Option<WorkState>,
     last_session_state: Option<LifecycleState>,
 }
 
 struct StallDetector {
     generation: SessionGeneration,
+    run_id: Uuid,
     state: WorkState,
     entered_at: Instant,
     handle: tokio::task::JoinHandle<()>,
@@ -177,6 +469,22 @@ struct StallDetector {
 struct DeliveryWriteResult {
     bytes_written: usize,
     payload_part_count: u32,
+}
+
+#[derive(Clone)]
+struct RunWriteTarget {
+    session: String,
+    session_id: Uuid,
+    run_id: Uuid,
+    generation: SessionGeneration,
+    pty: Arc<dyn PtySession>,
+    input_gate: Arc<RunInputGate>,
+}
+
+struct PlannedDelivery {
+    target: RunWriteTarget,
+    submit_behavior: SubmitBehavior,
+    payload: String,
 }
 
 struct RouteDeliveryEvent {
@@ -194,16 +502,6 @@ struct RouteDeliveryEvent {
     error: Option<String>,
 }
 
-struct SidebandLifecycleEvent<'a> {
-    request_id: &'a str,
-    action: &'a str,
-    session: Option<&'a str>,
-    extra_args: &'a [String],
-    phase: SidebandPhase,
-    elapsed: Duration,
-    error: Option<String>,
-}
-
 struct SupervisorAlertEvent {
     alert_type: SupervisorAlertType,
     request_id: Option<String>,
@@ -213,15 +511,6 @@ struct SupervisorAlertEvent {
     last_session_state: Option<LifecycleState>,
     message: String,
     severity: AlertSeverity,
-}
-
-struct PaneSignalRecord {
-    session: String,
-    task_id: String,
-    signal_type: PaneSignalType,
-    summary: String,
-    artifact_paths: Vec<String>,
-    commit_sha: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,19 +524,44 @@ struct DispatchAttemptDecision {
 }
 
 impl DispatchAttemptDecision {
+    fn from_slot(slot: &SessionSlot) -> Self {
+        let mut decision = Self {
+            target_lifecycle_state_before: slot.state,
+            target_work_state_before: slot.work_state_observed.then_some(slot.work_state),
+            target_last_activity_at: slot.last_activity_at.clone(),
+            last_route_from_target_at: slot.last_route_from_session_at.clone(),
+            last_route_from_target_instant: slot.last_route_from_session_instant,
+            reason: None,
+        };
+        decision.reason = dispatch_overlap_reason(&decision);
+        decision
+    }
+
     fn overlap(&self) -> bool {
         self.reason.is_some()
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PaneSignalWritePaths {
-    signal_path: PathBuf,
-    legacy_touch_path: PathBuf,
-}
-
 trait PtySpawner: Send + Sync {
     fn spawn(&self, spec: &LaunchSpec, handler: PtyEventHandler) -> Result<Box<dyn PtySession>>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedLaunchProgram {
+    program: String,
+    prefix_args: Vec<String>,
+}
+
+trait DriverExecutableResolver: Send + Sync {
+    fn resolve(&self, driver: DriverKind) -> Result<ResolvedLaunchProgram>;
+}
+
+struct HostDriverExecutableResolver;
+
+impl DriverExecutableResolver for HostDriverExecutableResolver {
+    fn resolve(&self, driver: DriverKind) -> Result<ResolvedLaunchProgram> {
+        resolve_driver_executable(driver)
+    }
 }
 
 struct ConcretePtySpawner;
@@ -258,41 +572,18 @@ impl PtySpawner for ConcretePtySpawner {
     }
 }
 
-// Exploration Finding 10 showed that very long routed messages could arrive
-// truncated inside Claude's queued-message rendering even though the audit log
-// still held the full routed_message payload. Keeping each Claude-targeted
-// routed input below a conservative size is the least invasive mitigation.
-const CLAUDE_ROUTED_MESSAGE_MAX_CHARS: usize = 500;
-// Codex starts staging large payloads as "[Pasted Content N chars]" once the
-// flattened routed input crosses its paste-detection threshold, so keep routed
-// and deliver payloads comfortably below that boundary.
-const CODEX_ROUTED_MESSAGE_MAX_CHARS: usize = 800;
-
 #[derive(Debug, Clone)]
 pub struct SupervisorConfig {
     pub working_root: PathBuf,
     pub runtime_dir: PathBuf,
-    pub cross_pair_room_broadcast: bool,
     pub heartbeat_interval: Option<Duration>,
-    pub auto_restart_on_stall_sessions: Option<Vec<String>>,
+    pub auto_restart_on_stall_sessions: Option<Vec<SessionId>>,
     pub auto_restart_stall_threshold: Option<Duration>,
-    pub reaction_window: Option<Duration>,
 }
 
 struct AuditInner {
     path: PathBuf,
     active_date: NaiveDate,
-}
-
-struct AuditReadBatch {
-    lines: Vec<AuditLine>,
-    next_offset: u64,
-    reached_eof: bool,
-}
-
-struct AuditLine {
-    text: String,
-    next_offset: u64,
 }
 
 struct AuditLog {
@@ -320,140 +611,6 @@ impl AuditLog {
 
     fn path(&self) -> PathBuf {
         self.inner.lock().path.clone()
-    }
-
-    fn active_file_name(&self) -> String {
-        audit_file_name(self.inner.lock().active_date)
-    }
-
-    fn resolve_path(&self, audit_file: &str) -> PathBuf {
-        self.dir.join(audit_file)
-    }
-
-    fn source_exists(&self, audit_file: &str) -> bool {
-        self.resolve_path(audit_file).exists() || self.gzip_path_for(audit_file).exists()
-    }
-
-    fn open_reader(&self, audit_file: &str) -> Result<Option<Box<dyn Read + Send>>> {
-        let plain = self.resolve_path(audit_file);
-        if plain.exists() {
-            let file = File::open(&plain)
-                .with_context(|| format!("audit read error: failed to open {}", plain.display()))?;
-            return Ok(Some(Box::new(file)));
-        }
-
-        let gz = self.gzip_path_for(audit_file);
-        if gz.exists() {
-            let file = File::open(&gz)
-                .with_context(|| format!("audit read error: failed to open {}", gz.display()))?;
-            return Ok(Some(Box::new(flate2::read::GzDecoder::new(file))));
-        }
-
-        Ok(None)
-    }
-
-    fn uncompressed_len(&self, audit_file: &str) -> Result<u64> {
-        let plain = self.resolve_path(audit_file);
-        match fs::metadata(&plain) {
-            Ok(metadata) => return Ok(metadata.len()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("audit read error: failed to stat {}", plain.display())
-                });
-            }
-        }
-
-        let gz = self.gzip_path_for(audit_file);
-        if !gz.exists() {
-            return Ok(0);
-        }
-
-        let file = File::open(&gz)
-            .with_context(|| format!("audit read error: failed to open {}", gz.display()))?;
-        let mut decoder = flate2::read::GzDecoder::new(file);
-        let mut sink = std::io::sink();
-        std::io::copy(&mut decoder, &mut sink)
-            .with_context(|| format!("audit read error: gz decode failed for {}", gz.display()))
-    }
-
-    fn read_lines_since(
-        &self,
-        audit_file: &str,
-        byte_offset: u64,
-        max_lines: usize,
-    ) -> Result<AuditReadBatch> {
-        if max_lines == 0 {
-            return Ok(AuditReadBatch {
-                lines: Vec::new(),
-                next_offset: byte_offset,
-                reached_eof: false,
-            });
-        }
-
-        let Some(mut reader) = self.open_reader(audit_file)? else {
-            return Ok(AuditReadBatch {
-                lines: Vec::new(),
-                next_offset: byte_offset,
-                reached_eof: true,
-            });
-        };
-
-        // Offsets are measured in the uncompressed JSONL stream. Gzip archives
-        // cannot seek, so replay from a non-zero cursor decodes and discards.
-        let mut remaining = byte_offset;
-        let mut skipped = 0_u64;
-        let mut discard = [0_u8; 8192];
-        while remaining > 0 {
-            let take = remaining.min(discard.len() as u64) as usize;
-            let read = reader
-                .read(&mut discard[..take])
-                .with_context(|| format!("audit read error: failed to seek into {audit_file}"))?;
-            if read == 0 {
-                return Ok(AuditReadBatch {
-                    lines: Vec::new(),
-                    next_offset: skipped,
-                    reached_eof: true,
-                });
-            }
-            remaining -= read as u64;
-            skipped += read as u64;
-        }
-
-        let mut reader = StdBufReader::new(reader);
-        let mut offset = byte_offset;
-        let mut lines = Vec::new();
-        let mut line = Vec::new();
-
-        loop {
-            line.clear();
-            let read = reader
-                .read_until(b'\n', &mut line)
-                .with_context(|| format!("audit read error: failed to read {audit_file}"))?;
-            if read == 0 {
-                return Ok(AuditReadBatch {
-                    lines,
-                    next_offset: offset,
-                    reached_eof: true,
-                });
-            }
-
-            offset += read as u64;
-            let line_text = String::from_utf8(line.clone())
-                .with_context(|| format!("audit read error: invalid UTF-8 in {audit_file}"))?;
-            lines.push(AuditLine {
-                text: line_text.trim_end_matches(['\r', '\n']).to_string(),
-                next_offset: offset,
-            });
-
-            if lines.len() >= max_lines {
-                return Ok(AuditReadBatch {
-                    lines,
-                    next_offset: offset,
-                    reached_eof: false,
-                });
-            }
-        }
     }
 
     fn append(&self, event: &RuntimeEvent) -> Result<()> {
@@ -522,14 +679,373 @@ impl AuditLog {
             }
         }
     }
+}
 
-    fn gzip_path_for(&self, audit_file: &str) -> PathBuf {
-        self.dir.join(format!("{audit_file}.gz"))
+#[derive(Clone)]
+struct RunningSession {
+    pty: Option<Arc<dyn PtySession>>,
+    input_gate: Arc<RunInputGate>,
+}
+
+impl RunningSession {
+    fn new(pty: Option<Arc<dyn PtySession>>) -> Self {
+        Self {
+            pty,
+            input_gate: Arc::new(RunInputGate::new()),
+        }
+    }
+
+    fn close_input(&self) {
+        self.input_gate.close();
     }
 }
 
-struct RunningSession {
-    pty: Option<Box<dyn PtySession>>,
+struct RunInputGate {
+    state: Mutex<RunInputState>,
+    ready: Condvar,
+}
+
+struct RunInputState {
+    accepting: bool,
+    active: bool,
+    cancellation_barrier: bool,
+    next_ticket: u64,
+    queue: VecDeque<u64>,
+}
+
+struct RunInputPermit<'a> {
+    gate: &'a RunInputGate,
+    control: Option<&'a InputWriteControl>,
+}
+
+const INPUT_WRITE_PENDING: u8 = 0;
+const INPUT_WRITE_ACTIVE: u8 = 1;
+const INPUT_WRITE_CANCELLED_BEFORE_START: u8 = 2;
+const INPUT_WRITE_CANCELLING: u8 = 3;
+const INPUT_WRITE_FINISHED: u8 = 4;
+const INPUT_WRITE_FINISHED_AFTER_CANCEL: u8 = 5;
+
+struct InputWriteControl {
+    state: AtomicU8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputCancelDisposition {
+    BeforeStart,
+    InFlight,
+    Finished,
+}
+
+struct RunEventPublishState {
+    next_sequence: Option<u64>,
+    pending: BTreeMap<u64, RuntimeEvent>,
+    draining: bool,
+}
+
+impl RunEventPublishState {
+    fn new(next_sequence: u64) -> Self {
+        Self {
+            next_sequence: Some(next_sequence),
+            pending: BTreeMap::new(),
+            draining: false,
+        }
+    }
+}
+
+impl RunInputGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(RunInputState {
+                accepting: true,
+                active: false,
+                cancellation_barrier: false,
+                next_ticket: 0,
+                queue: VecDeque::new(),
+            }),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn begin_write<'a>(
+        &'a self,
+        control: Option<&'a InputWriteControl>,
+    ) -> Result<RunInputPermit<'a>> {
+        let mut state = self.state.lock();
+        if !state.accepting {
+            return Err(anyhow!("run is closed for input"));
+        }
+        let ticket = state.next_ticket;
+        state.next_ticket = state
+            .next_ticket
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("run input ticket space exhausted"))?;
+        state.queue.push_back(ticket);
+
+        loop {
+            if control.is_some_and(InputWriteControl::cancelled_before_start) {
+                if let Some(position) = state.queue.iter().position(|queued| *queued == ticket) {
+                    state.queue.remove(position);
+                }
+                self.ready.notify_all();
+                return Err(anyhow!("input write cancelled before PTY input began"));
+            }
+            if !state.accepting {
+                if let Some(position) = state.queue.iter().position(|queued| *queued == ticket) {
+                    state.queue.remove(position);
+                }
+                self.ready.notify_all();
+                return Err(anyhow!("run is closed for input"));
+            }
+            if !state.active && !state.cancellation_barrier && state.queue.front() == Some(&ticket)
+            {
+                state.queue.pop_front();
+                state.active = true;
+                return Ok(RunInputPermit {
+                    gate: self,
+                    control,
+                });
+            }
+            self.ready.wait(&mut state);
+        }
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock();
+        state.accepting = false;
+        self.ready.notify_all();
+    }
+
+    fn is_accepting(&self) -> bool {
+        self.state.lock().accepting
+    }
+
+    fn wake_waiters(&self) {
+        self.ready.notify_all();
+    }
+
+    fn begin_cancellation_barrier(&self) {
+        self.state.lock().cancellation_barrier = true;
+    }
+
+    fn end_cancellation_barrier(&self) {
+        let mut state = self.state.lock();
+        state.cancellation_barrier = false;
+        self.ready.notify_all();
+    }
+
+    fn wait_until_idle_timeout(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock();
+        while state.active || !state.queue.is_empty() {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            self.ready.wait_for(&mut state, deadline - now);
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn queued_writes(&self) -> usize {
+        self.state.lock().queue.len()
+    }
+}
+
+struct TerminationAttempt {
+    kill_error: Option<String>,
+    exit_status: Option<PtyExitStatus>,
+    exit_poll_error: Option<String>,
+    input_idle: bool,
+}
+
+enum BoundedTerminationAttempt {
+    Completed(TerminationAttempt),
+    TimedOut(mpsc::Receiver<TerminationAttempt>),
+}
+
+fn begin_termination_attempt(
+    pty: Arc<dyn PtySession>,
+    input_gate: Arc<RunInputGate>,
+    deadline: Instant,
+) -> mpsc::Receiver<TerminationAttempt> {
+    let (tx, rx) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let kill_error = pty.kill().err().map(|error| error.to_string());
+        let (exit_status, exit_poll_error) = match pty.try_wait() {
+            Ok(status) => (status, None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        let input_idle = kill_error.is_none()
+            && input_gate
+                .wait_until_idle_timeout(deadline.saturating_duration_since(Instant::now()));
+        let _ = tx.send(TerminationAttempt {
+            kill_error,
+            exit_status,
+            exit_poll_error,
+            input_idle,
+        });
+    });
+    rx
+}
+
+fn terminate_running_session_bounded(
+    pty: Arc<dyn PtySession>,
+    input_gate: Arc<RunInputGate>,
+    timeout: Duration,
+) -> BoundedTerminationAttempt {
+    let deadline = Instant::now() + timeout;
+    let rx = begin_termination_attempt(pty, input_gate, deadline);
+    match rx.recv_timeout(timeout) {
+        Ok(attempt) => BoundedTerminationAttempt::Completed(attempt),
+        Err(_) => BoundedTerminationAttempt::TimedOut(rx),
+    }
+}
+
+impl InputWriteControl {
+    fn new() -> Self {
+        Self {
+            state: AtomicU8::new(INPUT_WRITE_PENDING),
+        }
+    }
+
+    fn begin_pty_write(&self) -> Result<()> {
+        match self.state.compare_exchange(
+            INPUT_WRITE_PENDING,
+            INPUT_WRITE_ACTIVE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(INPUT_WRITE_CANCELLED_BEFORE_START) => {
+                Err(anyhow!("input write cancelled before PTY input began"))
+            }
+            Err(state) => Err(anyhow!(
+                "input write entered an invalid cancellation state {state}"
+            )),
+        }
+    }
+
+    fn finish(&self) {
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+            let finished = match state {
+                INPUT_WRITE_ACTIVE => INPUT_WRITE_FINISHED,
+                INPUT_WRITE_CANCELLING => INPUT_WRITE_FINISHED_AFTER_CANCEL,
+                INPUT_WRITE_CANCELLED_BEFORE_START => INPUT_WRITE_FINISHED_AFTER_CANCEL,
+                INPUT_WRITE_FINISHED | INPUT_WRITE_FINISHED_AFTER_CANCEL => return,
+                other => panic!("invalid input-write completion state {other}"),
+            };
+            if self
+                .state
+                .compare_exchange(state, finished, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    fn request_cancel(&self) -> InputCancelDisposition {
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+            match state {
+                INPUT_WRITE_PENDING => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            INPUT_WRITE_PENDING,
+                            INPUT_WRITE_CANCELLED_BEFORE_START,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return InputCancelDisposition::BeforeStart;
+                    }
+                }
+                INPUT_WRITE_ACTIVE => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            INPUT_WRITE_ACTIVE,
+                            INPUT_WRITE_CANCELLING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return InputCancelDisposition::InFlight;
+                    }
+                }
+                INPUT_WRITE_CANCELLED_BEFORE_START => {
+                    return InputCancelDisposition::BeforeStart;
+                }
+                INPUT_WRITE_CANCELLING => return InputCancelDisposition::InFlight,
+                INPUT_WRITE_FINISHED | INPUT_WRITE_FINISHED_AFTER_CANCEL => {
+                    return InputCancelDisposition::Finished;
+                }
+                other => panic!("invalid input-write cancellation state {other}"),
+            }
+        }
+    }
+
+    fn cancelled_before_start(&self) -> bool {
+        self.state.load(Ordering::Acquire) == INPUT_WRITE_CANCELLED_BEFORE_START
+    }
+
+    fn cancellation_was_requested(&self) -> bool {
+        matches!(
+            self.state.load(Ordering::Acquire),
+            INPUT_WRITE_CANCELLING | INPUT_WRITE_FINISHED_AFTER_CANCEL
+        )
+    }
+}
+
+impl Drop for RunInputPermit<'_> {
+    fn drop(&mut self) {
+        let mut state = self.gate.state.lock();
+        if self
+            .control
+            .is_some_and(InputWriteControl::cancellation_was_requested)
+        {
+            state.cancellation_barrier = true;
+        }
+        state.active = false;
+        self.gate.ready.notify_all();
+    }
+}
+
+struct BackgroundRuntime(Option<tokio::runtime::Runtime>);
+
+impl BackgroundRuntime {
+    fn new(runtime: tokio::runtime::Runtime) -> Self {
+        Self(Some(runtime))
+    }
+
+    fn spawn<Future>(&self, future: Future) -> tokio::task::JoinHandle<Future::Output>
+    where
+        Future: std::future::Future + Send + 'static,
+        Future::Output: Send + 'static,
+    {
+        self.0
+            .as_ref()
+            .expect("background runtime unavailable during supervisor lifetime")
+            .spawn(future)
+    }
+}
+
+impl Drop for BackgroundRuntime {
+    fn drop(&mut self) {
+        let Some(runtime) = self.0.take() else {
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            runtime.shutdown_background();
+        } else {
+            drop(runtime);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -544,22 +1060,71 @@ struct StopIntent {
     kind: StopIntentKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LifecycleOperation {
+    generation: SessionGeneration,
+    kind: StopIntentKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SpawnReservation {
+    generation: SessionGeneration,
+    run_id: Uuid,
+}
+
+enum RunRetirementCause {
+    OutputClosed,
+    PtyError(String),
+    Liveness {
+        final_state: LifecycleState,
+        fallback_reason: SessionExitReason,
+        detail: String,
+    },
+}
+
+impl RunRetirementCause {
+    fn final_state(&self) -> LifecycleState {
+        match self {
+            Self::OutputClosed => LifecycleState::Closed,
+            Self::PtyError(_) => LifecycleState::Failed,
+            Self::Liveness { final_state, .. } => *final_state,
+        }
+    }
+
+    fn detail(&self) -> &str {
+        match self {
+            Self::OutputClosed => "session output closed",
+            Self::PtyError(error) => error,
+            Self::Liveness { detail, .. } => detail,
+        }
+    }
+}
+
 struct QuiesceTimer {
     generation: SessionGeneration,
+    run_id: Uuid,
     handle: tokio::task::JoinHandle<()>,
 }
 
 struct SessionSlot {
+    session_id: Uuid,
     definition: SessionDefinition,
+    qualified_working_directory: Option<QualifiedWorkingDirectory>,
     state: LifecycleState,
     work_state: WorkState,
     work_state_observed: bool,
     work_detail: Option<String>,
-    launch_banner_seen: bool,
     work_error_observations: HashMap<String, Vec<Instant>>,
     running: Option<RunningSession>,
+    run_id: Option<Uuid>,
+    last_run_id: Option<Uuid>,
+    bracketed_paste: BracketedPasteRunState,
+    run_event_sequence: u64,
     generation: SessionGeneration,
+    spawn_in_flight: Option<SpawnReservation>,
+    lifecycle_operation: Option<LifecycleOperation>,
     stop_intent: Option<StopIntent>,
+    termination_uncertain: bool,
     process_id: Option<u32>,
     last_activity_at: Option<String>,
     last_real_output_at: Option<Instant>,
@@ -575,11 +1140,16 @@ struct SessionSlot {
 impl SessionSlot {
     fn snapshot(&self) -> SessionSnapshot {
         SessionSnapshot {
-            name: self.definition.name.clone(),
-            title: self.definition.title.clone(),
+            session_id: self.session_id,
+            alias: self.definition.alias.clone(),
+            label: self.definition.label.clone(),
             driver: self.definition.driver,
+            permission_profile: self.definition.permission_profile,
             lifecycle_state: self.state,
             working_dir: self.definition.working_dir.clone(),
+            generation: self.generation,
+            run_id: self.run_id,
+            run_event_sequence: self.run_event_sequence,
             process_id: self.process_id,
             running: self.running.is_some(),
             last_activity_at: self.last_activity_at.clone(),
@@ -588,8 +1158,250 @@ impl SessionSlot {
     }
 
     fn title(&self) -> &str {
-        &self.definition.title
+        &self.definition.label
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct QualifiedWorkingDirectory {
+    canonical_path: String,
+    identity: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PersistedSessionV1 {
+    session_id: SessionId,
+    label: String,
+    driver: DriverKind,
+    working_directory: QualifiedWorkingDirectory,
+    permission_profile: shared_types::PermissionProfile,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct SessionCatalogV1 {
+    schema_version: u32,
+    workspace_preference: QualifiedWorkingDirectory,
+    sessions: Vec<PersistedSessionV1>,
+}
+
+impl SessionCatalogV1 {
+    fn empty(workspace_preference: QualifiedWorkingDirectory) -> Self {
+        Self {
+            schema_version: SESSION_CATALOG_SCHEMA_VERSION,
+            workspace_preference,
+            sessions: Vec::new(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct SessionRegistry {
+    by_id: HashMap<SessionId, SessionSlot>,
+    order: Vec<SessionId>,
+    alias_to_id: HashMap<String, SessionId>,
+}
+
+impl SessionRegistry {
+    fn from_catalog(catalog: &SessionCatalogV1) -> Result<Self> {
+        let mut registry = Self::default();
+        for persisted in &catalog.sessions {
+            if registry.by_id.contains_key(&persisted.session_id) {
+                return Err(anyhow!(
+                    "session catalog contains duplicate session id '{}'",
+                    persisted.session_id
+                ));
+            }
+            validate_session_label(&persisted.label)?;
+            if persisted.driver == DriverKind::GenericTerminal
+                && persisted.permission_profile == shared_types::PermissionProfile::Unsafe
+            {
+                return Err(anyhow!(
+                    "generic terminal session '{}' cannot use the unsafe permission profile",
+                    persisted.session_id
+                ));
+            }
+            let definition = SessionDefinition {
+                session_id: persisted.session_id,
+                alias: session_alias(persisted.session_id),
+                label: persisted.label.clone(),
+                driver: persisted.driver,
+                working_dir: persisted.working_directory.canonical_path.clone(),
+                permission_profile: persisted.permission_profile,
+            };
+            let mut slot = closed_session_slot(definition);
+            slot.qualified_working_directory = Some(persisted.working_directory.clone());
+            registry.insert(slot)?;
+        }
+        Ok(registry)
+    }
+
+    fn insert(&mut self, slot: SessionSlot) -> Result<()> {
+        self.validate_insert(&slot)?;
+        self.insert_prevalidated(slot);
+        Ok(())
+    }
+
+    fn validate_insert(&self, slot: &SessionSlot) -> Result<()> {
+        let session_id = slot.session_id;
+        if self.by_id.contains_key(&session_id) {
+            return Err(anyhow!("duplicate session id '{session_id}'"));
+        }
+        let alias = &slot.definition.alias;
+        if self.alias_to_id.contains_key(alias) {
+            return Err(anyhow!("duplicate internal session alias '{alias}'"));
+        }
+        Ok(())
+    }
+
+    fn insert_prevalidated(&mut self, slot: SessionSlot) {
+        debug_assert!(self.validate_insert(&slot).is_ok());
+        let session_id = slot.session_id;
+        let alias = slot.definition.alias.clone();
+        self.alias_to_id.insert(alias, session_id);
+        self.order.push(session_id);
+        self.by_id.insert(session_id, slot);
+    }
+
+    fn get_by_id(&self, session_id: SessionId) -> Option<&SessionSlot> {
+        self.by_id.get(&session_id)
+    }
+
+    fn get_by_id_mut(&mut self, session_id: SessionId) -> Option<&mut SessionSlot> {
+        self.by_id.get_mut(&session_id)
+    }
+
+    fn get_by_alias(&self, alias: &str) -> Option<&SessionSlot> {
+        self.alias_to_id
+            .get(alias)
+            .and_then(|session_id| self.by_id.get(session_id))
+    }
+
+    fn remove(&mut self, session_id: SessionId) -> Option<SessionSlot> {
+        let slot = self.by_id.remove(&session_id)?;
+        self.alias_to_id.remove(&slot.definition.alias);
+        self.order.retain(|candidate| *candidate != session_id);
+        Some(slot)
+    }
+
+    fn ordered_slots(&self) -> impl Iterator<Item = &SessionSlot> {
+        self.order
+            .iter()
+            .filter_map(|session_id| self.by_id.get(session_id))
+    }
+
+    fn ordered_snapshots(&self) -> Vec<SessionSnapshot> {
+        self.ordered_slots().map(SessionSlot::snapshot).collect()
+    }
+
+    #[cfg(test)]
+    fn get(&self, alias_or_legacy_label: &str) -> Option<&SessionSlot> {
+        if let Some(slot) = self.get_by_alias(alias_or_legacy_label) {
+            return Some(slot);
+        }
+        let mut matches = self.ordered_slots().filter(|slot| {
+            slot.definition
+                .label
+                .eq_ignore_ascii_case(alias_or_legacy_label)
+        });
+        let only = matches.next()?;
+        matches.next().is_none().then_some(only)
+    }
+
+    #[cfg(test)]
+    fn get_mut(&mut self, alias_or_legacy_label: &str) -> Option<&mut SessionSlot> {
+        let session_id = if let Some(session_id) = self.alias_to_id.get(alias_or_legacy_label) {
+            *session_id
+        } else {
+            let mut matches = self.order.iter().copied().filter(|session_id| {
+                self.by_id.get(session_id).is_some_and(|slot| {
+                    slot.definition
+                        .label
+                        .eq_ignore_ascii_case(alias_or_legacy_label)
+                })
+            });
+            let only = matches.next()?;
+            if matches.next().is_some() {
+                return None;
+            }
+            only
+        };
+        self.by_id.get_mut(&session_id)
+    }
+
+    #[cfg(test)]
+    fn values(&self) -> impl Iterator<Item = &SessionSlot> {
+        self.ordered_slots()
+    }
+}
+
+fn session_alias(session_id: SessionId) -> String {
+    format!("session-{session_id}")
+}
+
+fn validate_session_label(label: &str) -> Result<()> {
+    let trimmed = label.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("session label cannot be empty"));
+    }
+    if trimmed != label {
+        return Err(anyhow!(
+            "session label cannot contain leading or trailing whitespace"
+        ));
+    }
+    if trimmed.chars().count() > SESSION_LABEL_MAX_CHARS {
+        return Err(anyhow!(
+            "session label cannot exceed {SESSION_LABEL_MAX_CHARS} characters"
+        ));
+    }
+    if trimmed.chars().any(|character| character.is_control()) {
+        return Err(anyhow!("session label cannot contain control characters"));
+    }
+    Ok(())
+}
+
+fn ensure_closed_for_definition_edit(slot: &SessionSlot) -> Result<()> {
+    if slot.state != LifecycleState::Closed
+        || slot.running.is_some()
+        || slot.run_id.is_some()
+        || slot.spawn_in_flight.is_some()
+        || slot.lifecycle_operation.is_some()
+        || slot.stop_intent.is_some()
+        || slot.termination_uncertain
+    {
+        return Err(anyhow!(
+            "session '{}' must be fully closed before this operation",
+            slot.session_id
+        ));
+    }
+    Ok(())
+}
+
+fn next_run_event_identity(slot: &mut SessionSlot, run_id: Uuid) -> RunEventIdentity {
+    slot.run_event_sequence = slot
+        .run_event_sequence
+        .checked_add(1)
+        .expect("run event capacity must be reserved before slot mutation");
+    RunEventIdentity {
+        session_id: slot.session_id,
+        run_id,
+        generation: slot.generation,
+        sequence: slot.run_event_sequence,
+    }
+}
+
+fn ensure_run_event_capacity(slot: &SessionSlot, required: u64) -> Result<()> {
+    slot.run_event_sequence
+        .checked_add(required)
+        .map(|_| ())
+        .ok_or_else(|| {
+            anyhow!(
+                "run event sequence exhausted for '{}'",
+                slot.definition.alias
+            )
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -698,19 +1510,6 @@ fn classify_pty_error_exit(
     }
 }
 
-fn poll_pty_exit_status(
-    running: Option<&RunningSession>,
-) -> (Option<PtyExitStatus>, Option<String>) {
-    let Some(pty) = running.and_then(|running| running.pty.as_ref()) else {
-        return (None, None);
-    };
-
-    match pty.try_wait() {
-        Ok(status) => (status, None),
-        Err(error) => (None, Some(error.to_string())),
-    }
-}
-
 fn exit_code_i32(exit_code: u32) -> Option<i32> {
     i32::try_from(exit_code).ok()
 }
@@ -777,14 +1576,14 @@ fn session_exit_last_error(
 
 fn session_exit_event(
     session: String,
-    generation: SessionGeneration,
+    identity: RunEventIdentity,
     process_id: Option<u32>,
     classification: &SessionExitClassification,
     timestamp: String,
 ) -> RuntimeEvent {
     RuntimeEvent::SessionExit {
+        identity,
         session,
-        generation,
         process_id,
         exit_code: classification.exit_code,
         signal: classification.signal,
@@ -795,156 +1594,27 @@ fn session_exit_event(
     }
 }
 
-fn named_claude_session(name: &str, title: &str, working_dir: &str) -> SessionDefinition {
-    let mut definition = driver_claude::default_session(working_dir);
-    definition.name = name.into();
-    definition.title = title.into();
-    definition
-}
-
-fn named_codex_session(name: &str, title: &str, working_dir: &str) -> SessionDefinition {
-    let mut definition = driver_codex::default_session(working_dir);
-    definition.name = name.into();
-    definition.title = title.into();
-    definition
-}
-
-fn default_session_definitions(working_dir: &str) -> Vec<SessionDefinition> {
-    vec![
-        driver_claude::default_session(working_dir),
-        driver_codex::default_session(working_dir),
-    ]
-}
-
-fn pair_slot_names(name: &str) -> (String, String) {
-    (format!("{name}-claude"), format!("{name}-codex"))
-}
-
-/// Group sessions into "pairs" by naming convention.
-///
-/// - `claude` and `codex` (the protected main pair) -> `"main"`
-/// - `<prefix>-claude` and `<prefix>-codex` -> `<prefix>`
-/// - any other name -> the name itself (singleton pair, e.g. `operator`)
-///
-/// `"main"` is collision-safe because it is reserved by `validate_pair_name`.
-fn pair_of(session_name: &str) -> &str {
-    if session_name == "claude" || session_name == "codex" {
-        return "main";
-    }
-    if let Some(stem) = session_name.strip_suffix("-claude")
-        && !stem.is_empty()
-    {
-        return stem;
-    }
-    if let Some(stem) = session_name.strip_suffix("-codex")
-        && !stem.is_empty()
-    {
-        return stem;
-    }
-    session_name
-}
-
-fn pair_title_stem(name: &str) -> String {
-    let parts = name
-        .split(['-', '_'])
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            let mut chars = part.chars();
-            let Some(first) = chars.next() else {
-                return String::new();
-            };
-            let mut word = first.to_uppercase().collect::<String>();
-            word.push_str(chars.as_str());
-            word
-        })
-        .collect::<Vec<_>>();
-
-    if parts.is_empty() {
-        name.to_string()
-    } else {
-        parts.join(" ")
-    }
-}
-
-fn pair_session_definitions(name: &str, working_dir: &str) -> [SessionDefinition; 2] {
-    let title_stem = pair_title_stem(name);
-    let (claude_name, codex_name) = pair_slot_names(name);
-    [
-        named_claude_session(&claude_name, &format!("{title_stem} · Claude"), working_dir),
-        named_codex_session(&codex_name, &format!("{title_stem} · Codex"), working_dir),
-    ]
-}
-
-fn validate_pair_name(name: &str) -> Result<()> {
-    if name.is_empty() {
-        return Err(anyhow!("pair name cannot be empty"));
-    }
-    if name.len() > PAIR_NAME_MAX_LEN {
-        return Err(anyhow!(
-            "pair name cannot exceed {PAIR_NAME_MAX_LEN} characters"
-        ));
-    }
-    if RESERVED_PAIR_NAMES.contains(&name) {
-        return Err(anyhow!("pair name '{name}' is reserved"));
-    }
-    if !name
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
-    {
-        return Err(anyhow!(
-            "pair name '{name}' may only contain letters, numbers, hyphens, and underscores"
-        ));
-    }
-
-    Ok(())
-}
-
-fn ensure_pair_name_available(slots: &HashMap<String, SessionSlot>, name: &str) -> Result<()> {
-    let (claude_name, codex_name) = pair_slot_names(name);
-    if slots.contains_key(&claude_name) || slots.contains_key(&codex_name) {
-        return Err(anyhow!("pair '{name}' already exists"));
-    }
-
-    Ok(())
-}
-
-fn renamed_closed_slot(slot: SessionSlot, definition: SessionDefinition) -> SessionSlot {
-    SessionSlot {
-        definition,
-        state: LifecycleState::Closed,
-        work_state: WorkState::Idle,
-        work_state_observed: false,
-        work_detail: None,
-        launch_banner_seen: false,
-        work_error_observations: HashMap::new(),
-        running: None,
-        generation: slot.generation,
-        stop_intent: None,
-        process_id: None,
-        last_activity_at: slot.last_activity_at,
-        last_real_output_at: None,
-        last_route_from_session_at: slot.last_route_from_session_at,
-        last_route_from_session_instant: slot.last_route_from_session_instant,
-        last_error: slot.last_error,
-        quiesce_timer: None,
-        stall_state_entered_at: None,
-        stall_state_entered_timestamp: None,
-        stall_detector: None,
-    }
-}
-
 fn closed_session_slot(definition: SessionDefinition) -> SessionSlot {
+    let session_id = definition.session_id;
     SessionSlot {
+        session_id,
         definition,
+        qualified_working_directory: None,
         state: LifecycleState::Closed,
         work_state: WorkState::Idle,
         work_state_observed: false,
         work_detail: None,
-        launch_banner_seen: false,
         work_error_observations: HashMap::new(),
         running: None,
+        run_id: None,
+        last_run_id: None,
+        bracketed_paste: BracketedPasteRunState::default(),
+        run_event_sequence: 0,
         generation: 0,
+        spawn_in_flight: None,
+        lifecycle_operation: None,
         stop_intent: None,
+        termination_uncertain: false,
         process_id: None,
         last_activity_at: None,
         last_real_output_at: None,
@@ -958,44 +1628,126 @@ fn closed_session_slot(definition: SessionDefinition) -> SessionSlot {
     }
 }
 
+fn run_write_target_from_slot(name: &str, slot: &SessionSlot) -> Result<RunWriteTarget> {
+    let running = slot
+        .running
+        .as_ref()
+        .ok_or_else(|| anyhow!("session '{name}' is not running"))?;
+    let pty = running
+        .pty
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| anyhow!("session '{name}' transport is not available"))?;
+    let run_id = slot
+        .run_id
+        .ok_or_else(|| anyhow!("session '{name}' has no active run identity"))?;
+    Ok(RunWriteTarget {
+        session: name.to_string(),
+        session_id: slot.session_id,
+        run_id,
+        generation: slot.generation,
+        pty,
+        input_gate: running.input_gate.clone(),
+    })
+}
+
+fn run_binding_from_target(target: &RunWriteTarget) -> RunBinding {
+    RunBinding {
+        session_id: target.session_id,
+        run_id: target.run_id,
+        generation: target.generation,
+    }
+}
+
+fn ensure_run_input_safety_locked(
+    slot: &SessionSlot,
+    target: &RunWriteTarget,
+    safety: RunInputSafety,
+) -> Result<()> {
+    if safety == RunInputSafety::Raw {
+        return Ok(());
+    }
+
+    if slot.work_state_observed
+        && matches!(
+            slot.work_state,
+            WorkState::Blocked | WorkState::ErrorLoop | WorkState::Exited
+        )
+    {
+        let detail = slot
+            .work_detail
+            .as_deref()
+            .map(|detail| format!(" ({detail})"))
+            .unwrap_or_default();
+        return Err(anyhow!(
+            "session '{}' work state is {}{detail}; routed/delivered framing is blocked; use raw terminal input to resolve the prompt",
+            target.session,
+            work_state_alert_label(Some(slot.work_state)),
+        ));
+    }
+
+    if safety == RunInputSafety::RoutedSubmit {
+        return Ok(());
+    }
+
+    match slot
+        .bracketed_paste
+        .mode_for(run_binding_from_target(target))
+    {
+        BracketedPasteMode::Enabled => Ok(()),
+        BracketedPasteMode::Unknown => Err(anyhow!(
+            "session '{}' bracketed-paste mode is unknown for the active run; routed/delivered framing is blocked",
+            target.session
+        )),
+        BracketedPasteMode::Disabled => Err(anyhow!(
+            "session '{}' bracketed-paste mode is disabled for the active run; routed/delivered framing is blocked",
+            target.session
+        )),
+    }
+}
+
 struct SupervisorInner {
     runtime_dir: PathBuf,
+    catalog: Mutex<SessionCatalogV1>,
     audit: AuditLog,
-    slots: Mutex<HashMap<String, SessionSlot>>,
+    slots: Mutex<SessionRegistry>,
     event_sink: RwLock<Option<EventSink>>,
     control_plane: RwLock<Option<ControlPlaneStatus>>,
-    token_bindings: Mutex<HashMap<String, Option<String>>>,
-    session_control_planes: Mutex<HashMap<String, ControlPlaneStatus>>,
-    retired_sensitive_values: Mutex<HashSet<String>>,
-    cross_pair_room_broadcast: bool,
+    control_plane_lifecycle: Mutex<()>,
+    shutdown_lifecycle: Mutex<()>,
+    shutdown_started: AtomicBool,
+    #[cfg(windows)]
+    control_plane_listener: Mutex<Option<ControlPlaneListener>>,
     pty_spawner: RwLock<Arc<dyn PtySpawner>>,
-    background_runtime: Arc<tokio::runtime::Runtime>,
+    executable_resolver: RwLock<Arc<dyn DriverExecutableResolver>>,
+    background_runtime: BackgroundRuntime,
     events_seq: AtomicU64,
     events_watch: tokio::sync::watch::Sender<u64>,
-    stale_event_drop_counts: Mutex<HashMap<(String, SessionGeneration), u64>>,
-    stale_quiesce_drop_counts: Mutex<HashMap<(String, SessionGeneration), u64>>,
-    dispatch_reactions: Mutex<HashMap<DispatchReactionKey, PendingDispatchReaction>>,
+    run_event_publish: Mutex<HashMap<Uuid, RunEventPublishState>>,
+    stale_event_drop_counts: Mutex<HashMap<(SessionId, SessionGeneration, Uuid), u64>>,
+    stale_quiesce_drop_counts: Mutex<HashMap<(SessionId, SessionGeneration), u64>>,
     started_at: Instant,
     heartbeat_interval: Duration,
-    reaction_window: Duration,
+    sideband_write_timeout: Mutex<Duration>,
+    stop_kill_timeout: Mutex<Duration>,
     auto_restart_on_stall: AutoRestartOnStallConfig,
-    auto_restart_history: Mutex<HashMap<String, AutoRestartHistory>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct EventsSinceResult {
-    events: Vec<RuntimeEvent>,
-    next_cursor: EventCursor,
-    gap_detected: bool,
-    as_of: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AuditScan {
-    events: Vec<RuntimeEvent>,
-    next_offset: u64,
-    reached_eof: bool,
-    reached_limit: bool,
+    auto_restart_history: Mutex<HashMap<SessionId, AutoRestartHistory>>,
+    #[cfg(test)]
+    fail_next_catalog_write: AtomicBool,
+    #[cfg(test)]
+    pty_event_before_commit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    run_input_before_commit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    work_state_before_side_effect: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    stall_before_reservation: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    stall_after_reservation: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    sideband_after_initial_authorization: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    control_plane_after_prepare: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 #[derive(Clone)]
@@ -1008,355 +1760,21 @@ pub struct RendererEventProjector {
     inner: Weak<SupervisorInner>,
 }
 
-pub struct RendererOutputRedactor {
-    inner: Weak<SupervisorInner>,
-    carried_suffix: String,
-    sensitive_values: Vec<String>,
-}
-
 impl RendererEventProjector {
     pub fn project(&self, event: RuntimeEvent) -> RuntimeEvent {
-        let Some(inner) = self.inner.upgrade() else {
-            return RuntimeEvent::SystemLog {
+        if self.inner.upgrade().is_none() {
+            RuntimeEvent::SystemLog {
                 level: LogLevel::Warn,
                 message: "runtime event unavailable after supervisor shutdown".into(),
                 timestamp: now_rfc3339(),
-            };
-        };
-
-        project_runtime_event(event, &control_plane_sensitive_values(&inner))
-    }
-
-    pub fn output_redactor(&self) -> RendererOutputRedactor {
-        RendererOutputRedactor {
-            inner: self.inner.clone(),
-            carried_suffix: String::new(),
-            sensitive_values: Vec::new(),
-        }
-    }
-}
-
-fn project_runtime_event(event: RuntimeEvent, sensitive_values: &[String]) -> RuntimeEvent {
-    let mut value = match serde_json::to_value(event) {
-        Ok(value) => value,
-        Err(_) => {
-            return RuntimeEvent::SystemLog {
-                level: LogLevel::Warn,
-                message: "runtime event unavailable because projection failed".into(),
-                timestamp: now_rfc3339(),
-            };
-        }
-    };
-    redact_json_strings(&mut value, sensitive_values);
-    serde_json::from_value(value).unwrap_or_else(|_| RuntimeEvent::SystemLog {
-        level: LogLevel::Warn,
-        message: "runtime event unavailable because projection failed".into(),
-        timestamp: now_rfc3339(),
-    })
-}
-
-impl RendererOutputRedactor {
-    pub fn push(&mut self, chunk: &str) -> String {
-        self.refresh_sensitive_values();
-        let mut output = std::mem::take(&mut self.carried_suffix);
-        output.push_str(chunk);
-        redact_terminal_text(&mut output, &self.sensitive_values);
-
-        let carry_start = terminal_carry_start(&output, &self.sensitive_values);
-        self.carried_suffix = output.split_off(carry_start);
-        output
-    }
-
-    pub fn finish(mut self) -> String {
-        self.refresh_sensitive_values();
-        let mut output = std::mem::take(&mut self.carried_suffix);
-        redact_terminal_text(&mut output, &self.sensitive_values);
-
-        if let Some(prefix_start) = terminal_sensitive_prefix_start(&output, &self.sensitive_values)
-        {
-            output.truncate(prefix_start);
-            output.push_str("[redacted]");
-        } else if let Some(incomplete_start) = terminal_visible_projection(&output).incomplete_start
-        {
-            output.truncate(incomplete_start);
-        }
-        output
-    }
-
-    fn refresh_sensitive_values(&mut self) {
-        let Some(inner) = self.inner.upgrade() else {
-            return;
-        };
-        self.sensitive_values
-            .extend(control_plane_sensitive_values(&inner));
-        self.sensitive_values.retain(|value| !value.is_empty());
-        self.sensitive_values
-            .sort_by_key(|value| std::cmp::Reverse(value.len()));
-        self.sensitive_values.dedup();
-    }
-}
-
-fn control_plane_sensitive_values(inner: &SupervisorInner) -> Vec<String> {
-    let mut values = Vec::new();
-    if let Some(status) = inner.control_plane.read().as_ref() {
-        values.push(status.token.clone());
-        values.push(status.info_path.clone());
-    }
-    for status in inner.session_control_planes.lock().values() {
-        values.push(status.token.clone());
-        values.push(status.info_path.clone());
-    }
-    values.extend(inner.retired_sensitive_values.lock().iter().cloned());
-    values.retain(|value| !value.is_empty());
-    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
-    values.dedup();
-    values
-}
-
-fn redact_json_strings(value: &mut serde_json::Value, sensitive_values: &[String]) {
-    match value {
-        serde_json::Value::String(text) => {
-            for sensitive in sensitive_values {
-                if text.contains(sensitive) {
-                    *text = text.replace(sensitive, "[redacted]");
-                }
             }
-        }
-        serde_json::Value::Array(values) => {
-            for value in values {
-                redact_json_strings(value, sensitive_values);
-            }
-        }
-        serde_json::Value::Object(fields) => {
-            for value in fields.values_mut() {
-                redact_json_strings(value, sensitive_values);
-            }
-        }
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
-    }
-}
-
-#[derive(Debug, Default)]
-struct TerminalVisibleProjection {
-    text: String,
-    raw_spans: Vec<(usize, usize)>,
-    incomplete_start: Option<usize>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TerminalControlScan {
-    NotControl,
-    Complete(usize),
-    Incomplete,
-}
-
-fn redact_terminal_text(text: &mut String, sensitive_values: &[String]) {
-    for sensitive in sensitive_values.iter().filter(|value| !value.is_empty()) {
-        if text.contains(sensitive) {
-            *text = text.replace(sensitive, "[redacted]");
-        }
-    }
-
-    let projection = terminal_visible_projection(text);
-    let mut raw_matches = Vec::<(usize, usize)>::new();
-
-    for sensitive in sensitive_values.iter().filter(|value| !value.is_empty()) {
-        for (visible_start, _) in projection.text.match_indices(sensitive) {
-            let visible_end = visible_start + sensitive.len();
-            let Some((raw_start, _)) = projection.raw_spans.get(visible_start).copied() else {
-                continue;
-            };
-            let Some((_, raw_end)) = projection.raw_spans.get(visible_end - 1).copied() else {
-                continue;
-            };
-            raw_matches.push((raw_start, raw_end));
-        }
-    }
-
-    if raw_matches.is_empty() {
-        return;
-    }
-
-    raw_matches.sort_unstable();
-    let mut merged = Vec::<(usize, usize)>::with_capacity(raw_matches.len());
-    for (start, end) in raw_matches {
-        if let Some((_, previous_end)) = merged.last_mut()
-            && start < *previous_end
-        {
-            *previous_end = (*previous_end).max(end);
         } else {
-            merged.push((start, end));
+            event
         }
     }
-
-    let mut redacted = String::with_capacity(text.len());
-    let mut cursor = 0;
-    for (start, end) in merged {
-        redacted.push_str(&text[cursor..start]);
-        redacted.push_str("[redacted]");
-        cursor = end;
-    }
-    redacted.push_str(&text[cursor..]);
-    *text = redacted;
 }
 
-fn terminal_carry_start(text: &str, sensitive_values: &[String]) -> usize {
-    let projection = terminal_visible_projection(text);
-    let sensitive_start =
-        terminal_sensitive_prefix_start_from_projection(&projection, sensitive_values);
-    sensitive_start
-        .into_iter()
-        .chain(projection.incomplete_start)
-        .min()
-        .unwrap_or(text.len())
-}
-
-fn terminal_sensitive_prefix_start(text: &str, sensitive_values: &[String]) -> Option<usize> {
-    let projection = terminal_visible_projection(text);
-    terminal_sensitive_prefix_start_from_projection(&projection, sensitive_values)
-}
-
-fn terminal_sensitive_prefix_start_from_projection(
-    projection: &TerminalVisibleProjection,
-    sensitive_values: &[String],
-) -> Option<usize> {
-    let max_proper_prefix_len = sensitive_values
-        .iter()
-        .map(String::len)
-        .max()
-        .unwrap_or(0)
-        .saturating_sub(1);
-    if max_proper_prefix_len == 0 {
-        return None;
-    }
-
-    let earliest_candidate = projection.text.len().saturating_sub(max_proper_prefix_len);
-    projection
-        .text
-        .char_indices()
-        .filter(|(index, _)| *index >= earliest_candidate)
-        .find_map(|(index, _)| {
-            let suffix = &projection.text[index..];
-            sensitive_values
-                .iter()
-                .any(|sensitive| suffix.len() < sensitive.len() && sensitive.starts_with(suffix))
-                .then(|| projection.raw_spans[index].0)
-        })
-}
-
-fn terminal_visible_projection(text: &str) -> TerminalVisibleProjection {
-    let mut projection = TerminalVisibleProjection::default();
-    let mut index = 0;
-
-    while index < text.len() {
-        match scan_terminal_control(text, index) {
-            TerminalControlScan::Complete(end) => index = end,
-            TerminalControlScan::Incomplete => {
-                projection.incomplete_start = Some(index);
-                break;
-            }
-            TerminalControlScan::NotControl => {
-                let character = text[index..]
-                    .chars()
-                    .next()
-                    .expect("index remains on a character boundary");
-                let raw_end = index + character.len_utf8();
-                projection.text.push(character);
-                projection
-                    .raw_spans
-                    .extend((0..character.len_utf8()).map(|_| (index, raw_end)));
-                index = raw_end;
-            }
-        }
-    }
-
-    projection
-}
-
-fn scan_terminal_control(text: &str, start: usize) -> TerminalControlScan {
-    let bytes = text.as_bytes();
-    let byte = bytes[start];
-
-    if byte == 0x1b {
-        let Some(introducer) = bytes.get(start + 1).copied() else {
-            return TerminalControlScan::Incomplete;
-        };
-        return match introducer {
-            b'[' => scan_csi(bytes, start + 2),
-            b']' => scan_string_control(bytes, start + 2, true),
-            b'P' | b'X' | b'^' | b'_' => scan_string_control(bytes, start + 2, false),
-            0x20..=0x2f => scan_escape_intermediates(bytes, start + 2),
-            _ => TerminalControlScan::Complete((start + 2).min(bytes.len())),
-        };
-    }
-
-    let character = text[start..]
-        .chars()
-        .next()
-        .expect("start remains on a character boundary");
-    let character_end = start + character.len_utf8();
-    match character {
-        '\u{009b}' => scan_csi(bytes, character_end),
-        '\u{009d}' => scan_string_control(bytes, character_end, true),
-        '\u{0090}' | '\u{0098}' | '\u{009e}' | '\u{009f}' => {
-            scan_string_control(bytes, character_end, false)
-        }
-        '\u{009c}' => TerminalControlScan::Complete(character_end),
-        character if character.is_control() || is_zero_width_format(character) => {
-            TerminalControlScan::Complete(character_end)
-        }
-        _ => TerminalControlScan::NotControl,
-    }
-}
-
-fn scan_csi(bytes: &[u8], mut index: usize) -> TerminalControlScan {
-    while let Some(byte) = bytes.get(index).copied() {
-        index += 1;
-        if (0x40..=0x7e).contains(&byte) {
-            return TerminalControlScan::Complete(index);
-        }
-    }
-    TerminalControlScan::Incomplete
-}
-
-fn scan_escape_intermediates(bytes: &[u8], mut index: usize) -> TerminalControlScan {
-    while let Some(byte) = bytes.get(index).copied() {
-        index += 1;
-        if (0x30..=0x7e).contains(&byte) {
-            return TerminalControlScan::Complete(index);
-        }
-    }
-    TerminalControlScan::Incomplete
-}
-
-fn scan_string_control(
-    bytes: &[u8],
-    mut index: usize,
-    bell_terminates: bool,
-) -> TerminalControlScan {
-    while index < bytes.len() {
-        if bell_terminates && bytes[index] == 0x07 {
-            return TerminalControlScan::Complete(index + 1);
-        }
-        if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'\\') {
-            return TerminalControlScan::Complete(index + 2);
-        }
-        if bytes[index..].starts_with("\u{009c}".as_bytes()) {
-            return TerminalControlScan::Complete(index + '\u{009c}'.len_utf8());
-        }
-        index += 1;
-    }
-    TerminalControlScan::Incomplete
-}
-
-fn is_zero_width_format(character: char) -> bool {
-    matches!(
-        character,
-        '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}'
-    )
-}
-
-fn audit_event_projection(event: &RuntimeEvent, inner: &SupervisorInner) -> Option<RuntimeEvent> {
+fn audit_event_projection(event: &RuntimeEvent, _inner: &SupervisorInner) -> Option<RuntimeEvent> {
     let event = match event {
         RuntimeEvent::SessionOutput { .. } => return None,
         RuntimeEvent::RoutedMessage {
@@ -1374,87 +1792,499 @@ fn audit_event_projection(event: &RuntimeEvent, inner: &SupervisorInner) -> Opti
             content: "[content omitted]".into(),
             timestamp: timestamp.clone(),
         },
-        RuntimeEvent::PaneSignal {
-            request_id,
-            session,
-            signal_type,
-            timestamp,
-            ..
-        } => RuntimeEvent::PaneSignal {
-            request_id: request_id.clone(),
-            session: session.clone(),
-            task_id: String::new(),
-            signal_type: *signal_type,
-            summary: String::new(),
-            artifact_paths: Vec::new(),
-            commit_sha: None,
-            timestamp: timestamp.clone(),
-        },
         RuntimeEvent::SessionWorkState {
+            identity,
             session,
             state,
             previous_state,
             timestamp,
             ..
         } => RuntimeEvent::SessionWorkState {
+            identity: *identity,
             session: session.clone(),
             state: *state,
             detail: None,
             previous_state: *previous_state,
             timestamp: timestamp.clone(),
         },
-        RuntimeEvent::SidebandRequestLifecycle {
-            request_id,
-            action,
+        RuntimeEvent::SessionCreated {
+            schema_version,
             session,
-            phase,
-            error,
-            elapsed_ms,
+            timestamp,
+        } => {
+            let mut session = session.clone();
+            session.working_dir = "[path omitted]".into();
+            RuntimeEvent::SessionCreated {
+                schema_version: *schema_version,
+                session,
+                timestamp: timestamp.clone(),
+            }
+        }
+        RuntimeEvent::SessionWorkingDirectoryChanged {
+            schema_version,
+            session_id,
             timestamp,
             ..
-        } => RuntimeEvent::SidebandRequestLifecycle {
-            request_id: request_id.clone(),
-            action: action.clone(),
-            session: session.clone(),
-            extra_args: Vec::new(),
-            phase: *phase,
-            error: error.clone(),
-            elapsed_ms: *elapsed_ms,
+        } => RuntimeEvent::SessionWorkingDirectoryChanged {
+            schema_version: *schema_version,
+            session_id: *session_id,
+            old_working_dir: "[path omitted]".into(),
+            new_working_dir: "[path omitted]".into(),
             timestamp: timestamp.clone(),
         },
         event => event.clone(),
     };
 
-    Some(project_runtime_event(
-        event,
-        &control_plane_sensitive_values(inner),
-    ))
+    Some(event)
 }
 
-fn remove_revoked_credential_files(statuses: &[ControlPlaneStatus]) -> Result<()> {
-    let mut failure_count = 0_usize;
-    for status in statuses {
-        let path = Path::new(&status.info_path);
-        match fs::remove_file(path) {
-            Ok(()) => {}
+fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+
+    #[cfg(not(windows))]
+    false
+}
+
+fn ensure_existing_path_chain_has_no_reparse_points(path: &Path) -> Result<()> {
+    let mut cursor = Some(path);
+    while let Some(candidate) = cursor {
+        match fs::symlink_metadata(candidate) {
+            Ok(metadata) if metadata_is_link_or_reparse(&metadata) => {
+                return Err(anyhow!(
+                    "runtime storage path must not contain a symlink or reparse point: {}",
+                    candidate.display()
+                ));
+            }
+            Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
-                failure_count += 1;
-                eprintln!(
-                    "failed to remove revoked credential file {}: {error}",
-                    path.display()
-                );
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect runtime storage path component {}",
+                        candidate.display()
+                    )
+                });
+            }
+        }
+        cursor = candidate.parent();
+    }
+    Ok(())
+}
+
+fn canonical_destination_without_reparse_points(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("failed to resolve the current directory for runtime storage")?
+            .join(path)
+    };
+    ensure_existing_path_chain_has_no_reparse_points(&absolute)?;
+
+    let mut cursor = absolute.as_path();
+    let mut missing = Vec::new();
+    loop {
+        match fs::metadata(cursor) {
+            Ok(metadata) => {
+                if !metadata.is_dir() {
+                    return Err(anyhow!(
+                        "runtime storage ancestor is not a directory: {}",
+                        cursor.display()
+                    ));
+                }
+                let mut destination = fs::canonicalize(cursor).with_context(|| {
+                    format!(
+                        "failed to canonicalize runtime storage ancestor {}",
+                        cursor.display()
+                    )
+                })?;
+                for component in missing.iter().rev() {
+                    destination.push(component);
+                }
+                return Ok(destination);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let component = cursor.file_name().ok_or_else(|| {
+                    anyhow!(
+                        "runtime storage destination has no existing directory ancestor: {}",
+                        absolute.display()
+                    )
+                })?;
+                missing.push(component.to_os_string());
+                cursor = cursor.parent().ok_or_else(|| {
+                    anyhow!(
+                        "runtime storage destination has no parent: {}",
+                        absolute.display()
+                    )
+                })?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect runtime storage destination {}",
+                        cursor.display()
+                    )
+                });
             }
         }
     }
+}
 
-    if failure_count == 0 {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "failed to remove {failure_count} revoked credential file(s)"
-        ))
+fn comparable_storage_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        PathBuf::from(path.to_string_lossy().to_ascii_lowercase())
     }
+
+    #[cfg(not(windows))]
+    path.to_path_buf()
+}
+
+fn child_process_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let path = path.to_string_lossy();
+        if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = path.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+        PathBuf::from(path.as_ref())
+    }
+
+    #[cfg(not(windows))]
+    path.to_path_buf()
+}
+
+/// Resolves the runtime destination without following symlinks/reparse points and
+/// proves that it is disjoint from the harness working tree. This function is
+/// intentionally side-effect free so callers can run it before creating locks,
+/// files, or directories beneath the destination.
+pub fn validate_runtime_storage_paths(runtime_dir: &Path, working_root: &Path) -> Result<PathBuf> {
+    let runtime_destination = canonical_destination_without_reparse_points(runtime_dir)?;
+    let working_root = fs::canonicalize(working_root).with_context(|| {
+        format!(
+            "failed to canonicalize agent working root {}",
+            working_root.display()
+        )
+    })?;
+    if !working_root.is_dir() {
+        return Err(anyhow!(
+            "agent working root is not a directory: {}",
+            working_root.display()
+        ));
+    }
+
+    let runtime_comparable = comparable_storage_path(&runtime_destination);
+    let working_comparable = comparable_storage_path(&working_root);
+    if runtime_comparable.starts_with(&working_comparable)
+        || working_comparable.starts_with(&runtime_comparable)
+    {
+        return Err(anyhow!(
+            "runtime storage and agent working root must be disjoint (runtime={}, working_root={})",
+            runtime_destination.display(),
+            working_root.display()
+        ));
+    }
+
+    Ok(runtime_destination)
+}
+
+struct DirectoryLease {
+    _handle: File,
+    identity: String,
+}
+
+#[cfg(windows)]
+fn open_directory_lease(path: &Path) -> Result<DirectoryLease> {
+    use std::mem::zeroed;
+    use std::os::windows::{fs::OpenOptionsExt as _, io::AsRawHandle as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
+    };
+
+    let handle = OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .with_context(|| format!("failed to lease working directory {}", path.display()))?;
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { zeroed() };
+    if unsafe { GetFileInformationByHandle(handle.as_raw_handle().cast(), &mut information) } == 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "failed to query working-directory identity {}",
+                path.display()
+            )
+        });
+    }
+    let file_index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    Ok(DirectoryLease {
+        _handle: handle,
+        identity: format!("windows:{}:{file_index}", information.dwVolumeSerialNumber),
+    })
+}
+
+#[cfg(unix)]
+fn open_directory_lease(path: &Path) -> Result<DirectoryLease> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let handle = File::open(path)
+        .with_context(|| format!("failed to lease working directory {}", path.display()))?;
+    let metadata = handle
+        .metadata()
+        .with_context(|| format!("failed to inspect working directory {}", path.display()))?;
+    Ok(DirectoryLease {
+        _handle: handle,
+        identity: format!("unix:{}:{}", metadata.dev(), metadata.ino()),
+    })
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    let left = comparable_storage_path(left);
+    let right = comparable_storage_path(right);
+    left.starts_with(&right) || right.starts_with(&left)
+}
+
+fn qualify_working_directory(
+    candidate: &Path,
+    runtime_dir: &Path,
+) -> Result<(QualifiedWorkingDirectory, DirectoryLease)> {
+    if !candidate.is_absolute() {
+        return Err(anyhow!(
+            "working directory must be an absolute path: {}",
+            candidate.display()
+        ));
+    }
+    let canonical = fs::canonicalize(candidate).with_context(|| {
+        format!(
+            "failed to resolve selected working directory {}",
+            candidate.display()
+        )
+    })?;
+    if !canonical.is_dir() {
+        return Err(anyhow!(
+            "selected working directory is not a directory: {}",
+            canonical.display()
+        ));
+    }
+    if paths_overlap(&canonical, runtime_dir) {
+        return Err(anyhow!(
+            "working directory and runtime storage must be disjoint (working_directory={}, runtime={})",
+            canonical.display(),
+            runtime_dir.display()
+        ));
+    }
+
+    let lease = open_directory_lease(&canonical)?;
+    let confirmed = fs::canonicalize(&canonical).with_context(|| {
+        format!(
+            "working directory changed while it was being qualified: {}",
+            canonical.display()
+        )
+    })?;
+    if comparable_storage_path(&canonical) != comparable_storage_path(&confirmed) {
+        return Err(anyhow!(
+            "working directory changed while it was being qualified (expected={}, resolved={})",
+            canonical.display(),
+            confirmed.display()
+        ));
+    }
+
+    Ok((
+        QualifiedWorkingDirectory {
+            canonical_path: child_process_path(&canonical)
+                .to_string_lossy()
+                .into_owned(),
+            identity: lease.identity.clone(),
+        },
+        lease,
+    ))
+}
+
+fn revalidate_qualified_working_directory(
+    session_id: SessionId,
+    expected: &QualifiedWorkingDirectory,
+    runtime_dir: &Path,
+) -> Result<DirectoryLease> {
+    revalidate_qualified_directory(
+        &format!("session '{session_id}' working directory"),
+        expected,
+        runtime_dir,
+    )
+}
+
+fn revalidate_qualified_directory(
+    subject: &str,
+    expected: &QualifiedWorkingDirectory,
+    runtime_dir: &Path,
+) -> Result<DirectoryLease> {
+    let (actual, lease) =
+        qualify_working_directory(Path::new(&expected.canonical_path), runtime_dir)?;
+    if actual != *expected {
+        return Err(anyhow!(
+            "{subject} changed since it was selected; choose it again (expected identity {}, actual identity {})",
+            expected.identity,
+            actual.identity
+        ));
+    }
+    Ok(lease)
+}
+
+fn session_catalog_path(runtime_dir: &Path) -> PathBuf {
+    runtime_dir.join(SESSION_CATALOG_FILE_NAME)
+}
+
+fn read_session_catalog(path: &Path) -> Result<SessionCatalogV1> {
+    let file = File::open(path)
+        .with_context(|| format!("failed to open session catalog {}", path.display()))?;
+    let catalog: SessionCatalogV1 = serde_json::from_reader(StdBufReader::new(file))
+        .with_context(|| format!("failed to parse session catalog {}", path.display()))?;
+    if catalog.schema_version != SESSION_CATALOG_SCHEMA_VERSION {
+        return Err(anyhow!(
+            "unsupported session catalog schema version {} (expected {})",
+            catalog.schema_version,
+            SESSION_CATALOG_SCHEMA_VERSION
+        ));
+    }
+    validate_persisted_qualified_directory("workspace preference", &catalog.workspace_preference)?;
+    let mut seen = HashSet::new();
+    for session in &catalog.sessions {
+        if !seen.insert(session.session_id) {
+            return Err(anyhow!(
+                "session catalog contains duplicate session id '{}'",
+                session.session_id
+            ));
+        }
+        validate_session_label(&session.label)?;
+        validate_persisted_qualified_directory(
+            &format!("session '{}' working directory", session.session_id),
+            &session.working_directory,
+        )?;
+    }
+    Ok(catalog)
+}
+
+fn validate_persisted_qualified_directory(
+    subject: &str,
+    directory: &QualifiedWorkingDirectory,
+) -> Result<()> {
+    if directory.canonical_path.trim() != directory.canonical_path
+        || directory.canonical_path.contains('\0')
+        || !Path::new(&directory.canonical_path).is_absolute()
+    {
+        return Err(anyhow!("{subject} has an invalid absolute canonical path"));
+    }
+    if directory.identity.trim().is_empty() {
+        return Err(anyhow!("{subject} has a blank persisted identity"));
+    }
+    Ok(())
+}
+
+fn persist_session_catalog(runtime_dir: &Path, catalog: &SessionCatalogV1) -> Result<()> {
+    if catalog.schema_version != SESSION_CATALOG_SCHEMA_VERSION {
+        return Err(anyhow!("refusing to persist an unsupported catalog schema"));
+    }
+    let destination = session_catalog_path(runtime_dir);
+    let temporary = runtime_dir.join(format!(
+        ".{SESSION_CATALOG_FILE_NAME}.{}.tmp",
+        Uuid::new_v4()
+    ));
+    let write_result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .with_context(|| {
+                format!(
+                    "failed to create temporary session catalog {}",
+                    temporary.display()
+                )
+            })?;
+        restrict_path_to_current_user(&temporary, false)?;
+        serde_json::to_writer_pretty(&mut file, catalog)
+            .context("failed to serialize session catalog")?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+
+        replace_catalog_file(&temporary, &destination)?;
+        // The temporary file is already private. Rename/ReplaceFile is the commit
+        // point, so no fallible work may follow it or disk and memory could diverge.
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result
+}
+
+#[cfg(windows)]
+fn replace_catalog_file(temporary: &Path, destination: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{REPLACEFILE_WRITE_THROUGH, ReplaceFileW};
+
+    if !destination.exists() {
+        return fs::rename(temporary, destination).with_context(|| {
+            format!(
+                "failed to install initial session catalog {}",
+                destination.display()
+            )
+        });
+    }
+    let destination_wide = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let temporary_wide = temporary
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    if unsafe {
+        ReplaceFileW(
+            destination_wide.as_ptr(),
+            temporary_wide.as_ptr(),
+            std::ptr::null(),
+            REPLACEFILE_WRITE_THROUGH,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "failed to atomically replace session catalog {}",
+                destination.display()
+            )
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_catalog_file(temporary: &Path, destination: &Path) -> Result<()> {
+    fs::rename(temporary, destination).with_context(|| {
+        format!(
+            "failed to atomically replace session catalog {}",
+            destination.display()
+        )
+    })
 }
 
 fn remove_legacy_disk_mailbox(runtime_dir: &Path) -> Result<()> {
@@ -1469,7 +2299,7 @@ fn remove_legacy_disk_mailbox(runtime_dir: &Path) -> Result<()> {
         }
     };
 
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    if metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
         fs::remove_file(&path).or_else(|file_error| {
             fs::remove_dir(&path).map_err(|directory_error| {
                 std::io::Error::other(format!(
@@ -1483,83 +2313,56 @@ fn remove_legacy_disk_mailbox(runtime_dir: &Path) -> Result<()> {
     .with_context(|| format!("failed to remove legacy disk mailbox: {}", path.display()))
 }
 
-fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .with_context(|| format!("private file path has no parent: {}", path.display()))?;
-    fs::create_dir_all(parent).with_context(|| {
+fn remove_legacy_control_plane_files(runtime_dir: &Path) -> Result<()> {
+    for entry in fs::read_dir(runtime_dir).with_context(|| {
         format!(
-            "failed to create private file directory: {}",
-            parent.display()
+            "failed to inspect runtime directory {}",
+            runtime_dir.display()
         )
-    })?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow!("private file path has no UTF-8 file name"))?;
-    let temp_path = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+    })? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let is_legacy = file_name == "control-plane.json"
+            || (file_name.starts_with("control-plane-") && file_name.ends_with(".json"));
+        if !is_legacy {
+            continue;
+        }
 
-    let result = (|| -> Result<()> {
-        fs::write(&temp_path, contents).with_context(|| {
-            format!(
-                "failed to write private temporary file: {}",
-                temp_path.display()
-            )
-        })?;
-        restrict_path_to_current_user(&temp_path, false)?;
-        replace_file_atomically(&temp_path, path)?;
-        Ok(())
-    })();
-
-    if result.is_err() {
-        let _ = fs::remove_file(&temp_path);
-    }
-    result
-}
-
-#[cfg(windows)]
-fn replace_file_atomically(source: &Path, destination: &Path) -> Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    };
-
-    let source_wide = source
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let destination_wide = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let moved = unsafe {
-        MoveFileExW(
-            source_wide.as_ptr(),
-            destination_wide.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if moved == 0 {
-        return Err(std::io::Error::last_os_error()).with_context(|| {
-            format!(
-                "failed to atomically replace private file {}",
-                destination.display()
-            )
-        });
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata_is_link_or_reparse(&metadata) {
+            fs::remove_file(&path)
+                .or_else(|file_error| {
+                    fs::remove_dir(&path).map_err(|directory_error| {
+                        std::io::Error::other(format!(
+                            "symlink file removal failed: {file_error}; symlink directory removal failed: {directory_error}"
+                        ))
+                    })
+                })
+                .with_context(|| {
+                    format!(
+                        "failed to remove legacy control-plane symlink without following it: {}",
+                        path.display()
+                    )
+                })?;
+        } else if metadata.is_file() {
+            fs::remove_file(&path)?;
+        } else if metadata.is_dir() {
+            return Err(anyhow!(
+                "refusing to recursively remove legacy control-plane directory {}",
+                path.display()
+            ));
+        } else {
+            return Err(anyhow!(
+                "unsupported legacy control-plane artifact {}",
+                path.display()
+            ));
+        }
     }
     Ok(())
-}
-
-#[cfg(not(windows))]
-fn replace_file_atomically(source: &Path, destination: &Path) -> Result<()> {
-    fs::rename(source, destination).with_context(|| {
-        format!(
-            "failed to atomically replace private file {}",
-            destination.display()
-        )
-    })
 }
 
 #[cfg(windows)]
@@ -1734,10 +2537,24 @@ fn restrict_path_to_current_user(path: &Path, is_directory: bool) -> Result<()> 
 }
 
 impl SupervisorHandle {
-    pub fn new(config: SupervisorConfig) -> Result<Self> {
-        fs::create_dir_all(&config.runtime_dir).context("failed to create runtime directory")?;
+    pub fn new(mut config: SupervisorConfig) -> Result<Self> {
+        let expected_runtime =
+            validate_runtime_storage_paths(&config.runtime_dir, &config.working_root)?;
+        fs::create_dir_all(&expected_runtime).context("failed to create runtime directory")?;
+        let resolved_runtime =
+            validate_runtime_storage_paths(&expected_runtime, &config.working_root)?;
+        if comparable_storage_path(&expected_runtime) != comparable_storage_path(&resolved_runtime)
+        {
+            return Err(anyhow!(
+                "runtime storage destination changed while it was being prepared (expected={}, resolved={})",
+                expected_runtime.display(),
+                resolved_runtime.display()
+            ));
+        }
+        config.runtime_dir = resolved_runtime;
         restrict_path_to_current_user(&config.runtime_dir, true)?;
         remove_legacy_disk_mailbox(&config.runtime_dir)?;
+        remove_legacy_control_plane_files(&config.runtime_dir)?;
         let audit = AuditLog::new(&config.runtime_dir)?;
         let background_runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -1745,27 +2562,59 @@ impl SupervisorHandle {
             .build()
             .context("failed to create supervisor background runtime")?;
         let (events_watch, _events_watch_rx) = tokio::sync::watch::channel(0_u64);
-        let working_root = config.working_root.to_string_lossy().into_owned();
-        let mut slots = HashMap::new();
-        for definition in default_session_definitions(&working_root) {
-            slots.insert(definition.name.clone(), closed_session_slot(definition));
+        let catalog_path = session_catalog_path(&config.runtime_dir);
+        let catalog = if catalog_path.exists() {
+            read_session_catalog(&catalog_path)?
+        } else {
+            let (workspace_preference, _lease) =
+                qualify_working_directory(&config.working_root, &config.runtime_dir)?;
+            let catalog = SessionCatalogV1::empty(workspace_preference);
+            persist_session_catalog(&config.runtime_dir, &catalog)?;
+            catalog
+        };
+        let mut slots = SessionRegistry::from_catalog(&catalog)?;
+        for slot in slots.by_id.values_mut() {
+            let availability = slot
+                .qualified_working_directory
+                .as_ref()
+                .ok_or_else(|| anyhow!("qualified working-directory metadata is missing"))
+                .and_then(|qualified| {
+                    revalidate_qualified_working_directory(
+                        slot.session_id,
+                        qualified,
+                        &config.runtime_dir,
+                    )
+                    .map(|_lease| ())
+                });
+            if let Err(error) = availability {
+                slot.last_error = Some(format!("working directory unavailable: {error:#}"));
+            }
         }
+        let run_event_publish = slots
+            .ordered_slots()
+            .map(|slot| {
+                (
+                    slot.session_id,
+                    RunEventPublishState::new(
+                        slot.run_event_sequence
+                            .checked_add(1)
+                            .expect("new session run-event sequence must have capacity"),
+                    ),
+                )
+            })
+            .collect();
         let heartbeat_interval = config
             .heartbeat_interval
             .filter(|duration| !duration.is_zero())
             .unwrap_or_else(heartbeat_interval_from_env);
-        let reaction_window = config
-            .reaction_window
-            .filter(|duration| !duration.is_zero())
-            .unwrap_or_else(reaction_window_from_env);
         let auto_restart_on_stall = AutoRestartOnStallConfig {
-            allowed_sessions: config
-                .auto_restart_on_stall_sessions
-                .unwrap_or_else(auto_restart_sessions_from_env)
-                .into_iter()
-                .map(|session| session.trim().to_string())
-                .filter(|session| !session.is_empty())
-                .collect(),
+            allowed_sessions: RwLock::new(
+                config
+                    .auto_restart_on_stall_sessions
+                    .unwrap_or_else(auto_restart_sessions_from_env)
+                    .into_iter()
+                    .collect(),
+            ),
             threshold: config
                 .auto_restart_stall_threshold
                 .filter(|duration| !duration.is_zero())
@@ -1775,26 +2624,46 @@ impl SupervisorHandle {
         let handle = Self {
             inner: Arc::new(SupervisorInner {
                 runtime_dir: config.runtime_dir,
+                catalog: Mutex::new(catalog),
                 audit,
                 slots: Mutex::new(slots),
                 event_sink: RwLock::new(None),
                 control_plane: RwLock::new(None),
-                token_bindings: Mutex::new(HashMap::new()),
-                session_control_planes: Mutex::new(HashMap::new()),
-                retired_sensitive_values: Mutex::new(HashSet::new()),
-                cross_pair_room_broadcast: config.cross_pair_room_broadcast,
+                control_plane_lifecycle: Mutex::new(()),
+                shutdown_lifecycle: Mutex::new(()),
+                shutdown_started: AtomicBool::new(false),
+                #[cfg(windows)]
+                control_plane_listener: Mutex::new(None),
                 pty_spawner: RwLock::new(Arc::new(ConcretePtySpawner)),
-                background_runtime: Arc::new(background_runtime),
+                executable_resolver: RwLock::new(Arc::new(HostDriverExecutableResolver)),
+                background_runtime: BackgroundRuntime::new(background_runtime),
                 events_seq: AtomicU64::new(0),
                 events_watch,
+                run_event_publish: Mutex::new(run_event_publish),
                 stale_event_drop_counts: Mutex::new(HashMap::new()),
                 stale_quiesce_drop_counts: Mutex::new(HashMap::new()),
-                dispatch_reactions: Mutex::new(HashMap::new()),
                 started_at: Instant::now(),
                 heartbeat_interval,
-                reaction_window,
+                sideband_write_timeout: Mutex::new(SidebandTimeouts::write_budget()),
+                stop_kill_timeout: Mutex::new(SESSION_STOP_KILL_TIMEOUT),
                 auto_restart_on_stall,
                 auto_restart_history: Mutex::new(HashMap::new()),
+                #[cfg(test)]
+                fail_next_catalog_write: AtomicBool::new(false),
+                #[cfg(test)]
+                pty_event_before_commit: Mutex::new(None),
+                #[cfg(test)]
+                run_input_before_commit: Mutex::new(None),
+                #[cfg(test)]
+                work_state_before_side_effect: Mutex::new(None),
+                #[cfg(test)]
+                stall_before_reservation: Mutex::new(None),
+                #[cfg(test)]
+                stall_after_reservation: Mutex::new(None),
+                #[cfg(test)]
+                sideband_after_initial_authorization: Mutex::new(None),
+                #[cfg(test)]
+                control_plane_after_prepare: Mutex::new(None),
             }),
         };
         handle.start_supervisor_heartbeat_task();
@@ -1815,30 +2684,6 @@ impl SupervisorHandle {
         self.inner.audit.path()
     }
 
-    fn active_audit_file_name(&self) -> String {
-        self.inner.audit.active_file_name()
-    }
-
-    fn audit_file_len(&self, audit_file: &str) -> Result<u64> {
-        self.inner.audit.uncompressed_len(audit_file)
-    }
-
-    fn current_eof_cursor(&self) -> Result<EventCursor> {
-        let audit_file = self.active_audit_file_name();
-        let byte_offset = self.audit_file_len(&audit_file)?;
-        Ok(EventCursor {
-            audit_file,
-            byte_offset,
-        })
-    }
-
-    fn current_active_start_cursor(&self) -> EventCursor {
-        EventCursor {
-            audit_file: self.active_audit_file_name(),
-            byte_offset: 0,
-        }
-    }
-
     fn start_supervisor_heartbeat_task(&self) {
         let interval = self.inner.heartbeat_interval;
         let weak = Arc::downgrade(&self.inner);
@@ -1855,18 +2700,16 @@ impl SupervisorHandle {
 
     fn heartbeat_session_summaries(&self) -> Vec<HeartbeatSessionSummary> {
         let slots = self.inner.slots.lock();
-        let mut summaries = slots
-            .values()
+        slots
+            .ordered_slots()
             .map(|slot| HeartbeatSessionSummary {
-                name: slot.definition.name.clone(),
+                name: slot.definition.alias.clone(),
                 lifecycle_state: slot.state,
                 work_state: slot.work_state_observed.then_some(slot.work_state),
                 process_id: slot.process_id,
                 last_activity_at: slot.last_activity_at.clone(),
             })
-            .collect::<Vec<_>>();
-        summaries.sort_by(|left, right| left.name.cmp(&right.name));
-        summaries
+            .collect::<Vec<_>>()
     }
 
     fn emit_supervisor_heartbeat(&self) {
@@ -1879,306 +2722,116 @@ impl SupervisorHandle {
         });
     }
 
-    fn normalize_events_filter(filter: Option<EventFilter>) -> EventFilter {
-        filter.unwrap_or_default()
-    }
-
-    fn validate_events_filter(&self, filter: &EventFilter) -> Result<()> {
-        for kind in &filter.include_kinds {
-            if kind == EventFilter::ALL_KINDS {
-                continue;
-            }
-
-            let known = matches!(
-                kind.as_str(),
-                "session_output"
-                    | "session_state"
-                    | "session_exit"
-                    | "session_work_state"
-                    | "supervisor_heartbeat"
-                    | "supervisor_alert"
-                    | "dispatch_template_warning"
-                    | "pair_created"
-                    | "pair_renamed"
-                    | "pair_deleted"
-                    | "routed_message"
-                    | "route_delivery"
-                    | "dispatch_attempt"
-                    | "pane_signal"
-                    | "system_log"
-                    | "control_plane_ready"
-                    | "sideband_request_lifecycle"
-                    | "request_ack"
-                    | "request_ack_timeout"
-                    | "dispatch_no_reaction"
-            );
-            if !known {
-                return Err(anyhow!("unknown event kind: '{kind}'"));
-            }
-        }
-
-        if !filter.include_sessions.is_empty() {
-            let configured_sessions = {
-                let slots = self.inner.slots.lock();
-                slots.keys().cloned().collect::<Vec<_>>()
-            };
-            for session in &filter.include_sessions {
-                if !configured_sessions
-                    .iter()
-                    .any(|candidate| candidate == session)
-                {
-                    return Err(anyhow!("unknown session: '{session}'"));
-                }
-            }
-        }
-
-        for scope in &filter.include_scopes {
-            let known = matches!(scope.as_str(), "direct" | "room" | "system" | "private");
-            if !known {
-                return Err(anyhow!("unknown routed_message scope: '{scope}'"));
-            }
-        }
-
-        Ok(())
-    }
-
-    fn resolve_events_cursor(&self, cursor: Option<EventCursor>) -> Result<(EventCursor, bool)> {
-        let Some(cursor) = cursor else {
-            return Ok((self.current_eof_cursor()?, false));
-        };
-
-        if !is_valid_audit_filename(&cursor.audit_file) {
-            return Err(anyhow!(
-                "cursor audit_file not recognized: {}",
-                cursor.audit_file
-            ));
-        }
-
-        if self.inner.audit.source_exists(&cursor.audit_file) {
-            return Ok((cursor, false));
-        }
-
-        Ok((self.current_active_start_cursor(), true))
-    }
-
-    fn events_request_error(
+    #[cfg(test)]
+    fn bump_session_generation_for_tests(
         &self,
-        message: impl Into<String>,
-        echoed_cursor: serde_json::Value,
-    ) -> SidebandResponse {
-        SidebandResponse {
-            ok: false,
-            message: message.into(),
-            snapshot: Some(self.snapshot()),
-            timed_out: false,
-            payload: Some(SidebandResponsePayload::EventsSinceError { echoed_cursor }),
-            request_id: None,
-        }
-    }
-
-    fn read_events_since(
-        &self,
-        cursor: Option<EventCursor>,
-        filter: &EventFilter,
-        max_events: usize,
-    ) -> Result<EventsSinceResult> {
-        let (resolved_cursor, gap_detected) = self.resolve_events_cursor(cursor)?;
-        let active_file = self.active_audit_file_name();
-        let current_active_eof = self.current_eof_cursor()?;
-
-        let current_len = self.audit_file_len(&resolved_cursor.audit_file)?;
-        if resolved_cursor.byte_offset > current_len {
-            return Ok(EventsSinceResult {
-                events: Vec::new(),
-                next_cursor: current_active_eof,
-                gap_detected,
-                as_of: now_rfc3339(),
-            });
-        }
-
-        let mut events = Vec::new();
-        let mut current_file = resolved_cursor.audit_file.clone();
-        let mut current_offset = resolved_cursor.byte_offset;
-
-        loop {
-            let remaining = max_events.saturating_sub(events.len());
-            let scan = self.scan_audit_file(&current_file, current_offset, filter, remaining)?;
-            current_offset = scan.next_offset;
-            events.extend(scan.events);
-
-            if scan.reached_limit || events.len() >= max_events {
-                return Ok(EventsSinceResult {
-                    events,
-                    next_cursor: EventCursor {
-                        audit_file: current_file,
-                        byte_offset: current_offset,
-                    },
-                    gap_detected,
-                    as_of: now_rfc3339(),
-                });
-            }
-
-            if scan.reached_eof && current_file != active_file {
-                current_file = active_file.clone();
-                current_offset = 0;
-                continue;
-            }
-
-            return Ok(EventsSinceResult {
-                events,
-                next_cursor: EventCursor {
-                    audit_file: current_file,
-                    byte_offset: current_offset,
-                },
-                gap_detected,
-                as_of: now_rfc3339(),
-            });
-        }
-    }
-
-    async fn wait_for_events(
-        &self,
-        cursor: Option<EventCursor>,
-        filter: EventFilter,
-        max_events: usize,
-        max_wait: Duration,
-    ) -> Result<EventsSinceResult> {
-        let mut receiver = self.inner.events_watch.subscribe();
-        let mut observed_seq = *receiver.borrow_and_update();
-        let mut result = self.read_events_since(cursor, &filter, max_events)?;
-        let mut gap_detected = result.gap_detected;
-
-        if !result.events.is_empty() || max_wait.is_zero() {
-            result.gap_detected = gap_detected;
-            return Ok(result);
-        }
-
-        let deadline = tokio::time::Instant::now() + max_wait;
-        let mut next_cursor = result.next_cursor.clone();
-
-        loop {
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                result.gap_detected = gap_detected;
-                return Ok(result);
-            }
-
-            let remaining = deadline.saturating_duration_since(now);
-            let changed = tokio::time::timeout(remaining, receiver.changed()).await;
-            match changed {
-                Ok(Ok(())) => {
-                    observed_seq = *receiver.borrow_and_update();
-                    result =
-                        self.read_events_since(Some(next_cursor.clone()), &filter, max_events)?;
-                    gap_detected |= result.gap_detected;
-                    result.gap_detected = gap_detected;
-                    next_cursor = result.next_cursor.clone();
-
-                    if !result.events.is_empty() {
-                        return Ok(result);
-                    }
-                }
-                Ok(Err(_)) | Err(_) => {
-                    let current_seq = *receiver.borrow();
-                    if current_seq != observed_seq {
-                        observed_seq = *receiver.borrow_and_update();
-                        result =
-                            self.read_events_since(Some(next_cursor.clone()), &filter, max_events)?;
-                        gap_detected |= result.gap_detected;
-                        result.gap_detected = gap_detected;
-                        next_cursor = result.next_cursor.clone();
-                        if !result.events.is_empty() {
-                            return Ok(result);
-                        }
-                        continue;
-                    }
-
-                    result.gap_detected = gap_detected;
-                    return Ok(result);
-                }
-            }
-        }
-    }
-
-    fn scan_audit_file(
-        &self,
-        audit_file: &str,
-        byte_offset: u64,
-        filter: &EventFilter,
-        max_events: usize,
-    ) -> Result<AuditScan> {
-        if max_events == 0 {
-            return Ok(AuditScan {
-                events: Vec::new(),
-                next_offset: byte_offset,
-                reached_eof: false,
-                reached_limit: true,
-            });
-        }
-
-        let mut events = Vec::new();
-        let mut next_offset = byte_offset;
-
-        loop {
-            let batch = self
-                .inner
-                .audit
-                .read_lines_since(audit_file, next_offset, 1024)?;
-            if batch.lines.is_empty() {
-                return Ok(AuditScan {
-                    events,
-                    next_offset: batch.next_offset,
-                    reached_eof: batch.reached_eof,
-                    reached_limit: false,
-                });
-            }
-
-            for line in batch.lines {
-                let event: RuntimeEvent = serde_json::from_str(&line.text)
-                    .with_context(|| format!("audit read error: invalid JSON in {audit_file}"))?;
-                next_offset = line.next_offset;
-                if event_matches_filter(&event, filter) {
-                    events.push(event);
-                }
-
-                if events.len() >= max_events {
-                    return Ok(AuditScan {
-                        events,
-                        next_offset,
-                        reached_eof: false,
-                        reached_limit: true,
-                    });
-                }
-            }
-
-            next_offset = batch.next_offset;
-            if batch.reached_eof {
-                return Ok(AuditScan {
-                    events,
-                    next_offset,
-                    reached_eof: true,
-                    reached_limit: false,
-                });
-            }
-        }
-    }
-
-    fn bump_session_generation(&self, name: &str) -> Result<SessionGeneration> {
+        session_id: SessionId,
+    ) -> Result<SessionGeneration> {
         let mut slots = self.inner.slots.lock();
+        self.ensure_active()?;
         let slot = slots
-            .get_mut(name)
-            .with_context(|| format!("unknown session '{name}'"))?;
+            .get_by_id_mut(session_id)
+            .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
+        ensure_run_event_capacity(slot, 2)?;
+        let next_generation = slot
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("session generation exhausted for '{session_id}'"))?;
+        if let Some(running) = slot.running.as_ref() {
+            running.close_input();
+        }
+        slot.run_id = None;
         cancel_quiesce_timer_locked(slot);
-        slot.generation = slot.generation.wrapping_add(1);
+        slot.generation = next_generation;
         Ok(slot.generation)
     }
 
+    fn declare_stop_operation(
+        &self,
+        session_id: SessionId,
+        expected_run: Option<(SessionGeneration, Option<Uuid>)>,
+        kind: StopIntentKind,
+    ) -> Result<(String, SessionGeneration)> {
+        let mut slots = self.inner.slots.lock();
+        self.ensure_active()?;
+        let slot = slots
+            .get_by_id_mut(session_id)
+            .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
+        if let Some(operation) = slot.lifecycle_operation {
+            return Err(anyhow!(
+                "session '{session_id}' already has a {:?} lifecycle operation in progress at generation {}",
+                operation.kind,
+                operation.generation
+            ));
+        }
+        if slot.spawn_in_flight.is_some() && (slot.termination_uncertain || slot.running.is_some())
+        {
+            return Err(anyhow!(
+                "session '{session_id}' rejected-spawn cleanup is still in progress"
+            ));
+        }
+        if slot.termination_uncertain
+            && !(kind == StopIntentKind::Operator && slot.running.is_some())
+        {
+            return Err(anyhow!(
+                "session '{session_id}' has an unverified prior termination"
+            ));
+        }
+        if let Some((expected_generation, expected_run_id)) = expected_run
+            && (slot.generation != expected_generation || slot.run_id != expected_run_id)
+        {
+            return Err(anyhow!(
+                "session '{session_id}' run changed before lifecycle declaration"
+            ));
+        }
+        let alias = slot.definition.alias.clone();
+        ensure_run_event_capacity(
+            slot,
+            if kind == StopIntentKind::Restart {
+                5
+            } else {
+                2
+            },
+        )?;
+        if kind == StopIntentKind::Restart {
+            slot.generation
+                .checked_add(2)
+                .ok_or_else(|| anyhow!("session generation exhausted for '{session_id}'"))?;
+        }
+        let next_generation = slot
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("session generation exhausted for '{session_id}'"))?;
+        if let Some(running) = slot.running.as_ref() {
+            running.close_input();
+        }
+        slot.run_id = None;
+        cancel_quiesce_timer_locked(slot);
+        slot.generation = next_generation;
+        if kind == StopIntentKind::Restart {
+            slot.state = LifecycleState::Restarting;
+        }
+        slot.lifecycle_operation = Some(LifecycleOperation {
+            generation: next_generation,
+            kind,
+        });
+        Ok((alias, slot.generation))
+    }
+
+    fn ensure_active(&self) -> Result<()> {
+        if self.inner.shutdown_started.load(Ordering::Acquire) {
+            Err(anyhow!("supervisor has shut down"))
+        } else {
+            Ok(())
+        }
+    }
+
     #[cfg(test)]
-    fn current_generation(&self, name: &str) -> Option<SessionGeneration> {
+    fn current_generation_for_tests(&self, session_id: SessionId) -> Option<SessionGeneration> {
         self.inner
             .slots
             .lock()
-            .get(name)
+            .get_by_id(session_id)
             .map(|slot| slot.generation)
     }
 
@@ -2187,205 +2840,6 @@ impl SupervisorHandle {
         F: Fn(RuntimeEvent) + Send + Sync + 'static,
     {
         *self.inner.event_sink.write() = Some(Arc::new(sink));
-    }
-
-    fn emit_sideband_lifecycle(
-        &self,
-        request_id: &str,
-        action: &str,
-        session: Option<&str>,
-        extra_args: &[String],
-        phase: SidebandPhase,
-        elapsed: Duration,
-    ) {
-        self.emit_sideband_lifecycle_with_error(SidebandLifecycleEvent {
-            request_id,
-            action,
-            session,
-            extra_args,
-            phase,
-            elapsed,
-            error: None,
-        });
-    }
-
-    fn emit_sideband_lifecycle_with_error(&self, event: SidebandLifecycleEvent<'_>) {
-        self.emit(RuntimeEvent::SidebandRequestLifecycle {
-            request_id: event.request_id.to_string(),
-            action: event.action.to_string(),
-            session: event.session.map(ToOwned::to_owned),
-            extra_args: event.extra_args.to_vec(),
-            phase: event.phase,
-            error: event.error,
-            elapsed_ms: event.elapsed.as_millis() as u64,
-            timestamp: now_rfc3339(),
-        });
-    }
-
-    fn emit_request_ack(&self, context: &RequestAckContext, session: &str, bytes_written: usize) {
-        self.emit(RuntimeEvent::RequestAck {
-            request_id: context.request_id.clone(),
-            session: session.to_string(),
-            action: context.action.clone(),
-            bytes_written,
-            timestamp: now_rfc3339(),
-        });
-    }
-
-    fn emit_dispatch_no_reaction(&self, context: &RequestAckContext, session: &str, detail: &str) {
-        let (last_work_state, last_session_state) = self.session_state_for_alert(session);
-        self.emit(RuntimeEvent::DispatchNoReaction {
-            request_id: context.request_id.clone(),
-            session: session.to_string(),
-            action: context.action.clone(),
-            timestamp: now_rfc3339(),
-        });
-        self.emit_supervisor_alert(SupervisorAlertEvent {
-            alert_type: SupervisorAlertType::DispatchNoReaction,
-            request_id: Some(context.request_id.clone()),
-            session: Some(session.to_string()),
-            action: Some(context.action.clone()),
-            last_work_state,
-            last_session_state,
-            message: format!(
-                "Dispatch {} to {} produced no live pane reaction: {}",
-                context.action, session, detail
-            ),
-            severity: AlertSeverity::Critical,
-        });
-    }
-
-    fn register_dispatch_reaction(
-        &self,
-        context: &RequestAckContext,
-        session: &str,
-    ) -> DispatchReactionWaiter {
-        let (sender, receiver) = mpsc::channel();
-        let key = DispatchReactionKey {
-            request_id: context.request_id.clone(),
-            session: session.to_string(),
-        };
-        self.inner.dispatch_reactions.lock().insert(
-            key.clone(),
-            PendingDispatchReaction {
-                baseline: Instant::now(),
-                sender,
-            },
-        );
-        DispatchReactionWaiter { key, receiver }
-    }
-
-    fn cancel_dispatch_reaction(&self, waiter: &DispatchReactionWaiter) {
-        self.inner.dispatch_reactions.lock().remove(&waiter.key);
-    }
-
-    fn resolve_dispatch_reactions_for_session(
-        &self,
-        session: &str,
-        observed_at: Instant,
-        outcome: DispatchReactionOutcome,
-    ) {
-        let matches = {
-            let mut reactions = self.inner.dispatch_reactions.lock();
-            let keys = reactions
-                .iter()
-                .filter(|(key, pending)| key.session == session && observed_at >= pending.baseline)
-                .map(|(key, _)| key.clone())
-                .collect::<Vec<_>>();
-            keys.into_iter()
-                .filter_map(|key| reactions.remove(&key))
-                .collect::<Vec<_>>()
-        };
-
-        for pending in matches {
-            let _ = pending.sender.send(outcome);
-        }
-    }
-
-    fn wait_for_dispatch_reaction(
-        &self,
-        waiter: DispatchReactionWaiter,
-        context: &RequestAckContext,
-        session: &str,
-        bytes_written: usize,
-    ) -> Result<()> {
-        match waiter.receiver.recv_timeout(self.inner.reaction_window) {
-            Ok(DispatchReactionOutcome::Reacted) => {
-                self.mark_dispatch_reacted(context, session, bytes_written)?;
-                Ok(())
-            }
-            Ok(DispatchReactionOutcome::Terminal) => {
-                self.emit_dispatch_no_reaction(context, session, "terminal output observed");
-                Err(anyhow!(
-                    "dispatch no reaction from session '{}': terminal output observed",
-                    session
-                ))
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                self.cancel_dispatch_reaction(&waiter);
-                self.emit_dispatch_no_reaction(
-                    context,
-                    session,
-                    &format!(
-                        "no output, work-state transition, or routed_message within {}ms",
-                        self.inner.reaction_window.as_millis()
-                    ),
-                );
-                Err(anyhow!(
-                    "dispatch no reaction from session '{}' within {}ms",
-                    session,
-                    self.inner.reaction_window.as_millis()
-                ))
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                self.emit_dispatch_no_reaction(context, session, "reaction channel disconnected");
-                Err(anyhow!(
-                    "dispatch no reaction from session '{}': reaction channel disconnected",
-                    session
-                ))
-            }
-        }
-    }
-
-    fn mark_dispatch_reacted(
-        &self,
-        context: &RequestAckContext,
-        session: &str,
-        bytes_written: usize,
-    ) -> Result<()> {
-        let state_event = {
-            let mut slots = self.inner.slots.lock();
-            let slot = slots
-                .get_mut(session)
-                .with_context(|| format!("unknown session '{session}'"))?;
-            cancel_quiesce_timer_locked(slot);
-            slot.state = LifecycleState::Busy;
-            slot.last_activity_at = Some(now_rfc3339());
-            RuntimeEvent::SessionState {
-                session: session.to_string(),
-                state: LifecycleState::Busy,
-                reason: "dispatch reaction observed".into(),
-                timestamp: now_rfc3339(),
-            }
-        };
-        self.emit(state_event);
-        self.emit_request_ack(context, session, bytes_written);
-        Ok(())
-    }
-
-    fn session_state_for_alert(
-        &self,
-        session: &str,
-    ) -> (Option<WorkState>, Option<LifecycleState>) {
-        let slots = self.inner.slots.lock();
-        let Some(slot) = slots.get(session) else {
-            return (None, None);
-        };
-
-        (
-            slot.work_state_observed.then_some(slot.work_state),
-            Some(slot.state),
-        )
     }
 
     fn emit_supervisor_alert(&self, alert: SupervisorAlertEvent) {
@@ -2399,39 +2853,6 @@ impl SupervisorHandle {
             message: alert.message,
             severity: alert.severity,
             timestamp: now_rfc3339(),
-        });
-    }
-
-    #[cfg(test)]
-    fn emit_request_ack_timeout(
-        &self,
-        context: &RequestAckContext,
-        session: &str,
-        elapsed: Duration,
-    ) {
-        let (last_work_state, last_session_state) = self.session_state_for_alert(session);
-        self.emit(RuntimeEvent::RequestAckTimeout {
-            request_id: context.request_id.clone(),
-            session: session.to_string(),
-            action: context.action.clone(),
-            elapsed_ms: elapsed.as_millis() as u64,
-            timestamp: now_rfc3339(),
-        });
-        self.emit_supervisor_alert(SupervisorAlertEvent {
-            alert_type: SupervisorAlertType::AckTimeout,
-            request_id: Some(context.request_id.clone()),
-            session: Some(session.to_string()),
-            action: Some(context.action.clone()),
-            last_work_state,
-            last_session_state,
-            message: format!(
-                "Dispatch {} to {} didn't ACK in {}s; last work_state={}",
-                context.action,
-                session,
-                elapsed.as_secs(),
-                work_state_alert_label(last_work_state)
-            ),
-            severity: AlertSeverity::Warn,
         });
     }
 
@@ -2461,25 +2882,80 @@ impl SupervisorHandle {
         target_session: &str,
     ) -> Result<DispatchAttemptDecision> {
         self.refresh_session_liveness();
+        self.emit_dispatch_attempt_from_current_slot(request_id, action, from, target_session)
+    }
+
+    fn emit_dispatch_attempt_from_current_slot(
+        &self,
+        request_id: &str,
+        action: &str,
+        from: &str,
+        target_session: &str,
+    ) -> Result<DispatchAttemptDecision> {
         let decision = {
             let slots = self.inner.slots.lock();
             let slot = slots
-                .get(target_session)
+                .get_by_alias(target_session)
                 .with_context(|| format!("unknown session '{target_session}'"))?;
-            let target_work_state_before = slot.work_state_observed.then_some(slot.work_state);
-            let last_route_from_target_instant = slot.last_route_from_session_instant;
-            let mut decision = DispatchAttemptDecision {
-                target_lifecycle_state_before: slot.state,
-                target_work_state_before,
-                target_last_activity_at: slot.last_activity_at.clone(),
-                last_route_from_target_at: slot.last_route_from_session_at.clone(),
-                last_route_from_target_instant,
-                reason: None,
-            };
-            decision.reason = dispatch_overlap_reason(&decision);
-            decision
+            DispatchAttemptDecision::from_slot(slot)
         };
 
+        self.emit_dispatch_attempt_decision(request_id, action, from, target_session, decision)
+    }
+
+    fn emit_dispatch_attempt_for_session_id(
+        &self,
+        request_id: &str,
+        action: &str,
+        from: &str,
+        session_id: SessionId,
+    ) -> Result<DispatchAttemptDecision> {
+        self.refresh_session_liveness();
+        let (alias, decision) = {
+            let slots = self.inner.slots.lock();
+            let slot = slots
+                .get_by_id(session_id)
+                .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
+            (
+                slot.definition.alias.clone(),
+                DispatchAttemptDecision::from_slot(slot),
+            )
+        };
+        self.emit_dispatch_attempt_decision(request_id, action, from, &alias, decision)
+    }
+
+    fn emit_dispatch_attempt_from_pane_caller(
+        &self,
+        request_id: &str,
+        action: &str,
+        caller: &PaneCaller,
+    ) -> Result<DispatchAttemptDecision> {
+        let decision = {
+            let slots = self.inner.slots.lock();
+            Self::validate_pane_caller_locked(caller, &slots)?;
+            let slot = slots
+                .get_by_id(caller.session_id)
+                .ok_or_else(|| anyhow!("sideband caller run is stale"))?;
+            DispatchAttemptDecision::from_slot(slot)
+        };
+
+        self.emit_dispatch_attempt_decision(
+            request_id,
+            action,
+            &caller.session,
+            &caller.session,
+            decision,
+        )
+    }
+
+    fn emit_dispatch_attempt_decision(
+        &self,
+        request_id: &str,
+        action: &str,
+        from: &str,
+        target_session: &str,
+        decision: DispatchAttemptDecision,
+    ) -> Result<DispatchAttemptDecision> {
         self.emit(RuntimeEvent::DispatchAttempt {
             request_id: request_id.to_string(),
             action: action.to_string(),
@@ -2497,106 +2973,12 @@ impl SupervisorHandle {
         Ok(decision)
     }
 
-    fn emit_dispatch_template_warning_if_needed(
-        &self,
-        request_id: &str,
-        session: &str,
-        content: &str,
-    ) {
-        let (detected_patterns, missing_patterns) = dispatch_template_pattern_match(content);
-        if !detected_patterns.is_empty() {
-            return;
-        }
-
-        self.emit(RuntimeEvent::DispatchTemplateWarning {
-            request_id: request_id.to_string(),
-            session: session.to_string(),
-            detected_patterns,
-            missing_patterns,
-            severity: AlertSeverity::Info,
-            timestamp: now_rfc3339(),
-        });
-    }
-
-    fn record_route_from_session(&self, session: &str) {
-        let timestamp = now_rfc3339();
-        let now = Instant::now();
-        let mut slots = self.inner.slots.lock();
-        if let Some(slot) = slots.get_mut(session) {
-            slot.last_route_from_session_at = Some(timestamp);
-            slot.last_route_from_session_instant = Some(now);
-        }
-        drop(slots);
-        self.resolve_dispatch_reactions_for_session(session, now, DispatchReactionOutcome::Reacted);
-    }
-
-    fn record_pane_signal(
-        &self,
-        request_id: &str,
-        signal: PaneSignalRecord,
-    ) -> Result<PaneSignalWritePaths> {
-        let task_id = normalized_required_field("task_id", signal.task_id)?;
-        let summary = normalized_required_field("summary", signal.summary)?;
-        let session = signal.session;
-        let now = Utc::now();
-        let timestamp = now.to_rfc3339();
-        let signal_type_name = pane_signal_type_name(signal.signal_type);
-        let safe_request_id = pane_signal_filename_component(request_id);
-        let signal_path = self.runtime_dir().join("signals").join(format!(
-            "{}__{}__{}.json",
-            safe_request_id,
-            signal_type_name,
-            pane_signal_file_timestamp(now)
-        ));
-        let legacy_touch_path = self
-            .runtime_dir()
-            .join("dispatch-triggers")
-            .join(format!("{safe_request_id}.{signal_type_name}"));
-        let event = RuntimeEvent::PaneSignal {
-            request_id: request_id.to_string(),
-            session,
-            task_id,
-            signal_type: signal.signal_type,
-            summary,
-            artifact_paths: signal.artifact_paths,
-            commit_sha: signal.commit_sha,
-            timestamp,
-        };
-        let persisted_event = audit_event_projection(&event, self.inner.as_ref())
-            .expect("pane signal metadata projection should always be retained");
-        let payload = format!("{}\n", serde_json::to_string_pretty(&persisted_event)?);
-
-        write_atomic_bytes(&signal_path, payload.as_bytes()).with_context(|| {
-            format!(
-                "failed to write canonical pane signal {}",
-                signal_path.display()
-            )
-        })?;
-
-        if let Err(error) = write_empty_touch_file(&legacy_touch_path) {
-            self.emit(RuntimeEvent::SystemLog {
-                level: LogLevel::Warn,
-                message: format!(
-                    "pane_signal legacy touch-file write failed for {}: {error}",
-                    legacy_touch_path.display()
-                ),
-                timestamp: now_rfc3339(),
-            });
-        }
-
-        self.emit(event);
-
-        Ok(PaneSignalWritePaths {
-            signal_path,
-            legacy_touch_path,
-        })
-    }
-
     fn arm_quiesce_timer(
         &self,
-        session_name: &str,
+        session_id: SessionId,
         driver: DriverKind,
         generation: SessionGeneration,
+        run_id: Uuid,
         armed_at: Instant,
     ) {
         let Some(threshold) = quiesce_threshold(driver) else {
@@ -2604,17 +2986,21 @@ impl SupervisorHandle {
         };
 
         let handle = self.clone();
-        let session_name_owned = session_name.to_string();
         let task = self.inner.background_runtime.spawn(async move {
             tokio::time::sleep(threshold).await;
-            handle.fire_quiesce_timer(session_name_owned, generation, armed_at, threshold);
+            handle.fire_quiesce_timer(session_id, generation, run_id, armed_at, threshold);
         });
 
         let mut slots = self.inner.slots.lock();
-        if let Some(slot) = slots.get_mut(session_name) {
+        if !self.inner.shutdown_started.load(Ordering::Acquire)
+            && let Some(slot) = slots
+                .get_by_id_mut(session_id)
+                .filter(|slot| slot.generation == generation && slot.run_id == Some(run_id))
+        {
             cancel_quiesce_timer_locked(slot);
             slot.quiesce_timer = Some(QuiesceTimer {
                 generation,
+                run_id,
                 handle: task,
             });
         } else {
@@ -2624,37 +3010,57 @@ impl SupervisorHandle {
 
     fn fire_quiesce_timer(
         &self,
-        session_name: String,
+        session_id: SessionId,
         armed_generation: SessionGeneration,
+        armed_run_id: Uuid,
         armed_at: Instant,
         threshold: Duration,
     ) {
+        let _shutdown = self.inner.shutdown_lifecycle.lock();
+        if self.inner.shutdown_started.load(Ordering::Acquire) {
+            return;
+        }
         let (events, stale_drop) = {
             let mut slots = self.inner.slots.lock();
-            let Some(slot) = slots.get_mut(&session_name) else {
+            let Some(slot) = slots.get_by_id_mut(session_id) else {
                 return;
             };
+            let session_alias = slot.definition.alias.clone();
             let timer = slot.quiesce_timer.take();
             match timer {
-                Some(timer) if timer.generation == armed_generation => {
+                Some(timer)
+                    if timer.generation == armed_generation && timer.run_id == armed_run_id =>
+                {
                     if slot.generation == armed_generation
+                        && slot.run_id == Some(armed_run_id)
                         && slot.state == LifecycleState::Ready
                         && slot.last_real_output_at == Some(armed_at)
                     {
-                        slot.state = LifecycleState::Idle;
-                        slot.last_activity_at = Some(now_rfc3339());
-                        let mut events = vec![RuntimeEvent::SessionState {
-                            session: session_name.clone(),
-                            state: LifecycleState::Idle,
-                            reason: format!("quiesce timeout {}s", threshold.as_secs()),
-                            timestamp: now_rfc3339(),
-                        }];
-                        if let Some(event) =
-                            transition_work_state_locked(&session_name, slot, WorkState::Idle, None)
-                        {
-                            events.push(event);
+                        if ensure_run_event_capacity(slot, 2).is_err() {
+                            (Vec::new(), true)
+                        } else {
+                            slot.state = LifecycleState::Idle;
+                            slot.last_activity_at = Some(now_rfc3339());
+                            let mut events = Vec::new();
+                            if let Some(event) = transition_work_state_locked(
+                                &session_alias,
+                                slot,
+                                armed_run_id,
+                                WorkState::Idle,
+                                None,
+                            ) {
+                                events.push(event);
+                            }
+                            let identity = next_run_event_identity(slot, armed_run_id);
+                            events.push(RuntimeEvent::SessionState {
+                                identity,
+                                session: session_alias,
+                                state: LifecycleState::Idle,
+                                reason: format!("quiesce timeout {}s", threshold.as_secs()),
+                                timestamp: now_rfc3339(),
+                            });
+                            (events, false)
                         }
-                        (events, false)
                     } else {
                         (Vec::new(), true)
                     }
@@ -2668,19 +3074,21 @@ impl SupervisorHandle {
         };
 
         if stale_drop {
-            self.note_stale_quiesce_drop(&session_name, armed_generation);
+            self.note_stale_quiesce_drop(session_id, armed_generation);
         }
         for event in events {
-            self.emit(event);
+            if matches!(&event, RuntimeEvent::SessionWorkState { .. }) {
+                self.emit_run_work_state(event, armed_generation, armed_run_id);
+            } else {
+                self.emit_run_event(event);
+            }
         }
     }
 
-    fn note_stale_quiesce_drop(&self, session_name: &str, generation: SessionGeneration) {
+    fn note_stale_quiesce_drop(&self, session_id: SessionId, generation: SessionGeneration) {
         let counter = {
             let mut counts = self.inner.stale_quiesce_drop_counts.lock();
-            let count = counts
-                .entry((session_name.to_string(), generation))
-                .or_insert(0);
+            let count = counts.entry((session_id, generation)).or_insert(0);
             *count += 1;
             *count
         };
@@ -2689,23 +3097,32 @@ impl SupervisorHandle {
             self.emit(RuntimeEvent::SystemLog {
                 level: LogLevel::Info,
                 message: format!(
-                    "Dropped stale quiesce timer for session '{session_name}' generation {generation} (count={counter})"
+                    "Dropped stale quiesce timer for session '{session_id}' generation {generation} (count={counter})"
                 ),
                 timestamp: now_rfc3339(),
             });
         }
     }
 
-    fn handle_session_work_state_side_effects(&self, session_name: &str, state: WorkState) {
+    fn handle_session_work_state_side_effects(
+        &self,
+        session_id: SessionId,
+        generation: SessionGeneration,
+        run_id: Uuid,
+        state: WorkState,
+    ) {
         let is_stall_state = matches!(state, WorkState::Blocked | WorkState::ErrorLoop);
         let now = Instant::now();
         let timestamp = now_rfc3339();
-        let enabled = self.inner.auto_restart_on_stall.enabled_for(session_name);
+        let enabled = self.inner.auto_restart_on_stall.enabled_for(session_id);
         let threshold = self.inner.auto_restart_on_stall.threshold;
         let weak = Arc::downgrade(&self.inner);
 
         let mut slots = self.inner.slots.lock();
-        let Some(slot) = slots.get_mut(session_name) else {
+        let Some(slot) = slots
+            .get_by_id_mut(session_id)
+            .filter(|slot| slot.generation == generation && slot.run_id == Some(run_id))
+        else {
             return;
         };
         cancel_stall_detector_locked(slot);
@@ -2723,20 +3140,18 @@ impl SupervisorHandle {
             return;
         }
 
-        let session = session_name.to_string();
-        let generation = slot.generation;
-        let task_session = session.clone();
         let task = self.inner.background_runtime.spawn(async move {
             tokio::time::sleep(threshold).await;
             let Some(inner) = weak.upgrade() else {
                 return;
             };
             SupervisorHandle { inner }
-                .fire_stall_detector(task_session, generation, state, now)
+                .fire_stall_detector(session_id, generation, run_id, state, now)
                 .await;
         });
         slot.stall_detector = Some(StallDetector {
             generation,
+            run_id,
             state,
             entered_at: now,
             handle: task,
@@ -2745,60 +3160,93 @@ impl SupervisorHandle {
 
     async fn fire_stall_detector(
         &self,
-        session: String,
+        session_id: SessionId,
         generation: SessionGeneration,
+        run_id: Uuid,
         state: WorkState,
         entered_at: Instant,
     ) {
-        let Some(stall) = self.current_stall_snapshot(&session, generation, state, entered_at)
+        #[cfg(test)]
+        if let Some(hook) = self.inner.stall_before_reservation.lock().take() {
+            hook();
+        }
+
+        let Some((stall, reservation)) =
+            self.reserve_current_stall_attempt(session_id, generation, run_id, state, entered_at)
         else {
             return;
         };
+        let session_alias = self
+            .inner
+            .slots
+            .lock()
+            .get_by_id(session_id)
+            .map(|slot| slot.definition.alias.clone())
+            .unwrap_or_else(|| session_alias(session_id));
 
-        match self.reserve_auto_restart_attempt(&session) {
-            AutoRestartReservation::Reserved => {
-                self.emit_supervisor_alert(SupervisorAlertEvent {
-                    alert_type: SupervisorAlertType::SessionStallDetected,
-                    request_id: None,
-                    session: Some(session.clone()),
-                    action: Some("restart_session".into()),
-                    last_work_state: stall.last_work_state,
-                    last_session_state: stall.last_session_state,
-                    message: format!(
-                        "Session {} stayed in {} for {}s; issuing auto-restart",
-                        session,
-                        work_state_alert_label(stall.last_work_state),
-                        self.inner.auto_restart_on_stall.threshold.as_secs()
-                    ),
-                    severity: AlertSeverity::Critical,
-                });
+        #[cfg(test)]
+        if let Some(hook) = self.inner.stall_after_reservation.lock().take() {
+            hook();
+        }
+        if !self.is_current_run(session_id, generation, run_id) {
+            self.rollback_auto_restart_reservation(session_id, reservation);
+            return;
+        }
 
+        match reservation {
+            AutoRestartReservation::Reserved(reserved_at) => {
                 let restart_handle = self.clone();
-                let restart_session = session.clone();
+                let restart_session_id = stall.session_id;
                 let join = tokio::task::spawn_blocking(move || {
-                    restart_handle.restart_session_at(&restart_session, generation)
+                    restart_handle.restart_session_at(restart_session_id, generation, Some(run_id))
                 })
                 .await;
                 match join {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(error)) => self.emit_supervisor_alert(SupervisorAlertEvent {
-                        alert_type: SupervisorAlertType::OperatorAttention,
+                    Ok(Ok(_)) => self.emit_supervisor_alert(SupervisorAlertEvent {
+                        alert_type: SupervisorAlertType::SessionStallDetected,
                         request_id: None,
-                        session: Some(session),
+                        session: Some(session_alias.clone()),
                         action: Some("restart_session".into()),
                         last_work_state: stall.last_work_state,
                         last_session_state: stall.last_session_state,
-                        message: format!("Auto-restart failed: {error}"),
+                        message: format!(
+                            "Session {} run {} stayed in {} for {}s; auto-restart completed",
+                            session_alias,
+                            run_id,
+                            work_state_alert_label(stall.last_work_state),
+                            self.inner.auto_restart_on_stall.threshold.as_secs()
+                        ),
                         severity: AlertSeverity::Critical,
                     }),
+                    Ok(Err(error)) => {
+                        if error.to_string().contains("superseded") {
+                            self.rollback_auto_restart_reservation(
+                                session_id,
+                                AutoRestartReservation::Reserved(reserved_at),
+                            );
+                            return;
+                        }
+                        self.emit_supervisor_alert(SupervisorAlertEvent {
+                            alert_type: SupervisorAlertType::OperatorAttention,
+                            request_id: None,
+                            session: Some(session_alias),
+                            action: Some("restart_session".into()),
+                            last_work_state: stall.last_work_state,
+                            last_session_state: stall.last_session_state,
+                            message: format!("Auto-restart failed for run {run_id}: {error}"),
+                            severity: AlertSeverity::Critical,
+                        });
+                    }
                     Err(error) => self.emit_supervisor_alert(SupervisorAlertEvent {
                         alert_type: SupervisorAlertType::OperatorAttention,
                         request_id: None,
-                        session: Some(session),
+                        session: Some(session_alias),
                         action: Some("restart_session".into()),
                         last_work_state: stall.last_work_state,
                         last_session_state: stall.last_session_state,
-                        message: format!("Auto-restart worker join failed: {error}"),
+                        message: format!(
+                            "Auto-restart worker join failed for run {run_id}: {error}"
+                        ),
                         severity: AlertSeverity::Critical,
                     }),
                 }
@@ -2807,11 +3255,13 @@ impl SupervisorHandle {
                 self.emit_supervisor_alert(SupervisorAlertEvent {
                     alert_type: SupervisorAlertType::SessionStallDetected,
                     request_id: None,
-                    session: Some(session),
+                    session: Some(session_alias),
                     action: Some("restart_session".into()),
                     last_work_state: stall.last_work_state,
                     last_session_state: stall.last_session_state,
-                    message: "Auto-restart cap reached: 3 restarts in 30 minutes; manual operator intervention required".to_string(),
+                    message: format!(
+                        "Auto-restart cap reached for run {run_id}: 3 restarts in 30 minutes; manual operator intervention required"
+                    ),
                     severity: AlertSeverity::Critical,
                 });
             }
@@ -2819,30 +3269,37 @@ impl SupervisorHandle {
         }
     }
 
-    fn current_stall_snapshot(
+    fn reserve_current_stall_attempt(
         &self,
-        session: &str,
+        session_id: SessionId,
         generation: SessionGeneration,
+        run_id: Uuid,
         state: WorkState,
         entered_at: Instant,
-    ) -> Option<StallAlertSnapshot> {
+    ) -> Option<(StallAlertSnapshot, AutoRestartReservation)> {
+        if !self.inner.auto_restart_on_stall.enabled_for(session_id) {
+            return None;
+        }
         let mut slots = self.inner.slots.lock();
-        let slot = slots.get_mut(session)?;
+        let slot = slots.get_by_id_mut(session_id)?;
         let detector_matches = slot
             .stall_detector
             .as_ref()
             .map(|detector| {
                 detector.generation == generation
+                    && detector.run_id == run_id
                     && detector.state == state
                     && detector.entered_at == entered_at
             })
             .unwrap_or(false);
         if !detector_matches
             || slot.generation != generation
+            || slot.run_id != Some(run_id)
             || slot.work_state != state
             || !matches!(slot.work_state, WorkState::Blocked | WorkState::ErrorLoop)
             || slot.state != LifecycleState::Ready
             || slot.running.is_none()
+            || slot.lifecycle_operation.is_some()
             || matches!(
                 slot.stop_intent,
                 Some(StopIntent {
@@ -2854,35 +3311,55 @@ impl SupervisorHandle {
             return None;
         }
 
+        let now = Instant::now();
+        let reservation = {
+            let mut history_by_session = self.inner.auto_restart_history.lock();
+            let history = history_by_session.entry(session_id).or_default();
+            if history.disabled {
+                AutoRestartReservation::Disabled
+            } else {
+                history
+                    .attempts
+                    .retain(|attempt| now.duration_since(*attempt) <= AUTO_RESTART_WINDOW);
+                if history.attempts.len() >= AUTO_RESTART_MAX_PER_WINDOW {
+                    history.disabled = true;
+                    AutoRestartReservation::CapReached
+                } else {
+                    history.attempts.push(now);
+                    AutoRestartReservation::Reserved(now)
+                }
+            }
+        };
         slot.stall_detector.take();
-        Some(StallAlertSnapshot {
-            last_work_state: slot.work_state_observed.then_some(slot.work_state),
-            last_session_state: Some(slot.state),
-        })
+        Some((
+            StallAlertSnapshot {
+                session_id: slot.session_id,
+                last_work_state: slot.work_state_observed.then_some(slot.work_state),
+                last_session_state: Some(slot.state),
+            },
+            reservation,
+        ))
     }
 
-    fn reserve_auto_restart_attempt(&self, session: &str) -> AutoRestartReservation {
-        if !self.inner.auto_restart_on_stall.enabled_for(session) {
-            return AutoRestartReservation::Disabled;
-        }
-
-        let now = Instant::now();
+    fn rollback_auto_restart_reservation(
+        &self,
+        session_id: SessionId,
+        reservation: AutoRestartReservation,
+    ) {
         let mut history_by_session = self.inner.auto_restart_history.lock();
-        let history = history_by_session.entry(session.to_string()).or_default();
-        if history.disabled {
-            return AutoRestartReservation::Disabled;
+        let Some(history) = history_by_session.get_mut(&session_id) else {
+            return;
+        };
+        match reservation {
+            AutoRestartReservation::Reserved(reserved_at) => {
+                history.attempts.retain(|attempt| *attempt != reserved_at);
+            }
+            AutoRestartReservation::CapReached => history.disabled = false,
+            AutoRestartReservation::Disabled => {}
         }
-
-        history
-            .attempts
-            .retain(|attempt| now.duration_since(*attempt) <= AUTO_RESTART_WINDOW);
-        if history.attempts.len() >= AUTO_RESTART_MAX_PER_WINDOW {
-            history.disabled = true;
-            return AutoRestartReservation::CapReached;
+        if history.attempts.is_empty() && !history.disabled {
+            history_by_session.remove(&session_id);
         }
-
-        history.attempts.push(now);
-        AutoRestartReservation::Reserved
     }
 
     #[cfg(test)]
@@ -2890,16 +3367,78 @@ impl SupervisorHandle {
         *self.inner.pty_spawner.write() = spawner;
     }
 
+    #[cfg(test)]
+    fn set_executable_resolver_for_tests(&self, resolver: Arc<dyn DriverExecutableResolver>) {
+        *self.inner.executable_resolver.write() = resolver;
+    }
+
+    #[cfg(test)]
+    fn set_pty_event_before_commit_for_tests<F>(&self, hook: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        *self.inner.pty_event_before_commit.lock() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn set_work_state_before_side_effect_for_tests<F>(&self, hook: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        *self.inner.work_state_before_side_effect.lock() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn set_stall_before_reservation_for_tests<F>(&self, hook: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        *self.inner.stall_before_reservation.lock() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn set_stall_after_reservation_for_tests<F>(&self, hook: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        *self.inner.stall_after_reservation.lock() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn set_sideband_write_timeout_for_tests(&self, timeout: Duration) {
+        *self.inner.sideband_write_timeout.lock() = timeout;
+    }
+
+    #[cfg(test)]
+    fn set_stop_kill_timeout_for_tests(&self, timeout: Duration) {
+        *self.inner.stop_kill_timeout.lock() = timeout;
+    }
+
+    #[cfg(test)]
+    fn fail_next_catalog_write_for_tests(&self) {
+        self.inner
+            .fail_next_catalog_write
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn set_run_input_before_commit_for_tests<F>(&self, hook: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        *self.inner.run_input_before_commit.lock() = Some(Box::new(hook));
+    }
+
     pub fn snapshot(&self) -> RuntimeSnapshot {
         self.refresh_session_liveness();
-        let mut sessions = self
+        let sessions = self.inner.slots.lock().ordered_snapshots();
+        let workspace_preference = self
             .inner
-            .slots
+            .catalog
             .lock()
-            .values()
-            .map(SessionSlot::snapshot)
-            .collect::<Vec<_>>();
-        sessions.sort_by(|left, right| left.name.cmp(&right.name));
+            .workspace_preference
+            .canonical_path
+            .clone();
         let control_plane = self
             .inner
             .control_plane
@@ -2909,6 +3448,7 @@ impl SupervisorHandle {
 
         RuntimeSnapshot {
             sessions,
+            workspace_preference,
             control_plane,
             runtime_dir: self.runtime_dir().display().to_string(),
             audit_log_path: self.audit_log_path().display().to_string(),
@@ -2916,298 +3456,915 @@ impl SupervisorHandle {
         }
     }
 
-    pub fn start_session(&self, name: &str, extra_args: Vec<String>) -> Result<SessionSnapshot> {
-        validate_extra_args(&extra_args)?;
+    pub fn start_session_by_id(&self, session_id: SessionId) -> Result<SessionSnapshot> {
+        self.ensure_active()?;
         self.refresh_session_liveness();
-        let expected = {
-            let mut slots = self.inner.slots.lock();
+        let (initial_generation, definition, lease) = {
+            let slots = self.inner.slots.lock();
+            self.ensure_active()?;
             let slot = slots
-                .get_mut(name)
-                .with_context(|| format!("unknown session '{name}'"))?;
+                .get_by_id(session_id)
+                .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
+            if slot.lifecycle_operation.is_some() {
+                return Err(anyhow!(
+                    "session '{session_id}' already has a lifecycle operation in progress"
+                ));
+            }
+            if slot.termination_uncertain {
+                return Err(anyhow!(
+                    "session '{session_id}' has an unverified prior termination and cannot be started"
+                ));
+            }
+            if slot.spawn_in_flight.is_some() {
+                return Err(anyhow!(
+                    "session '{session_id}' already has a spawn in progress"
+                ));
+            }
             if slot.running.is_some() {
                 return Ok(slot.snapshot());
             }
+            let lease = self.revalidate_slot_working_directory(slot)?;
+            (slot.generation, slot.definition.clone(), lease)
+        };
+        let spec = self.prepare_launch_spec_for_spawn(&definition)?;
+        let expected = {
+            let mut slots = self.inner.slots.lock();
+            self.ensure_active()?;
+            let slot = slots
+                .get_by_id_mut(session_id)
+                .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
+            if slot.lifecycle_operation.is_some() {
+                return Err(anyhow!(
+                    "session '{session_id}' already has a lifecycle operation in progress"
+                ));
+            }
+            if slot.termination_uncertain {
+                return Err(anyhow!(
+                    "session '{session_id}' has an unverified prior termination and cannot be started"
+                ));
+            }
+            if slot.spawn_in_flight.is_some() {
+                return Err(anyhow!(
+                    "session '{session_id}' already has a spawn in progress"
+                ));
+            }
+            if slot.running.is_some() {
+                return Ok(slot.snapshot());
+            }
+            if slot.generation != initial_generation || slot.definition != definition {
+                return Err(anyhow!(
+                    "session '{session_id}' definition changed while launch was being prepared; retry"
+                ));
+            }
+            ensure_run_event_capacity(slot, 1)?;
             cancel_quiesce_timer_locked(slot);
-            slot.generation = slot.generation.wrapping_add(1);
+            slot.run_id = None;
+            slot.generation = slot
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("session generation exhausted for '{session_id}'"))?;
+            slot.state = LifecycleState::Starting;
             slot.generation
         };
-        self.start_session_at(name, expected, extra_args)
+        self.start_session_at(session_id, expected, lease, spec)
     }
 
-    pub fn stop_session(&self, name: &str) -> Result<SessionSnapshot> {
-        let expected = self.bump_session_generation(name)?;
-        self.stop_session_at(name, expected)
+    pub fn stop_session_by_id(&self, session_id: SessionId) -> Result<SessionSnapshot> {
+        {
+            let slots = self.inner.slots.lock();
+            let slot = slots
+                .get_by_id(session_id)
+                .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
+            if slot.state == LifecycleState::Closed
+                && slot.running.is_none()
+                && slot.run_id.is_none()
+                && slot.spawn_in_flight.is_none()
+                && slot.lifecycle_operation.is_none()
+                && slot.stop_intent.is_none()
+                && !slot.termination_uncertain
+            {
+                return Ok(slot.snapshot());
+            }
+        }
+        let (_, expected) =
+            self.declare_stop_operation(session_id, None, StopIntentKind::Operator)?;
+        self.stop_session_at(session_id, expected)
     }
 
-    pub fn restart_session(&self, name: &str) -> Result<SessionSnapshot> {
+    pub fn restart_session_by_id(&self, session_id: SessionId) -> Result<SessionSnapshot> {
         self.refresh_session_liveness();
-        let expected_stop = self.bump_session_generation(name)?;
-        self.restart_session_at(name, expected_stop)
+        let (expected_generation, expected_run_id) = {
+            let slots = self.inner.slots.lock();
+            let slot = slots
+                .get_by_id(session_id)
+                .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
+            if slot.lifecycle_operation.is_some() {
+                return Err(anyhow!(
+                    "session '{session_id}' already has a lifecycle operation in progress"
+                ));
+            }
+            if slot.termination_uncertain {
+                return Err(anyhow!(
+                    "session '{session_id}' has an unverified prior termination and cannot be restarted"
+                ));
+            }
+            if slot.spawn_in_flight.is_some() {
+                return Err(anyhow!(
+                    "session '{session_id}' already has a spawn in progress"
+                ));
+            }
+            ensure_run_event_capacity(slot, 5)?;
+            (slot.generation, slot.run_id)
+        };
+        self.restart_session_at(session_id, expected_generation, expected_run_id)
     }
 
     pub fn shutdown(&self) -> Result<()> {
-        let (ptys, revoked_credentials) = {
+        let _shutdown = self.inner.shutdown_lifecycle.lock();
+        if self.inner.shutdown_started.swap(true, Ordering::AcqRel) {
+            let slots = self.inner.slots.lock();
+            let cleanup_pending = slots.ordered_slots().any(|slot| {
+                slot.running.is_some()
+                    || slot.spawn_in_flight.is_some()
+                    || slot.lifecycle_operation.is_some()
+                    || slot.termination_uncertain
+            });
+            drop(slots);
+            #[cfg(windows)]
+            let listener_cleanup_pending = self.inner.control_plane_listener.lock().is_some();
+            #[cfg(not(windows))]
+            let listener_cleanup_pending = false;
+            if !cleanup_pending && !listener_cleanup_pending {
+                return Ok(());
+            }
+        }
+
+        #[cfg(windows)]
+        let listener = {
+            let _lifecycle = self.inner.control_plane_lifecycle.lock();
+            self.inner.control_plane.write().take();
+            self.inner.control_plane_listener.lock().take()
+        };
+
+        #[cfg(not(windows))]
+        {
+            let _lifecycle = self.inner.control_plane_lifecycle.lock();
+            self.inner.control_plane.write().take();
+        }
+
+        #[cfg(windows)]
+        if let Some(listener) = listener.as_ref() {
+            listener.cancel();
+        }
+
+        let kill_timeout = *self.inner.stop_kill_timeout.lock();
+        let deadline = Instant::now() + kill_timeout;
+        let (termination_attempts, mut errors) = {
             let mut slots = self.inner.slots.lock();
-            let revoked_credentials = self.revoke_all_control_plane_credentials_in_memory();
-            let mut ptys = Vec::new();
-            for (name, slot) in slots.iter_mut() {
+            let mut attempts = Vec::new();
+            let mut errors = Vec::new();
+            for slot in slots.by_id.values_mut() {
                 cancel_quiesce_timer_locked(slot);
-                slot.state = LifecycleState::Closed;
-                slot.process_id = None;
+                slot.run_id = None;
+                slot.stop_intent = None;
                 slot.last_activity_at = Some(now_rfc3339());
                 slot.last_real_output_at = None;
                 reset_work_state_locked(slot);
-                if let Some(mut running) = slot.running.take()
-                    && let Some(pty) = running.pty.take()
-                {
-                    ptys.push((name.clone(), pty));
+
+                if let Some(operation) = slot.lifecycle_operation {
+                    slot.state = LifecycleState::Failed;
+                    slot.termination_uncertain = true;
+                    slot.last_error = Some(format!(
+                        "shutdown could not overtake the in-flight {:?} lifecycle operation at generation {}",
+                        operation.kind, operation.generation
+                    ));
+                    errors.push(format!(
+                        "session '{}' still has an in-flight lifecycle operation",
+                        slot.definition.alias
+                    ));
+                    continue;
+                }
+
+                if slot.spawn_in_flight.is_some() {
+                    slot.generation = slot.generation.saturating_add(1);
+                    slot.state = LifecycleState::Failed;
+                    slot.termination_uncertain = true;
+                    slot.last_error = Some(
+                        "shutdown superseded a spawn that has not returned a process-scope termination receipt"
+                            .into(),
+                    );
+                    errors.push(format!(
+                        "session '{}' still has a spawn in flight",
+                        slot.definition.alias
+                    ));
+                    continue;
+                }
+
+                let Some(running) = slot.running.as_ref().cloned() else {
+                    if slot.termination_uncertain {
+                        slot.state = LifecycleState::Failed;
+                        errors.push(format!(
+                            "session '{}' has no retained process-scope owner for re-proof",
+                            slot.definition.alias
+                        ));
+                    } else {
+                        slot.state = LifecycleState::Closed;
+                        slot.process_id = None;
+                    }
+                    continue;
+                };
+
+                slot.generation = slot.generation.saturating_add(1);
+                slot.lifecycle_operation = Some(LifecycleOperation {
+                    generation: slot.generation,
+                    kind: StopIntentKind::Operator,
+                });
+                slot.state = LifecycleState::Failed;
+                slot.termination_uncertain = true;
+                slot.last_error = Some("shutdown process-scope termination is in progress".into());
+                running.close_input();
+                if let Some(pty) = running.pty.as_ref().cloned() {
+                    let receiver = begin_termination_attempt(
+                        pty.clone(),
+                        running.input_gate.clone(),
+                        deadline,
+                    );
+                    attempts.push((
+                        slot.session_id,
+                        slot.generation,
+                        slot.definition.alias.clone(),
+                        pty,
+                        receiver,
+                    ));
+                } else {
+                    errors.push(format!(
+                        "session '{}' has no retained PTY process-scope owner",
+                        slot.definition.alias
+                    ));
                 }
             }
-            (ptys, revoked_credentials)
+            (attempts, errors)
         };
 
-        for (name, pty) in ptys {
-            if let Err(error) = pty.kill() {
+        for (session_id, generation, alias, pty, receiver) in termination_attempts {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let attempt = receiver.recv_timeout(remaining).ok();
+            let timed_out = attempt.is_none();
+            let proved = attempt
+                .as_ref()
+                .is_some_and(|attempt| attempt.kill_error.is_none() && attempt.input_idle);
+            let mut detail = match &attempt {
+                Some(attempt) if attempt.kill_error.is_some() => {
+                    format!("process-scope termination failed: {}", attempt.kill_error.as_deref().unwrap_or_default())
+                }
+                Some(_) if !proved => "process scope terminated but input writers did not drain before the shutdown deadline".into(),
+                Some(_) => "shutdown process-scope termination proved".into(),
+                None => format!(
+                    "process-scope termination did not finish within {}ms",
+                    kill_timeout.as_millis()
+                ),
+            };
+            let committed_proof = {
+                let mut slots = self.inner.slots.lock();
+                if let Some(slot) = slots.get_by_id_mut(session_id)
+                    && slot.generation == generation
+                    && slot.lifecycle_operation
+                        == Some(LifecycleOperation {
+                            generation,
+                            kind: StopIntentKind::Operator,
+                        })
+                {
+                    let owns_same_pty = slot
+                        .running
+                        .as_ref()
+                        .and_then(|running| running.pty.as_ref())
+                        .is_some_and(|current| Arc::ptr_eq(current, &pty));
+                    let committed_proof = proved && owns_same_pty;
+                    if committed_proof {
+                        slot.running = None;
+                        slot.process_id = None;
+                        slot.termination_uncertain = false;
+                        slot.state = LifecycleState::Closed;
+                        slot.last_error = None;
+                    } else {
+                        if proved && !owns_same_pty {
+                            detail =
+                                "process-scope owner changed before shutdown proof could commit"
+                                    .into();
+                        }
+                        slot.termination_uncertain = true;
+                        slot.state = LifecycleState::Failed;
+                        slot.last_error = Some(detail.clone());
+                    }
+                    if !timed_out {
+                        slot.lifecycle_operation = None;
+                    }
+                    committed_proof
+                } else {
+                    detail =
+                        "shutdown termination reservation changed before proof could commit".into();
+                    false
+                }
+            };
+            if !committed_proof {
+                errors.push(format!("session '{alias}': {detail}"));
                 self.emit(RuntimeEvent::SystemLog {
                     level: LogLevel::Warn,
-                    message: format!("shutdown: failed to kill session '{name}': {error:#}"),
+                    message: format!("shutdown: {alias}: {detail}"),
                     timestamp: now_rfc3339(),
                 });
             }
-            drop(pty);
+            if timed_out {
+                self.schedule_late_termination_reproof(
+                    session_id,
+                    generation,
+                    StopIntentKind::Operator,
+                    pty,
+                    receiver,
+                    "shutdown",
+                );
+            }
         }
 
-        remove_revoked_credential_files(&revoked_credentials)?;
+        #[cfg(windows)]
+        {
+            if let Some(listener) = listener {
+                match listener.join_until(deadline) {
+                    ControlPlaneJoinOutcome::Joined(Ok(())) => {}
+                    ControlPlaneJoinOutcome::Joined(Err(error)) => {
+                        errors.push(format!("control-plane listener shutdown failed: {error:#}"));
+                    }
+                    ControlPlaneJoinOutcome::TimedOut(listener) => {
+                        let mut retained = self.inner.control_plane_listener.lock();
+                        if retained.is_none() {
+                            *retained = Some(listener);
+                        } else {
+                            errors.push(
+                                "control-plane listener shutdown lost its exclusive retained handle"
+                                    .into(),
+                            );
+                        }
+                        errors.push(format!(
+                            "control-plane listener did not stop within the {}ms shutdown deadline",
+                            kill_timeout.as_millis()
+                        ));
+                    }
+                }
+            }
+        }
 
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow!("shutdown incomplete: {}", errors.join("; ")))
+        }
     }
 
-    pub fn create_pair(&self, name: &str) -> Result<Vec<SessionSnapshot>> {
-        let snapshots = {
-            let mut slots = self.inner.slots.lock();
-            validate_pair_name(name)?;
-            ensure_pair_name_available(&slots, name)?;
+    fn persist_catalog_candidate(&self, candidate: &SessionCatalogV1) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .inner
+            .fail_next_catalog_write
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err(anyhow!("injected session catalog persistence failure"));
+        }
+        persist_session_catalog(&self.inner.runtime_dir, candidate)
+    }
 
-            let working_dir = slots
-                .get("claude")
-                .or_else(|| slots.get("codex"))
-                .map(|slot| slot.definition.working_dir.clone())
-                .ok_or_else(|| anyhow!("main pair is missing from supervisor state"))?;
-            let [claude_definition, codex_definition] =
-                pair_session_definitions(name, &working_dir);
+    fn revalidate_slot_working_directory(&self, slot: &SessionSlot) -> Result<DirectoryLease> {
+        let expected = slot.qualified_working_directory.as_ref().ok_or_else(|| {
+            anyhow!(
+                "session '{}' has no qualified working directory",
+                slot.session_id
+            )
+        })?;
+        revalidate_qualified_working_directory(slot.session_id, expected, &self.inner.runtime_dir)
+    }
 
-            let claude_slot = closed_session_slot(claude_definition);
-            let codex_slot = closed_session_slot(codex_definition);
-            let mut snapshots = vec![claude_slot.snapshot(), codex_slot.snapshot()];
-            snapshots.sort_by(|left, right| left.name.cmp(&right.name));
+    pub fn set_workspace_preference(&self, path: &Path) -> Result<String> {
+        self.ensure_active()?;
+        let (qualified, _lease) = qualify_working_directory(path, &self.inner.runtime_dir)?;
+        let mut catalog = self.inner.catalog.lock();
+        let mut candidate = catalog.clone();
+        candidate.workspace_preference = qualified.clone();
+        self.persist_catalog_candidate(&candidate)?;
+        *catalog = candidate;
+        Ok(qualified.canonical_path)
+    }
 
-            slots.insert(claude_slot.definition.name.clone(), claude_slot);
-            slots.insert(codex_slot.definition.name.clone(), codex_slot);
-            snapshots
+    pub fn create_session(
+        &self,
+        request: shared_types::CreateSessionRequest,
+    ) -> Result<SessionSnapshot> {
+        self.ensure_active()?;
+        let label = request.label.unwrap_or_else(|| match request.driver {
+            DriverKind::Claude => "Claude".into(),
+            DriverKind::Codex => "Codex".into(),
+            DriverKind::GenericTerminal => "Terminal".into(),
+        });
+        validate_session_label(&label)?;
+        if request.driver == DriverKind::GenericTerminal
+            && request.permission_profile == shared_types::PermissionProfile::Unsafe
+        {
+            return Err(anyhow!(
+                "generic terminal sessions do not support the unsafe permission profile"
+            ));
+        }
+
+        let workspace_preference = self.inner.catalog.lock().workspace_preference.clone();
+        let _lease = revalidate_qualified_directory(
+            "workspace preference",
+            &workspace_preference,
+            &self.inner.runtime_dir,
+        )?;
+        let session_id = Uuid::new_v4();
+        let definition = SessionDefinition {
+            session_id,
+            alias: session_alias(session_id),
+            label: label.clone(),
+            driver: request.driver,
+            working_dir: workspace_preference.canonical_path.clone(),
+            permission_profile: request.permission_profile,
         };
+        let mut slot = closed_session_slot(definition);
+        slot.qualified_working_directory = Some(workspace_preference.clone());
+        let snapshot = slot.snapshot();
 
-        self.emit(RuntimeEvent::PairCreated {
-            name: name.to_string(),
+        {
+            let mut slots = self.inner.slots.lock();
+            let mut catalog = self.inner.catalog.lock();
+            if catalog.workspace_preference != workspace_preference {
+                return Err(anyhow!(
+                    "workspace preference changed while the session was being created; retry"
+                ));
+            }
+            slots.validate_insert(&slot)?;
+            let mut candidate = catalog.clone();
+            candidate.sessions.push(PersistedSessionV1 {
+                session_id,
+                label,
+                driver: request.driver,
+                working_directory: workspace_preference,
+                permission_profile: request.permission_profile,
+            });
+            self.persist_catalog_candidate(&candidate)?;
+            slots.insert_prevalidated(slot);
+            self.inner
+                .run_event_publish
+                .lock()
+                .insert(session_id, RunEventPublishState::new(1));
+            *catalog = candidate;
+        }
+
+        self.emit(RuntimeEvent::SessionCreated {
+            schema_version: 1,
+            session: snapshot.clone(),
             timestamp: now_rfc3339(),
         });
-
-        Ok(snapshots)
+        Ok(snapshot)
     }
 
-    pub fn rename_pair(&self, old_name: &str, new_name: &str) -> Result<Vec<SessionSnapshot>> {
-        self.refresh_session_liveness();
-        if old_name == "main" {
-            return Err(anyhow!("cannot rename the main pair"));
-        }
-
-        let (snapshots, revoked_credentials) = {
+    pub fn rename_session(&self, session_id: SessionId, label: &str) -> Result<SessionSnapshot> {
+        self.ensure_active()?;
+        validate_session_label(label)?;
+        let (snapshot, old_label) = {
             let mut slots = self.inner.slots.lock();
-            validate_pair_name(new_name)?;
-            ensure_pair_name_available(&slots, new_name)?;
+            let mut catalog = self.inner.catalog.lock();
+            let old_label = slots
+                .get_by_id(session_id)
+                .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?
+                .definition
+                .label
+                .clone();
+            let mut candidate = catalog.clone();
+            let persisted = candidate
+                .sessions
+                .iter_mut()
+                .find(|session| session.session_id == session_id)
+                .ok_or_else(|| anyhow!("session '{session_id}' is missing from the catalog"))?;
+            persisted.label = label.to_string();
+            self.persist_catalog_candidate(&candidate)?;
+            let slot = slots
+                .get_by_id_mut(session_id)
+                .expect("validated session disappeared during rename");
+            slot.definition.label = label.to_string();
+            let snapshot = slot.snapshot();
+            *catalog = candidate;
+            (snapshot, old_label)
+        };
+        self.emit(RuntimeEvent::SessionRenamed {
+            schema_version: 1,
+            session_id,
+            old_label,
+            new_label: label.to_string(),
+            timestamp: now_rfc3339(),
+        });
+        Ok(snapshot)
+    }
 
-            let (old_claude_name, old_codex_name) = pair_slot_names(old_name);
-            let old_claude = slots
-                .get(&old_claude_name)
-                .ok_or_else(|| anyhow!("pair '{old_name}' not found"))?;
-            let old_codex = slots
-                .get(&old_codex_name)
-                .ok_or_else(|| anyhow!("pair '{old_name}' not found"))?;
+    pub fn set_session_working_directory(
+        &self,
+        session_id: SessionId,
+        path: &Path,
+    ) -> Result<SessionSnapshot> {
+        self.ensure_active()?;
+        let (qualified, _lease) = qualify_working_directory(path, &self.inner.runtime_dir)?;
+        let (snapshot, old_working_dir) = {
+            let mut slots = self.inner.slots.lock();
+            let mut catalog = self.inner.catalog.lock();
+            let slot = slots
+                .get_by_id(session_id)
+                .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
+            ensure_closed_for_definition_edit(slot)?;
+            let old_working_dir = slot.definition.working_dir.clone();
+            let mut candidate = catalog.clone();
+            let persisted = candidate
+                .sessions
+                .iter_mut()
+                .find(|session| session.session_id == session_id)
+                .ok_or_else(|| anyhow!("session '{session_id}' is missing from the catalog"))?;
+            persisted.working_directory = qualified.clone();
+            self.persist_catalog_candidate(&candidate)?;
+            let slot = slots
+                .get_by_id_mut(session_id)
+                .expect("validated session disappeared during cwd update");
+            slot.definition.working_dir = qualified.canonical_path.clone();
+            slot.qualified_working_directory = Some(qualified.clone());
+            let snapshot = slot.snapshot();
+            *catalog = candidate;
+            (snapshot, old_working_dir)
+        };
+        self.emit(RuntimeEvent::SessionWorkingDirectoryChanged {
+            schema_version: 1,
+            session_id,
+            old_working_dir,
+            new_working_dir: qualified.canonical_path,
+            timestamp: now_rfc3339(),
+        });
+        Ok(snapshot)
+    }
 
-            if old_claude.state != LifecycleState::Closed
-                || old_claude.running.is_some()
-                || old_codex.state != LifecycleState::Closed
-                || old_codex.running.is_some()
+    pub fn set_permission_profile(
+        &self,
+        session_id: SessionId,
+        permission_profile: shared_types::PermissionProfile,
+    ) -> Result<SessionSnapshot> {
+        self.ensure_active()?;
+        let (snapshot, old_profile) = {
+            let mut slots = self.inner.slots.lock();
+            let mut catalog = self.inner.catalog.lock();
+            let slot = slots
+                .get_by_id(session_id)
+                .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
+            ensure_closed_for_definition_edit(slot)?;
+            if slot.definition.driver == DriverKind::GenericTerminal
+                && permission_profile == shared_types::PermissionProfile::Unsafe
             {
                 return Err(anyhow!(
-                    "pair '{old_name}' has running sessions; stop both panes first"
+                    "generic terminal sessions do not support the unsafe permission profile"
                 ));
             }
-
-            let working_dir = old_claude.definition.working_dir.clone();
-            let [new_claude_definition, new_codex_definition] =
-                pair_session_definitions(new_name, &working_dir);
-
-            let revoked_credentials = self.revoke_session_credentials_in_memory(&[
-                old_claude_name.clone(),
-                old_codex_name.clone(),
-            ]);
-
-            let old_claude_slot = slots
-                .remove(&old_claude_name)
-                .expect("validated pair slot disappeared during rename");
-            let old_codex_slot = slots
-                .remove(&old_codex_name)
-                .expect("validated pair slot disappeared during rename");
-
-            let new_claude_slot = renamed_closed_slot(old_claude_slot, new_claude_definition);
-            let new_codex_slot = renamed_closed_slot(old_codex_slot, new_codex_definition);
-            let mut snapshots = vec![new_claude_slot.snapshot(), new_codex_slot.snapshot()];
-            snapshots.sort_by(|left, right| left.name.cmp(&right.name));
-
-            slots.insert(new_claude_slot.definition.name.clone(), new_claude_slot);
-            slots.insert(new_codex_slot.definition.name.clone(), new_codex_slot);
-            (snapshots, revoked_credentials)
+            let old_profile = slot.definition.permission_profile;
+            let mut candidate = catalog.clone();
+            let persisted = candidate
+                .sessions
+                .iter_mut()
+                .find(|session| session.session_id == session_id)
+                .ok_or_else(|| anyhow!("session '{session_id}' is missing from the catalog"))?;
+            persisted.permission_profile = permission_profile;
+            self.persist_catalog_candidate(&candidate)?;
+            let slot = slots
+                .get_by_id_mut(session_id)
+                .expect("validated session disappeared during permission update");
+            slot.definition.permission_profile = permission_profile;
+            let snapshot = slot.snapshot();
+            *catalog = candidate;
+            (snapshot, old_profile)
         };
-
-        let cleanup_result = remove_revoked_credential_files(&revoked_credentials);
-
-        self.emit(RuntimeEvent::PairRenamed {
-            old_name: old_name.to_string(),
-            new_name: new_name.to_string(),
+        self.emit(RuntimeEvent::SessionPermissionChanged {
+            schema_version: 1,
+            session_id,
+            old_profile,
+            new_profile: permission_profile,
             timestamp: now_rfc3339(),
         });
-
-        cleanup_result?;
-
-        Ok(snapshots)
+        Ok(snapshot)
     }
 
-    pub fn delete_pair(&self, name: &str) -> Result<()> {
-        self.refresh_session_liveness();
-        if name == "main" {
-            return Err(anyhow!("cannot delete the main pair"));
-        }
-
-        let (claude_name, codex_name) = pair_slot_names(name);
-        let sessions_to_stop = {
-            let slots = self.inner.slots.lock();
-            let claude_slot = slots
-                .get(&claude_name)
-                .ok_or_else(|| anyhow!("pair '{name}' not found"))?;
-            let codex_slot = slots
-                .get(&codex_name)
-                .ok_or_else(|| anyhow!("pair '{name}' not found"))?;
-
-            let mut sessions = Vec::new();
-            if claude_slot.running.is_some() {
-                sessions.push((claude_name.clone(), claude_slot.generation));
-            }
-            if codex_slot.running.is_some() {
-                sessions.push((codex_name.clone(), codex_slot.generation));
-            }
-            sessions
-        };
-
-        for (session_name, generation) in sessions_to_stop {
-            self.stop_session_at(&session_name, generation)?;
-        }
-
-        let revoked_credentials = {
+    pub fn move_session(&self, session_id: SessionId, new_index: usize) -> Result<RuntimeSnapshot> {
+        self.ensure_active()?;
+        let old_index = {
             let mut slots = self.inner.slots.lock();
-            let claude_slot = slots
-                .get(&claude_name)
-                .ok_or_else(|| anyhow!("pair '{name}' not found"))?;
-            let codex_slot = slots
-                .get(&codex_name)
-                .ok_or_else(|| anyhow!("pair '{name}' not found"))?;
-            if claude_slot.running.is_some() || codex_slot.running.is_some() {
+            let mut catalog = self.inner.catalog.lock();
+            let old_index = slots
+                .order
+                .iter()
+                .position(|candidate| *candidate == session_id)
+                .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
+            if new_index >= slots.order.len() {
                 return Err(anyhow!(
-                    "pair '{name}' has running sessions; stop both panes first"
+                    "session index {new_index} is out of bounds for {} sessions",
+                    slots.order.len()
                 ));
             }
-
-            let revoked_credentials = self
-                .revoke_session_credentials_in_memory(&[claude_name.clone(), codex_name.clone()]);
-
-            slots.remove(&claude_name);
-            slots.remove(&codex_name);
-            revoked_credentials
+            if old_index == new_index {
+                drop(catalog);
+                drop(slots);
+                return Ok(self.snapshot());
+            }
+            let mut candidate = catalog.clone();
+            let persisted = candidate.sessions.remove(old_index);
+            candidate.sessions.insert(new_index, persisted);
+            self.persist_catalog_candidate(&candidate)?;
+            let moved = slots.order.remove(old_index);
+            slots.order.insert(new_index, moved);
+            *catalog = candidate;
+            old_index
         };
-
-        let cleanup_result = remove_revoked_credential_files(&revoked_credentials);
-
-        self.emit(RuntimeEvent::PairDeleted {
-            name: name.to_string(),
+        self.emit(RuntimeEvent::SessionMoved {
+            schema_version: 1,
+            session_id,
+            old_index,
+            new_index,
             timestamp: now_rfc3339(),
         });
+        Ok(self.snapshot())
+    }
 
-        cleanup_result?;
-
+    pub fn delete_session(&self, session_id: SessionId) -> Result<()> {
+        self.ensure_active()?;
+        self.refresh_session_liveness();
+        let label = {
+            let mut slots = self.inner.slots.lock();
+            let slot = slots
+                .get_by_id(session_id)
+                .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
+            ensure_closed_for_definition_edit(slot)?;
+            let next_sequence = slot
+                .run_event_sequence
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("session run-event sequence is exhausted"))?;
+            {
+                let streams = self.inner.run_event_publish.lock();
+                let stream = streams
+                    .get(&session_id)
+                    .ok_or_else(|| anyhow!("session event stream is missing"))?;
+                if stream.draining
+                    || !stream.pending.is_empty()
+                    || stream.next_sequence != Some(next_sequence)
+                {
+                    return Err(anyhow!(
+                        "session event stream is still draining; retry deletion"
+                    ));
+                }
+            }
+            let label = slot.definition.label.clone();
+            let mut catalog = self.inner.catalog.lock();
+            let mut candidate = catalog.clone();
+            let index = candidate
+                .sessions
+                .iter()
+                .position(|session| session.session_id == session_id)
+                .ok_or_else(|| anyhow!("session '{session_id}' is missing from the catalog"))?;
+            candidate.sessions.remove(index);
+            self.persist_catalog_candidate(&candidate)?;
+            slots
+                .remove(session_id)
+                .expect("validated session disappeared during deletion");
+            self.inner.run_event_publish.lock().remove(&session_id);
+            *catalog = candidate;
+            label
+        };
+        self.emit(RuntimeEvent::SessionDeleted {
+            schema_version: 1,
+            session_id,
+            label,
+            timestamp: now_rfc3339(),
+        });
         Ok(())
     }
 
-    fn stop_session_at(&self, name: &str, expected: SessionGeneration) -> Result<SessionSnapshot> {
-        self.refresh_session_liveness();
-        let (pty, stop_intent, process_id, revoked_credentials) = {
+    fn schedule_late_termination_reproof(
+        &self,
+        session_id: SessionId,
+        generation: SessionGeneration,
+        kind: StopIntentKind,
+        pty: Arc<dyn PtySession>,
+        receiver: mpsc::Receiver<TerminationAttempt>,
+        context: &'static str,
+    ) {
+        let supervisor = self.clone();
+        thread::spawn(move || {
+            let late_result = receiver.recv();
+            let detail = match late_result {
+                Ok(attempt) if attempt.kill_error.is_none() && attempt.input_idle => format!(
+                    "{context} termination returned after its deadline; an explicit reserved re-proof is required"
+                ),
+                Ok(attempt) => format!(
+                    "{context} termination returned after its deadline without a usable proof: {}",
+                    attempt
+                        .kill_error
+                        .or(attempt.exit_poll_error)
+                        .unwrap_or_else(|| "input writers did not drain".into())
+                ),
+                Err(_) => format!(
+                    "{context} termination worker ended without returning a proof; an explicit reserved re-proof is required"
+                ),
+            };
+            let reconciled = {
+                let mut slots = supervisor.inner.slots.lock();
+                slots.get_by_id_mut(session_id).is_some_and(|slot| {
+                    let owns_same_pty = slot
+                        .running
+                        .as_ref()
+                        .and_then(|running| running.pty.as_ref())
+                        .is_some_and(|current| Arc::ptr_eq(current, &pty));
+                    if slot.generation != generation
+                        || slot.lifecycle_operation != Some(LifecycleOperation { generation, kind })
+                        || !owns_same_pty
+                    {
+                        return false;
+                    }
+                    slot.lifecycle_operation = None;
+                    slot.state = LifecycleState::Failed;
+                    slot.termination_uncertain = true;
+                    slot.last_error = Some(detail.clone());
+                    true
+                })
+            };
+            if reconciled {
+                supervisor.emit(RuntimeEvent::SystemLog {
+                    level: LogLevel::Warn,
+                    message: format!("{}: {detail}", session_alias(session_id)),
+                    timestamp: now_rfc3339(),
+                });
+            }
+        });
+    }
+
+    fn schedule_late_rejected_spawn_reproof(
+        &self,
+        session_id: SessionId,
+        reservation: SpawnReservation,
+        pty: Arc<dyn PtySession>,
+        receiver: mpsc::Receiver<TerminationAttempt>,
+    ) {
+        let supervisor = self.clone();
+        thread::spawn(move || {
+            let late_result = receiver.recv();
+            let detail = match late_result {
+                Ok(attempt) if attempt.kill_error.is_none() && attempt.input_idle =>
+                    "rejected-spawn termination returned after its deadline; an explicit reserved re-proof is required".to_string(),
+                Ok(attempt) => format!(
+                    "rejected-spawn termination returned after its deadline without a usable proof: {}",
+                    attempt
+                        .kill_error
+                        .or(attempt.exit_poll_error)
+                        .unwrap_or_else(|| "input writers did not drain".into())
+                ),
+                Err(_) => "rejected-spawn termination worker ended without returning a proof; an explicit reserved re-proof is required".into(),
+            };
+            let reconciled = {
+                let mut slots = supervisor.inner.slots.lock();
+                slots.get_by_id_mut(session_id).is_some_and(|slot| {
+                    let owns_same_pty = slot
+                        .running
+                        .as_ref()
+                        .and_then(|running| running.pty.as_ref())
+                        .is_some_and(|current| Arc::ptr_eq(current, &pty));
+                    if slot.spawn_in_flight != Some(reservation) || !owns_same_pty {
+                        return false;
+                    }
+                    slot.spawn_in_flight = None;
+                    if slot
+                        .lifecycle_operation
+                        .is_some_and(|operation| operation.generation == reservation.generation)
+                    {
+                        slot.lifecycle_operation = None;
+                    }
+                    slot.state = LifecycleState::Failed;
+                    slot.termination_uncertain = true;
+                    slot.last_error = Some(detail.clone());
+                    true
+                })
+            };
+            if reconciled {
+                supervisor.emit(RuntimeEvent::SystemLog {
+                    level: LogLevel::Warn,
+                    message: format!("{}: {detail}", session_alias(session_id)),
+                    timestamp: now_rfc3339(),
+                });
+            }
+        });
+    }
+
+    fn stop_session_at(
+        &self,
+        session_id: SessionId,
+        expected: SessionGeneration,
+    ) -> Result<SessionSnapshot> {
+        let (alias, pty, input_gate, stop_intent, process_id, spawn_in_flight, lifecycle_kind) = {
             let mut slots = self.inner.slots.lock();
             let slot = slots
-                .get_mut(name)
-                .with_context(|| format!("unknown session '{name}'"))?;
+                .get_by_id_mut(session_id)
+                .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
+            let alias = slot.definition.alias.clone();
             if slot.generation != expected {
                 return Err(anyhow!(
                     "stop_session_at superseded: expected gen {expected}, current {}",
                     slot.generation
                 ));
             }
+            let operation = slot.lifecycle_operation.ok_or_else(|| {
+                anyhow!(
+                    "stop_session_at has no declared lifecycle operation for session '{session_id}'"
+                )
+            })?;
+            if operation.generation != expected {
+                return Err(anyhow!(
+                    "stop_session_at lifecycle declaration mismatch: expected gen {expected}, declared {}",
+                    operation.generation
+                ));
+            }
+            ensure_run_event_capacity(slot, 2)?;
 
-            let revoked_credentials =
-                self.revoke_session_credentials_in_memory(&[name.to_string()]);
             cancel_quiesce_timer_locked(slot);
-            let pty = slot.running.take().and_then(|running| running.pty);
+            let running = slot.running.as_ref().cloned();
+            if let Some(running) = &running {
+                running.close_input();
+            }
+            let pty = running
+                .as_ref()
+                .and_then(|running| running.pty.as_ref().cloned());
+            let input_gate = running.map(|running| running.input_gate);
+            slot.run_id = None;
             let process_id = slot.process_id;
             let stop_intent = pty.as_ref().map(|_| StopIntent {
                 generation: expected,
-                kind: if slot.state == LifecycleState::Restarting {
-                    StopIntentKind::Restart
-                } else {
-                    StopIntentKind::Operator
-                },
+                kind: operation.kind,
             });
             slot.stop_intent = stop_intent;
-            slot.state = LifecycleState::Closed;
-            slot.process_id = None;
+            let spawn_in_flight = slot.spawn_in_flight.is_some();
+            slot.termination_uncertain = pty.is_some() || spawn_in_flight;
+            slot.state = if matches!(
+                stop_intent,
+                Some(StopIntent {
+                    kind: StopIntentKind::Restart,
+                    ..
+                })
+            ) {
+                LifecycleState::Restarting
+            } else if pty.is_some() || spawn_in_flight {
+                LifecycleState::Failed
+            } else {
+                LifecycleState::Closed
+            };
             slot.last_activity_at = Some(now_rfc3339());
             slot.last_real_output_at = None;
             reset_work_state_locked(slot);
-            (pty, stop_intent, process_id, revoked_credentials)
+            (
+                alias,
+                pty,
+                input_gate,
+                stop_intent,
+                process_id,
+                spawn_in_flight,
+                operation.kind,
+            )
         };
-
-        let credential_cleanup_result = remove_revoked_credential_files(&revoked_credentials);
 
         let mut exit_status = None;
         let mut exit_poll_error = None;
-        if let Some(pty) = pty {
-            let (tx, rx) = std::sync::mpsc::channel();
-            thread::spawn(move || {
-                let kill_error = pty.kill().err().map(|error| error.to_string());
-                let (status, poll_error) = match pty.try_wait() {
-                    Ok(status) => (status, None),
-                    Err(error) => (None, Some(error.to_string())),
-                };
-                let _ = tx.send((kill_error, status, poll_error));
-            });
-            match rx.recv_timeout(Duration::from_secs(5)) {
-                Ok((kill_error, status, poll_error)) => {
-                    exit_status = status;
-                    exit_poll_error = kill_error.or(poll_error);
+        let mut termination_proven = pty.is_none() && process_id.is_none() && !spawn_in_flight;
+        let mut termination_attempt_timed_out = false;
+        let mut late_termination = None;
+        if let (Some(pty), Some(input_gate)) = (pty.as_ref(), input_gate) {
+            let kill_timeout = *self.inner.stop_kill_timeout.lock();
+            match terminate_running_session_bounded(pty.clone(), input_gate, kill_timeout) {
+                BoundedTerminationAttempt::Completed(attempt) => {
+                    termination_proven = attempt.kill_error.is_none() && attempt.input_idle;
+                    exit_status = attempt.exit_status;
+                    exit_poll_error = attempt.kill_error.or(attempt.exit_poll_error);
+                    if !attempt.input_idle && exit_poll_error.is_none() {
+                        exit_poll_error = Some(format!(
+                            "PTY input writers did not drain within {}ms after process-scope termination",
+                            kill_timeout.as_millis()
+                        ));
+                    }
                 }
-                Err(_) => {
-                    exit_poll_error =
-                        Some("pty.kill() did not return within 5s; exit status unavailable".into());
+                BoundedTerminationAttempt::TimedOut(receiver) => {
+                    termination_attempt_timed_out = true;
+                    late_termination = Some(receiver);
+                    exit_poll_error = Some(format!(
+                        "pty.kill() did not return within {}ms; process-scope termination is unproved",
+                        kill_timeout.as_millis()
+                    ));
                     self.emit(RuntimeEvent::SystemLog {
                         level: LogLevel::Warn,
                         message: format!(
-                            "pty.kill() for session '{name}' (gen {expected}) did not return within 5s; proceeding (resource may be leaked)"
+                            "pty.kill() for session '{alias}' (gen {expected}) did not return within {}ms; retained ownership and blocked lifecycle mutation",
+                            kill_timeout.as_millis()
                         ),
                         timestamp: now_rfc3339(),
                     });
@@ -3218,18 +4375,18 @@ impl SupervisorHandle {
         let exit_classification = stop_intent.map(|intent| {
             classify_session_exit(
                 exit_status,
-                exit_poll_error,
+                exit_poll_error.clone(),
                 Some(intent),
                 SessionExitReason::ProcessDisappeared,
                 "requested stop completed without exit status",
             )
         });
 
-        let snapshot = {
+        let (snapshot, state_identity, exit_identity) = {
             let mut slots = self.inner.slots.lock();
             let slot = slots
-                .get_mut(name)
-                .expect("session disappeared during stop_session_at");
+                .get_by_id_mut(session_id)
+                .ok_or_else(|| anyhow!("session disappeared during stop_session_at"))?;
             if slot.generation != expected {
                 return Err(anyhow!(
                     "stop_session_at superseded mid-op: expected gen {expected}, current {}",
@@ -3242,14 +4399,71 @@ impl SupervisorHandle {
                     slot.stop_intent = None;
                 }
             }
-            slot.snapshot()
+            if termination_proven && let Some(expected_pty) = pty.as_ref() {
+                let owns_expected_pty = slot
+                    .running
+                    .as_ref()
+                    .and_then(|running| running.pty.as_ref())
+                    .is_some_and(|current| Arc::ptr_eq(current, expected_pty));
+                if !owns_expected_pty {
+                    termination_proven = false;
+                    exit_poll_error = Some(
+                        "process-scope owner changed before termination proof could commit".into(),
+                    );
+                }
+            }
+            if !termination_attempt_timed_out
+                && slot.lifecycle_operation.is_some_and(|operation| {
+                    operation.generation == expected
+                        && (operation.kind == StopIntentKind::Operator || !termination_proven)
+                })
+            {
+                slot.lifecycle_operation = None;
+            }
+            slot.termination_uncertain = !termination_proven;
+            if termination_proven {
+                slot.running = None;
+                slot.process_id = None;
+                slot.state = LifecycleState::Closed;
+            } else {
+                slot.state = LifecycleState::Failed;
+                slot.last_error = Some(match exit_poll_error.as_deref() {
+                    Some(detail) => format!(
+                        "process termination could not be proved; session definition and process-scope owner are retained: {detail}"
+                    ),
+                    None => "process termination could not be proved; session definition and process-scope owner are retained".into(),
+                });
+            }
+            let state_identity = slot
+                .last_run_id
+                .map(|run_id| next_run_event_identity(slot, run_id));
+            let exit_identity = if termination_proven && exit_classification.is_some() {
+                slot.last_run_id
+                    .map(|run_id| next_run_event_identity(slot, run_id))
+            } else {
+                None
+            };
+            (slot.snapshot(), state_identity, exit_identity)
         };
 
         let timestamp = now_rfc3339();
-        if let Some(classification) = &exit_classification {
-            self.emit(session_exit_event(
-                snapshot.name.clone(),
-                expected,
+        if let Some(identity) = state_identity {
+            self.emit_run_event(RuntimeEvent::SessionState {
+                identity,
+                session: snapshot.alias.clone(),
+                state: snapshot.lifecycle_state,
+                reason: if termination_proven {
+                    "session stopped".into()
+                } else {
+                    "process termination could not be proved".into()
+                },
+                timestamp: timestamp.clone(),
+            });
+        }
+        if let (Some(classification), Some(identity)) = (&exit_classification, exit_identity) {
+            self.emit_run_event(session_exit_event(
+                snapshot.alias.clone(),
+                identity,
                 process_id,
                 classification,
                 timestamp.clone(),
@@ -3259,107 +4473,301 @@ impl SupervisorHandle {
         {
             let slots = self.inner.slots.lock();
             let slot = slots
-                .get(name)
-                .expect("session disappeared during stop_session_at");
+                .get_by_id(session_id)
+                .ok_or_else(|| anyhow!("session disappeared during stop_session_at"))?;
             if slot.generation != expected {
                 return Err(anyhow!(
                     "stop_session_at superseded mid-op: expected gen {expected}, current {}",
                     slot.generation
                 ));
             }
+        };
+
+        if let (Some(receiver), Some(pty)) = (late_termination, pty) {
+            self.schedule_late_termination_reproof(
+                session_id,
+                expected,
+                lifecycle_kind,
+                pty,
+                receiver,
+                "stop",
+            );
         }
 
-        self.emit(RuntimeEvent::SessionState {
-            session: snapshot.name.clone(),
-            state: snapshot.lifecycle_state,
-            reason: "session stopped".into(),
-            timestamp,
-        });
-        credential_cleanup_result?;
         Ok(snapshot)
     }
 
     fn start_session_at(
         &self,
-        name: &str,
+        session_id: SessionId,
         expected: SessionGeneration,
-        extra_args: Vec<String>,
+        directory_lease: DirectoryLease,
+        spec: LaunchSpec,
     ) -> Result<SessionSnapshot> {
-        validate_extra_args(&extra_args)?;
         self.refresh_session_liveness();
-        let definition = {
+        let (run_id, starting_event) = {
             let mut slots = self.inner.slots.lock();
+            self.ensure_active()?;
             let slot = slots
-                .get_mut(name)
-                .with_context(|| format!("unknown session '{name}'"))?;
+                .get_by_id_mut(session_id)
+                .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
             if slot.generation != expected {
                 return Err(anyhow!(
                     "start_session_at superseded: expected gen {expected}, current {}",
                     slot.generation
                 ));
             }
+            if slot.termination_uncertain {
+                return Err(anyhow!(
+                    "session '{session_id}' has an unverified prior termination and cannot be started"
+                ));
+            }
+            if slot.spawn_in_flight.is_some() {
+                return Err(anyhow!(
+                    "session '{session_id}' already has a spawn in progress"
+                ));
+            }
             if slot.running.is_some() {
                 return Ok(slot.snapshot());
             }
 
+            ensure_run_event_capacity(slot, 1)?;
             cancel_quiesce_timer_locked(slot);
             slot.state = LifecycleState::Starting;
             slot.last_error = None;
             slot.last_activity_at = Some(now_rfc3339());
             slot.last_real_output_at = None;
             reset_work_state_locked(slot);
+            let run_id = Uuid::new_v4();
+            slot.bracketed_paste.begin_run(RunBinding {
+                session_id: slot.session_id,
+                run_id,
+                generation: slot.generation,
+            });
+            slot.run_id = Some(run_id);
+            slot.last_run_id = Some(run_id);
+            slot.spawn_in_flight = Some(SpawnReservation {
+                generation: expected,
+                run_id,
+            });
             let snapshot = slot.snapshot();
-            let mut definition = slot.definition.clone();
-            definition.args.extend(extra_args.clone());
-            drop(slots);
-
-            self.emit(RuntimeEvent::SessionState {
-                session: snapshot.name,
+            let identity = next_run_event_identity(slot, run_id);
+            let starting_event = RuntimeEvent::SessionState {
+                identity,
+                session: snapshot.alias,
                 state: LifecycleState::Starting,
                 reason: "launch requested".into(),
                 timestamp: now_rfc3339(),
-            });
-            definition
+            };
+            (run_id, starting_event)
         };
+        self.emit_run_event(starting_event);
 
-        let definition = self.prepare_definition_for_spawn(&definition)?;
-        let spec = build_launch_spec(&definition);
-        let session_name = definition.name.clone();
         let handle = self.clone();
         let handler: PtyEventHandler = Arc::new(move |event| {
-            handle.handle_pty_event(&session_name, expected, event);
+            handle.handle_pty_event_by_id(session_id, expected, run_id, event);
         });
 
-        match self.inner.pty_spawner.read().clone().spawn(&spec, handler) {
+        let spawn_result = self.inner.pty_spawner.read().clone().spawn(&spec, handler);
+        drop(directory_lease);
+        match spawn_result {
             Ok(pty) => {
-                let snapshot = {
+                let pty: Arc<dyn PtySession> = Arc::from(pty);
+                let installation = {
                     let mut slots = self.inner.slots.lock();
-                    let slot = slots
-                        .get_mut(name)
-                        .expect("session disappeared during start_session_at success");
-                    if slot.generation != expected {
-                        let _ = pty.kill();
-                        return Err(anyhow!(
-                            "start_session_at superseded mid-spawn: expected gen {expected}, current {}",
-                            slot.generation
-                        ));
+                    match slots.get_by_id_mut(session_id) {
+                        None => Err(anyhow!(
+                            "session '{session_id}' was removed while its PTY was spawning"
+                        )),
+                        Some(slot) => {
+                            if self.inner.shutdown_started.load(Ordering::Acquire) {
+                                Err(anyhow!("supervisor has shut down"))
+                            } else if slot.generation != expected {
+                                Err(anyhow!(
+                                    "start_session_at superseded mid-spawn: expected gen {expected}, current {}",
+                                    slot.generation
+                                ))
+                            } else if slot.run_id != Some(run_id) {
+                                Err(anyhow!(
+                                    "start_session_at superseded by another run identity"
+                                ))
+                            } else if slot.spawn_in_flight
+                                != Some(SpawnReservation {
+                                    generation: expected,
+                                    run_id,
+                                })
+                            {
+                                Err(anyhow!("start_session_at lost its spawn reservation"))
+                            } else if let Err(error) = ensure_run_event_capacity(slot, 1) {
+                                Err(error)
+                            } else {
+                                slot.spawn_in_flight = None;
+                                slot.process_id = pty.process_id();
+                                slot.running = Some(RunningSession::new(Some(pty.clone())));
+                                slot.state = LifecycleState::Ready;
+                                slot.last_activity_at = Some(now_rfc3339());
+                                slot.last_real_output_at = None;
+                                reset_work_state_locked(slot);
+                                let identity = next_run_event_identity(slot, run_id);
+                                Ok((slot.snapshot(), identity))
+                            }
+                        }
                     }
-
-                    slot.process_id = pty.process_id();
-                    slot.running = Some(RunningSession { pty: Some(pty) });
-                    slot.state = LifecycleState::Ready;
-                    slot.last_activity_at = Some(now_rfc3339());
-                    slot.last_real_output_at = None;
-                    reset_work_state_locked(slot);
-                    slot.snapshot()
+                };
+                let (snapshot, identity) = match installation {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let process_id = pty.process_id();
+                        let reservation = SpawnReservation {
+                            generation: expected,
+                            run_id,
+                        };
+                        let rejected_running = RunningSession::new(Some(pty.clone()));
+                        rejected_running.close_input();
+                        let input_gate = rejected_running.input_gate.clone();
+                        {
+                            let mut slots = self.inner.slots.lock();
+                            if let Some(slot) = slots.get_by_id_mut(session_id) {
+                                slot.running = Some(rejected_running);
+                                slot.process_id = process_id;
+                                slot.run_id = None;
+                                slot.state = LifecycleState::Failed;
+                                slot.termination_uncertain = true;
+                                slot.last_error = Some(
+                                    "rejected spawned process-scope termination is in progress"
+                                        .into(),
+                                );
+                            }
+                        }
+                        let kill_timeout = *self.inner.stop_kill_timeout.lock();
+                        let (mut cleanup_proven, cleanup_error, late_termination) =
+                            match terminate_running_session_bounded(
+                                pty.clone(),
+                                input_gate,
+                                kill_timeout,
+                            ) {
+                                BoundedTerminationAttempt::Completed(attempt) => {
+                                    let proved = attempt.kill_error.is_none() && attempt.input_idle;
+                                    let error = attempt
+                                        .kill_error
+                                        .or(attempt.exit_poll_error)
+                                        .or_else(|| {
+                                            (!attempt.input_idle).then(|| {
+                                                format!(
+                                                    "PTY input writers did not drain within {}ms",
+                                                    kill_timeout.as_millis()
+                                                )
+                                            })
+                                        });
+                                    (proved, error, None)
+                                }
+                                BoundedTerminationAttempt::TimedOut(receiver) => (
+                                    false,
+                                    Some(format!(
+                                        "process-scope termination did not finish within {}ms",
+                                        kill_timeout.as_millis()
+                                    )),
+                                    Some(receiver),
+                                ),
+                            };
+                        let terminal_event = {
+                            let mut slots = self.inner.slots.lock();
+                            slots.get_by_id_mut(session_id).and_then(|slot| {
+                                if late_termination.is_none()
+                                    && slot.spawn_in_flight == Some(reservation)
+                                {
+                                    slot.spawn_in_flight = None;
+                                }
+                                if late_termination.is_none()
+                                    && slot.lifecycle_operation.is_some_and(|operation| {
+                                        operation.generation == expected
+                                    })
+                                {
+                                    slot.lifecycle_operation = None;
+                                }
+                                slot.stop_intent = None;
+                                slot.run_id = None;
+                                slot.last_activity_at = Some(now_rfc3339());
+                                slot.last_real_output_at = None;
+                                reset_work_state_locked(slot);
+                                if cleanup_proven {
+                                    let owns_same_pty = slot
+                                        .running
+                                        .as_ref()
+                                        .and_then(|running| running.pty.as_ref())
+                                        .is_some_and(|current| Arc::ptr_eq(current, &pty));
+                                    if !owns_same_pty {
+                                        cleanup_proven = false;
+                                        slot.state = LifecycleState::Failed;
+                                        slot.termination_uncertain = true;
+                                        slot.last_error = Some(
+                                            "rejected spawned process-scope owner changed during termination proof"
+                                                .into(),
+                                        );
+                                    } else {
+                                        slot.running = None;
+                                        slot.process_id = None;
+                                        slot.state = LifecycleState::Closed;
+                                        slot.termination_uncertain = false;
+                                        slot.last_error = None;
+                                    }
+                                } else {
+                                    slot.state = LifecycleState::Failed;
+                                    slot.termination_uncertain = true;
+                                    slot.last_error = Some(format!(
+                                        "rejected spawned process scope could not be terminated; ownership retained: {}",
+                                        cleanup_error.as_deref().unwrap_or("termination proof unavailable")
+                                    ));
+                                }
+                                let identity = slot.last_run_id.and_then(|event_run_id| {
+                                    ensure_run_event_capacity(slot, 1)
+                                        .ok()
+                                        .map(|_| next_run_event_identity(slot, event_run_id))
+                                });
+                                identity.map(|identity| RuntimeEvent::SessionState {
+                                    identity,
+                                    session: slot.definition.alias.clone(),
+                                    state: slot.state,
+                                    reason: if cleanup_proven {
+                                        "rejected spawned process scope terminated".into()
+                                    } else {
+                                        "rejected spawned process-scope termination failed".into()
+                                    },
+                                    timestamp: now_rfc3339(),
+                                })
+                            })
+                        };
+                        if let Some(event) = terminal_event {
+                            self.emit_run_event(event);
+                        }
+                        if let Some(receiver) = late_termination {
+                            self.schedule_late_rejected_spawn_reproof(
+                                session_id,
+                                reservation,
+                                pty,
+                                receiver,
+                            );
+                        }
+                        return if cleanup_proven {
+                            Err(error)
+                        } else {
+                            Err(anyhow!(
+                                "{error}; failed to prove rejected spawned PTY termination: {}",
+                                cleanup_error
+                                    .as_deref()
+                                    .unwrap_or("unknown cleanup failure")
+                            ))
+                        };
+                    }
                 };
                 self.emit(RuntimeEvent::SystemLog {
                     level: LogLevel::Info,
-                    message: format!("Started {} session", snapshot.title),
+                    message: format!("Started {} session", snapshot.label),
                     timestamp: now_rfc3339(),
                 });
-                self.emit(RuntimeEvent::SessionState {
-                    session: snapshot.name.clone(),
+                self.emit_run_event(RuntimeEvent::SessionState {
+                    identity,
+                    session: snapshot.alias.clone(),
                     state: snapshot.lifecycle_state,
                     reason: "session ready".into(),
                     timestamp: now_rfc3339(),
@@ -3367,39 +4775,74 @@ impl SupervisorHandle {
                 Ok(snapshot)
             }
             Err(error) => {
-                let (snapshot, revoked_credentials) = {
+                let terminal = {
                     let mut slots = self.inner.slots.lock();
-                    let slot = slots
-                        .get_mut(name)
-                        .expect("session disappeared during start_session_at failure");
-                    if slot.generation != expected {
+                    let Some(slot) = slots.get_by_id_mut(session_id) else {
                         return Err(error);
+                    };
+                    if slot.spawn_in_flight
+                        == Some(SpawnReservation {
+                            generation: expected,
+                            run_id,
+                        })
+                    {
+                        slot.spawn_in_flight = None;
                     }
-                    let revoked_credentials =
-                        self.revoke_session_credentials_in_memory(&[name.to_string()]);
                     slot.running = None;
+                    slot.run_id = None;
                     slot.process_id = None;
-                    slot.state = LifecycleState::Failed;
-                    slot.last_error = Some(error.to_string());
+                    slot.termination_uncertain = false;
+                    let superseded = self.inner.shutdown_started.load(Ordering::Acquire)
+                        || slot.session_id != session_id
+                        || slot.generation != expected;
+                    slot.state = if superseded {
+                        LifecycleState::Closed
+                    } else {
+                        LifecycleState::Failed
+                    };
+                    slot.last_error = (!superseded).then(|| error.to_string());
                     slot.last_real_output_at = None;
                     reset_work_state_locked(slot);
-                    let snapshot = slot.snapshot();
-                    (snapshot, revoked_credentials)
+                    let identity = ensure_run_event_capacity(slot, 1)
+                        .ok()
+                        .map(|_| next_run_event_identity(slot, run_id));
+                    if slot
+                        .lifecycle_operation
+                        .is_some_and(|operation| operation.generation == expected)
+                    {
+                        slot.lifecycle_operation = None;
+                    }
+                    (slot.snapshot(), identity, superseded)
                 };
-                let cleanup_result = remove_revoked_credential_files(&revoked_credentials);
+                let (snapshot, identity, superseded) = terminal;
                 self.emit(RuntimeEvent::SystemLog {
-                    level: LogLevel::Error,
-                    message: format!("Failed to start {}: {error}", snapshot.title),
+                    level: if superseded {
+                        LogLevel::Info
+                    } else {
+                        LogLevel::Error
+                    },
+                    message: if superseded {
+                        format!(
+                            "Discarded failed spawn for superseded {} session: {error}",
+                            snapshot.label
+                        )
+                    } else {
+                        format!("Failed to start {}: {error}", snapshot.label)
+                    },
                     timestamp: now_rfc3339(),
                 });
-                self.emit(RuntimeEvent::SessionState {
-                    session: snapshot.name.clone(),
-                    state: snapshot.lifecycle_state,
-                    reason: "spawn failed".into(),
-                    timestamp: now_rfc3339(),
-                });
-                if let Err(cleanup_error) = cleanup_result {
-                    return Err(error.context(cleanup_error));
+                if let Some(identity) = identity {
+                    self.emit_run_event(RuntimeEvent::SessionState {
+                        identity,
+                        session: snapshot.alias.clone(),
+                        state: snapshot.lifecycle_state,
+                        reason: if superseded {
+                            "superseded spawn failed before creating a process scope".into()
+                        } else {
+                            "spawn failed".into()
+                        },
+                        timestamp: now_rfc3339(),
+                    });
                 }
                 Err(error)
             }
@@ -3408,186 +4851,419 @@ impl SupervisorHandle {
 
     fn restart_session_at(
         &self,
-        name: &str,
-        expected_stop: SessionGeneration,
+        session_id: SessionId,
+        expected_generation: SessionGeneration,
+        expected_run_id: Option<Uuid>,
     ) -> Result<SessionSnapshot> {
-        {
+        let (definition, directory_lease) = {
+            let slots = self.inner.slots.lock();
+            self.ensure_active()?;
+            let slot = slots
+                .get_by_id(session_id)
+                .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
+            if slot.generation != expected_generation || slot.run_id != expected_run_id {
+                return Err(anyhow!(
+                    "restart_session_at superseded before launch preparation"
+                ));
+            }
+            if slot.lifecycle_operation.is_some() {
+                return Err(anyhow!(
+                    "session '{session_id}' already has a lifecycle operation in progress"
+                ));
+            }
+            if slot.termination_uncertain {
+                return Err(anyhow!(
+                    "session '{session_id}' has an unverified prior termination and cannot be restarted"
+                ));
+            }
+            if slot.spawn_in_flight.is_some() {
+                return Err(anyhow!(
+                    "session '{session_id}' already has a spawn in progress"
+                ));
+            }
+            (
+                slot.definition.clone(),
+                self.revalidate_slot_working_directory(slot)?,
+            )
+        };
+        let spec = self.prepare_launch_spec_for_spawn(&definition)?;
+        let (_, expected_stop) = self.declare_stop_operation(
+            session_id,
+            Some((expected_generation, expected_run_id)),
+            StopIntentKind::Restart,
+        )?;
+        let restarting_event = {
             let mut slots = self.inner.slots.lock();
             let slot = slots
-                .get_mut(name)
-                .with_context(|| format!("unknown session '{name}'"))?;
+                .get_by_id_mut(session_id)
+                .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
             if slot.generation != expected_stop {
                 return Err(anyhow!(
                     "restart_session_at superseded: expected gen {expected_stop}, current {}",
                     slot.generation
                 ));
             }
-            cancel_quiesce_timer_locked(slot);
-            slot.state = LifecycleState::Restarting;
+            if slot.lifecycle_operation
+                != Some(LifecycleOperation {
+                    generation: expected_stop,
+                    kind: StopIntentKind::Restart,
+                })
+            {
+                return Err(anyhow!(
+                    "restart_session_at lifecycle declaration changed before stop"
+                ));
+            }
             slot.last_activity_at = Some(now_rfc3339());
             reset_work_state_locked(slot);
             let snapshot = slot.snapshot();
-            drop(slots);
-            self.emit(RuntimeEvent::SessionState {
-                session: snapshot.name,
+            slot.last_run_id.map(|run_id| RuntimeEvent::SessionState {
+                identity: next_run_event_identity(slot, run_id),
+                session: snapshot.alias,
                 state: LifecycleState::Restarting,
                 reason: "restart requested".into(),
                 timestamp: now_rfc3339(),
-            });
+            })
+        };
+        if let Some(event) = restarting_event {
+            self.emit_run_event(event);
         }
 
-        self.stop_session_at(name, expected_stop)?;
-        let expected_start = self.bump_session_generation(name)?;
-        self.start_session_at(name, expected_start, Vec::new())
+        let stopped = self.stop_session_at(session_id, expected_stop)?;
+        if stopped.lifecycle_state != LifecycleState::Closed {
+            return Err(anyhow!(
+                "session '{session_id}' could not be restarted because prior process-scope termination was not proved"
+            ));
+        }
+        let expected_start_result = {
+            let mut slots = self.inner.slots.lock();
+            let admission = (|| -> Result<SessionGeneration> {
+                self.ensure_active()?;
+                let slot = slots
+                    .get_by_id_mut(session_id)
+                    .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
+                if slot.lifecycle_operation
+                    != Some(LifecycleOperation {
+                        generation: expected_stop,
+                        kind: StopIntentKind::Restart,
+                    })
+                {
+                    return Err(anyhow!(
+                        "restart_session_at lifecycle declaration changed after stop"
+                    ));
+                }
+                if slot.definition.driver != definition.driver
+                    || slot.definition.working_dir != definition.working_dir
+                    || slot.definition.permission_profile != definition.permission_profile
+                {
+                    return Err(anyhow!(
+                        "session '{session_id}' definition changed during restart; retry"
+                    ));
+                }
+                ensure_run_event_capacity(slot, 2)?;
+                slot.generation = slot
+                    .generation
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("session generation exhausted for '{session_id}'"))?;
+                slot.state = LifecycleState::Starting;
+                slot.lifecycle_operation = Some(LifecycleOperation {
+                    generation: slot.generation,
+                    kind: StopIntentKind::Restart,
+                });
+                Ok(slot.generation)
+            })();
+            if let Err(error) = &admission
+                && let Some(slot) = slots.get_by_id_mut(session_id)
+                && slot.lifecycle_operation
+                    == Some(LifecycleOperation {
+                        generation: expected_stop,
+                        kind: StopIntentKind::Restart,
+                    })
+            {
+                slot.lifecycle_operation = None;
+                if slot.running.is_none() && slot.spawn_in_flight.is_none() {
+                    slot.state = LifecycleState::Closed;
+                    slot.termination_uncertain = false;
+                    slot.run_id = None;
+                    slot.process_id = None;
+                    slot.stop_intent = None;
+                    slot.last_error = Some(format!("restart did not begin: {error:#}"));
+                }
+            }
+            admission
+        };
+        let expected_start = expected_start_result?;
+        let result = self.start_session_at(session_id, expected_start, directory_lease, spec);
+        let shutdown_crossed_restart = self.inner.shutdown_started.load(Ordering::Acquire);
+        let mut slots = self.inner.slots.lock();
+        if let Some(slot) = slots.get_by_id_mut(session_id)
+            && slot.lifecycle_operation
+                == Some(LifecycleOperation {
+                    generation: expected_start,
+                    kind: StopIntentKind::Restart,
+                })
+        {
+            slot.lifecycle_operation = None;
+            if shutdown_crossed_restart {
+                if slot.running.is_none() && slot.spawn_in_flight.is_none() {
+                    slot.state = LifecycleState::Closed;
+                    slot.termination_uncertain = false;
+                    slot.run_id = None;
+                    slot.process_id = None;
+                    slot.stop_intent = None;
+                } else {
+                    slot.state = LifecycleState::Failed;
+                    slot.termination_uncertain = true;
+                    slot.last_error = Some(
+                        "supervisor shutdown crossed restart; retained process-scope ownership"
+                            .into(),
+                    );
+                }
+            }
+        }
+        drop(slots);
+        if shutdown_crossed_restart {
+            result
+                .map(|_| ())
+                .context("supervisor shut down during restart")?;
+            return Err(anyhow!("supervisor has shut down"));
+        }
+        result
+    }
+
+    fn validate_run_input_target_locked(
+        target: &RunWriteTarget,
+        caller: Option<&PaneCaller>,
+        safety: RunInputSafety,
+        slots: &SessionRegistry,
+    ) -> Result<()> {
+        if let Some(caller) = caller {
+            Self::validate_pane_target_locked(caller, &target.session, slots)?;
+        }
+        let slot = slots
+            .get_by_id(target.session_id)
+            .with_context(|| format!("unknown session '{}'", target.session))?;
+        if slot.definition.alias != target.session
+            || slot.generation != target.generation
+            || slot.run_id != Some(target.run_id)
+        {
+            return Err(anyhow!(
+                "session '{}' run identity changed before input",
+                target.session
+            ));
+        }
+        ensure_run_input_safety_locked(slot, target, safety)?;
+        let running = slot
+            .running
+            .as_ref()
+            .ok_or_else(|| anyhow!("session '{}' is not running", target.session))?;
+        let current_pty = running
+            .pty
+            .as_ref()
+            .ok_or_else(|| anyhow!("session '{}' transport is not available", target.session))?;
+        if !target.input_gate.is_accepting()
+            || !Arc::ptr_eq(&running.input_gate, &target.input_gate)
+            || !Arc::ptr_eq(current_pty, &target.pty)
+        {
+            return Err(anyhow!(
+                "session '{}' run changed before input",
+                target.session
+            ));
+        }
+        Ok(())
+    }
+
+    fn begin_run_input_write<'a>(
+        &self,
+        target: &'a RunWriteTarget,
+        caller: Option<&PaneCaller>,
+        safety: RunInputSafety,
+        control: Option<&'a InputWriteControl>,
+    ) -> Result<RunInputPermit<'a>> {
+        #[cfg(test)]
+        if let Some(hook) = self.inner.run_input_before_commit.lock().take() {
+            hook();
+        }
+        let writer = target.input_gate.begin_write(control)?;
+        let slots = self.inner.slots.lock();
+        Self::validate_run_input_target_locked(target, caller, safety, &slots)?;
+        drop(slots);
+        if let Some(control) = control {
+            control.begin_pty_write()?;
+        }
+        Ok(writer)
+    }
+
+    fn write_full_pty_input(pty: &dyn PtySession, input: &str) -> Result<usize> {
+        let bytes_written = pty.send_input(input)?;
+        if bytes_written != input.len() {
+            return Err(PtyWriteError::new(
+                bytes_written,
+                format!(
+                    "PTY reported a successful short write: accepted {bytes_written} of {} bytes",
+                    input.len()
+                ),
+            )
+            .into());
+        }
+        Ok(bytes_written)
+    }
+
+    fn delivery_error_after_progress(error: anyhow::Error, prior_bytes: usize) -> anyhow::Error {
+        let current_bytes = error
+            .downcast_ref::<PtyWriteError>()
+            .map(PtyWriteError::bytes_written)
+            .unwrap_or(0);
+        PtyWriteError::new(prior_bytes.saturating_add(current_bytes), error.to_string()).into()
+    }
+
+    fn write_run_input(
+        &self,
+        target: &RunWriteTarget,
+        caller: Option<&PaneCaller>,
+        input: &str,
+        safety: RunInputSafety,
+        control: Option<&InputWriteControl>,
+    ) -> Result<usize> {
+        let _writer = self.begin_run_input_write(target, caller, safety, control)?;
+        let write_result = Self::write_full_pty_input(target.pty.as_ref(), input);
+        if let Some(control) = control {
+            control.finish();
+        }
+        write_result
+    }
+
+    fn write_bracketed_submission(
+        &self,
+        target: &RunWriteTarget,
+        content: &str,
+        submit_behavior: SubmitBehavior,
+    ) -> Result<usize> {
+        let safety = RunInputSafety::BracketedPasteEnabled;
+        let _writer = self.begin_run_input_write(target, None, safety, None)?;
+        let framed_content = frame_message_payload(content, MessageFraming::BracketedPaste);
+        let content_bytes = Self::write_full_pty_input(target.pty.as_ref(), &framed_content)?;
+        thread::sleep(submit_behavior.submit_delay);
+
+        let slots = self.inner.slots.lock();
+        if let Err(error) = Self::validate_run_input_target_locked(
+            target,
+            None,
+            RunInputSafety::RoutedSubmit,
+            &slots,
+        ) {
+            return Err(Self::delivery_error_after_progress(error, content_bytes));
+        }
+        drop(slots);
+
+        Self::write_full_pty_input(target.pty.as_ref(), submit_behavior.sequence)
+            .map(|submit_bytes| content_bytes + submit_bytes)
+            .map_err(|error| Self::delivery_error_after_progress(error, content_bytes))
     }
 
     fn send_input_with_bytes(&self, request: SendInputRequest) -> Result<(SessionSnapshot, usize)> {
         self.refresh_session_liveness();
-        let (snapshot, bytes_written) = {
-            let mut slots = self.inner.slots.lock();
+        let (snapshot, target) = {
+            let slots = self.inner.slots.lock();
             let slot = slots
-                .get_mut(&request.name)
-                .with_context(|| format!("unknown session '{}'", request.name))?;
-            let running = slot
-                .running
-                .as_ref()
-                .ok_or_else(|| anyhow!("session '{}' is not running", request.name))?;
-            let bytes_written = running
-                .pty
-                .as_ref()
-                .ok_or_else(|| anyhow!("session '{}' transport is not available", request.name))?
-                .send_input(&request.input)?;
-            (slot.snapshot(), bytes_written)
+                .get_by_id(request.session_id)
+                .ok_or_else(|| anyhow!("unknown session id '{}'", request.session_id))?;
+            (
+                slot.snapshot(),
+                run_write_target_from_slot(&slot.definition.alias, slot)?,
+            )
         };
+        let bytes_written =
+            self.write_run_input(&target, None, &request.input, RunInputSafety::Raw, None)?;
 
         Ok((snapshot, bytes_written))
     }
 
     pub fn send_input(&self, request: SendInputRequest) -> Result<SessionSnapshot> {
+        self.ensure_active()?;
         let request_id = Uuid::new_v4().to_string();
-        self.emit_dispatch_attempt(&request_id, "send_input", "operator", &request.name)?;
+        self.emit_dispatch_attempt_for_session_id(
+            &request_id,
+            "send_input",
+            "operator",
+            request.session_id,
+        )?;
         self.send_input_with_bytes(request)
             .map(|(snapshot, _bytes_written)| snapshot)
     }
 
-    fn send_input_with_request_ack(
+    pub fn send_control_key_by_id(
         &self,
-        request: SendInputRequest,
-        ack_context: &RequestAckContext,
-        from: &str,
-        require_idle: bool,
+        session_id: SessionId,
+        key: ControlKey,
     ) -> Result<SessionSnapshot> {
-        let session_name = request.name.clone();
-        let decision =
-            self.emit_dispatch_attempt(&ack_context.request_id, "send_input", from, &session_name)?;
-        if require_idle && decision.overlap() {
-            return Err(anyhow!(
-                "dispatch aborted: target {}",
-                decision.reason.unwrap_or("overlap")
-            ));
-        }
-        let waiter = self.register_dispatch_reaction(ack_context, &session_name);
-        let (snapshot, bytes_written) = match self.send_input_with_bytes(request) {
-            Ok(result) => result,
-            Err(error) => {
-                self.cancel_dispatch_reaction(&waiter);
-                return Err(error);
-            }
-        };
-        self.wait_for_dispatch_reaction(waiter, ack_context, &snapshot.name, bytes_written)?;
-        Ok(snapshot)
-    }
-
-    pub fn send_control_key(&self, name: &str, key: ControlKey) -> Result<SessionSnapshot> {
+        self.ensure_active()?;
         let request_id = Uuid::new_v4().to_string();
-        self.emit_dispatch_attempt(&request_id, "send_key", "operator", name)?;
+        self.emit_dispatch_attempt_for_session_id(&request_id, "send_key", "operator", session_id)?;
         let (snapshot, _bytes_written) = self.send_input_with_bytes(SendInputRequest {
-            name: name.into(),
+            session_id,
             input: control_key_sequence(key).into(),
         })?;
         Ok(snapshot)
     }
 
-    fn send_control_key_with_request_ack(
+    pub fn route_operator_message(
         &self,
-        name: &str,
-        key: ControlKey,
-        ack_context: &RequestAckContext,
-        from: &str,
-        require_idle: bool,
-    ) -> Result<SessionSnapshot> {
-        let decision =
-            self.emit_dispatch_attempt(&ack_context.request_id, "send_key", from, name)?;
-        if require_idle && decision.overlap() {
-            return Err(anyhow!(
-                "dispatch aborted: target {}",
-                decision.reason.unwrap_or("overlap")
-            ));
-        }
-        let waiter = self.register_dispatch_reaction(ack_context, name);
-        let (snapshot, bytes_written) = match self.send_input_with_bytes(SendInputRequest {
-            name: name.into(),
-            input: control_key_sequence(key).into(),
-        }) {
-            Ok(result) => result,
-            Err(error) => {
-                self.cancel_dispatch_reaction(&waiter);
-                return Err(error);
-            }
-        };
-        self.wait_for_dispatch_reaction(waiter, ack_context, &snapshot.name, bytes_written)?;
-        Ok(snapshot)
-    }
-
-    pub fn route_message(&self, request: RouteMessageRequest) -> Result<RuntimeSnapshot> {
-        self.route_message_inner(request, None, false)
-    }
-
-    fn route_message_with_request_ack(
-        &self,
-        request: RouteMessageRequest,
-        ack_context: &RequestAckContext,
-        require_idle: bool,
+        request: OperatorRouteMessageRequest,
     ) -> Result<RuntimeSnapshot> {
-        self.route_message_inner(request, Some(ack_context), require_idle)
-    }
-
-    fn route_message_inner(
-        &self,
-        request: RouteMessageRequest,
-        ack_context: Option<&RequestAckContext>,
-        require_idle: bool,
-    ) -> Result<RuntimeSnapshot> {
+        self.ensure_active()?;
+        validate_message_body(&request.content)?;
         self.refresh_session_liveness();
+        let recipient = {
+            let slots = self.inner.slots.lock();
+            slots
+                .get_by_id(request.recipient_id)
+                .ok_or_else(|| anyhow!("unknown session id '{}'", request.recipient_id))?
+                .definition
+                .alias
+                .clone()
+        };
+        let route = RouteMessageRequest {
+            from: "operator".into(),
+            to: recipient.clone(),
+            scope: MessageScope::Direct,
+            content: request.content,
+        };
+        let (target, behavior) = self
+            .delivery_target_for_session_id(request.recipient_id)
+            .and_then(|(target, behavior)| {
+                validate_message_framing(&route.content, behavior)?;
+                Ok((target, behavior))
+            })
+            .map_err(|error| {
+                anyhow!("route preflight failed for recipient '{recipient}': {error}")
+            })?;
+        let payload = routed_message_payload(&route, behavior);
+        let delivery_plan = vec![PlannedDelivery {
+            target,
+            submit_behavior: behavior,
+            payload,
+        }];
+
+        self.execute_route(route, delivery_plan)
+    }
+
+    fn execute_route(
+        &self,
+        request: RouteMessageRequest,
+        delivery_plan: Vec<PlannedDelivery>,
+    ) -> Result<RuntimeSnapshot> {
         let route_id = Uuid::new_v4();
         let route_id_string = route_id.to_string();
-        let request_id = ack_context
-            .map(|context| context.request_id.clone())
-            .unwrap_or_else(|| route_id_string.clone());
-        let sender_filter = if request.scope == MessageScope::Room
-            && !self.inner.slots.lock().contains_key(&request.from)
-        {
-            None
-        } else {
-            Some(request.from.as_str())
-        };
-        let recipients = self.resolve_recipients(&request.to, request.scope, sender_filter);
-        let recipient_count = recipients.len() as u32;
-        let mut attempts = Vec::new();
-        for recipient in &recipients {
-            let decision =
-                self.emit_dispatch_attempt(&request_id, "route_message", &request.from, recipient)?;
-            attempts.push((recipient.clone(), decision));
-        }
-        if require_idle
-            && let Some((recipient, decision)) =
-                attempts.iter().find(|(_, decision)| decision.overlap())
-        {
-            return Err(anyhow!(
-                "dispatch aborted: target {} {}",
-                recipient,
-                decision.reason.unwrap_or("overlap")
-            ));
+        let request_id = route_id_string.clone();
+        let recipient_count = delivery_plan.len() as u32;
+
+        for delivery in &delivery_plan {
+            self.emit_dispatch_attempt(
+                &request_id,
+                "route_message",
+                &request.from,
+                &delivery.target.session,
+            )?;
         }
 
         self.emit_route_delivery(RouteDeliveryEvent {
@@ -3604,14 +5280,7 @@ impl SupervisorHandle {
             bytes_written: 0,
             error: None,
         });
-        if recipients.is_empty() {
-            return Err(anyhow!(
-                "no running recipients available for '{}'",
-                request.to
-            ));
-        }
 
-        self.record_route_from_session(&request.from);
         self.emit(RuntimeEvent::RoutedMessage {
             id: route_id,
             from: request.from.clone(),
@@ -3622,34 +5291,14 @@ impl SupervisorHandle {
         });
 
         let mut failures = Vec::new();
-        for (recipient_index, recipient) in recipients.into_iter().enumerate() {
-            let submit_behavior = match self.submit_behavior_for_session(&recipient) {
-                Ok(submit_behavior) => submit_behavior,
-                Err(error) => {
-                    let error = error.to_string();
-                    self.emit_route_delivery(RouteDeliveryEvent {
-                        request_id: request_id.clone(),
-                        route_id: route_id_string.clone(),
-                        from: request.from.clone(),
-                        logical_to: request.to.clone(),
-                        scope: request.scope,
-                        recipient: Some(recipient.clone()),
-                        recipient_index: recipient_index as u32,
-                        recipient_count,
-                        payload_part_count: 0,
-                        phase: RouteDeliveryPhase::Failed,
-                        bytes_written: 0,
-                        error: Some(error.clone()),
-                    });
-                    failures.push((recipient, error));
-                    continue;
-                }
-            };
-            let payloads = routed_message_payloads(&request, submit_behavior);
-            let payload_part_count = payloads.len() as u32;
-            let waiter =
-                ack_context.map(|context| self.register_dispatch_reaction(context, &recipient));
-            match self.deliver_prepared_payloads(&recipient, &payloads, submit_behavior) {
+        for (recipient_index, delivery) in delivery_plan.into_iter().enumerate() {
+            let recipient = delivery.target.session.clone();
+            let payload_part_count = 1;
+            match self.deliver_prepared_payload(
+                &delivery.target,
+                &delivery.payload,
+                delivery.submit_behavior,
+            ) {
                 Ok(delivery) => {
                     self.emit_route_delivery(RouteDeliveryEvent {
                         request_id: request_id.clone(),
@@ -3665,37 +5314,20 @@ impl SupervisorHandle {
                         bytes_written: delivery.bytes_written,
                         error: None,
                     });
-                    if let (Some(context), Some(waiter)) = (ack_context, waiter)
-                        && let Err(error) = self.wait_for_dispatch_reaction(
-                            waiter,
-                            context,
-                            &recipient,
-                            delivery.bytes_written,
-                        )
-                    {
-                        let error = error.to_string();
-                        self.emit_route_delivery(RouteDeliveryEvent {
-                            request_id: request_id.clone(),
-                            route_id: route_id_string.clone(),
-                            from: request.from.clone(),
-                            logical_to: request.to.clone(),
-                            scope: request.scope,
-                            recipient: Some(recipient.clone()),
-                            recipient_index: recipient_index as u32,
-                            recipient_count,
-                            payload_part_count: delivery.payload_part_count,
-                            phase: RouteDeliveryPhase::Failed,
-                            bytes_written: delivery.bytes_written,
-                            error: Some(error.clone()),
-                        });
-                        failures.push((recipient, error));
-                    }
                 }
                 Err(error) => {
-                    if let Some(waiter) = waiter.as_ref() {
-                        self.cancel_dispatch_reaction(waiter);
-                    }
+                    let bytes_written = error
+                        .downcast_ref::<PtyWriteError>()
+                        .map(PtyWriteError::bytes_written)
+                        .unwrap_or(0);
                     let error = error.to_string();
+                    let failure_summary = if bytes_written > 0 {
+                        format!(
+                            "{error} after {bytes_written} bytes were accepted by the PTY; content may be partial"
+                        )
+                    } else {
+                        error.clone()
+                    };
                     self.emit_route_delivery(RouteDeliveryEvent {
                         request_id: request_id.clone(),
                         route_id: route_id_string.clone(),
@@ -3707,10 +5339,10 @@ impl SupervisorHandle {
                         recipient_count,
                         payload_part_count,
                         phase: RouteDeliveryPhase::Failed,
-                        bytes_written: 0,
+                        bytes_written,
                         error: Some(error.clone()),
                     });
-                    failures.push((recipient, error));
+                    failures.push((recipient, failure_summary));
                 }
             }
         }
@@ -3735,94 +5367,27 @@ impl SupervisorHandle {
         Ok(self.snapshot())
     }
 
-    pub fn deliver_message(&self, request: DeliverMessageRequest) -> Result<SessionSnapshot> {
-        self.deliver_message_inner(request, None, "operator", false)
-    }
-
-    fn deliver_message_with_request_ack(
-        &self,
-        request: DeliverMessageRequest,
-        ack_context: &RequestAckContext,
-        from: &str,
-        require_idle: bool,
-    ) -> Result<SessionSnapshot> {
-        self.deliver_message_inner(request, Some(ack_context), from, require_idle)
-    }
-
-    fn deliver_message_inner(
-        &self,
-        request: DeliverMessageRequest,
-        ack_context: Option<&RequestAckContext>,
-        from: &str,
-        require_idle: bool,
-    ) -> Result<SessionSnapshot> {
-        let request_id = ack_context
-            .map(|context| context.request_id.clone())
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let decision =
-            self.emit_dispatch_attempt(&request_id, "deliver_message", from, &request.name)?;
-        if require_idle && decision.overlap() {
-            return Err(anyhow!(
-                "dispatch aborted: target {}",
-                decision.reason.unwrap_or("overlap")
-            ));
-        }
-        self.emit_dispatch_template_warning_if_needed(&request_id, &request.name, &request.content);
-
-        let (_, submit_behavior, payloads) =
-            self.prepare_delivery_for_session(&request.name, &request.content)?;
-
-        let waiter =
-            ack_context.map(|context| self.register_dispatch_reaction(context, &request.name));
-        let delivery =
-            match self.deliver_prepared_payloads(&request.name, &payloads, submit_behavior) {
-                Ok(delivery) => delivery,
-                Err(error) => {
-                    if let Some(waiter) = waiter.as_ref() {
-                        self.cancel_dispatch_reaction(waiter);
-                    }
-                    return Err(error);
-                }
-            };
-        if let (Some(context), Some(waiter)) = (ack_context, waiter) {
-            self.wait_for_dispatch_reaction(
-                waiter,
-                context,
-                &request.name,
-                delivery.bytes_written,
-            )?;
-        }
-
-        let snapshot = {
-            let slots = self.inner.slots.lock();
-            let slot = slots
-                .get(&request.name)
-                .with_context(|| format!("unknown session '{}'", request.name))?;
-            slot.snapshot()
-        };
-
-        Ok(snapshot)
-    }
-
-    pub fn resize_session(&self, name: &str, cols: u16, rows: u16) -> Result<()> {
+    pub fn resize_session_by_id(&self, session_id: SessionId, cols: u16, rows: u16) -> Result<()> {
+        self.ensure_active()?;
         self.refresh_session_liveness();
         let slots = self.inner.slots.lock();
         let slot = slots
-            .get(name)
-            .with_context(|| format!("unknown session '{name}'"))?;
+            .get_by_id(session_id)
+            .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
         let running = slot
             .running
             .as_ref()
-            .ok_or_else(|| anyhow!("session '{name}' is not running"))?;
+            .ok_or_else(|| anyhow!("session '{session_id}' is not running"))?;
         running
             .pty
             .as_ref()
-            .ok_or_else(|| anyhow!("session '{name}' transport is not available"))?
+            .ok_or_else(|| anyhow!("session '{session_id}' transport is not available"))?
             .resize(cols, rows)?;
         Ok(())
     }
 
     pub fn start_control_plane(&self) -> Result<ControlPlaneStatus> {
+        self.ensure_active()?;
         self.start_control_plane_at(None)
     }
 
@@ -3830,119 +5395,307 @@ impl SupervisorHandle {
         &self,
         endpoint_override: Option<String>,
     ) -> Result<ControlPlaneStatus> {
+        let _shutdown = self.inner.shutdown_lifecycle.lock();
+        let _lifecycle = self.inner.control_plane_lifecycle.lock();
+        self.ensure_active()?;
         if let Some(existing) = self.inner.control_plane.read().clone() {
             return Ok(existing);
         }
 
-        let info_path = self.runtime_dir().join("control-plane.json");
-        if let Some(existing_status) = load_existing_control_plane_status(&info_path)?
-            && probe_control_plane_owner(&existing_status, CONTROL_PLANE_PROBE_TIMEOUT)?
+        #[cfg(not(windows))]
         {
-            return Err(anyhow!(
-                "another wrapper instance is already holding the control plane at {}. Close the other instance before starting a new one.",
-                existing_status.endpoint
-            ));
+            let _ = endpoint_override;
+            Err(anyhow!(
+                "external pane control is unavailable on this platform; use the desktop UI"
+            ))
         }
 
-        let endpoint = endpoint_override.unwrap_or_else(control_plane_endpoint);
-        let status = ControlPlaneStatus {
-            transport: control_plane_transport().into(),
-            endpoint: endpoint.clone(),
-            token: Uuid::new_v4().to_string(),
-            info_path: info_path.display().to_string(),
-        };
+        #[cfg(windows)]
+        {
+            let endpoint = endpoint_override.unwrap_or_else(control_plane_endpoint);
+            let status = ControlPlaneStatus {
+                transport: control_plane_transport().into(),
+                endpoint,
+            };
 
-        let activation = prepare_control_plane_thread(self.clone(), status.clone())?;
-        write_private_file(
-            &info_path,
-            serde_json::to_string_pretty(&status)?.as_bytes(),
-        )
-        .context("failed to persist control plane credentials")?;
-
-        *self.inner.control_plane.write() = Some(status.clone());
-        self.inner
-            .token_bindings
-            .lock()
-            .insert(status.token.clone(), None);
-        if activation.send(()).is_err() {
-            self.inner.control_plane.write().take();
-            self.inner.token_bindings.lock().remove(&status.token);
-            let _ = fs::remove_file(&info_path);
-            return Err(anyhow!(
-                "control plane listener stopped before credential activation"
-            ));
-        }
-        self.emit(RuntimeEvent::ControlPlaneReady {
-            endpoint: status.endpoint.clone(),
-            transport: status.transport.clone(),
-            timestamp: now_rfc3339(),
-        });
-        Ok(status)
-    }
-
-    fn resolve_recipients(
-        &self,
-        to: &str,
-        scope: MessageScope,
-        sender: Option<&str>,
-    ) -> Vec<String> {
-        let slots = self.inner.slots.lock();
-        match scope {
-            MessageScope::Room => {
-                let cross_pair = self.inner.cross_pair_room_broadcast;
-                let sender_pair = sender.map(pair_of);
-                slots
-                    .iter()
-                    .filter(|(name, slot)| {
-                        if slot.running.is_none() {
-                            return false;
-                        }
-                        if Some(name.as_str()) == sender {
-                            return false;
-                        }
-                        if cross_pair {
-                            return true;
-                        }
-                        // Pair-scoped room delivery. Unknown sender keeps the
-                        // old broadcast behavior for supervisor-originated room messages.
-                        match sender_pair {
-                            Some(pair) => pair_of(name) == pair,
-                            None => true,
-                        }
-                    })
-                    .map(|(name, _)| name.clone())
-                    .collect()
+            let prepared = prepare_control_plane_thread(self.clone(), status.clone())?;
+            #[cfg(test)]
+            if let Some(hook) = self.inner.control_plane_after_prepare.lock().take() {
+                hook();
             }
-            _ => slots
-                .get(to)
-                .and_then(|slot| {
-                    slot.running
-                        .as_ref()
-                        .map(|_| vec![slot.definition.name.clone()])
-                })
-                .unwrap_or_default(),
+            self.ensure_active()?;
+            let listener = prepared.activate()?;
+            *self.inner.control_plane_listener.lock() = Some(listener);
+            *self.inner.control_plane.write() = Some(status.clone());
+            self.emit(RuntimeEvent::ControlPlaneReady {
+                endpoint: status.endpoint.clone(),
+                transport: status.transport.clone(),
+                timestamp: now_rfc3339(),
+            });
+            Ok(status)
         }
     }
 
-    fn submit_behavior_for_session(&self, name: &str) -> Result<SubmitBehavior> {
+    fn delivery_target_for_session_id(
+        &self,
+        session_id: SessionId,
+    ) -> Result<(RunWriteTarget, SubmitBehavior)> {
         let slots = self.inner.slots.lock();
         let slot = slots
-            .get(name)
-            .with_context(|| format!("unknown session '{name}'"))?;
-        Ok(routed_message_submit_behavior(slot.definition.driver))
+            .get_by_id(session_id)
+            .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
+        let behavior = routed_message_submit_behavior(slot.definition.driver);
+        let target = run_write_target_from_slot(&slot.definition.alias, slot)?;
+        ensure_run_input_safety_locked(slot, &target, RunInputSafety::from(behavior))?;
+        Ok((target, behavior))
+    }
+
+    fn retire_session_run(
+        &self,
+        session_id: SessionId,
+        event_generation: SessionGeneration,
+        event_run_id: Uuid,
+        cause: RunRetirementCause,
+    ) {
+        let (session_alias, process_id, pty, input_gate, stop_intent) = {
+            let mut slots = self.inner.slots.lock();
+            let Some(slot) = slots.get_by_id_mut(session_id).filter(|slot| {
+                slot.generation == event_generation
+                    && slot.run_id == Some(event_run_id)
+                    && slot.lifecycle_operation.is_none()
+                    && slot.spawn_in_flight.is_none()
+                    && !slot.termination_uncertain
+            }) else {
+                return;
+            };
+            if ensure_run_event_capacity(slot, 2).is_err() {
+                return;
+            }
+            let Some(running) = slot.running.as_ref().cloned() else {
+                return;
+            };
+            let Some(pty) = running.pty.as_ref().cloned() else {
+                return;
+            };
+            running.close_input();
+            slot.run_id = None;
+            slot.lifecycle_operation = Some(LifecycleOperation {
+                generation: event_generation,
+                kind: StopIntentKind::Operator,
+            });
+            slot.state = LifecycleState::Failed;
+            slot.termination_uncertain = true;
+            slot.last_activity_at = Some(now_rfc3339());
+            slot.last_real_output_at = None;
+            slot.last_error = Some(format!(
+                "{}; process-scope termination proof is in progress",
+                cause.detail()
+            ));
+            cancel_quiesce_timer_locked(slot);
+            reset_work_state_locked(slot);
+            (
+                slot.definition.alias.clone(),
+                slot.process_id,
+                pty,
+                running.input_gate,
+                slot.stop_intent.take(),
+            )
+        };
+
+        if let RunRetirementCause::PtyError(error) = &cause {
+            self.emit(RuntimeEvent::SystemLog {
+                level: LogLevel::Error,
+                message: format!("{session_id} PTY error: {error}"),
+                timestamp: now_rfc3339(),
+            });
+        }
+
+        let kill_timeout = *self.inner.stop_kill_timeout.lock();
+        let (
+            mut termination_proven,
+            exit_status,
+            exit_poll_error,
+            failure_detail,
+            timed_out,
+            late_termination,
+        ) = match terminate_running_session_bounded(pty.clone(), input_gate, kill_timeout) {
+            BoundedTerminationAttempt::Completed(attempt) => {
+                let termination_proven = attempt.kill_error.is_none() && attempt.input_idle;
+                let failure_detail = if let Some(error) = &attempt.kill_error {
+                    Some(format!("process-scope termination failed: {error}"))
+                } else if !attempt.input_idle {
+                    Some(format!(
+                        "PTY input writers did not drain within {}ms after process-scope termination",
+                        kill_timeout.as_millis()
+                    ))
+                } else {
+                    None
+                };
+                (
+                    termination_proven,
+                    attempt.exit_status,
+                    attempt.exit_poll_error,
+                    failure_detail,
+                    false,
+                    None,
+                )
+            }
+            BoundedTerminationAttempt::TimedOut(receiver) => (
+                false,
+                None,
+                None,
+                Some(format!(
+                    "process-scope termination did not finish within {}ms",
+                    kill_timeout.as_millis()
+                )),
+                true,
+                Some(receiver),
+            ),
+        };
+
+        let classification = if termination_proven {
+            Some(match &cause {
+                RunRetirementCause::OutputClosed => classify_session_exit(
+                    exit_status,
+                    exit_poll_error,
+                    stop_intent,
+                    SessionExitReason::ProcessDisappeared,
+                    "session output closed before exit status was available",
+                ),
+                RunRetirementCause::PtyError(error) => classify_pty_error_exit(error, stop_intent),
+                RunRetirementCause::Liveness {
+                    fallback_reason,
+                    detail,
+                    ..
+                } => classify_session_exit(
+                    exit_status,
+                    exit_poll_error,
+                    stop_intent,
+                    *fallback_reason,
+                    detail,
+                ),
+            })
+        } else {
+            None
+        };
+
+        let terminal_events = {
+            let mut slots = self.inner.slots.lock();
+            let Some(slot) = slots.get_by_id_mut(session_id).filter(|slot| {
+                slot.generation == event_generation
+                    && slot.run_id.is_none()
+                    && slot.lifecycle_operation
+                        == Some(LifecycleOperation {
+                            generation: event_generation,
+                            kind: StopIntentKind::Operator,
+                        })
+            }) else {
+                return;
+            };
+            let owns_same_pty = slot
+                .running
+                .as_ref()
+                .and_then(|running| running.pty.as_ref())
+                .is_some_and(|current| Arc::ptr_eq(current, &pty));
+            termination_proven &= owns_same_pty;
+            if !timed_out {
+                slot.lifecycle_operation = None;
+            }
+            let timestamp = now_rfc3339();
+            slot.last_activity_at = Some(timestamp.clone());
+            if termination_proven {
+                slot.running = None;
+                slot.process_id = None;
+                slot.termination_uncertain = false;
+                slot.state = cause.final_state();
+                slot.last_error = classification
+                    .as_ref()
+                    .and_then(|classification| classification.last_error.clone());
+            } else {
+                slot.state = LifecycleState::Failed;
+                slot.termination_uncertain = true;
+                slot.last_error = Some(format!(
+                    "{}; process termination could not be proved and the process-scope owner is retained: {}",
+                    cause.detail(),
+                    failure_detail
+                        .as_deref()
+                        .unwrap_or("process-scope ownership changed during cleanup")
+                ));
+            }
+            let exit_event = if termination_proven {
+                classification.as_ref().map(|classification| {
+                    session_exit_event(
+                        session_alias.clone(),
+                        next_run_event_identity(slot, event_run_id),
+                        process_id,
+                        classification,
+                        timestamp.clone(),
+                    )
+                })
+            } else {
+                None
+            };
+            let state_identity = next_run_event_identity(slot, event_run_id);
+            let state_event = RuntimeEvent::SessionState {
+                identity: state_identity,
+                session: session_alias.clone(),
+                state: slot.state,
+                reason: if termination_proven {
+                    cause.detail().into()
+                } else {
+                    "process termination could not be proved".into()
+                },
+                timestamp,
+            };
+            (exit_event, state_event)
+        };
+
+        if !termination_proven {
+            self.emit(RuntimeEvent::SystemLog {
+                level: LogLevel::Error,
+                message: format!(
+                    "{session_alias}: {}; retained the process-scope owner",
+                    failure_detail
+                        .as_deref()
+                        .unwrap_or("termination proof failed")
+                ),
+                timestamp: now_rfc3339(),
+            });
+        }
+        if let Some(exit_event) = terminal_events.0 {
+            self.emit_run_event(exit_event);
+        }
+        self.emit_run_event(terminal_events.1);
+        if let Some(receiver) = late_termination {
+            self.schedule_late_termination_reproof(
+                session_id,
+                event_generation,
+                StopIntentKind::Operator,
+                pty,
+                receiver,
+                "terminal retirement",
+            );
+        }
     }
 
     fn refresh_session_liveness(&self) {
-        let mut lifecycle_events = Vec::new();
+        let _shutdown = self.inner.shutdown_lifecycle.lock();
+        if self.inner.shutdown_started.load(Ordering::Acquire) {
+            return;
+        }
+        let mut retirements = Vec::new();
         let mut log_events = Vec::new();
-        let mut exit_events = Vec::new();
-        let mut terminal_reactions = Vec::new();
-        let mut revoked_credentials = Vec::new();
-
         {
-            let mut slots = self.inner.slots.lock();
-            for (session_name, slot) in slots.iter_mut() {
-                if slot.running.is_none() {
+            let slots = self.inner.slots.lock();
+            for slot in slots.by_id.values() {
+                let Some(run_id) = slot.run_id else {
+                    continue;
+                };
+                if slot.running.is_none()
+                    || slot.lifecycle_operation.is_some()
+                    || slot.spawn_in_flight.is_some()
+                    || slot.termination_uncertain
+                {
                     continue;
                 }
 
@@ -3998,97 +5751,80 @@ impl SupervisorHandle {
                 let Some((closed_state, fallback_reason, fallback_error)) = prune_reason else {
                     continue;
                 };
-
-                let timestamp = now_rfc3339();
-                let process_id_for_event = slot.process_id;
-                let (exit_status, poll_error) = poll_pty_exit_status(slot.running.as_ref());
-                let classification = classify_session_exit(
-                    exit_status,
-                    poll_error,
-                    slot.stop_intent.take(),
-                    fallback_reason,
-                    &fallback_error,
-                );
-                revoked_credentials.extend(
-                    self.revoke_session_credentials_in_memory(std::slice::from_ref(session_name)),
-                );
-                slot.running = None;
-                slot.process_id = None;
-                slot.state = closed_state;
-                slot.last_activity_at = Some(timestamp.clone());
-                slot.last_error = classification.last_error.clone();
-                cancel_quiesce_timer_locked(slot);
-                reset_work_state_locked(slot);
-
                 log_events.push(RuntimeEvent::SystemLog {
                     level: LogLevel::Warn,
                     message: format!(
-                        "{} {} (wrapper pid {:?}); pruning stale session state",
+                        "{} {} (wrapper pid {:?}); proving process-scope retirement",
                         slot.title(),
                         fallback_error,
-                        process_id_for_event
+                        slot.process_id
                     ),
-                    timestamp: timestamp.clone(),
+                    timestamp: now_rfc3339(),
                 });
-                exit_events.push(session_exit_event(
-                    session_name.clone(),
+                retirements.push((
+                    slot.session_id,
                     slot.generation,
-                    process_id_for_event,
-                    &classification,
-                    timestamp.clone(),
+                    run_id,
+                    RunRetirementCause::Liveness {
+                        final_state: closed_state,
+                        fallback_reason,
+                        detail: fallback_error,
+                    },
                 ));
-                lifecycle_events.push(RuntimeEvent::SessionState {
-                    session: session_name.clone(),
-                    state: closed_state,
-                    reason: fallback_error,
-                    timestamp,
-                });
-                terminal_reactions.push((session_name.clone(), Instant::now()));
             }
         }
 
-        if let Err(error) = remove_revoked_credential_files(&revoked_credentials) {
-            log_events.push(RuntimeEvent::SystemLog {
-                level: LogLevel::Error,
-                message: error.to_string(),
-                timestamp: now_rfc3339(),
-            });
-        }
-
-        for (session, observed_at) in terminal_reactions {
-            self.resolve_dispatch_reactions_for_session(
-                &session,
-                observed_at,
-                DispatchReactionOutcome::Terminal,
-            );
-        }
         for event in log_events {
             self.emit(event);
         }
-        for event in exit_events {
-            self.emit(event);
-        }
-        for event in lifecycle_events {
-            self.emit(event);
+        for (session_id, generation, run_id, cause) in retirements {
+            self.retire_session_run(session_id, generation, run_id, cause);
         }
     }
 
+    #[cfg(test)]
     fn handle_pty_event(
         &self,
-        session_name: &str,
+        alias_or_label: &str,
         event_generation: SessionGeneration,
+        event_run_id: Uuid,
         event: PtyEvent,
     ) {
+        let Some(session_id) = self
+            .inner
+            .slots
+            .lock()
+            .get(alias_or_label)
+            .map(|slot| slot.session_id)
+        else {
+            return;
+        };
+        self.handle_pty_event_by_id(session_id, event_generation, event_run_id, event);
+    }
+
+    fn handle_pty_event_by_id(
+        &self,
+        session_id: SessionId,
+        event_generation: SessionGeneration,
+        event_run_id: Uuid,
+        event: PtyEvent,
+    ) {
+        let _shutdown = self.inner.shutdown_lifecycle.lock();
+        if self.inner.shutdown_started.load(Ordering::Acquire) {
+            return;
+        }
         let should_log_stale_event = {
             let slots = self.inner.slots.lock();
-            let current = slots.get(session_name).map(|slot| slot.generation);
-            current != Some(event_generation)
+            let current = slots
+                .get_by_id(session_id)
+                .map(|slot| (slot.generation, slot.run_id));
+            current != Some((event_generation, Some(event_run_id)))
         };
 
         if should_log_stale_event {
             let counter = {
                 let mut counts = self.inner.stale_event_drop_counts.lock();
-                let key = (session_name.to_string(), event_generation);
+                let key = (session_id, event_generation, event_run_id);
                 let count = counts.entry(key).or_insert(0);
                 *count += 1;
                 *count
@@ -4098,7 +5834,7 @@ impl SupervisorHandle {
                 self.emit(RuntimeEvent::SystemLog {
                     level: LogLevel::Info,
                     message: format!(
-                        "Dropped stale PTY event for session '{session_name}' generation {event_generation} (count={counter})"
+                        "Dropped stale PTY event for session '{session_id}' generation {event_generation} run {event_run_id} (count={counter})"
                     ),
                     timestamp: now_rfc3339(),
                 });
@@ -4106,20 +5842,31 @@ impl SupervisorHandle {
             return;
         }
 
+        #[cfg(test)]
+        if let Some(hook) = self.inner.pty_event_before_commit.lock().take() {
+            hook();
+        }
+
         match event {
             PtyEvent::Output(chunk) => {
                 let has_real_content = chunk_has_real_content(&chunk);
                 let observed_at = Instant::now();
                 let real_output_at = has_real_content.then_some(observed_at);
-                let (
-                    transitioned_to_ready,
-                    quiesce_arm,
-                    work_state_event,
-                    reaction_outcome,
-                    needs_liveness_refresh,
-                ) = {
+                let outcome = {
                     let mut slots = self.inner.slots.lock();
-                    if let Some(slot) = slots.get_mut(session_name) {
+                    if let Some(slot) = slots.get_by_id_mut(session_id).filter(|slot| {
+                        slot.generation == event_generation && slot.run_id == Some(event_run_id)
+                    }) {
+                        let session_alias = slot.definition.alias.clone();
+                        let binding = RunBinding {
+                            session_id: slot.session_id,
+                            run_id: event_run_id,
+                            generation: event_generation,
+                        };
+                        slot.bracketed_paste.observe_output(binding, &chunk);
+                        if ensure_run_event_capacity(slot, 3).is_err() {
+                            return;
+                        }
                         let transitioned = slot.state != LifecycleState::Ready;
                         if slot.state != LifecycleState::Ready {
                             slot.state = LifecycleState::Ready;
@@ -4136,292 +5883,284 @@ impl SupervisorHandle {
 
                         let classification =
                             classify_work_state_for_driver(slot.definition.driver, &chunk);
-                        let mut terminal_signature = false;
-                        let mut first_launch_banner = false;
                         let work_state_event = classification.and_then(|(state, detail)| {
-                            if state == WorkState::Exited {
-                                terminal_signature = true;
-                                if detail.as_deref() == Some("launch_banner")
-                                    && !slot.launch_banner_seen
-                                {
-                                    slot.launch_banner_seen = true;
-                                    first_launch_banner = true;
-                                    return None;
-                                }
-                            }
-                            transition_work_state_locked(session_name, slot, state, detail)
+                            transition_work_state_locked(
+                                &session_alias,
+                                slot,
+                                event_run_id,
+                                state,
+                                detail,
+                            )
                         });
 
-                        let terminal_reaction = terminal_signature && !first_launch_banner;
-                        let quiesce_arm = if terminal_reaction {
+                        let quiesce_arm = real_output_at.map(|armed_at| {
+                            slot.last_real_output_at = Some(armed_at);
                             cancel_quiesce_timer_locked(slot);
-                            None
-                        } else {
-                            real_output_at.map(|armed_at| {
-                                slot.last_real_output_at = Some(armed_at);
-                                cancel_quiesce_timer_locked(slot);
-                                (slot.definition.driver, slot.generation, armed_at)
-                            })
-                        };
-                        let reaction_outcome = if terminal_reaction {
-                            Some(DispatchReactionOutcome::Terminal)
-                        } else if has_real_content || work_state_event.is_some() {
-                            Some(DispatchReactionOutcome::Reacted)
-                        } else {
-                            None
-                        };
-                        (
-                            transitioned,
+                            (
+                                slot.definition.driver,
+                                slot.generation,
+                                event_run_id,
+                                armed_at,
+                            )
+                        });
+                        let ready_identity =
+                            transitioned.then(|| next_run_event_identity(slot, event_run_id));
+                        let output_identity = next_run_event_identity(slot, event_run_id);
+                        Some((
+                            session_alias,
+                            ready_identity,
+                            output_identity,
                             quiesce_arm,
                             work_state_event,
-                            reaction_outcome,
-                            terminal_reaction,
-                        )
+                        ))
                     } else {
-                        (false, None, None, None, false)
+                        None
                     }
                 };
+                let Some((
+                    session_alias,
+                    ready_identity,
+                    output_identity,
+                    quiesce_arm,
+                    work_state_event,
+                )) = outcome
+                else {
+                    return;
+                };
 
-                if let Some((driver, generation, armed_at)) = quiesce_arm {
-                    self.arm_quiesce_timer(session_name, driver, generation, armed_at);
+                if let Some((driver, generation, run_id, armed_at)) = quiesce_arm {
+                    self.arm_quiesce_timer(session_id, driver, generation, run_id, armed_at);
                 }
 
-                if transitioned_to_ready {
-                    self.emit(RuntimeEvent::SessionState {
-                        session: session_name.into(),
+                if let Some(event) = work_state_event {
+                    self.emit_run_work_state(event, event_generation, event_run_id);
+                }
+
+                if let Some(identity) = ready_identity {
+                    self.emit_run_event(RuntimeEvent::SessionState {
+                        identity,
+                        session: session_alias.clone(),
                         state: LifecycleState::Ready,
                         reason: "session emitted output".into(),
                         timestamp: now_rfc3339(),
                     });
                 }
 
-                if let Some(event) = work_state_event {
-                    self.emit(event);
-                }
-
-                self.emit(RuntimeEvent::SessionOutput {
-                    session: session_name.into(),
+                self.emit_run_event(RuntimeEvent::SessionOutput {
+                    identity: output_identity,
+                    session: session_alias,
                     chunk,
                     synthetic: false,
                     timestamp: now_rfc3339(),
                 });
-
-                if let Some(outcome) = reaction_outcome {
-                    self.resolve_dispatch_reactions_for_session(session_name, observed_at, outcome);
-                }
-
-                if needs_liveness_refresh {
-                    self.refresh_session_liveness();
-                }
             }
             PtyEvent::Closed => {
-                let timestamp = now_rfc3339();
-                let observed_at = Instant::now();
-                let mut exit_event = None;
-                let mut revoked_credentials = Vec::new();
-                {
-                    let mut slots = self.inner.slots.lock();
-                    if let Some(slot) = slots.get_mut(session_name) {
-                        let process_id = slot.process_id;
-                        let (exit_status, poll_error) = poll_pty_exit_status(slot.running.as_ref());
-                        let classification = classify_session_exit(
-                            exit_status,
-                            poll_error,
-                            slot.stop_intent.take(),
-                            SessionExitReason::ProcessDisappeared,
-                            "session output closed before exit status was available",
-                        );
-                        revoked_credentials =
-                            self.revoke_session_credentials_in_memory(&[session_name.to_string()]);
-                        slot.running = None;
-                        slot.process_id = None;
-                        slot.state = LifecycleState::Closed;
-                        slot.last_activity_at = Some(timestamp.clone());
-                        slot.last_error = classification.last_error.clone();
-                        slot.last_real_output_at = None;
-                        cancel_quiesce_timer_locked(slot);
-                        reset_work_state_locked(slot);
-                        exit_event = Some(session_exit_event(
-                            session_name.into(),
-                            event_generation,
-                            process_id,
-                            &classification,
-                            timestamp.clone(),
-                        ));
-                    }
-                }
-                if let Err(error) = remove_revoked_credential_files(&revoked_credentials) {
-                    self.emit(RuntimeEvent::SystemLog {
-                        level: LogLevel::Error,
-                        message: error.to_string(),
-                        timestamp: now_rfc3339(),
-                    });
-                }
-                self.resolve_dispatch_reactions_for_session(
-                    session_name,
-                    observed_at,
-                    DispatchReactionOutcome::Terminal,
+                self.retire_session_run(
+                    session_id,
+                    event_generation,
+                    event_run_id,
+                    RunRetirementCause::OutputClosed,
                 );
-                if let Some(event) = exit_event {
-                    self.emit(event);
-                }
-                self.emit(RuntimeEvent::SessionState {
-                    session: session_name.into(),
-                    state: LifecycleState::Closed,
-                    reason: "session output closed".into(),
-                    timestamp,
-                });
             }
             PtyEvent::Error(error) => {
-                let timestamp = now_rfc3339();
-                let observed_at = Instant::now();
-                let mut exit_event = None;
-                let mut revoked_credentials = Vec::new();
-                {
-                    let mut slots = self.inner.slots.lock();
-                    if let Some(slot) = slots.get_mut(session_name) {
-                        let process_id = slot.process_id;
-                        let classification =
-                            classify_pty_error_exit(&error, slot.stop_intent.take());
-                        revoked_credentials =
-                            self.revoke_session_credentials_in_memory(&[session_name.to_string()]);
-                        slot.state = LifecycleState::Failed;
-                        slot.last_error = classification.last_error.clone();
-                        slot.running = None;
-                        slot.process_id = None;
-                        slot.last_activity_at = Some(timestamp.clone());
-                        slot.last_real_output_at = None;
-                        cancel_quiesce_timer_locked(slot);
-                        reset_work_state_locked(slot);
-                        exit_event = Some(session_exit_event(
-                            session_name.into(),
-                            event_generation,
-                            process_id,
-                            &classification,
-                            timestamp.clone(),
-                        ));
-                    }
-                }
-                if let Err(cleanup_error) = remove_revoked_credential_files(&revoked_credentials) {
-                    self.emit(RuntimeEvent::SystemLog {
-                        level: LogLevel::Error,
-                        message: cleanup_error.to_string(),
-                        timestamp: now_rfc3339(),
-                    });
-                }
-                self.resolve_dispatch_reactions_for_session(
-                    session_name,
-                    observed_at,
-                    DispatchReactionOutcome::Terminal,
+                self.retire_session_run(
+                    session_id,
+                    event_generation,
+                    event_run_id,
+                    RunRetirementCause::PtyError(error),
                 );
-                self.emit(RuntimeEvent::SystemLog {
-                    level: LogLevel::Error,
-                    message: format!("{session_name} PTY error: {error}"),
-                    timestamp: timestamp.clone(),
-                });
-                if let Some(event) = exit_event {
-                    self.emit(event);
-                }
-                self.emit(RuntimeEvent::SessionState {
-                    session: session_name.into(),
-                    state: LifecycleState::Failed,
-                    reason: "PTY error".into(),
-                    timestamp,
-                });
             }
         }
     }
 
-    #[cfg(test)]
-    fn apply_sideband_request(&self, request: SidebandRequest) -> SidebandResponse {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .expect("failed to create wait_quiet runtime");
-        runtime.block_on(self.apply_sideband_request_async(request))
-    }
-
-    fn validate_sideband_request(&self, token: &str) -> Option<SidebandResponse> {
-        let Some(_) = self.inner.control_plane.read().clone() else {
-            return Some(SidebandResponse {
-                ok: false,
-                message: "control plane not ready".into(),
-                snapshot: None,
-                timed_out: false,
-                payload: None,
-                request_id: None,
-            });
-        };
-
-        if !self.inner.token_bindings.lock().contains_key(token) {
-            return Some(SidebandResponse {
-                ok: false,
-                message: "invalid control plane token".into(),
-                snapshot: None,
-                timed_out: false,
-                payload: None,
-                request_id: None,
-            });
-        }
-
-        None
-    }
-
-    fn authorize_lifecycle_request(
-        &self,
-        request: SidebandRequest,
-    ) -> Result<AuthorizedLifecycleRequest> {
-        let (token, target_session) = match &request {
-            SidebandRequest::StartSession { token, name, .. }
-            | SidebandRequest::StopSession { token, name }
-            | SidebandRequest::RestartSession { token, name } => (token.as_str(), name.clone()),
-            _ => return Err(anyhow!("request is not a lifecycle action")),
-        };
-
-        if self.inner.control_plane.read().is_none() {
-            return Err(anyhow!("control plane not ready"));
-        }
-
-        let binding = self
-            .inner
-            .token_bindings
-            .lock()
-            .get(token)
-            .cloned()
-            .ok_or_else(|| anyhow!("invalid control plane token"))?;
-
-        if let Some(bound_session) = binding.as_deref()
-            && bound_session != target_session
-        {
+    fn resolve_pane_process_locked(
+        process: &dyn PaneProcess,
+        slots: &SessionRegistry,
+    ) -> Result<(String, Uuid, SessionGeneration, Uuid)> {
+        if !process.is_alive()? {
             return Err(anyhow!(
-                "lifecycle action: pane-bound token cannot target other sessions"
+                "sideband caller process {} has exited",
+                process.pid()
             ));
         }
 
-        Ok(AuthorizedLifecycleRequest {
-            request,
-            target_session,
+        let mut matches = Vec::new();
+        let mut query_failed = false;
+        for (session_id, slot) in &slots.by_id {
+            let Some(running) = slot.running.as_ref() else {
+                continue;
+            };
+            let Some(pty) = running.pty.as_deref() else {
+                query_failed = true;
+                continue;
+            };
+            match process.belongs_to(pty) {
+                Ok(true) => {
+                    let Some(run_id) = slot.run_id else {
+                        query_failed = true;
+                        continue;
+                    };
+                    matches.push((
+                        slot.definition.alias.clone(),
+                        *session_id,
+                        slot.generation,
+                        run_id,
+                    ));
+                }
+                Ok(false) => {}
+                Err(_) => query_failed = true,
+            }
+        }
+
+        if query_failed {
+            return Err(anyhow!(
+                "sideband caller process {} membership could not be verified",
+                process.pid()
+            ));
+        }
+        match matches.as_slice() {
+            [(session, session_id, generation, run_id)] => {
+                Ok((session.clone(), *session_id, *generation, *run_id))
+            }
+            [] => Err(anyhow!(
+                "sideband caller process {} is not owned by a live pane",
+                process.pid()
+            )),
+            _ => Err(anyhow!(
+                "sideband caller process {} belongs to multiple live panes",
+                process.pid()
+            )),
+        }
+    }
+
+    fn resolve_pane_caller(&self, process: Arc<dyn PaneProcess>) -> Result<PaneCaller> {
+        let (session, session_id, generation, run_id) = {
+            let slots = self.inner.slots.lock();
+            Self::resolve_pane_process_locked(process.as_ref(), &slots)?
+        };
+        Ok(PaneCaller {
+            session,
+            session_id,
+            generation,
+            run_id,
+            process,
         })
     }
 
-    fn sideband_response_from_outcome(&self, outcome: Result<String>) -> SidebandResponse {
+    fn validate_pane_caller_locked(caller: &PaneCaller, slots: &SessionRegistry) -> Result<()> {
+        let Some(bound_slot) = slots.get_by_id(caller.session_id) else {
+            return Err(anyhow!("sideband caller run is stale"));
+        };
+        if bound_slot.definition.alias != caller.session
+            || bound_slot.generation != caller.generation
+            || bound_slot.run_id != Some(caller.run_id)
+        {
+            return Err(anyhow!("sideband caller run is stale"));
+        }
+        let (session, session_id, generation, run_id) =
+            Self::resolve_pane_process_locked(caller.process.as_ref(), slots)?;
+        if session != caller.session
+            || session_id != caller.session_id
+            || generation != caller.generation
+            || run_id != caller.run_id
+        {
+            return Err(anyhow!("sideband caller run is stale"));
+        }
+        Ok(())
+    }
+
+    fn validate_pane_target_locked(
+        caller: &PaneCaller,
+        target: &str,
+        slots: &SessionRegistry,
+    ) -> Result<()> {
+        if target != caller.session {
+            return Err(anyhow!(
+                "sideband request may target only the calling session"
+            ));
+        }
+        Self::validate_pane_caller_locked(caller, slots)
+    }
+
+    fn authorize_sideband_request(
+        &self,
+        caller: &PaneCaller,
+        request: &SidebandRequest,
+    ) -> Result<()> {
+        let slots = self.inner.slots.lock();
+        match request {
+            SidebandRequest::Ping {} => Self::validate_pane_caller_locked(caller, &slots),
+            SidebandRequest::WaitQuiet {
+                name,
+                quiet_seconds,
+                timeout_seconds,
+            } => {
+                Self::validate_pane_target_locked(caller, name, &slots)?;
+                validate_wait_quiet_bounds(*quiet_seconds, *timeout_seconds)
+            }
+            SidebandRequest::SendInput { name, .. } | SidebandRequest::SendKey { name, .. } => {
+                Self::validate_pane_target_locked(caller, name, &slots)
+            }
+        }
+    }
+
+    fn pane_input_target(&self, caller: &PaneCaller, name: &str) -> Result<RunWriteTarget> {
+        {
+            let slots = self.inner.slots.lock();
+            Self::validate_pane_target_locked(caller, name, &slots)?;
+            let slot = slots
+                .get_by_id(caller.session_id)
+                .with_context(|| format!("unknown session '{name}'"))?;
+            run_write_target_from_slot(name, slot)
+        }
+    }
+
+    fn send_pane_input(&self, caller: &PaneCaller, name: &str, input: &str) -> Result<usize> {
+        let target = self.pane_input_target(caller, name)?;
+        self.write_run_input(&target, Some(caller), input, RunInputSafety::Raw, None)
+    }
+
+    fn terminate_timed_out_pane_run(&self, caller: &PaneCaller) -> Result<()> {
+        let (_, expected_stop) = self
+            .declare_stop_operation(
+                caller.session_id,
+                Some((caller.generation, Some(caller.run_id))),
+                StopIntentKind::Operator,
+            )
+            .map_err(|error| {
+                if error.to_string().contains("run changed") {
+                    anyhow!("sideband caller run is stale")
+                } else {
+                    error
+                }
+            })?;
+        self.stop_session_at(caller.session_id, expected_stop)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn apply_sideband_request(
+        &self,
+        caller: &PaneCaller,
+        request: SidebandRequest,
+    ) -> SidebandResponse {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("failed to create sideband test runtime");
+        runtime.block_on(self.apply_sideband_request_async(caller, request))
+    }
+
+    fn sideband_response(outcome: Result<String>) -> SidebandResponse {
         match outcome {
             Ok(message) => SidebandResponse {
                 ok: true,
                 message,
-                snapshot: Some(self.snapshot()),
                 timed_out: false,
                 payload: None,
                 request_id: None,
             },
-            Err(error) => SidebandResponse {
-                ok: false,
-                message: error.to_string(),
-                snapshot: Some(self.snapshot()),
-                timed_out: false,
-                payload: None,
-                request_id: None,
-            },
+            Err(error) => Self::rejected_sideband_response(error.to_string()),
         }
     }
 
@@ -4429,520 +6168,490 @@ impl SupervisorHandle {
         SidebandResponse {
             ok: false,
             message: message.into(),
-            snapshot: None,
             timed_out: false,
             payload: None,
             request_id: None,
         }
     }
 
-    fn apply_authorized_lifecycle_request_at(
+    async fn wait_quiet_from_pane(
         &self,
-        authorized: AuthorizedLifecycleRequest,
-        expected_generation: SessionGeneration,
+        caller: &PaneCaller,
+        request: WaitQuietRequest,
     ) -> SidebandResponse {
-        let outcome = match authorized.request {
-            SidebandRequest::StartSession {
-                name, extra_args, ..
-            } => self
-                .start_session_at(&name, expected_generation, extra_args)
-                .map(|_| format!("started {name}")),
-            SidebandRequest::StopSession { name, .. } => self
-                .stop_session_at(&name, expected_generation)
-                .map(|_| format!("stopped {name}")),
-            SidebandRequest::RestartSession { name, .. } => self
-                .restart_session_at(&name, expected_generation)
-                .map(|_| format!("restarted {name}")),
-            _ => unreachable!("authorized lifecycle request contained a non-lifecycle action"),
-        };
+        let quiet_window = Duration::from_secs(request.quiet_seconds as u64);
+        let timeout = Duration::from_secs(request.timeout_seconds as u64);
+        let wait_started_at = Instant::now();
 
-        self.sideband_response_from_outcome(outcome)
+        loop {
+            let last_output_age_ms = {
+                let slots = self.inner.slots.lock();
+                if let Err(error) = Self::validate_pane_target_locked(caller, &request.name, &slots)
+                {
+                    return Self::rejected_sideband_response(error.to_string());
+                }
+                let slot = slots
+                    .get_by_id(caller.session_id)
+                    .expect("validated pane target disappeared while slots were locked");
+                let last_real_output_at = slot.last_real_output_at.unwrap_or(wait_started_at);
+                Instant::now()
+                    .saturating_duration_since(last_real_output_at)
+                    .as_millis() as u64
+            };
+
+            if last_output_age_ms >= quiet_window.as_millis() as u64 {
+                return SidebandResponse {
+                    ok: true,
+                    message: "session is quiet".into(),
+                    timed_out: false,
+                    payload: Some(SidebandResponsePayload::WaitQuiet {
+                        quiet_duration_ms: last_output_age_ms,
+                    }),
+                    request_id: None,
+                };
+            }
+
+            if Instant::now().saturating_duration_since(wait_started_at) >= timeout {
+                return SidebandResponse {
+                    ok: false,
+                    message: "wait_quiet timed out".into(),
+                    timed_out: true,
+                    payload: Some(SidebandResponsePayload::WaitQuietTimeout { last_output_age_ms }),
+                    request_id: None,
+                };
+            }
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
-    async fn apply_side_effect_request_async(
+    async fn apply_authorized_sideband_request(
         &self,
+        caller: &PaneCaller,
         request: SidebandRequest,
-        request_id: &str,
-        ack_context: Option<RequestAckContext>,
     ) -> SidebandResponse {
-        if let Some(response) = self.validate_sideband_request(request.token()) {
-            return response;
-        }
-
-        let outcome = match request {
-            SidebandRequest::Ping { .. } => Ok("pong".into()),
-            SidebandRequest::ListSessions { .. } => Ok("sessions listed".into()),
+        match request {
+            SidebandRequest::Ping {} => Self::sideband_response(Ok("pong".into())),
             SidebandRequest::WaitQuiet {
                 name,
                 quiet_seconds,
                 timeout_seconds,
-                ..
             } => {
-                return self
-                    .wait_quiet(WaitQuietRequest {
+                self.wait_quiet_from_pane(
+                    caller,
+                    WaitQuietRequest {
                         name,
                         quiet_seconds,
                         timeout_seconds,
-                    })
-                    .await;
-            }
-            SidebandRequest::EventsSince {
-                cursor,
-                max_events,
-                max_wait_seconds,
-                filter,
-                ..
-            } => {
-                let filter = Self::normalize_events_filter(filter);
-                let echoed_cursor = cursor
-                    .as_ref()
-                    .map(|value| serde_json::to_value(value).unwrap_or(serde_json::Value::Null))
-                    .unwrap_or(serde_json::Value::Null);
-                if let Err(error) = self.validate_events_filter(&filter) {
-                    return self.events_request_error(error.to_string(), echoed_cursor);
-                }
-
-                let max_events = max_events.unwrap_or(500).clamp(1, 5000) as usize;
-                let max_wait_seconds = max_wait_seconds.unwrap_or(0);
-                if max_wait_seconds > 60 {
-                    return self.events_request_error(
-                        "max_wait_seconds > 60 not supported in V1",
-                        echoed_cursor,
-                    );
-                }
-
-                return match self
-                    .wait_for_events(
-                        cursor,
-                        filter,
-                        max_events,
-                        Duration::from_secs(max_wait_seconds as u64),
-                    )
-                    .await
-                {
-                    Ok(result) => SidebandResponse {
-                        ok: true,
-                        message: format!("returned {} events", result.events.len()),
-                        snapshot: Some(self.snapshot()),
-                        timed_out: false,
-                        payload: Some(SidebandResponsePayload::EventsSince {
-                            events: result.events,
-                            next_cursor: result.next_cursor,
-                            gap_detected: result.gap_detected,
-                            as_of: result.as_of,
-                        }),
-                        request_id: None,
                     },
-                    Err(error) => {
-                        let message = if error.to_string().starts_with("audit read error:") {
-                            error.to_string()
-                        } else {
-                            format!("audit read error: {error}")
+                )
+                .await
+            }
+            SidebandRequest::SendInput { name, input } => Self::sideband_response(
+                self.send_pane_input(caller, &name, &input)
+                    .map(|_| "input sent".into()),
+            ),
+            SidebandRequest::SendKey { name, key } => Self::sideband_response(
+                self.send_pane_input(caller, &name, control_key_sequence(key))
+                    .map(|_| format!("key {:?} sent", key)),
+            ),
+        }
+    }
+
+    async fn apply_sideband_write_with_timeout(
+        &self,
+        caller: PaneCaller,
+        name: String,
+        input: String,
+        success_message: String,
+        action: &'static str,
+    ) -> SidebandResponse {
+        let target = match self.pane_input_target(&caller, &name) {
+            Ok(target) => target,
+            Err(error) => return Self::rejected_sideband_response(error.to_string()),
+        };
+        let pty = target.pty.clone();
+        let input_gate = target.input_gate.clone();
+        let control = Arc::new(InputWriteControl::new());
+        let writer_handle = self.clone();
+        let writer_caller = caller.clone();
+        let writer_target = target.clone();
+        let writer_control = control.clone();
+        let mut writer = tokio::task::spawn_blocking(move || {
+            writer_handle
+                .write_run_input(
+                    &writer_target,
+                    Some(&writer_caller),
+                    &input,
+                    RunInputSafety::Raw,
+                    Some(&writer_control),
+                )
+                .map(|_| success_message)
+        });
+        let budget = *self.inner.sideband_write_timeout.lock();
+        match tokio::time::timeout(budget, &mut writer).await {
+            Ok(Ok(outcome)) => Self::sideband_response(outcome),
+            Ok(Err(error)) => Self::rejected_sideband_response(format!(
+                "sideband {action} worker failed: {error}"
+            )),
+            Err(_) => {
+                let disposition = control.request_cancel();
+                let owns_cancellation_barrier = disposition == InputCancelDisposition::InFlight;
+                if owns_cancellation_barrier {
+                    input_gate.begin_cancellation_barrier();
+                }
+                input_gate.wake_waiters();
+                let cancellation_deadline = Instant::now() + Duration::from_secs(5);
+                let mut cancellation_attempts = 0_u32;
+                let mut cancellation_failure = None;
+
+                loop {
+                    if disposition == InputCancelDisposition::InFlight {
+                        cancellation_attempts += 1;
+                        let cancel_pty = pty.clone();
+                        let cancellation =
+                            tokio::task::spawn_blocking(move || cancel_pty.cancel_input_write());
+                        match tokio::time::timeout(Duration::from_millis(250), cancellation).await {
+                            Ok(Ok(Ok(()))) => {}
+                            Ok(Ok(Err(error))) => {
+                                cancellation_failure =
+                                    Some(format!("isolated input cancellation failed: {error:#}"));
+                                break;
+                            }
+                            Ok(Err(error)) => {
+                                cancellation_failure = Some(format!(
+                                    "isolated input cancellation worker failed: {error}"
+                                ));
+                                break;
+                            }
+                            Err(_) => {
+                                cancellation_failure =
+                                    Some("isolated input cancellation exceeded 250ms".into());
+                                break;
+                            }
+                        }
+                    }
+
+                    let remaining = cancellation_deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    let poll = remaining.min(Duration::from_millis(50));
+                    if let Ok(outcome) = tokio::time::timeout(poll, &mut writer).await {
+                        let detail = match disposition {
+                            InputCancelDisposition::BeforeStart => {
+                                "write was cancelled before PTY input began".to_string()
+                            }
+                            InputCancelDisposition::InFlight => format!(
+                                "isolated PTY input cancellation completed after {cancellation_attempts} attempt(s); run preserved"
+                            ),
+                            InputCancelDisposition::Finished => {
+                                "writer completed as the deadline elapsed".to_string()
+                            }
                         };
-                        self.events_request_error(message, echoed_cursor)
+                        if owns_cancellation_barrier {
+                            input_gate.end_cancellation_barrier();
+                        }
+                        return Self::sideband_response_after_write_deadline(
+                            action, budget, detail, outcome,
+                        );
                     }
-                };
-            }
-            SidebandRequest::DeliverMessage {
-                token,
-                name,
-                content,
-                require_idle,
-            } => {
-                let from = match self.authorize_deliver_message(&token, &name) {
-                    Ok(from) => from,
-                    Err(error) => return Self::rejected_sideband_response(error.to_string()),
-                };
-                tokio::task::yield_now().await;
-                let request = DeliverMessageRequest { name, content };
-                match ack_context.as_ref() {
-                    Some(context) => {
-                        self.deliver_message_with_request_ack(request, context, &from, require_idle)
-                    }
-                    None => self.deliver_message_inner(request, None, &from, require_idle),
                 }
-                .map(|_| "delivered".into())
-            }
-            SidebandRequest::SendInput {
-                token,
-                name,
-                input,
-                require_idle,
-            } => {
-                let from = match self.authorize_session_action(&token, &name) {
-                    Ok(from) => from,
-                    Err(error) => return Self::rejected_sideband_response(error.to_string()),
-                };
-                tokio::task::yield_now().await;
-                let request = SendInputRequest { name, input };
-                match ack_context.as_ref() {
-                    Some(context) => {
-                        self.send_input_with_request_ack(request, context, &from, require_idle)
+
+                let terminate_handle = self.clone();
+                let terminate_caller = caller.clone();
+                let termination = tokio::task::spawn_blocking(move || {
+                    terminate_handle.terminate_timed_out_pane_run(&terminate_caller)
+                });
+                let termination_detail =
+                    match tokio::time::timeout(Duration::from_secs(5), termination).await {
+                        Ok(Ok(Ok(()))) => {
+                            "exact run terminated as cancellation fallback".to_string()
+                        }
+                        Ok(Ok(Err(error))) => format!("run termination failed: {error:#}"),
+                        Ok(Err(error)) => format!("run termination worker failed: {error}"),
+                        Err(_) => "run termination exceeded 5s".to_string(),
+                    };
+                let cancellation_detail = cancellation_failure.unwrap_or_else(|| match disposition {
+                    InputCancelDisposition::BeforeStart => {
+                        "cancelled queued writer did not stop within 5s".into()
                     }
-                    None => self.send_input(request),
-                }
-                .map(|_| "input sent".into())
-            }
-            SidebandRequest::SendKey {
-                token,
-                name,
-                key,
-                require_idle,
-            } => {
-                let from = match self.authorize_session_action(&token, &name) {
-                    Ok(from) => from,
-                    Err(error) => return Self::rejected_sideband_response(error.to_string()),
-                };
-                tokio::task::yield_now().await;
-                match ack_context.as_ref() {
-                    Some(context) => self.send_control_key_with_request_ack(
-                        &name,
-                        key,
-                        context,
-                        &from,
-                        require_idle,
+                    InputCancelDisposition::InFlight => format!(
+                        "isolated input cancellation did not stop the writer after {cancellation_attempts} attempt(s)"
                     ),
-                    None => self.send_control_key(&name, key),
-                }
-                .map(|_| format!("key {:?} sent", key))
-            }
-            SidebandRequest::RouteMessage {
-                token,
-                mut request,
-                require_idle,
-            } => {
-                let bound_sender = match self.resolve_route_sender_identity(&token) {
-                    Ok(bound_sender) => bound_sender,
-                    Err(error) => return Self::rejected_sideband_response(error.to_string()),
-                };
-                if let Some(name) = bound_sender {
-                    request.from = name;
-                }
-                tokio::task::yield_now().await;
-                match ack_context.as_ref() {
-                    Some(context) => {
-                        self.route_message_with_request_ack(request, context, require_idle)
+                    InputCancelDisposition::Finished => {
+                        "finished writer did not join within 5s".into()
                     }
-                    None => self.route_message_inner(request, None, require_idle),
-                }
-                .map(|_| "message routed".into())
-            }
-            SidebandRequest::PaneSignal {
-                token,
-                task_id,
-                signal_type,
-                summary,
-                artifact_paths,
-                commit_sha,
-            } => {
-                let session = match self.resolve_pane_signal_session(&token) {
-                    Ok(session) => session,
-                    Err(error) => return Self::rejected_sideband_response(error.to_string()),
-                };
-                let result = self.record_pane_signal(
-                    request_id,
-                    PaneSignalRecord {
-                        session,
-                        task_id,
-                        signal_type,
-                        summary,
-                        artifact_paths,
-                        commit_sha,
-                    },
-                );
-                return match result {
-                    Ok(paths) => SidebandResponse {
-                        ok: true,
-                        message: format!("pane signal recorded at {}", paths.signal_path.display()),
-                        snapshot: Some(self.snapshot()),
-                        timed_out: false,
-                        payload: Some(SidebandResponsePayload::PaneSignal {
-                            signal_path: paths.signal_path.display().to_string(),
-                            legacy_touch_path: paths.legacy_touch_path.display().to_string(),
-                        }),
-                        request_id: None,
-                    },
-                    Err(error) => SidebandResponse {
+                });
+                match tokio::time::timeout(Duration::from_secs(5), &mut writer).await {
+                    Ok(outcome) => Self::sideband_response_after_write_deadline(
+                        action,
+                        budget,
+                        format!("{cancellation_detail}; {termination_detail}"),
+                        outcome,
+                    ),
+                    Err(_) => SidebandResponse {
                         ok: false,
-                        message: error.to_string(),
-                        snapshot: Some(self.snapshot()),
-                        timed_out: false,
+                        message: format!(
+                            "sideband action '{action}' timed out after {}ms; {cancellation_detail}; {termination_detail}; writer did not stop within 5s of fallback termination",
+                            budget.as_millis()
+                        ),
+                        timed_out: true,
                         payload: None,
                         request_id: None,
                     },
-                };
-            }
-            SidebandRequest::CreatePair { token, name } => {
-                if let Err(error) = self.validate_master_token(&token) {
-                    return Self::rejected_sideband_response(error.to_string());
                 }
-                tokio::task::yield_now().await;
-                self.create_pair(&name)
-                    .map(|snapshots| format!("created pair '{name}' ({} slots)", snapshots.len()))
             }
-            lifecycle => {
-                return SidebandResponse {
-                    ok: false,
-                    message: format!(
-                        "side-effect dispatcher received unexpected lifecycle request '{}'",
-                        action_label_for(&lifecycle)
-                    ),
-                    snapshot: Some(self.snapshot()),
-                    timed_out: false,
-                    payload: None,
-                    request_id: None,
-                };
-            }
-        };
-
-        self.sideband_response_from_outcome(outcome)
+        }
     }
 
-    async fn apply_sideband_request_async(&self, request: SidebandRequest) -> SidebandResponse {
-        let request_id = Uuid::new_v4().to_string();
-        let action = action_label_for(&request).to_string();
-        let session = session_name_of(&request).map(str::to_string);
-        let extra_args = start_session_extra_args_of(&request).to_vec();
-        let budget = SidebandTimeouts::budget(&request);
-        let started = Instant::now();
-
-        self.emit_sideband_lifecycle(
-            &request_id,
-            &action,
-            session.as_deref(),
-            &extra_args,
-            SidebandPhase::Started,
-            Duration::ZERO,
-        );
-
-        let mut response = match SidebandTimeouts::lane(&request) {
-            OpLane::Lifecycle => {
-                self.run_detached_with_timeout_async(
-                    request.clone(),
-                    budget,
-                    &request_id,
-                    &action,
-                    session.as_deref(),
-                    &extra_args,
-                )
-                .await
+    fn sideband_response_after_write_deadline(
+        action: &str,
+        budget: Duration,
+        cancellation_detail: String,
+        outcome: std::result::Result<Result<String>, tokio::task::JoinError>,
+    ) -> SidebandResponse {
+        match outcome {
+            Ok(Ok(message)) => SidebandResponse {
+                ok: true,
+                message: format!(
+                    "{message}; completed after the {}ms sideband deadline before cancellation took effect; {cancellation_detail}",
+                    budget.as_millis()
+                ),
+                timed_out: true,
+                payload: None,
+                request_id: None,
+            },
+            Ok(Err(error)) => {
+                let bytes_written = error
+                    .downcast_ref::<PtyWriteError>()
+                    .map(PtyWriteError::bytes_written)
+                    .unwrap_or(0);
+                let partial_detail = if bytes_written > 0 {
+                    format!(
+                        "; {bytes_written} bytes reached the PTY before cancellation and content may be partial"
+                    )
+                } else {
+                    String::new()
+                };
+                SidebandResponse {
+                    ok: false,
+                    message: format!(
+                        "sideband action '{action}' timed out after {}ms; {cancellation_detail}; writer stopped: {error:#}{partial_detail}",
+                        budget.as_millis()
+                    ),
+                    timed_out: true,
+                    payload: None,
+                    request_id: None,
+                }
             }
-            OpLane::SideEffect => {
-                self.run_inline_with_timeout_async(
-                    request.clone(),
-                    budget,
-                    &request_id,
-                    &action,
-                    session.as_deref(),
-                    &extra_args,
-                )
-                .await
-            }
-        };
+            Err(error) => SidebandResponse {
+                ok: false,
+                message: format!(
+                    "sideband action '{action}' timed out after {}ms; {cancellation_detail}; writer worker failed: {error}",
+                    budget.as_millis()
+                ),
+                timed_out: true,
+                payload: None,
+                request_id: None,
+            },
+        }
+    }
 
-        response.request_id = Some(request_id.clone());
-
-        if !response.timed_out {
-            let phase = if response.ok {
-                SidebandPhase::Completed
-            } else {
-                SidebandPhase::Failed
-            };
-            let error = (!response.ok).then(|| response.message.clone());
-            self.emit_sideband_lifecycle_with_error(SidebandLifecycleEvent {
-                request_id: &request_id,
-                action: &action,
-                session: session.as_deref(),
-                extra_args: &extra_args,
-                phase,
-                elapsed: started.elapsed(),
-                error,
-            });
+    async fn apply_sideband_request_async(
+        &self,
+        caller: &PaneCaller,
+        request: SidebandRequest,
+    ) -> SidebandResponse {
+        if let Err(error) = self.authorize_sideband_request(caller, &request) {
+            return Self::rejected_sideband_response(error.to_string());
         }
 
+        #[cfg(test)]
+        if let Some(hook) = self
+            .inner
+            .sideband_after_initial_authorization
+            .lock()
+            .take()
+        {
+            hook();
+        }
+
+        let request_id = Uuid::new_v4().to_string();
+        let action = match &request {
+            SidebandRequest::Ping {} => "ping",
+            SidebandRequest::WaitQuiet { .. } => "wait_quiet",
+            SidebandRequest::SendInput { .. } => "send_input",
+            SidebandRequest::SendKey { .. } => "send_key",
+        };
+        if let Err(error) = self.emit_dispatch_attempt_from_pane_caller(&request_id, action, caller)
+        {
+            return Self::rejected_sideband_response(error.to_string());
+        }
+        let mut response = match request {
+            SidebandRequest::SendInput { name, input } => {
+                self.apply_sideband_write_with_timeout(
+                    caller.clone(),
+                    name,
+                    input,
+                    "input sent".into(),
+                    "send_input",
+                )
+                .await
+            }
+            SidebandRequest::SendKey { name, key } => {
+                self.apply_sideband_write_with_timeout(
+                    caller.clone(),
+                    name,
+                    control_key_sequence(key).into(),
+                    format!("key {:?} sent", key),
+                    "send_key",
+                )
+                .await
+            }
+            request @ (SidebandRequest::Ping {} | SidebandRequest::WaitQuiet { .. }) => {
+                self.apply_authorized_sideband_request(caller, request)
+                    .await
+            }
+        };
+        response.request_id = Some(request_id);
         response
     }
 
-    async fn run_detached_with_timeout_async(
+    fn emit_run_work_state(
         &self,
-        request: SidebandRequest,
-        budget: Duration,
-        request_id: &str,
-        action: &str,
-        session: Option<&str>,
-        extra_args: &[String],
-    ) -> SidebandResponse {
-        let authorized = match self.authorize_lifecycle_request(request) {
-            Ok(authorized) => authorized,
-            Err(error) => return Self::rejected_sideband_response(error.to_string()),
+        event: RuntimeEvent,
+        generation: SessionGeneration,
+        run_id: Uuid,
+    ) {
+        let RuntimeEvent::SessionWorkState {
+            identity, state, ..
+        } = &event
+        else {
+            debug_assert!(false, "emit_run_work_state requires SessionWorkState");
+            return;
         };
 
-        if let Err(error) = validate_extra_args(start_session_extra_args_of(&authorized.request)) {
-            return self.sideband_response_from_outcome(Err(error));
+        #[cfg(test)]
+        if let Some(hook) = self.inner.work_state_before_side_effect.lock().take() {
+            hook();
         }
 
-        let expected_generation = match self.bump_session_generation(&authorized.target_session) {
-            Ok(expected) => expected,
-            Err(error) => return self.sideband_response_from_outcome(Err(error)),
-        };
-
-        let handle = self.clone();
-        let mut worker = tokio::task::spawn_blocking(move || {
-            handle.apply_authorized_lifecycle_request_at(authorized, expected_generation)
-        });
-        let slow_warn_at = budget / 2;
-        let started = Instant::now();
-        let mut warned = false;
-        let slow_warning = tokio::time::sleep(slow_warn_at);
-        tokio::pin!(slow_warning);
-        let deadline = tokio::time::sleep(budget);
-        tokio::pin!(deadline);
-
-        loop {
-            tokio::select! {
-                join_result = &mut worker => {
-                    let elapsed = started.elapsed();
-                    if !warned && elapsed >= slow_warn_at {
-                        self.emit_sideband_lifecycle(
-                            request_id,
-                            action,
-                            session,
-                            extra_args,
-                            SidebandPhase::SlowWarning,
-                            elapsed,
-                        );
-                    }
-
-                    return match join_result {
-                        Ok(response) => response,
-                        Err(join_error) => SidebandResponse {
-                            ok: false,
-                            message: format!("worker join failed: {join_error}"),
-                            snapshot: Some(self.snapshot()),
-                            timed_out: false,
-                            payload: None,
-                            request_id: None,
-                        },
-                    };
-                }
-                _ = &mut slow_warning, if !warned => {
-                    warned = true;
-                    self.emit_sideband_lifecycle(
-                        request_id,
-                        action,
-                        session,
-                        extra_args,
-                        SidebandPhase::SlowWarning,
-                        started.elapsed(),
-                    );
-                }
-                _ = &mut deadline => {
-                    let elapsed = started.elapsed();
-                    let message = format!(
-                        "lifecycle op '{action}' timed out after {}ms",
-                        elapsed.as_millis()
-                    );
-                    self.emit_sideband_lifecycle_with_error(SidebandLifecycleEvent {
-                        request_id,
-                        action,
-                        session,
-                        extra_args,
-                        phase: SidebandPhase::TimedOut,
-                        elapsed,
-                        error: Some(message.clone()),
-                    });
-                    return SidebandResponse {
-                        ok: false,
-                        message,
-                        snapshot: Some(self.snapshot()),
-                        timed_out: true,
-                        payload: None,
-                        request_id: None,
-                    };
-                }
-            }
+        let is_current = self
+            .inner
+            .slots
+            .lock()
+            .get_by_id(identity.session_id)
+            .map(|slot| (slot.generation, slot.run_id))
+            == Some((generation, Some(run_id)));
+        if is_current {
+            self.handle_session_work_state_side_effects(
+                identity.session_id,
+                generation,
+                run_id,
+                *state,
+            );
         }
+        self.emit_run_event(event);
     }
 
-    async fn run_inline_with_timeout_async(
+    fn is_current_run(
         &self,
-        request: SidebandRequest,
-        budget: Duration,
-        request_id: &str,
-        action: &str,
-        session: Option<&str>,
-        extra_args: &[String],
-    ) -> SidebandResponse {
-        let slow_warn_at = budget / 2;
-        let started = Instant::now();
-        let mut warned = false;
-        let ack_context = request_ack_context_for(request_id, action, &request);
-        let operation = self.apply_side_effect_request_async(request, request_id, ack_context);
-        tokio::pin!(operation);
-        let slow_warning = tokio::time::sleep(slow_warn_at);
-        tokio::pin!(slow_warning);
-        let deadline = tokio::time::sleep(budget);
-        tokio::pin!(deadline);
+        session_id: SessionId,
+        generation: SessionGeneration,
+        run_id: Uuid,
+    ) -> bool {
+        self.inner
+            .slots
+            .lock()
+            .get_by_id(session_id)
+            .map(|slot| (slot.generation, slot.run_id))
+            == Some((generation, Some(run_id)))
+    }
+
+    fn emit_run_event(&self, event: RuntimeEvent) {
+        let identity = match &event {
+            RuntimeEvent::SessionState { identity, .. }
+            | RuntimeEvent::SessionOutput { identity, .. }
+            | RuntimeEvent::SessionExit { identity, .. }
+            | RuntimeEvent::SessionWorkState { identity, .. } => *identity,
+            _ => {
+                debug_assert!(false, "emit_run_event requires a run-derived event");
+                self.emit(event);
+                return;
+            }
+        };
+
+        let should_drain = {
+            let mut streams = self.inner.run_event_publish.lock();
+            let Some(stream) = streams.get_mut(&identity.session_id) else {
+                eprintln!(
+                    "run event for unknown or retired session stream {} sequence {} was dropped",
+                    identity.session_id, identity.sequence
+                );
+                return;
+            };
+            let Some(next_sequence) = stream.next_sequence else {
+                eprintln!(
+                    "run event stream {} is exhausted; dropping sequence {}",
+                    identity.session_id, identity.sequence
+                );
+                return;
+            };
+            if identity.sequence < next_sequence {
+                eprintln!(
+                    "duplicate run event for stream {}: sequence {} < next {}",
+                    identity.session_id, identity.sequence, next_sequence
+                );
+                return;
+            }
+            if stream.pending.insert(identity.sequence, event).is_some() {
+                eprintln!(
+                    "duplicate pending run event for stream {} sequence {}",
+                    identity.session_id, identity.sequence
+                );
+                return;
+            }
+            if stream.draining {
+                false
+            } else {
+                stream.draining = true;
+                true
+            }
+        };
+        if !should_drain {
+            return;
+        }
 
         loop {
-            tokio::select! {
-                response = &mut operation => {
-                    let elapsed = started.elapsed();
-                    if !warned && elapsed >= slow_warn_at {
-                        self.emit_sideband_lifecycle(
-                            request_id,
-                            action,
-                            session,
-                            extra_args,
-                            SidebandPhase::SlowWarning,
-                            elapsed,
-                        );
+            let next_event = {
+                let mut streams = self.inner.run_event_publish.lock();
+                let Some(stream) = streams.get_mut(&identity.session_id) else {
+                    return;
+                };
+                let Some(next_sequence) = stream.next_sequence else {
+                    stream.draining = false;
+                    return;
+                };
+                match stream.pending.remove(&next_sequence) {
+                    Some(event) => {
+                        stream.next_sequence = next_sequence.checked_add(1);
+                        Some(event)
                     }
-                    return response;
+                    None => {
+                        stream.draining = false;
+                        None
+                    }
                 }
-                _ = &mut slow_warning, if !warned => {
-                    warned = true;
-                    self.emit_sideband_lifecycle(
-                        request_id,
-                        action,
-                        session,
-                        extra_args,
-                        SidebandPhase::SlowWarning,
-                        started.elapsed(),
-                    );
-                }
-                _ = &mut deadline => {
-                    let message = format!(
-                        "side-effect op '{action}' timed out after {}ms (boundary pre-PTY-write unless documented otherwise)",
-                        budget.as_millis()
-                    );
-                    self.emit_sideband_lifecycle_with_error(SidebandLifecycleEvent {
-                        request_id,
-                        action,
-                        session,
-                        extra_args,
-                        phase: SidebandPhase::TimedOut,
-                        elapsed: budget,
-                        error: Some(message.clone()),
-                    });
-                    return SidebandResponse {
-                        ok: false,
-                        message,
-                        snapshot: Some(self.snapshot()),
-                        timed_out: true,
-                        payload: None,
-                        request_id: None,
-                    };
-                }
-            }
+            };
+            let Some(event) = next_event else {
+                return;
+            };
+            self.emit(event);
         }
     }
 
     fn emit(&self, event: RuntimeEvent) {
-        if let RuntimeEvent::SessionWorkState { session, state, .. } = &event {
-            self.handle_session_work_state_side_effects(session, *state);
-        }
-
         let appended = match audit_event_projection(&event, &self.inner) {
             Some(audit_event) => match self.inner.audit.append(&audit_event) {
                 Ok(()) => true,
@@ -4966,337 +6675,65 @@ impl SupervisorHandle {
 }
 
 impl SupervisorHandle {
-    fn prepare_definition_for_spawn(
-        &self,
-        definition: &SessionDefinition,
-    ) -> Result<SessionDefinition> {
-        let mut prepared = definition.clone();
+    fn prepare_launch_spec_for_spawn(&self, definition: &SessionDefinition) -> Result<LaunchSpec> {
+        let resolved = self
+            .inner
+            .executable_resolver
+            .read()
+            .resolve(definition.driver)?;
+        let mut spec = build_launch_spec(definition, &resolved)?;
 
-        if let Some(status) = self.rotate_session_control_plane_status(&definition.name)? {
-            prepared.env.push(EnvVar {
+        if let Some(status) = self.inner.control_plane.read().clone() {
+            spec.env.push(EnvVar {
                 key: "PRIM1_PANE_IDENTITY".into(),
-                value: definition.name.clone(),
+                value: definition.alias.clone(),
             });
-            prepared.env.push(EnvVar {
-                key: "PRIM1_PANE_CREDENTIALS".into(),
-                value: status.info_path,
+            spec.env.push(EnvVar {
+                key: "PRIM1_CONTROL_PLANE_ENDPOINT".into(),
+                value: status.endpoint,
             });
-        }
-
-        Ok(prepared)
-    }
-
-    fn rotate_session_control_plane_status(
-        &self,
-        session_name: &str,
-    ) -> Result<Option<ControlPlaneStatus>> {
-        let Some(control_plane) = self.inner.control_plane.read().clone() else {
-            return Ok(None);
-        };
-
-        let info_path = self
-            .runtime_dir()
-            .join(format!("control-plane-{session_name}.json"));
-        let info_path_text = info_path.display().to_string();
-
-        let mut statuses = self.inner.session_control_planes.lock();
-        let existing = statuses.get(session_name).cloned();
-        let status = ControlPlaneStatus {
-            transport: control_plane.transport.clone(),
-            endpoint: control_plane.endpoint.clone(),
-            token: Uuid::new_v4().to_string(),
-            info_path: info_path_text,
-        };
-
-        let payload = serde_json::to_string_pretty(&status)?;
-        if let Err(error) = write_private_file(&info_path, payload.as_bytes()) {
-            eprintln!(
-                "failed to persist session credentials at {}: {error}",
-                info_path.display()
-            );
-            return Err(anyhow!("failed to persist session credentials"));
-        }
-
-        let mut bindings = self.inner.token_bindings.lock();
-        if let Some(existing) = existing {
-            bindings.remove(&existing.token);
-            self.inner
-                .retired_sensitive_values
-                .lock()
-                .extend([existing.token, existing.info_path]);
-        }
-        bindings.insert(status.token.clone(), Some(session_name.to_string()));
-        statuses.insert(session_name.to_string(), status.clone());
-        drop(bindings);
-        drop(statuses);
-
-        Ok(Some(status))
-    }
-
-    fn revoke_session_credentials_in_memory(
-        &self,
-        session_names: &[String],
-    ) -> Vec<ControlPlaneStatus> {
-        let mut statuses = self.inner.session_control_planes.lock();
-        let mut bindings = self.inner.token_bindings.lock();
-        let mut retired = self.inner.retired_sensitive_values.lock();
-        let mut revoked = Vec::new();
-
-        for session_name in session_names {
-            if let Some(status) = statuses.remove(session_name) {
-                bindings.remove(&status.token);
-                retired.extend([status.token.clone(), status.info_path.clone()]);
-                revoked.push(status);
+            spec.env.push(EnvVar {
+                key: "PRIM1_CONTROL_PLANE_TRANSPORT".into(),
+                value: status.transport,
+            });
+            #[cfg(windows)]
+            {
+                let server = PinnedProcess::open(std::process::id())
+                    .context("failed to identify the control-plane server process")?;
+                spec.env.push(EnvVar {
+                    key: "PRIM1_CONTROL_PLANE_SERVER_PID".into(),
+                    value: server.pid().to_string(),
+                });
+                spec.env.push(EnvVar {
+                    key: "PRIM1_CONTROL_PLANE_SERVER_STARTED_FILETIME".into(),
+                    value: server.creation_time_filetime().to_string(),
+                });
             }
         }
-        drop(retired);
-        drop(bindings);
-        drop(statuses);
-        revoked
+
+        Ok(spec)
     }
 
-    fn revoke_all_control_plane_credentials_in_memory(&self) -> Vec<ControlPlaneStatus> {
-        let session_names = self
-            .inner
-            .session_control_planes
-            .lock()
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut revoked = self.revoke_session_credentials_in_memory(&session_names);
-
-        let master = self.inner.control_plane.write().take();
-        if let Some(status) = master.as_ref() {
-            self.inner.token_bindings.lock().remove(&status.token);
-            self.inner
-                .retired_sensitive_values
-                .lock()
-                .extend([status.token.clone(), status.info_path.clone()]);
-        }
-        revoked.extend(master);
-        self.inner.token_bindings.lock().clear();
-        revoked
-    }
-
-    fn authorize_session_action(&self, token: &str, target_session: &str) -> Result<String> {
-        let binding = self
-            .inner
-            .token_bindings
-            .lock()
-            .get(token)
-            .cloned()
-            .ok_or_else(|| anyhow!("invalid control plane token"))?;
-
-        if let Some(bound_session) = binding.as_deref()
-            && bound_session != target_session
-        {
-            return Err(anyhow!(
-                "session action: pane-bound token cannot target other sessions"
-            ));
-        }
-
-        Ok(binding.unwrap_or_else(|| "operator".into()))
-    }
-
-    #[cfg(test)]
-    fn validate_session_action_token(&self, token: &str, target_session: &str) -> Result<()> {
-        self.authorize_session_action(token, target_session)
-            .map(drop)
-    }
-
-    fn validate_master_token(&self, token: &str) -> Result<()> {
-        let binding = self
-            .inner
-            .token_bindings
-            .lock()
-            .get(token)
-            .cloned()
-            .ok_or_else(|| anyhow!("invalid control plane token"))?;
-
-        if binding.is_some() {
-            return Err(anyhow!(
-                "create_pair: pane-bound tokens are not authorised; master token required"
-            ));
-        }
-
-        Ok(())
-    }
-
-    fn resolve_route_sender_identity(&self, token: &str) -> Result<Option<String>> {
-        let binding = self
-            .inner
-            .token_bindings
-            .lock()
-            .get(token)
-            .cloned()
-            .ok_or_else(|| anyhow!("invalid control plane token"))?;
-
-        Ok(binding)
-    }
-
-    fn resolve_pane_signal_session(&self, token: &str) -> Result<String> {
-        let binding = self
-            .inner
-            .token_bindings
-            .lock()
-            .get(token)
-            .cloned()
-            .ok_or_else(|| anyhow!("invalid control plane token"))?;
-
-        Ok(binding.unwrap_or_else(|| "supervisor".into()))
-    }
-
-    fn authorize_deliver_message(&self, token: &str, target_session: &str) -> Result<String> {
-        let binding = self
-            .inner
-            .token_bindings
-            .lock()
-            .get(token)
-            .cloned()
-            .ok_or_else(|| anyhow!("invalid control plane token"))?;
-
-        if let Some(bound_session) = binding.as_deref()
-            && bound_session != target_session
-        {
-            return Err(anyhow!(
-                "deliver_message: pane-bound token cannot target other sessions; use route_message instead"
-            ));
-        }
-
-        Ok(binding.unwrap_or_else(|| "operator".into()))
-    }
-
-    #[cfg(test)]
-    fn validate_deliver_message_token(&self, token: &str, target_session: &str) -> Result<()> {
-        self.authorize_deliver_message(token, target_session)
-            .map(drop)
-    }
-
-    fn prepare_delivery_for_session(
+    fn deliver_prepared_payload(
         &self,
-        session_name: &str,
-        content: &str,
-    ) -> Result<(SessionSnapshot, SubmitBehavior, Vec<String>)> {
-        if content.trim_start().starts_with('/') {
-            return Err(anyhow!(
-                "deliver_message: slash commands are not supported; use send_input"
-            ));
-        }
-
-        self.refresh_session_liveness();
-        let slots = self.inner.slots.lock();
-        let slot = slots
-            .get(session_name)
-            .with_context(|| format!("unknown session '{}'", session_name))?;
-        if slot.running.is_none() {
-            return Err(anyhow!("session '{}' is not running", session_name));
-        }
-
-        let submit_behavior = routed_message_submit_behavior(slot.definition.driver);
-        let prepared = prepare_direct_message(slot.definition.driver, content);
-        let single_payload = prepared.into_iter().next().unwrap_or_default();
-        let chunks = split_routed_message_content(&single_payload, submit_behavior.max_chunk_chars);
-        let payloads = if chunks.is_empty() {
-            vec![String::new()]
-        } else {
-            chunks
-        };
-        Ok((slot.snapshot(), submit_behavior, payloads))
-    }
-
-    async fn wait_quiet(&self, request: WaitQuietRequest) -> SidebandResponse {
-        self.refresh_session_liveness();
-        let quiet_window = Duration::from_secs(request.quiet_seconds as u64);
-        let timeout = Duration::from_secs(request.timeout_seconds as u64);
-        let wait_started_at = Instant::now();
-
-        loop {
-            self.refresh_session_liveness();
-            let status = {
-                let slots = self.inner.slots.lock();
-                let Some(slot) = slots.get(&request.name) else {
-                    return SidebandResponse {
-                        ok: false,
-                        message: format!("unknown session '{}'", request.name),
-                        snapshot: Some(self.snapshot()),
-                        timed_out: false,
-                        payload: None,
-                        request_id: None,
-                    };
-                };
-                if slot.running.is_none() {
-                    return SidebandResponse {
-                        ok: false,
-                        message: format!("session '{}' is not running", request.name),
-                        snapshot: Some(self.snapshot()),
-                        timed_out: false,
-                        payload: None,
-                        request_id: None,
-                    };
-                }
-
-                let last_real_output_at = slot.last_real_output_at.unwrap_or(wait_started_at);
-                Instant::now()
-                    .saturating_duration_since(last_real_output_at)
-                    .as_millis() as u64
-            };
-
-            if status >= quiet_window.as_millis() as u64 {
-                return SidebandResponse {
-                    ok: true,
-                    message: "session is quiet".into(),
-                    snapshot: Some(self.snapshot()),
-                    timed_out: false,
-                    payload: Some(SidebandResponsePayload::WaitQuiet {
-                        quiet_duration_ms: status,
-                    }),
-                    request_id: None,
-                };
-            }
-
-            if Instant::now().saturating_duration_since(wait_started_at) >= timeout {
-                return SidebandResponse {
-                    ok: false,
-                    message: "wait_quiet timed out".into(),
-                    snapshot: Some(self.snapshot()),
-                    timed_out: false,
-                    payload: Some(SidebandResponsePayload::WaitQuietTimeout {
-                        last_output_age_ms: status,
-                    }),
-                    request_id: None,
-                };
-            }
-
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    }
-
-    fn deliver_prepared_payloads(
-        &self,
-        session_name: &str,
-        payloads: &[String],
+        target: &RunWriteTarget,
+        payload: &str,
         submit_behavior: SubmitBehavior,
     ) -> Result<DeliveryWriteResult> {
-        let mut total_bytes_written = 0;
-        for payload in payloads {
-            let (_snapshot, bytes_written) = self.send_input_with_bytes(SendInputRequest {
-                name: session_name.into(),
-                input: payload.clone(),
-            })?;
-            total_bytes_written += bytes_written;
-            if !submit_behavior.delay.is_zero() {
-                thread::sleep(submit_behavior.delay);
+        let bytes_written = match submit_behavior.framing {
+            MessageFraming::BracketedPaste => {
+                self.write_bracketed_submission(target, payload, submit_behavior)?
             }
-            let (_snapshot, bytes_written) = self.send_input_with_bytes(SendInputRequest {
-                name: session_name.into(),
-                input: submit_behavior.sequence.into(),
-            })?;
-            total_bytes_written += bytes_written;
-        }
+            MessageFraming::RawSingleLine => {
+                let mut input = frame_message_payload(payload, submit_behavior.framing);
+                input.push_str(submit_behavior.sequence);
+                self.write_run_input(target, None, &input, RunInputSafety::Raw, None)?
+            }
+        };
 
         Ok(DeliveryWriteResult {
-            bytes_written: total_bytes_written,
-            payload_part_count: payloads.len() as u32,
+            bytes_written,
+            payload_part_count: 1,
         })
     }
 }
@@ -5330,13 +6767,85 @@ fn process_id_is_running(process_id: u32) -> bool {
     unsafe { libc::kill(process_id as i32, 0) == 0 }
 }
 
+#[cfg(windows)]
+struct ControlPlaneListener {
+    shutdown: tokio::sync::watch::Sender<bool>,
+    thread: Option<thread::JoinHandle<Result<()>>>,
+}
+
+#[cfg(windows)]
+enum ControlPlaneJoinOutcome {
+    Joined(Result<()>),
+    TimedOut(ControlPlaneListener),
+}
+
+#[cfg(windows)]
+impl ControlPlaneListener {
+    fn cancel(&self) {
+        self.shutdown.send_replace(true);
+    }
+
+    fn join(mut self) -> Result<()> {
+        let Some(thread) = self.thread.take() else {
+            return Ok(());
+        };
+        thread
+            .join()
+            .map_err(|_| anyhow!("control plane listener thread panicked"))?
+    }
+
+    fn join_until(self, deadline: Instant) -> ControlPlaneJoinOutcome {
+        loop {
+            let Some(listener_thread) = self.thread.as_ref() else {
+                return ControlPlaneJoinOutcome::Joined(Ok(()));
+            };
+            if listener_thread.is_finished() {
+                return ControlPlaneJoinOutcome::Joined(self.join());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return ControlPlaneJoinOutcome::TimedOut(self);
+            }
+            thread::sleep(remaining.min(Duration::from_millis(5)));
+        }
+    }
+
+    fn stop(self) -> Result<()> {
+        self.cancel();
+        self.join()
+    }
+}
+
+#[cfg(windows)]
+struct PreparedControlPlaneListener {
+    activation: mpsc::SyncSender<()>,
+    listener: ControlPlaneListener,
+}
+
+#[cfg(windows)]
+impl PreparedControlPlaneListener {
+    fn activate(self) -> Result<ControlPlaneListener> {
+        let Self {
+            activation,
+            listener,
+        } = self;
+        if activation.send(()).is_err() {
+            let _ = listener.stop();
+            return Err(anyhow!("control plane listener stopped before activation"));
+        }
+        Ok(listener)
+    }
+}
+
+#[cfg(windows)]
 fn prepare_control_plane_thread(
     handle: SupervisorHandle,
     status: ControlPlaneStatus,
-) -> Result<mpsc::SyncSender<()>> {
+) -> Result<PreparedControlPlaneListener> {
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
     let (activation_tx, activation_rx) = mpsc::sync_channel::<()>(1);
-    thread::spawn(move || {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let thread = thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -5348,33 +6857,31 @@ fn prepare_control_plane_thread(
                     "failed to create control plane runtime: {error}"
                 )));
                 eprintln!("failed to create control plane runtime: {error}");
-                return;
+                return Err(error).context("failed to create control plane runtime");
             }
         };
 
-        #[cfg(windows)]
         let result = runtime.block_on(run_windows_pipe_server(
             handle,
             status,
             ready_tx,
             activation_rx,
+            shutdown_rx,
         ));
 
-        #[cfg(unix)]
-        let result = runtime.block_on(run_unix_socket_server(
-            handle,
-            status,
-            ready_tx,
-            activation_rx,
-        ));
-
-        if let Err(error) = result {
+        if let Err(error) = &result {
             eprintln!("control plane failed: {error}");
         }
+        result
     });
 
-    match ready_rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(Ok(())) => Ok(activation_tx),
+    let listener = ControlPlaneListener {
+        shutdown: shutdown_tx,
+        thread: Some(thread),
+    };
+
+    let startup = match ready_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => Err(anyhow!(error)),
         Err(mpsc::RecvTimeoutError::Timeout) => {
             Err(anyhow!("timed out preparing control plane listener"))
@@ -5382,15 +6889,122 @@ fn prepare_control_plane_thread(
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             Err(anyhow!("control plane listener stopped during startup"))
         }
+    };
+    if let Err(error) = startup {
+        drop(activation_tx);
+        let _ = listener.stop();
+        return Err(error);
+    }
+
+    Ok(PreparedControlPlaneListener {
+        activation: activation_tx,
+        listener,
+    })
+}
+
+fn build_launch_spec(
+    definition: &SessionDefinition,
+    resolved: &ResolvedLaunchProgram,
+) -> Result<LaunchSpec> {
+    match definition.driver {
+        DriverKind::Claude => driver_claude::launch_spec(definition, &resolved.program),
+        DriverKind::Codex => {
+            driver_codex::launch_spec(definition, &resolved.program, &resolved.prefix_args)
+        }
+        DriverKind::GenericTerminal => {
+            let mut spec = driver_generic_terminal::launch_spec(definition, &resolved.program)?;
+            spec.args.extend(resolved.prefix_args.clone());
+            return Ok(spec);
+        }
+    }
+    .map_err(anyhow::Error::from)
+}
+
+fn resolve_driver_executable(driver: DriverKind) -> Result<ResolvedLaunchProgram> {
+    match driver {
+        DriverKind::Claude => Ok(ResolvedLaunchProgram {
+            program: find_direct_executable(&[if cfg!(windows) {
+                "claude.exe"
+            } else {
+                "claude"
+            }])?,
+            prefix_args: Vec::new(),
+        }),
+        DriverKind::Codex => resolve_codex_executable(),
+        DriverKind::GenericTerminal => Ok(ResolvedLaunchProgram {
+            program: find_direct_executable(if cfg!(windows) {
+                &["powershell.exe", "pwsh.exe"]
+            } else {
+                &["bash"]
+            })?,
+            prefix_args: Vec::new(),
+        }),
     }
 }
 
-fn build_launch_spec(definition: &SessionDefinition) -> shared_types::LaunchSpec {
-    match definition.driver {
-        DriverKind::Claude => driver_claude::launch_spec(definition),
-        DriverKind::Codex => driver_codex::launch_spec(definition),
-        DriverKind::GenericTerminal => driver_generic_terminal::launch_spec(definition),
+fn find_direct_executable(names: &[&str]) -> Result<String> {
+    let search_path = std::env::var_os("PATH").ok_or_else(|| anyhow!("PATH is not set"))?;
+    for directory in std::env::split_paths(&search_path) {
+        for name in names {
+            let candidate = directory.join(name);
+            let Ok(metadata) = fs::metadata(&candidate) else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            let canonical = fs::canonicalize(&candidate)
+                .with_context(|| format!("failed to qualify executable {}", candidate.display()))?;
+            return Ok(child_process_path(&canonical)
+                .to_string_lossy()
+                .into_owned());
+        }
     }
+    Err(anyhow!(
+        "no supported direct executable found on PATH (looked for {})",
+        names.join(", ")
+    ))
+}
+
+fn resolve_codex_executable() -> Result<ResolvedLaunchProgram> {
+    let direct_name = if cfg!(windows) { "codex.exe" } else { "codex" };
+    if let Ok(program) = find_direct_executable(&[direct_name]) {
+        return Ok(ResolvedLaunchProgram {
+            program,
+            prefix_args: Vec::new(),
+        });
+    }
+
+    #[cfg(windows)]
+    {
+        let search_path = std::env::var_os("PATH").ok_or_else(|| anyhow!("PATH is not set"))?;
+        for directory in std::env::split_paths(&search_path) {
+            let shim = directory.join("codex.cmd");
+            if !shim.is_file() {
+                continue;
+            }
+            let script = directory
+                .join("node_modules")
+                .join("@openai")
+                .join("codex")
+                .join("bin")
+                .join("codex.js");
+            if !script.is_file() {
+                continue;
+            }
+            let node = find_direct_executable(&["node.exe"])?;
+            let script = fs::canonicalize(&script)
+                .with_context(|| format!("failed to qualify Codex script {}", script.display()))?;
+            return Ok(ResolvedLaunchProgram {
+                program: node,
+                prefix_args: vec![child_process_path(&script).to_string_lossy().into_owned()],
+            });
+        }
+    }
+
+    Err(anyhow!(
+        "Codex requires a direct codex executable or node.exe plus the canonical npm codex.js"
+    ))
 }
 
 fn scope_label(scope: MessageScope) -> &'static str {
@@ -5419,7 +7033,6 @@ fn reset_work_state_locked(slot: &mut SessionSlot) {
     slot.work_state = WorkState::Idle;
     slot.work_state_observed = false;
     slot.work_detail = None;
-    slot.launch_banner_seen = false;
     slot.work_error_observations.clear();
     slot.stall_state_entered_at = None;
     slot.stall_state_entered_timestamp = None;
@@ -5439,6 +7052,7 @@ fn classify_work_state_for_driver(
 fn transition_work_state_locked(
     session_name: &str,
     slot: &mut SessionSlot,
+    run_id: Uuid,
     mut state: WorkState,
     detail: Option<String>,
 ) -> Option<RuntimeEvent> {
@@ -5469,7 +7083,9 @@ fn transition_work_state_locked(
     slot.work_state = state;
     slot.work_state_observed = true;
     slot.work_detail = detail.clone();
+    let identity = next_run_event_identity(slot, run_id);
     Some(RuntimeEvent::SessionWorkState {
+        identity,
         session: session_name.to_string(),
         state,
         detail,
@@ -5516,233 +7132,6 @@ fn quiesce_threshold(driver: DriverKind) -> Option<Duration> {
 
     (threshold >= Duration::from_secs(1) && threshold <= Duration::from_secs(30))
         .then_some(threshold)
-}
-
-fn event_kind(event: &RuntimeEvent) -> &'static str {
-    match event {
-        RuntimeEvent::SessionOutput { .. } => "session_output",
-        RuntimeEvent::SessionState { .. } => "session_state",
-        RuntimeEvent::SessionExit { .. } => "session_exit",
-        RuntimeEvent::SessionWorkState { .. } => "session_work_state",
-        RuntimeEvent::SupervisorHeartbeat { .. } => "supervisor_heartbeat",
-        RuntimeEvent::SupervisorAlert { .. } => "supervisor_alert",
-        RuntimeEvent::DispatchTemplateWarning { .. } => "dispatch_template_warning",
-        RuntimeEvent::PairCreated { .. } => "pair_created",
-        RuntimeEvent::PairRenamed { .. } => "pair_renamed",
-        RuntimeEvent::PairDeleted { .. } => "pair_deleted",
-        RuntimeEvent::RoutedMessage { .. } => "routed_message",
-        RuntimeEvent::RouteDelivery { .. } => "route_delivery",
-        RuntimeEvent::DispatchAttempt { .. } => "dispatch_attempt",
-        RuntimeEvent::PaneSignal { .. } => "pane_signal",
-        RuntimeEvent::SystemLog { .. } => "system_log",
-        RuntimeEvent::ControlPlaneReady { .. } => "control_plane_ready",
-        RuntimeEvent::SidebandRequestLifecycle { .. } => "sideband_request_lifecycle",
-        RuntimeEvent::RequestAck { .. } => "request_ack",
-        RuntimeEvent::RequestAckTimeout { .. } => "request_ack_timeout",
-        RuntimeEvent::DispatchNoReaction { .. } => "dispatch_no_reaction",
-    }
-}
-
-fn event_matches_filter(event: &RuntimeEvent, filter: &EventFilter) -> bool {
-    if !filter.includes_kind(event_kind(event)) {
-        return false;
-    }
-
-    if !filter.include_sessions.is_empty() {
-        let session_match = match event {
-            RuntimeEvent::SessionOutput { session, .. }
-            | RuntimeEvent::SessionState { session, .. }
-            | RuntimeEvent::SessionExit { session, .. }
-            | RuntimeEvent::SessionWorkState { session, .. } => filter
-                .include_sessions
-                .iter()
-                .any(|candidate| candidate == session),
-            RuntimeEvent::RoutedMessage { from, to, .. } => filter
-                .include_sessions
-                .iter()
-                .any(|candidate| candidate == from || candidate == to),
-            RuntimeEvent::RouteDelivery {
-                from,
-                logical_to,
-                recipient,
-                ..
-            } => filter.include_sessions.iter().any(|candidate| {
-                candidate == from
-                    || candidate == logical_to
-                    || recipient
-                        .as_ref()
-                        .map(|value| candidate == value)
-                        .unwrap_or(false)
-            }),
-            RuntimeEvent::DispatchAttempt {
-                from,
-                target_session,
-                ..
-            } => filter
-                .include_sessions
-                .iter()
-                .any(|candidate| candidate == from || candidate == target_session),
-            RuntimeEvent::SidebandRequestLifecycle { session, .. } => session
-                .as_ref()
-                .map(|value| {
-                    filter
-                        .include_sessions
-                        .iter()
-                        .any(|candidate| candidate == value)
-                })
-                .unwrap_or(false),
-            RuntimeEvent::RequestAck { session, .. }
-            | RuntimeEvent::RequestAckTimeout { session, .. }
-            | RuntimeEvent::DispatchNoReaction { session, .. } => filter
-                .include_sessions
-                .iter()
-                .any(|candidate| candidate == session),
-            RuntimeEvent::PaneSignal { session, .. } => filter
-                .include_sessions
-                .iter()
-                .any(|candidate| candidate == session),
-            RuntimeEvent::SupervisorHeartbeat { sessions, .. } => sessions.iter().any(|summary| {
-                filter
-                    .include_sessions
-                    .iter()
-                    .any(|candidate| candidate == &summary.name)
-            }),
-            RuntimeEvent::SupervisorAlert { session, .. } => session
-                .as_ref()
-                .map(|value| {
-                    filter
-                        .include_sessions
-                        .iter()
-                        .any(|candidate| candidate == value)
-                })
-                .unwrap_or(false),
-            RuntimeEvent::DispatchTemplateWarning { session, .. } => filter
-                .include_sessions
-                .iter()
-                .any(|candidate| candidate == session),
-            RuntimeEvent::PairCreated { .. }
-            | RuntimeEvent::PairRenamed { .. }
-            | RuntimeEvent::PairDeleted { .. }
-            | RuntimeEvent::SystemLog { .. }
-            | RuntimeEvent::ControlPlaneReady { .. } => false,
-        };
-
-        if !session_match {
-            return false;
-        }
-    }
-
-    match event {
-        RuntimeEvent::RoutedMessage { scope, .. } if !filter.include_scopes.is_empty() => filter
-            .include_scopes
-            .iter()
-            .any(|candidate| candidate == message_scope_name(*scope)),
-        RuntimeEvent::RouteDelivery { scope, .. } if !filter.include_scopes.is_empty() => filter
-            .include_scopes
-            .iter()
-            .any(|candidate| candidate == message_scope_name(*scope)),
-        _ => true,
-    }
-}
-
-fn message_scope_name(scope: MessageScope) -> &'static str {
-    match scope {
-        MessageScope::Direct => "direct",
-        MessageScope::Room => "room",
-        MessageScope::System => "system",
-        MessageScope::Private => "private",
-    }
-}
-
-fn normalized_required_field(field: &str, value: String) -> Result<String> {
-    let value = value.trim().to_string();
-    if value.is_empty() {
-        return Err(anyhow!("pane_signal requires non-empty {field}"));
-    }
-    Ok(value)
-}
-
-fn pane_signal_type_name(signal_type: PaneSignalType) -> &'static str {
-    match signal_type {
-        PaneSignalType::Done => "done",
-        PaneSignalType::Blocked => "blocked",
-        PaneSignalType::Yellow => "yellow",
-        PaneSignalType::Heartbeat => "heartbeat",
-        PaneSignalType::Progress => "progress",
-    }
-}
-
-fn pane_signal_file_timestamp(now: DateTime<Utc>) -> String {
-    now.format("%Y%m%dT%H%M%S%.9fZ").to_string()
-}
-
-fn pane_signal_filename_component(value: &str) -> String {
-    let sanitized = value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    let trimmed = sanitized.trim_matches('.');
-    if trimmed.is_empty() {
-        "signal".into()
-    } else {
-        trimmed.into()
-    }
-}
-
-fn write_atomic_bytes(path: &Path, contents: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create directory {}", parent.display()))?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow!("path has no UTF-8 filename: {}", path.display()))?;
-    let temp_path = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
-
-    let result = (|| -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-            .with_context(|| format!("failed to create temp file {}", temp_path.display()))?;
-        file.write_all(contents)
-            .with_context(|| format!("failed to write temp file {}", temp_path.display()))?;
-        file.sync_all()
-            .with_context(|| format!("failed to sync temp file {}", temp_path.display()))?;
-        drop(file);
-        fs::rename(&temp_path, path).with_context(|| {
-            format!(
-                "failed to rename temp file {} to {}",
-                temp_path.display(),
-                path.display()
-            )
-        })?;
-        Ok(())
-    })();
-
-    if result.is_err() {
-        let _ = fs::remove_file(&temp_path);
-    }
-
-    result
-}
-
-fn write_empty_touch_file(path: &Path) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create directory {}", parent.display()))?;
-    fs::write(path, b"").with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
 }
 
 fn audit_file_name(date: NaiveDate) -> String {
@@ -5802,58 +7191,11 @@ fn is_valid_audit_filename(name: &str) -> bool {
         && name.as_bytes()[10..] == *b".jsonl"
 }
 
-fn action_label_for(request: &SidebandRequest) -> &'static str {
-    match request {
-        SidebandRequest::Ping { .. } => "ping",
-        SidebandRequest::ListSessions { .. } => "list_sessions",
-        SidebandRequest::CreatePair { .. } => "create_pair",
-        SidebandRequest::StartSession { .. } => "start_session",
-        SidebandRequest::StopSession { .. } => "stop_session",
-        SidebandRequest::RestartSession { .. } => "restart_session",
-        SidebandRequest::DeliverMessage { .. } => "deliver_message",
-        SidebandRequest::WaitQuiet { .. } => "wait_quiet",
-        SidebandRequest::EventsSince { .. } => "events_since",
-        SidebandRequest::SendInput { .. } => "send_input",
-        SidebandRequest::SendKey { .. } => "send_key",
-        SidebandRequest::RouteMessage { .. } => "route_message",
-        SidebandRequest::PaneSignal { .. } => "pane_signal",
-    }
-}
-
-fn request_ack_context_for(
-    request_id: &str,
-    action: &str,
-    request: &SidebandRequest,
-) -> Option<RequestAckContext> {
-    match request {
-        SidebandRequest::DeliverMessage { .. }
-        | SidebandRequest::SendInput { .. }
-        | SidebandRequest::SendKey { .. }
-        | SidebandRequest::RouteMessage { .. } => Some(RequestAckContext {
-            request_id: request_id.to_string(),
-            action: action.to_string(),
-        }),
-        SidebandRequest::Ping { .. }
-        | SidebandRequest::ListSessions { .. }
-        | SidebandRequest::CreatePair { .. }
-        | SidebandRequest::StartSession { .. }
-        | SidebandRequest::StopSession { .. }
-        | SidebandRequest::RestartSession { .. }
-        | SidebandRequest::WaitQuiet { .. }
-        | SidebandRequest::EventsSince { .. }
-        | SidebandRequest::PaneSignal { .. } => None,
-    }
-}
-
 fn heartbeat_interval_from_env() -> Duration {
     positive_duration_from_env(
         "PRIM1_HEARTBEAT_INTERVAL_SECS",
         DEFAULT_HEARTBEAT_INTERVAL_SECS,
     )
-}
-
-fn reaction_window_from_env() -> Duration {
-    positive_duration_from_env("PRIM1_REACTION_WINDOW_SECS", DEFAULT_REACTION_WINDOW_SECS)
 }
 
 fn auto_restart_stall_threshold_from_env() -> Duration {
@@ -5872,29 +7214,12 @@ fn positive_duration_from_env(name: &str, default_seconds: u64) -> Duration {
         .unwrap_or(Duration::from_secs(default_seconds))
 }
 
-fn auto_restart_sessions_from_env() -> Vec<String> {
+fn auto_restart_sessions_from_env() -> Vec<SessionId> {
     std::env::var("PRIM1_AUTO_RESTART_ON_STALL")
         .unwrap_or_default()
         .split(',')
-        .map(|session| session.trim().to_string())
-        .filter(|session| !session.is_empty())
+        .filter_map(|session| session.trim().parse::<SessionId>().ok())
         .collect()
-}
-
-fn dispatch_template_pattern_match(content: &str) -> (Vec<String>, Vec<String>) {
-    let lower_content = content.to_ascii_lowercase();
-    let mut detected = Vec::new();
-    let mut missing = Vec::new();
-
-    for pattern in DISPATCH_TEMPLATE_PATTERNS {
-        if lower_content.contains(&pattern.to_ascii_lowercase()) {
-            detected.push(pattern.to_string());
-        } else {
-            missing.push(pattern.to_string());
-        }
-    }
-
-    (detected, missing)
 }
 
 fn work_state_alert_label(state: Option<WorkState>) -> &'static str {
@@ -5909,325 +7234,79 @@ fn work_state_alert_label(state: Option<WorkState>) -> &'static str {
     }
 }
 
-fn session_name_of(request: &SidebandRequest) -> Option<&str> {
-    match request {
-        SidebandRequest::StartSession { name, .. }
-        | SidebandRequest::StopSession { name, .. }
-        | SidebandRequest::RestartSession { name, .. }
-        | SidebandRequest::DeliverMessage { name, .. }
-        | SidebandRequest::WaitQuiet { name, .. }
-        | SidebandRequest::SendInput { name, .. }
-        | SidebandRequest::SendKey { name, .. } => Some(name.as_str()),
-        SidebandRequest::RouteMessage { request, .. } => Some(request.to.as_str()),
-        SidebandRequest::Ping { .. }
-        | SidebandRequest::ListSessions { .. }
-        | SidebandRequest::CreatePair { .. }
-        | SidebandRequest::EventsSince { .. }
-        | SidebandRequest::PaneSignal { .. } => None,
-    }
-}
-
-fn start_session_extra_args_of(request: &SidebandRequest) -> &[String] {
-    match request {
-        SidebandRequest::StartSession { extra_args, .. } => extra_args.as_slice(),
-        _ => &[],
-    }
-}
-
-fn validate_extra_args(extra_args: &[String]) -> Result<()> {
-    if let Some(index) = extra_args.iter().position(|arg| arg.trim().is_empty()) {
-        return Err(anyhow!(
-            "extra_args[{index}] must not be empty or whitespace-only"
-        ));
-    }
-
-    Ok(())
-}
-
-#[cfg(test)]
 fn routed_message_payload(request: &RouteMessageRequest, behavior: SubmitBehavior) -> String {
-    routed_message_payloads(request, behavior)
-        .into_iter()
-        .next()
-        .unwrap_or_default()
-}
-
-fn routed_message_payloads(request: &RouteMessageRequest, behavior: SubmitBehavior) -> Vec<String> {
-    let message_content = prepare_direct_message(
-        if behavior.flatten_payload {
-            DriverKind::Codex
-        } else {
-            DriverKind::Claude
-        },
-        &request.content,
-    )
-    .into_iter()
-    .next()
-    .unwrap_or_default();
-    let content_chunks = split_routed_message_content(&message_content, behavior.max_chunk_chars);
-    let total_parts = content_chunks.len();
-
-    content_chunks
-        .into_iter()
-        .enumerate()
-        .map(|(index, chunk)| {
-            let header =
-                routed_message_header(request.scope, &request.from, index + 1, total_parts);
-            if behavior.flatten_payload {
-                if chunk.is_empty() {
-                    header
-                } else {
-                    format!("{header} {chunk}")
-                }
-            } else {
-                format!("\n{header}\n{chunk}\n")
-            }
-        })
-        .collect()
+    let header = routed_message_header(request.scope, &request.from);
+    if request.content.is_empty() {
+        header
+    } else if behavior.framing == MessageFraming::RawSingleLine {
+        format!("{header} {}", request.content)
+    } else {
+        format!("{header}\n{}", request.content)
+    }
 }
 
 fn routed_message_submit_behavior(driver: DriverKind) -> SubmitBehavior {
     match driver {
-        DriverKind::Codex => SubmitBehavior {
+        DriverKind::Claude | DriverKind::Codex => SubmitBehavior {
             sequence: "\r",
-            delay: Duration::from_millis(500),
-            flatten_payload: true,
-            max_chunk_chars: Some(CODEX_ROUTED_MESSAGE_MAX_CHARS),
-        },
-        DriverKind::Claude => SubmitBehavior {
-            sequence: "\r",
-            delay: Duration::from_millis(200),
-            flatten_payload: false,
-            max_chunk_chars: Some(CLAUDE_ROUTED_MESSAGE_MAX_CHARS),
+            framing: MessageFraming::BracketedPaste,
+            submit_delay: BRACKETED_PASTE_SUBMIT_DELAY,
         },
         DriverKind::GenericTerminal => SubmitBehavior {
             sequence: "\r",
-            delay: Duration::ZERO,
-            flatten_payload: false,
-            max_chunk_chars: None,
+            framing: MessageFraming::RawSingleLine,
+            submit_delay: Duration::ZERO,
         },
     }
 }
 
-fn prepare_direct_message(driver: DriverKind, content: &str) -> Vec<String> {
-    match driver {
-        DriverKind::Codex => vec![collapse_inline_content(content)],
-        DriverKind::Claude | DriverKind::GenericTerminal => vec![content.to_string()],
-    }
+fn routed_message_header(scope: MessageScope, sender: &str) -> String {
+    format!("[{} message from {}]", scope_label(scope), sender)
 }
 
-fn load_existing_control_plane_status(info_path: &Path) -> Result<Option<ControlPlaneStatus>> {
-    if !info_path.exists() {
-        return Ok(None);
+fn validate_message_body(content: &str) -> Result<()> {
+    if content.len() > MESSAGE_BODY_MAX_BYTES {
+        return Err(anyhow!(
+            "message body is {} bytes; maximum is {} bytes",
+            content.len(),
+            MESSAGE_BODY_MAX_BYTES
+        ));
     }
-
-    let raw = fs::read_to_string(info_path).with_context(|| {
-        format!(
-            "failed to read existing control plane info file {}",
-            info_path.display()
-        )
-    })?;
-    let status = serde_json::from_str::<ControlPlaneStatus>(&raw).with_context(|| {
-        format!(
-            "failed to parse existing control plane info file {}",
-            info_path.display()
-        )
-    })?;
-    Ok(Some(status))
-}
-
-fn probe_control_plane_owner(status: &ControlPlaneStatus, timeout: Duration) -> Result<bool> {
-    let payload = format!(
-        "{}\n",
-        encode_request(&SidebandRequest::Ping {
-            token: status.token.clone(),
-        })?
-    );
-    let deadline = Instant::now() + timeout;
-
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Ok(false);
-        }
-
-        if try_probe_control_plane_endpoint(&status.endpoint, &payload, remaining)? {
-            return Ok(true);
-        }
-
-        let sleep_for = CONTROL_PLANE_PROBE_RETRY_INTERVAL
-            .min(deadline.saturating_duration_since(Instant::now()));
-        if sleep_for.is_zero() {
-            return Ok(false);
-        }
-
-        thread::sleep(sleep_for);
-    }
-}
-
-#[cfg(windows)]
-fn try_probe_control_plane_endpoint(
-    endpoint: &str,
-    payload: &str,
-    timeout: Duration,
-) -> Result<bool> {
-    use tokio::net::windows::named_pipe::ClientOptions;
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .enable_time()
-        .build()
-        .context("failed to create control-plane probe runtime")?;
-
-    runtime.block_on(async {
-        let client = match ClientOptions::new().open(endpoint) {
-            Ok(client) => client,
-            Err(_) => return Ok(false),
-        };
-
-        tokio::time::timeout(timeout, async move {
-            let (read_half, mut write_half) = tokio::io::split(client);
-            write_half
-                .write_all(payload.as_bytes())
-                .await
-                .context("failed to write probe request")?;
-            write_half
-                .flush()
-                .await
-                .context("failed to flush probe request")?;
-
-            let mut reader = BufReader::new(read_half);
-            let mut line = String::new();
-            let bytes = reader
-                .read_line(&mut line)
-                .await
-                .context("failed to read probe response")?;
-            Ok::<bool, anyhow::Error>(bytes > 0)
-        })
-        .await
-        .map_err(|_| anyhow!("control-plane probe timed out"))?
-    })
-}
-
-#[cfg(unix)]
-fn try_probe_control_plane_endpoint(
-    endpoint: &str,
-    payload: &str,
-    timeout: Duration,
-) -> Result<bool> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .enable_time()
-        .build()
-        .context("failed to create control-plane probe runtime")?;
-
-    runtime.block_on(async {
-        let client =
-            match tokio::time::timeout(timeout, tokio::net::UnixStream::connect(endpoint)).await {
-                Ok(Ok(client)) => client,
-                Ok(Err(_)) | Err(_) => return Ok(false),
-            };
-
-        tokio::time::timeout(timeout, async move {
-            let (read_half, mut write_half) = tokio::io::split(client);
-            write_half
-                .write_all(payload.as_bytes())
-                .await
-                .context("failed to write probe request")?;
-            write_half
-                .flush()
-                .await
-                .context("failed to flush probe request")?;
-
-            let mut reader = BufReader::new(read_half);
-            let mut line = String::new();
-            let bytes = reader
-                .read_line(&mut line)
-                .await
-                .context("failed to read probe response")?;
-            Ok::<bool, anyhow::Error>(bytes > 0)
-        })
-        .await
-        .map_err(|_| anyhow!("control-plane probe timed out"))?
-    })
-}
-
-fn collapse_inline_content(content: &str) -> String {
-    content.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn routed_message_header(
-    scope: MessageScope,
-    sender: &str,
-    part_number: usize,
-    total_parts: usize,
-) -> String {
-    if total_parts <= 1 {
-        return format!("[{} message from {}]", scope_label(scope), sender);
-    }
-
-    format!(
-        "[{} message from {} | part {}/{}]",
-        scope_label(scope),
-        sender,
-        part_number,
-        total_parts
-    )
-}
-
-fn split_routed_message_content(content: &str, max_chunk_chars: Option<usize>) -> Vec<String> {
-    let Some(max_chunk_chars) = max_chunk_chars else {
-        return vec![content.to_string()];
-    };
-
-    if content.chars().count() <= max_chunk_chars {
-        return vec![content.to_string()];
-    }
-
-    let mut chunks = Vec::new();
-    let mut remaining = content.trim();
-
-    while remaining.chars().count() > max_chunk_chars {
-        let split_index = split_point_within_limit(remaining, max_chunk_chars);
-        let (chunk, tail) = remaining.split_at(split_index);
-        let chunk = chunk.trim();
-        if !chunk.is_empty() {
-            chunks.push(chunk.to_string());
-        }
-        remaining = tail.trim_start();
-    }
-
-    if !remaining.is_empty() {
-        chunks.push(remaining.to_string());
-    }
-
-    if chunks.is_empty() {
-        vec![String::new()]
-    } else {
-        chunks
-    }
-}
-
-fn split_point_within_limit(content: &str, max_chunk_chars: usize) -> usize {
-    let mut last_whitespace_index = None;
-    for (char_count, (index, ch)) in content.char_indices().enumerate() {
-        if char_count == max_chunk_chars {
-            break;
-        }
-        if ch.is_whitespace() {
-            last_whitespace_index = Some(index);
-        }
-    }
-
-    if let Some(index) = last_whitespace_index {
-        return index;
-    }
-
-    content
+    if let Some((offset, ch)) = content
         .char_indices()
-        .nth(max_chunk_chars)
-        .map(|(index, _)| index)
-        .unwrap_or(content.len())
+        .find(|(_, ch)| ch.is_control() && !matches!(*ch, '\t' | '\n' | '\r'))
+    {
+        return Err(anyhow!(
+            "message body contains disallowed control character U+{:04X} at byte offset {offset}",
+            ch as u32
+        ));
+    }
+    Ok(())
+}
+
+fn validate_message_framing(content: &str, behavior: SubmitBehavior) -> Result<()> {
+    if behavior.framing == MessageFraming::RawSingleLine && content.chars().any(char::is_control) {
+        return Err(anyhow!(
+            "generic terminal delivery supports only printable single-line message bodies"
+        ));
+    }
+    Ok(())
+}
+
+fn frame_message_payload(content: &str, framing: MessageFraming) -> String {
+    let framing_bytes = match framing {
+        MessageFraming::BracketedPaste => BRACKETED_PASTE_START.len() + BRACKETED_PASTE_END.len(),
+        MessageFraming::RawSingleLine => 0,
+    };
+    let mut input = String::with_capacity(content.len() + framing_bytes);
+    if framing == MessageFraming::BracketedPaste {
+        input.push_str(BRACKETED_PASTE_START);
+    }
+    input.push_str(content);
+    if framing == MessageFraming::BracketedPaste {
+        input.push_str(BRACKETED_PASTE_END);
+    }
+    input
 }
 
 fn control_key_sequence(key: ControlKey) -> &'static str {
@@ -6241,6 +7320,25 @@ fn control_key_sequence(key: ControlKey) -> &'static str {
         ControlKey::Esc => "\x1b",
         ControlKey::CtrlC => "\x03",
     }
+}
+
+fn validate_wait_quiet_bounds(quiet_seconds: u32, timeout_seconds: u32) -> Result<()> {
+    if !(1..=SIDEBAND_WAIT_QUIET_MAX_QUIET_SECONDS).contains(&quiet_seconds) {
+        return Err(anyhow!(
+            "wait_quiet quiet_seconds must be between 1 and {SIDEBAND_WAIT_QUIET_MAX_QUIET_SECONDS}"
+        ));
+    }
+    if !(1..=SIDEBAND_WAIT_QUIET_MAX_TIMEOUT_SECONDS).contains(&timeout_seconds) {
+        return Err(anyhow!(
+            "wait_quiet timeout_seconds must be between 1 and {SIDEBAND_WAIT_QUIET_MAX_TIMEOUT_SECONDS}"
+        ));
+    }
+    if quiet_seconds > timeout_seconds {
+        return Err(anyhow!(
+            "wait_quiet quiet_seconds must not exceed timeout_seconds"
+        ));
+    }
+    Ok(())
 }
 
 fn chunk_has_real_content(chunk: &str) -> bool {
@@ -6373,6 +7471,7 @@ async fn run_windows_pipe_server(
     status: ControlPlaneStatus,
     ready: mpsc::SyncSender<Result<(), String>>,
     activation: mpsc::Receiver<()>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let first_server = match create_windows_pipe_server(&status.endpoint, true) {
         Ok(server) => server,
@@ -6388,6 +7487,9 @@ async fn run_windows_pipe_server(
     if activation.recv().is_err() {
         return Ok(());
     }
+    if *shutdown.borrow() {
+        return Ok(());
+    }
 
     let connection_slots = Arc::new(Semaphore::new(SIDEBAND_MAX_CONNECTIONS));
     let mut prepared_server = Some(first_server);
@@ -6396,70 +7498,26 @@ async fn run_windows_pipe_server(
             Some(server) => server,
             None => create_windows_pipe_server(&status.endpoint, false)?,
         };
-        server
-            .connect()
-            .await
-            .context("failed to connect named pipe")?;
-        let Some(connection_permit) = reserve_sideband_connection(&connection_slots) else {
-            continue;
-        };
-        let handle_clone = handle.clone();
-        tokio::spawn(async move {
-            let _connection_permit = connection_permit;
-            if let Err(error) = handle_sideband_stream(handle_clone, server).await {
-                eprintln!("named pipe connection failed: {error}");
+        tokio::select! {
+            changed = shutdown.changed() => {
+                match changed {
+                    Ok(()) if *shutdown.borrow() => return Ok(()),
+                    Ok(()) => continue,
+                    Err(_) => return Ok(()),
+                }
             }
-        });
-    }
-}
-
-#[cfg(unix)]
-async fn run_unix_socket_server(
-    handle: SupervisorHandle,
-    status: ControlPlaneStatus,
-    ready: mpsc::SyncSender<Result<(), String>>,
-    activation: mpsc::Receiver<()>,
-) -> Result<()> {
-    use tokio::net::UnixListener;
-
-    let _ = fs::remove_file(&status.endpoint);
-    let listener = match UnixListener::bind(&status.endpoint) {
-        Ok(listener) => listener,
-        Err(error) => {
-            let message = format!("failed to bind unix socket {}: {error}", status.endpoint);
-            let _ = ready.send(Err(message.clone()));
-            return Err(anyhow!(message));
+            connected = server.connect() => {
+                connected.context("failed to connect named pipe")?;
+            }
         }
-    };
-    if let Err(error) = restrict_path_to_current_user(Path::new(&status.endpoint), false) {
-        let message = format!(
-            "failed to secure unix socket {}: {error:#}",
-            status.endpoint
-        );
-        let _ = ready.send(Err(message.clone()));
-        return Err(anyhow!(message));
-    }
-    ready
-        .send(Ok(()))
-        .map_err(|_| anyhow!("control plane startup receiver disconnected"))?;
-    if activation.recv().is_err() {
-        return Ok(());
-    }
-
-    let connection_slots = Arc::new(Semaphore::new(SIDEBAND_MAX_CONNECTIONS));
-    loop {
-        let (stream, _) = listener
-            .accept()
-            .await
-            .context("failed to accept unix socket")?;
         let Some(connection_permit) = reserve_sideband_connection(&connection_slots) else {
             continue;
         };
         let handle_clone = handle.clone();
         tokio::spawn(async move {
             let _connection_permit = connection_permit;
-            if let Err(error) = handle_sideband_stream(handle_clone, stream).await {
-                eprintln!("unix socket connection failed: {error}");
+            if let Err(error) = handle_windows_sideband_connection(handle_clone, server).await {
+                eprintln!("named pipe connection failed: {error}");
             }
         });
     }
@@ -6469,7 +7527,55 @@ fn reserve_sideband_connection(slots: &Arc<Semaphore>) -> Option<OwnedSemaphoreP
     slots.clone().try_acquire_owned().ok()
 }
 
-async fn handle_sideband_stream<Stream>(handle: SupervisorHandle, stream: Stream) -> Result<()>
+#[cfg(windows)]
+fn pane_process_from_windows_pipe(
+    server: &tokio::net::windows::named_pipe::NamedPipeServer,
+) -> Result<Arc<dyn PaneProcess>> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::{Foundation::HANDLE, System::Pipes::GetNamedPipeClientProcessId};
+
+    let mut process_id = 0_u32;
+    let ok =
+        unsafe { GetNamedPipeClientProcessId(server.as_raw_handle() as HANDLE, &mut process_id) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to identify named-pipe client process");
+    }
+    Ok(Arc::new(WindowsPaneProcess::open(process_id)?))
+}
+
+#[cfg(windows)]
+async fn handle_windows_sideband_connection(
+    handle: SupervisorHandle,
+    mut server: tokio::net::windows::named_pipe::NamedPipeServer,
+) -> Result<()> {
+    const ACCESS_DENIED: &str = "sideband access denied";
+    let caller = match pane_process_from_windows_pipe(&server)
+        .and_then(|process| handle.resolve_pane_caller(process))
+    {
+        Ok(caller) => caller,
+        Err(error) => {
+            eprintln!("rejected unaffiliated sideband client: {error:#}");
+            let response = SupervisorHandle::rejected_sideband_response(ACCESS_DENIED);
+            let payload = format!("{}\n", encode_response(&response)?);
+            write_sideband_response(
+                &mut server,
+                payload.as_bytes(),
+                SIDEBAND_RESPONSE_WRITE_TIMEOUT,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    handle_sideband_stream(handle, caller, server).await
+}
+
+async fn handle_sideband_stream<Stream>(
+    handle: SupervisorHandle,
+    caller: PaneCaller,
+    stream: Stream,
+) -> Result<()>
 where
     Stream: tokio::io::AsyncRead + AsyncWrite + Unpin,
 {
@@ -6482,7 +7588,7 @@ where
     )
     .await?;
     let request = decode_request(&frame).context("invalid sideband payload")?;
-    let response = handle.apply_sideband_request_async(request).await;
+    let response = handle.apply_sideband_request_async(&caller, request).await;
     let payload = format!("{}\n", encode_response(&response)?);
     write_sideband_response(
         &mut write_half,
@@ -6568,42 +7674,13 @@ mod tests {
     use control_plane::{decode_response, encode_request};
     use parking_lot::Condvar;
     use pty_host::PtySession as PtySessionTrait;
-    use shared_types::{MessageScope, RouteMessageRequest, SidebandRequest};
+    use shared_types::{MessageScope, SidebandRequest};
     use std::{
         collections::{BTreeSet, VecDeque},
+        io::Read,
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-
-    #[cfg(windows)]
-    fn security_descriptor_sddl_for_path(path: &Path) -> String {
-        use std::{os::windows::ffi::OsStrExt, ptr};
-        use windows_sys::Win32::Security::{
-            Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT},
-            DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-        };
-
-        let path_wide = path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>();
-        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
-        let result = unsafe {
-            GetNamedSecurityInfoW(
-                path_wide.as_ptr(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-                &mut descriptor,
-            )
-        };
-        assert_eq!(result, 0, "GetNamedSecurityInfoW failed for {path:?}");
-        security_descriptor_to_sddl(LocalSecurityDescriptor(descriptor))
-    }
 
     #[cfg(windows)]
     fn security_descriptor_sddl_for_handle(
@@ -6677,6 +7754,7 @@ mod tests {
     enum MockKillBehavior {
         Immediate,
         Sleep(Duration),
+        Error(&'static str),
     }
 
     struct MockPtySession {
@@ -6689,8 +7767,366 @@ mod tests {
         on_send: Option<Arc<dyn Fn() + Send + Sync>>,
     }
 
+    struct GatedKillPtySession {
+        process_id: u32,
+        kill_entered: Mutex<Option<mpsc::SyncSender<()>>>,
+        kill_release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    struct FirstKillFailsPtySession {
+        process_id: u32,
+        kill_count: Arc<AtomicUsize>,
+    }
+
+    struct RecordingPtySession {
+        process_id: u32,
+        inputs: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct FirstWriteSignalPtySession {
+        process_id: u32,
+        inputs: Arc<Mutex<Vec<String>>>,
+        write_times: Arc<Mutex<Vec<Instant>>>,
+        first_write: Mutex<Option<mpsc::SyncSender<()>>>,
+    }
+
+    struct FirstWriteSignalFixture {
+        pty: Box<dyn PtySessionTrait>,
+        inputs: Arc<Mutex<Vec<String>>>,
+        write_times: Arc<Mutex<Vec<Instant>>>,
+    }
+
+    struct FirstWriteBlockingPtySession {
+        process_id: u32,
+        inputs: Arc<Mutex<Vec<String>>>,
+        calls: Arc<AtomicUsize>,
+        first_entered: mpsc::SyncSender<()>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    struct TimedOutWritePtySession {
+        process_id: u32,
+        entered: Mutex<Option<mpsc::SyncSender<()>>>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+        writes_started: Arc<AtomicUsize>,
+        writes_finished: Arc<AtomicUsize>,
+        inputs: Arc<Mutex<Vec<String>>>,
+        cancel_supported: bool,
+        cancel_count: Arc<AtomicUsize>,
+        kill_count: Arc<AtomicUsize>,
+        first_write_error_bytes: usize,
+    }
+
+    struct DelayedCancelPtySession {
+        process_id: u32,
+        calls: AtomicUsize,
+        inputs: Arc<Mutex<Vec<String>>>,
+        first_entered: mpsc::SyncSender<()>,
+        first_release: Arc<(Mutex<bool>, Condvar)>,
+        second_entered: Mutex<Option<mpsc::SyncSender<()>>>,
+        cancel_entered: Mutex<Option<mpsc::SyncSender<()>>>,
+        cancel_release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl PtySessionTrait for TimedOutWritePtySession {
+        fn send_input(&self, input: &str) -> pty_host::PtyWriteResult {
+            let call = self.writes_started.fetch_add(1, Ordering::SeqCst);
+            self.inputs.lock().push(input.to_string());
+            if call > 0 {
+                self.writes_finished.fetch_add(1, Ordering::SeqCst);
+                return Ok(input.len());
+            }
+            if let Some(entered) = self.entered.lock().take() {
+                let _ = entered.send(());
+            }
+            let (released, ready) = &*self.release;
+            let mut released = released.lock();
+            while !*released {
+                ready.wait(&mut released);
+            }
+            self.writes_finished.fetch_add(1, Ordering::SeqCst);
+            Err(PtyWriteError::new(
+                self.first_write_error_bytes,
+                "timed-out PTY write interrupted",
+            ))
+        }
+
+        fn cancel_input_write(&self) -> Result<()> {
+            self.cancel_count.fetch_add(1, Ordering::SeqCst);
+            if !self.cancel_supported {
+                return Err(anyhow!("isolated cancellation unsupported by test PTY"));
+            }
+            let (released, ready) = &*self.release;
+            *released.lock() = true;
+            ready.notify_all();
+            Ok(())
+        }
+
+        fn resize(&self, _cols: u16, _rows: u16) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill(&self) -> Result<()> {
+            self.kill_count.fetch_add(1, Ordering::SeqCst);
+            let (released, ready) = &*self.release;
+            *released.lock() = true;
+            ready.notify_all();
+            Ok(())
+        }
+
+        fn try_wait(&self) -> Result<Option<pty_host::PtyExitStatus>> {
+            Ok(None)
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            Some(self.process_id)
+        }
+
+        fn agent_alive(&self, _driver: DriverKind) -> Result<AgentLiveness> {
+            Ok(AgentLiveness::Alive(Vec::new()))
+        }
+    }
+
+    impl PtySessionTrait for DelayedCancelPtySession {
+        fn send_input(&self, input: &str) -> pty_host::PtyWriteResult {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inputs.lock().push(input.to_string());
+            if call == 0 {
+                self.first_entered.send(()).unwrap();
+                let (released, ready) = &*self.first_release;
+                let mut released = released.lock();
+                while !*released {
+                    ready.wait(&mut released);
+                }
+            } else if let Some(entered) = self.second_entered.lock().take() {
+                entered.send(()).unwrap();
+            }
+            Ok(input.len())
+        }
+
+        fn cancel_input_write(&self) -> Result<()> {
+            if let Some(entered) = self.cancel_entered.lock().take() {
+                entered.send(()).unwrap();
+            }
+            let (released, ready) = &*self.cancel_release;
+            let mut released = released.lock();
+            while !*released {
+                ready.wait(&mut released);
+            }
+            Ok(())
+        }
+
+        fn resize(&self, _cols: u16, _rows: u16) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill(&self) -> Result<()> {
+            for release in [&self.first_release, &self.cancel_release] {
+                let (released, ready) = &**release;
+                *released.lock() = true;
+                ready.notify_all();
+            }
+            Ok(())
+        }
+
+        fn try_wait(&self) -> Result<Option<pty_host::PtyExitStatus>> {
+            Ok(None)
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            Some(self.process_id)
+        }
+
+        fn agent_alive(&self, _driver: DriverKind) -> Result<AgentLiveness> {
+            Ok(AgentLiveness::Alive(Vec::new()))
+        }
+    }
+
+    impl PtySessionTrait for FirstWriteBlockingPtySession {
+        fn send_input(&self, input: &str) -> pty_host::PtyWriteResult {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inputs.lock().push(input.to_string());
+            if call == 0 {
+                self.first_entered.send(()).unwrap();
+                let (released, ready) = &*self.release;
+                let mut released = released.lock();
+                while !*released {
+                    ready.wait(&mut released);
+                }
+            }
+            Ok(input.len())
+        }
+
+        fn resize(&self, _cols: u16, _rows: u16) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill(&self) -> Result<()> {
+            let (released, ready) = &*self.release;
+            *released.lock() = true;
+            ready.notify_all();
+            Ok(())
+        }
+
+        fn try_wait(&self) -> Result<Option<pty_host::PtyExitStatus>> {
+            Ok(None)
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            Some(self.process_id)
+        }
+
+        fn agent_alive(&self, _driver: DriverKind) -> Result<AgentLiveness> {
+            Ok(AgentLiveness::Alive(Vec::new()))
+        }
+    }
+
+    impl PtySessionTrait for RecordingPtySession {
+        fn send_input(&self, input: &str) -> pty_host::PtyWriteResult {
+            self.inputs.lock().push(input.to_string());
+            Ok(input.len())
+        }
+
+        fn resize(&self, _cols: u16, _rows: u16) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn try_wait(&self) -> Result<Option<pty_host::PtyExitStatus>> {
+            Ok(None)
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            Some(self.process_id)
+        }
+
+        fn agent_alive(&self, _driver: DriverKind) -> Result<AgentLiveness> {
+            Ok(AgentLiveness::Alive(Vec::new()))
+        }
+    }
+
+    impl PtySessionTrait for FirstWriteSignalPtySession {
+        fn send_input(&self, input: &str) -> pty_host::PtyWriteResult {
+            self.inputs.lock().push(input.to_string());
+            self.write_times.lock().push(Instant::now());
+            if let Some(first_write) = self.first_write.lock().take() {
+                first_write.send(()).unwrap();
+            }
+            Ok(input.len())
+        }
+
+        fn resize(&self, _cols: u16, _rows: u16) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn try_wait(&self) -> Result<Option<PtyExitStatus>> {
+            Ok(None)
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            Some(self.process_id)
+        }
+
+        fn agent_alive(&self, _driver: DriverKind) -> Result<AgentLiveness> {
+            Ok(AgentLiveness::Alive(Vec::new()))
+        }
+    }
+
+    fn recording_pty_session(
+        process_id: u32,
+    ) -> (Box<dyn PtySessionTrait>, Arc<Mutex<Vec<String>>>) {
+        let inputs = Arc::new(Mutex::new(Vec::new()));
+        (
+            Box::new(RecordingPtySession {
+                process_id,
+                inputs: inputs.clone(),
+            }),
+            inputs,
+        )
+    }
+
+    fn first_write_signal_pty_session(
+        process_id: u32,
+        first_write: mpsc::SyncSender<()>,
+    ) -> FirstWriteSignalFixture {
+        let inputs = Arc::new(Mutex::new(Vec::new()));
+        let write_times = Arc::new(Mutex::new(Vec::new()));
+        FirstWriteSignalFixture {
+            pty: Box::new(FirstWriteSignalPtySession {
+                process_id,
+                inputs: inputs.clone(),
+                write_times: write_times.clone(),
+                first_write: Mutex::new(Some(first_write)),
+            }),
+            inputs,
+            write_times,
+        }
+    }
+
+    struct TestPaneProcess {
+        process_id: u32,
+        alive: AtomicBool,
+        member_process_ids: Mutex<HashSet<u32>>,
+        failing_process_ids: Mutex<HashSet<u32>>,
+        queried_process_ids: Mutex<Vec<u32>>,
+    }
+
+    impl TestPaneProcess {
+        fn new(process_id: u32, member_process_ids: impl IntoIterator<Item = u32>) -> Arc<Self> {
+            Arc::new(Self {
+                process_id,
+                alive: AtomicBool::new(true),
+                member_process_ids: Mutex::new(member_process_ids.into_iter().collect()),
+                failing_process_ids: Mutex::new(HashSet::new()),
+                queried_process_ids: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn fail_membership_for(&self, process_id: u32) {
+            self.failing_process_ids.lock().insert(process_id);
+        }
+
+        fn queried_process_ids(&self) -> Vec<u32> {
+            let mut queried = self.queried_process_ids.lock().clone();
+            queried.sort_unstable();
+            queried
+        }
+
+        fn exit(&self) {
+            self.alive.store(false, Ordering::SeqCst);
+        }
+    }
+
+    impl PaneProcess for TestPaneProcess {
+        fn pid(&self) -> u32 {
+            self.process_id
+        }
+
+        fn is_alive(&self) -> Result<bool> {
+            Ok(self.alive.load(Ordering::SeqCst))
+        }
+
+        fn belongs_to(&self, pty: &dyn PtySession) -> Result<bool> {
+            let process_id = pty
+                .process_id()
+                .ok_or_else(|| anyhow!("test PTY has no process identity"))?;
+            self.queried_process_ids.lock().push(process_id);
+            if self.failing_process_ids.lock().contains(&process_id) {
+                return Err(anyhow!("injected membership query failure"));
+            }
+            Ok(self.member_process_ids.lock().contains(&process_id))
+        }
+    }
+
     impl PtySessionTrait for MockPtySession {
-        fn send_input(&self, input: &str) -> Result<usize> {
+        fn send_input(&self, input: &str) -> pty_host::PtyWriteResult {
             self.send_input_count.fetch_add(1, Ordering::SeqCst);
             if let Some(on_send) = self.on_send.clone() {
                 thread::spawn(move || on_send());
@@ -6704,10 +8140,14 @@ mod tests {
 
         fn kill(&self) -> Result<()> {
             self.kill_count.fetch_add(1, Ordering::SeqCst);
-            if let MockKillBehavior::Sleep(duration) = self.kill_behavior {
-                thread::sleep(duration);
+            match self.kill_behavior {
+                MockKillBehavior::Immediate => Ok(()),
+                MockKillBehavior::Sleep(duration) => {
+                    thread::sleep(duration);
+                    Ok(())
+                }
+                MockKillBehavior::Error(message) => Err(anyhow!(message)),
             }
-            Ok(())
         }
 
         fn try_wait(&self) -> Result<Option<pty_host::PtyExitStatus>> {
@@ -6723,15 +8163,108 @@ mod tests {
         }
     }
 
+    impl PtySessionTrait for GatedKillPtySession {
+        fn send_input(&self, input: &str) -> pty_host::PtyWriteResult {
+            Ok(input.len())
+        }
+
+        fn resize(&self, _cols: u16, _rows: u16) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill(&self) -> Result<()> {
+            if let Some(entered) = self.kill_entered.lock().take() {
+                entered.send(()).context("failed to announce gated kill")?;
+            }
+            self.kill_release
+                .lock()
+                .recv()
+                .context("gated kill was not released")?;
+            Ok(())
+        }
+
+        fn try_wait(&self) -> Result<Option<pty_host::PtyExitStatus>> {
+            Ok(None)
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            Some(self.process_id)
+        }
+
+        fn agent_alive(&self, _driver: DriverKind) -> Result<AgentLiveness> {
+            Ok(AgentLiveness::Alive(Vec::new()))
+        }
+    }
+
+    impl PtySessionTrait for FirstKillFailsPtySession {
+        fn send_input(&self, input: &str) -> pty_host::PtyWriteResult {
+            Ok(input.len())
+        }
+
+        fn resize(&self, _cols: u16, _rows: u16) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill(&self) -> Result<()> {
+            if self.kill_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(anyhow!("injected first process-scope termination failure"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn try_wait(&self) -> Result<Option<PtyExitStatus>> {
+            Ok(None)
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            Some(self.process_id)
+        }
+
+        fn agent_alive(&self, _driver: DriverKind) -> Result<AgentLiveness> {
+            Ok(AgentLiveness::Alive(Vec::new()))
+        }
+    }
+
     struct FailingPtySession {
         send_input_count: Arc<AtomicUsize>,
+        bytes_written: usize,
         error_message: String,
     }
 
+    struct ShortOkPtySession {
+        bytes_written: usize,
+    }
+
+    impl PtySessionTrait for ShortOkPtySession {
+        fn send_input(&self, _input: &str) -> pty_host::PtyWriteResult {
+            Ok(self.bytes_written)
+        }
+
+        fn resize(&self, _cols: u16, _rows: u16) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn try_wait(&self) -> Result<Option<pty_host::PtyExitStatus>> {
+            Ok(None)
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+    }
+
     impl PtySessionTrait for FailingPtySession {
-        fn send_input(&self, _input: &str) -> Result<usize> {
+        fn send_input(&self, _input: &str) -> pty_host::PtyWriteResult {
             self.send_input_count.fetch_add(1, Ordering::SeqCst);
-            Err(anyhow!(self.error_message.clone()))
+            Err(PtyWriteError::new(
+                self.bytes_written,
+                self.error_message.clone(),
+            ))
         }
 
         fn resize(&self, _cols: u16, _rows: u16) -> Result<()> {
@@ -6796,30 +8329,19 @@ mod tests {
         )
     }
 
-    fn reacting_pty_session(
-        supervisor: &SupervisorHandle,
-        session: &str,
-        chunk: &str,
-    ) -> (Box<dyn PtySessionTrait>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
-        let handle = supervisor.clone();
-        let session = session.to_string();
-        let chunk = chunk.to_string();
-        mock_pty_session_full(
-            None,
-            None,
-            MockKillBehavior::Immediate,
-            AgentLiveness::Alive(Vec::new()),
-            Some(Arc::new(move || {
-                handle.handle_pty_event(&session, 0, PtyEvent::Output(chunk.clone()));
-            })),
-        )
+    fn failing_pty_session(error_message: &str) -> (Box<dyn PtySessionTrait>, Arc<AtomicUsize>) {
+        write_failing_pty_session(0, error_message)
     }
 
-    fn failing_pty_session(error_message: &str) -> (Box<dyn PtySessionTrait>, Arc<AtomicUsize>) {
+    fn write_failing_pty_session(
+        bytes_written: usize,
+        error_message: &str,
+    ) -> (Box<dyn PtySessionTrait>, Arc<AtomicUsize>) {
         let send_input_count = Arc::new(AtomicUsize::new(0));
         (
             Box::new(FailingPtySession {
                 send_input_count: send_input_count.clone(),
+                bytes_written,
                 error_message: error_message.into(),
             }) as Box<dyn PtySessionTrait>,
             send_input_count,
@@ -6863,6 +8385,35 @@ mod tests {
         }
     }
 
+    struct TestExecutableResolver;
+
+    impl DriverExecutableResolver for TestExecutableResolver {
+        fn resolve(&self, _driver: DriverKind) -> Result<ResolvedLaunchProgram> {
+            Ok(ResolvedLaunchProgram {
+                program: fs::canonicalize(std::env::current_exe()?)?
+                    .to_string_lossy()
+                    .into_owned(),
+                prefix_args: Vec::new(),
+            })
+        }
+    }
+
+    struct FailingExecutableResolver;
+
+    impl DriverExecutableResolver for FailingExecutableResolver {
+        fn resolve(&self, driver: DriverKind) -> Result<ResolvedLaunchProgram> {
+            Err(anyhow!("injected unresolved {driver:?} executable"))
+        }
+    }
+
+    struct FixedExecutableResolver(ResolvedLaunchProgram);
+
+    impl DriverExecutableResolver for FixedExecutableResolver {
+        fn resolve(&self, _driver: DriverKind) -> Result<ResolvedLaunchProgram> {
+            Ok(self.0.clone())
+        }
+    }
+
     struct CapturingPtySpawner {
         sessions: Mutex<VecDeque<Box<dyn PtySessionTrait>>>,
         specs: Arc<Mutex<Vec<LaunchSpec>>>,
@@ -6895,47 +8446,86 @@ mod tests {
         }
     }
 
-    struct StagedPtySpawner {
-        release_gate: Arc<(Mutex<bool>, Condvar)>,
-        stage_first_spawn: AtomicBool,
-        sessions: Mutex<VecDeque<Box<dyn PtySessionTrait>>>,
+    struct GatedPtySpawner {
+        session: Mutex<Option<Box<dyn PtySessionTrait>>>,
+        entered: mpsc::SyncSender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
     }
 
-    impl StagedPtySpawner {
-        fn new(
-            release_gate: Arc<(Mutex<bool>, Condvar)>,
-            sessions: Vec<Box<dyn PtySessionTrait>>,
-        ) -> Self {
-            Self {
-                release_gate,
-                stage_first_spawn: AtomicBool::new(true),
-                sessions: Mutex::new(sessions.into()),
-            }
-        }
-    }
-
-    impl PtySpawner for StagedPtySpawner {
+    impl PtySpawner for GatedPtySpawner {
         fn spawn(
             &self,
             _spec: &LaunchSpec,
             _handler: PtyEventHandler,
         ) -> Result<Box<dyn PtySessionTrait>> {
-            let session = self
-                .sessions
+            self.entered
+                .send(())
+                .context("failed to announce gated spawn")?;
+            self.release
                 .lock()
-                .pop_front()
-                .ok_or_else(|| anyhow!("no staged PTY sessions"))?;
-
-            if self.stage_first_spawn.swap(false, Ordering::SeqCst) {
-                let (lock, cvar) = &*self.release_gate;
-                let mut released = lock.lock();
-                while !*released {
-                    cvar.wait(&mut released);
-                }
-            }
-
-            Ok(session)
+                .recv()
+                .context("gated spawn was not released")?;
+            self.session
+                .lock()
+                .take()
+                .ok_or_else(|| anyhow!("gated PTY session already consumed"))
         }
+    }
+
+    fn gated_pty_spawner(
+        session: Box<dyn PtySessionTrait>,
+    ) -> (GatedPtySpawner, mpsc::Receiver<()>, mpsc::SyncSender<()>) {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        (
+            GatedPtySpawner {
+                session: Mutex::new(Some(session)),
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+            },
+            entered_rx,
+            release_tx,
+        )
+    }
+
+    #[cfg(windows)]
+    fn create_windows_junction(link: &Path, target: &Path) {
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .expect("launch mklink junction command");
+        assert!(
+            output.status.success(),
+            "failed to create junction {} -> {}: stdout={} stderr={}",
+            link.display(),
+            target.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(windows)]
+    fn windows_path_sddl(path: &Path) -> String {
+        let output = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "& { param([string]$TargetPath); (Get-Acl -LiteralPath $TargetPath).Sddl }",
+                "-TargetPath",
+            ])
+            .arg(path)
+            .output()
+            .expect("query Windows path security descriptor");
+        assert!(
+            output.status.success(),
+            "failed to read SDDL for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
     fn test_supervisor() -> SupervisorHandle {
@@ -6943,34 +8533,124 @@ mod tests {
         test_supervisor_with_root(root)
     }
 
-    fn test_supervisor_with_root(root: PathBuf) -> SupervisorHandle {
-        SupervisorHandle::new(SupervisorConfig {
-            working_root: root.clone(),
-            runtime_dir: root.join("runtime"),
-            cross_pair_room_broadcast: false,
-            heartbeat_interval: None,
-            auto_restart_on_stall_sessions: None,
-            auto_restart_stall_threshold: None,
-            reaction_window: Some(Duration::from_millis(200)),
-        })
-        .unwrap()
+    fn empty_test_supervisor() -> SupervisorHandle {
+        let root = std::env::temp_dir().join(format!("prim1-empty-supervisor-{}", Uuid::new_v4()));
+        empty_test_supervisor_with_root(root)
     }
 
-    fn test_supervisor_with_cross_pair_room_broadcast(enabled: bool) -> SupervisorHandle {
-        let root = std::env::temp_dir().join(format!(
-            "cli-master-wrapper-cross-pair-test-{}",
-            Uuid::new_v4()
-        ));
-        SupervisorHandle::new(SupervisorConfig {
-            working_root: root.clone(),
+    fn test_session_id(supervisor: &SupervisorHandle, name: &str) -> SessionId {
+        supervisor
+            .inner
+            .slots
+            .lock()
+            .get(name)
+            .unwrap_or_else(|| panic!("missing test session '{name}'"))
+            .session_id
+    }
+
+    fn test_session_alias(supervisor: &SupervisorHandle, label: &str) -> String {
+        supervisor
+            .inner
+            .slots
+            .lock()
+            .get(label)
+            .unwrap_or_else(|| panic!("missing test session '{label}'"))
+            .definition
+            .alias
+            .clone()
+    }
+
+    fn start_test_session(
+        supervisor: &SupervisorHandle,
+        unique_label: &str,
+    ) -> Result<SessionSnapshot> {
+        supervisor.start_session_by_id(test_session_id(supervisor, unique_label))
+    }
+
+    fn stop_test_session(
+        supervisor: &SupervisorHandle,
+        unique_label: &str,
+    ) -> Result<SessionSnapshot> {
+        supervisor.stop_session_by_id(test_session_id(supervisor, unique_label))
+    }
+
+    fn restart_test_session(
+        supervisor: &SupervisorHandle,
+        unique_label: &str,
+    ) -> Result<SessionSnapshot> {
+        supervisor.restart_session_by_id(test_session_id(supervisor, unique_label))
+    }
+
+    fn test_supervisor_with_root(root: PathBuf) -> SupervisorHandle {
+        let supervisor = empty_test_supervisor_with_root(root);
+        install_standard_test_sessions(&supervisor);
+        supervisor
+    }
+
+    fn empty_test_supervisor_with_root(root: PathBuf) -> SupervisorHandle {
+        let working_root = root.join("work");
+        fs::create_dir_all(&working_root).expect("create test working root");
+        let supervisor = SupervisorHandle::new(test_supervisor_config(&root))
+            .expect("create empty test supervisor");
+        supervisor.set_executable_resolver_for_tests(Arc::new(TestExecutableResolver));
+        supervisor
+    }
+
+    fn test_supervisor_config(root: &Path) -> SupervisorConfig {
+        SupervisorConfig {
+            working_root: root.join("work"),
             runtime_dir: root.join("runtime"),
-            cross_pair_room_broadcast: enabled,
             heartbeat_interval: None,
             auto_restart_on_stall_sessions: None,
             auto_restart_stall_threshold: None,
-            reaction_window: Some(Duration::from_millis(200)),
+        }
+    }
+
+    fn install_standard_test_sessions(supervisor: &SupervisorHandle) {
+        assert!(
+            supervisor.snapshot().sessions.is_empty(),
+            "the standard test fixture requires a fresh zero-session catalog"
+        );
+        supervisor
+            .create_session(shared_types::CreateSessionRequest {
+                label: Some("claude".into()),
+                driver: DriverKind::Claude,
+                permission_profile: shared_types::PermissionProfile::Normal,
+            })
+            .expect("create Claude test session");
+        supervisor
+            .create_session(shared_types::CreateSessionRequest {
+                label: Some("codex".into()),
+                driver: DriverKind::Codex,
+                permission_profile: shared_types::PermissionProfile::Normal,
+            })
+            .expect("create Codex test session");
+    }
+
+    fn create_test_session(
+        supervisor: &SupervisorHandle,
+        label: &str,
+        driver: DriverKind,
+        permission_profile: shared_types::PermissionProfile,
+    ) -> SessionSnapshot {
+        supervisor
+            .create_session(shared_types::CreateSessionRequest {
+                label: Some(label.into()),
+                driver,
+                permission_profile,
+            })
+            .expect("create test session")
+    }
+
+    fn route_operator_to_test_session(
+        supervisor: &SupervisorHandle,
+        label: &str,
+        content: impl Into<String>,
+    ) -> Result<RuntimeSnapshot> {
+        supervisor.route_operator_message(OperatorRouteMessageRequest {
+            recipient_id: test_session_id(supervisor, label),
+            content: content.into(),
         })
-        .unwrap()
     }
 
     fn test_supervisor_with_wrapper_defaults(
@@ -6982,25 +8662,40 @@ mod tests {
             "cli-master-wrapper-defaults-test-{}",
             Uuid::new_v4()
         ));
-        SupervisorHandle::new(SupervisorConfig {
-            working_root: root.clone(),
+        let working_root = root.join("work");
+        fs::create_dir_all(&working_root).expect("create defaults test working root");
+        let supervisor = SupervisorHandle::new(SupervisorConfig {
+            working_root,
             runtime_dir: root.join("runtime"),
-            cross_pair_room_broadcast: false,
             heartbeat_interval,
-            auto_restart_on_stall_sessions: auto_restart_sessions,
+            auto_restart_on_stall_sessions: None,
             auto_restart_stall_threshold: auto_restart_threshold,
-            reaction_window: Some(Duration::from_millis(200)),
         })
-        .unwrap()
+        .unwrap();
+        install_standard_test_sessions(&supervisor);
+        supervisor.set_executable_resolver_for_tests(Arc::new(TestExecutableResolver));
+        let allowed = auto_restart_sessions
+            .unwrap_or_default()
+            .into_iter()
+            .map(|name| test_session_id(&supervisor, &name))
+            .collect();
+        *supervisor
+            .inner
+            .auto_restart_on_stall
+            .allowed_sessions
+            .write() = allowed;
+        supervisor
     }
 
     fn install_stale_running_session(supervisor: &SupervisorHandle, name: &str) {
-        let mut slots = supervisor.inner.slots.lock();
-        let slot = slots.get_mut(name).unwrap();
-        slot.running = Some(RunningSession { pty: None });
-        slot.process_id = Some(u32::MAX);
-        slot.state = LifecycleState::Busy;
-        slot.last_real_output_at = None;
+        let (pty, _, _) = mock_pty_session(Some(u32::MAX), MockKillBehavior::Immediate);
+        install_mock_running_session_with_process_id(
+            supervisor,
+            name,
+            DriverKind::Codex,
+            Some(u32::MAX),
+            pty,
+        );
     }
 
     fn install_synthetic_running_session(
@@ -7011,7 +8706,11 @@ mod tests {
         let mut slots = supervisor.inner.slots.lock();
         let slot = slots.get_mut(name).unwrap();
         slot.definition.driver = driver;
-        slot.running = Some(RunningSession { pty: None });
+        slot.running = Some(RunningSession::new(None));
+        let run_id = Uuid::new_v4();
+        set_test_bracketed_paste_mode(slot, run_id, BracketedPasteMode::Unknown);
+        slot.run_id = Some(run_id);
+        slot.last_run_id = Some(run_id);
         slot.process_id = None;
         slot.state = LifecycleState::Busy;
         slot.last_real_output_at = None;
@@ -7033,13 +8732,120 @@ mod tests {
         process_id: Option<u32>,
         pty: Box<dyn PtySessionTrait>,
     ) {
+        install_mock_running_session_with_process_id_and_mode(
+            supervisor,
+            name,
+            driver,
+            process_id,
+            pty,
+            BracketedPasteMode::Unknown,
+        );
+    }
+
+    fn install_mock_running_session_with_bracketed_paste_enabled(
+        supervisor: &SupervisorHandle,
+        name: &str,
+        driver: DriverKind,
+        pty: Box<dyn PtySessionTrait>,
+    ) {
+        install_mock_running_session_with_process_id_and_bracketed_paste_enabled(
+            supervisor, name, driver, None, pty,
+        );
+    }
+
+    fn install_mock_running_session_with_process_id_and_bracketed_paste_enabled(
+        supervisor: &SupervisorHandle,
+        name: &str,
+        driver: DriverKind,
+        process_id: Option<u32>,
+        pty: Box<dyn PtySessionTrait>,
+    ) {
+        install_mock_running_session_with_process_id_and_mode(
+            supervisor,
+            name,
+            driver,
+            process_id,
+            pty,
+            BracketedPasteMode::Enabled,
+        );
+    }
+
+    fn install_mock_running_session_with_process_id_and_mode(
+        supervisor: &SupervisorHandle,
+        name: &str,
+        driver: DriverKind,
+        process_id: Option<u32>,
+        pty: Box<dyn PtySessionTrait>,
+        bracketed_paste_mode: BracketedPasteMode,
+    ) {
+        let session_id = test_session_id(supervisor, name);
+        install_mock_running_session_by_id_with_mode(
+            supervisor,
+            session_id,
+            driver,
+            process_id,
+            pty,
+            bracketed_paste_mode,
+        );
+    }
+
+    fn install_mock_running_session_by_id_with_mode(
+        supervisor: &SupervisorHandle,
+        session_id: SessionId,
+        driver: DriverKind,
+        process_id: Option<u32>,
+        pty: Box<dyn PtySessionTrait>,
+        bracketed_paste_mode: BracketedPasteMode,
+    ) {
         let mut slots = supervisor.inner.slots.lock();
-        let slot = slots.get_mut(name).unwrap();
+        let slot = slots.get_by_id_mut(session_id).unwrap();
         slot.definition.driver = driver;
-        slot.running = Some(RunningSession { pty: Some(pty) });
+        slot.running = Some(RunningSession::new(Some(Arc::from(pty))));
+        let run_id = Uuid::new_v4();
+        set_test_bracketed_paste_mode(slot, run_id, bracketed_paste_mode);
+        slot.run_id = Some(run_id);
+        slot.last_run_id = Some(run_id);
         slot.process_id = process_id;
         slot.state = LifecycleState::Busy;
         slot.last_real_output_at = None;
+    }
+
+    fn set_test_bracketed_paste_mode(
+        slot: &mut SessionSlot,
+        run_id: Uuid,
+        mode: BracketedPasteMode,
+    ) {
+        let binding = RunBinding {
+            session_id: slot.session_id,
+            run_id,
+            generation: slot.generation,
+        };
+        slot.bracketed_paste.begin_run(binding);
+        let control = match mode {
+            BracketedPasteMode::Unknown => return,
+            BracketedPasteMode::Enabled => "\x1b[?2004h",
+            BracketedPasteMode::Disabled => "\x1b[?2004l",
+        };
+        slot.bracketed_paste.observe_output(binding, control);
+    }
+
+    fn current_run_id(supervisor: &SupervisorHandle, name: &str) -> Uuid {
+        supervisor
+            .inner
+            .slots
+            .lock()
+            .get(name)
+            .and_then(|slot| slot.run_id)
+            .expect("test session must have an active run identity")
+    }
+
+    fn handle_current_pty_event(
+        supervisor: &SupervisorHandle,
+        name: &str,
+        generation: SessionGeneration,
+        event: PtyEvent,
+    ) {
+        supervisor.handle_pty_event(name, generation, current_run_id(supervisor, name), event);
     }
 
     fn capture_runtime_events(supervisor: &SupervisorHandle) -> Arc<Mutex<Vec<RuntimeEvent>>> {
@@ -7060,33 +8866,6 @@ mod tests {
             .collect()
     }
 
-    fn dispatch_attempt_events(events: &Arc<Mutex<Vec<RuntimeEvent>>>) -> Vec<RuntimeEvent> {
-        events
-            .lock()
-            .iter()
-            .filter(|event| matches!(event, RuntimeEvent::DispatchAttempt { .. }))
-            .cloned()
-            .collect()
-    }
-
-    fn request_ack_events(events: &Arc<Mutex<Vec<RuntimeEvent>>>) -> Vec<RuntimeEvent> {
-        events
-            .lock()
-            .iter()
-            .filter(|event| matches!(event, RuntimeEvent::RequestAck { .. }))
-            .cloned()
-            .collect()
-    }
-
-    fn dispatch_no_reaction_events(events: &Arc<Mutex<Vec<RuntimeEvent>>>) -> Vec<RuntimeEvent> {
-        events
-            .lock()
-            .iter()
-            .filter(|event| matches!(event, RuntimeEvent::DispatchNoReaction { .. }))
-            .cloned()
-            .collect()
-    }
-
     fn set_session_dispatch_state(
         supervisor: &SupervisorHandle,
         name: &str,
@@ -7098,22 +8877,6 @@ mod tests {
         slot.state = lifecycle_state;
         slot.work_state = work_state.unwrap_or(WorkState::Idle);
         slot.work_state_observed = work_state.is_some();
-    }
-
-    fn mark_recent_route_from_session(supervisor: &SupervisorHandle, name: &str) {
-        let mut slots = supervisor.inner.slots.lock();
-        let slot = slots.get_mut(name).unwrap();
-        slot.last_route_from_session_at = Some(now_rfc3339());
-        slot.last_route_from_session_instant = Some(Instant::now());
-    }
-
-    fn pane_signal_events(events: &Arc<Mutex<Vec<RuntimeEvent>>>) -> Vec<RuntimeEvent> {
-        events
-            .lock()
-            .iter()
-            .filter(|event| matches!(event, RuntimeEvent::PaneSignal { .. }))
-            .cloned()
-            .collect()
     }
 
     fn work_state_events(events: &Arc<Mutex<Vec<RuntimeEvent>>>) -> Vec<RuntimeEvent> {
@@ -7143,17 +8906,6 @@ mod tests {
             .collect()
     }
 
-    fn dispatch_template_warning_events(
-        events: &Arc<Mutex<Vec<RuntimeEvent>>>,
-    ) -> Vec<RuntimeEvent> {
-        events
-            .lock()
-            .iter()
-            .filter(|event| matches!(event, RuntimeEvent::DispatchTemplateWarning { .. }))
-            .cloned()
-            .collect()
-    }
-
     fn wait_for_event_count<F>(events: &Arc<Mutex<Vec<RuntimeEvent>>>, expected: usize, matches: F)
     where
         F: Fn(&RuntimeEvent) -> bool,
@@ -7172,62 +8924,53 @@ mod tests {
         }
     }
 
-    fn wait_until<F>(timeout: Duration, condition: F)
-    where
-        F: Fn() -> bool,
-    {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if condition() {
-                return;
-            }
-            assert!(Instant::now() < deadline, "timed out waiting for condition");
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    fn session_token(supervisor: &SupervisorHandle, name: &str) -> String {
-        supervisor.start_control_plane().unwrap();
-        supervisor
-            .rotate_session_control_plane_status(name)
-            .unwrap()
-            .unwrap()
-            .token
-    }
-
     fn arm_test_quiesce_timer(supervisor: &SupervisorHandle, name: &str) {
-        let generation = supervisor.current_generation(name).unwrap();
+        let generation = supervisor
+            .current_generation_for_tests(test_session_id(supervisor, name))
+            .unwrap();
+        let run_id = current_run_id(supervisor, name);
         let handle = supervisor
             .inner
             .background_runtime
             .spawn(std::future::pending::<()>());
         let mut slots = supervisor.inner.slots.lock();
-        slots.get_mut(name).unwrap().quiesce_timer = Some(QuiesceTimer { generation, handle });
+        slots.get_mut(name).unwrap().quiesce_timer = Some(QuiesceTimer {
+            generation,
+            run_id,
+            handle,
+        });
     }
 
     #[derive(Debug, PartialEq, Eq)]
     struct SlotMutationProbe {
+        session_id: Uuid,
         definition: SessionDefinition,
         state: LifecycleState,
         work_state: WorkState,
         work_state_observed: bool,
         work_detail: Option<String>,
-        launch_banner_seen: bool,
         work_error_observations: HashMap<String, Vec<Instant>>,
         running: bool,
         running_has_pty: bool,
+        run_id: Option<Uuid>,
+        last_run_id: Option<Uuid>,
+        bracketed_paste: BracketedPasteRunState,
+        run_event_sequence: u64,
         generation: SessionGeneration,
+        spawn_in_flight: Option<SpawnReservation>,
+        lifecycle_operation: Option<LifecycleOperation>,
         stop_intent: Option<StopIntent>,
+        termination_uncertain: bool,
         process_id: Option<u32>,
         last_activity_at: Option<String>,
         last_real_output_at: Option<Instant>,
         last_route_from_session_at: Option<String>,
         last_route_from_session_instant: Option<Instant>,
         last_error: Option<String>,
-        quiesce_timer: Option<(SessionGeneration, bool)>,
+        quiesce_timer: Option<(SessionGeneration, Uuid, bool)>,
         stall_state_entered_at: Option<Instant>,
         stall_state_entered_timestamp: Option<String>,
-        stall_detector: Option<(SessionGeneration, WorkState, Instant, bool)>,
+        stall_detector: Option<(SessionGeneration, Uuid, WorkState, Instant, bool)>,
     }
 
     fn slots_mutation_probe(supervisor: &SupervisorHandle) -> Vec<SlotMutationProbe> {
@@ -7235,12 +8978,12 @@ mod tests {
         let mut probes = slots
             .values()
             .map(|slot| SlotMutationProbe {
+                session_id: slot.session_id,
                 definition: slot.definition.clone(),
                 state: slot.state,
                 work_state: slot.work_state,
                 work_state_observed: slot.work_state_observed,
                 work_detail: slot.work_detail.clone(),
-                launch_banner_seen: slot.launch_banner_seen,
                 work_error_observations: slot.work_error_observations.clone(),
                 running: slot.running.is_some(),
                 running_has_pty: slot
@@ -7248,8 +8991,15 @@ mod tests {
                     .as_ref()
                     .and_then(|running| running.pty.as_ref())
                     .is_some(),
+                run_id: slot.run_id,
+                last_run_id: slot.last_run_id,
+                bracketed_paste: slot.bracketed_paste,
+                run_event_sequence: slot.run_event_sequence,
                 generation: slot.generation,
+                spawn_in_flight: slot.spawn_in_flight,
+                lifecycle_operation: slot.lifecycle_operation,
                 stop_intent: slot.stop_intent,
+                termination_uncertain: slot.termination_uncertain,
                 process_id: slot.process_id,
                 last_activity_at: slot.last_activity_at.clone(),
                 last_real_output_at: slot.last_real_output_at,
@@ -7259,12 +9009,13 @@ mod tests {
                 quiesce_timer: slot
                     .quiesce_timer
                     .as_ref()
-                    .map(|timer| (timer.generation, timer.handle.is_finished())),
+                    .map(|timer| (timer.generation, timer.run_id, timer.handle.is_finished())),
                 stall_state_entered_at: slot.stall_state_entered_at,
                 stall_state_entered_timestamp: slot.stall_state_entered_timestamp.clone(),
                 stall_detector: slot.stall_detector.as_ref().map(|detector| {
                     (
                         detector.generation,
+                        detector.run_id,
                         detector.state,
                         detector.entered_at,
                         detector.handle.is_finished(),
@@ -7272,27 +9023,50 @@ mod tests {
                 }),
             })
             .collect::<Vec<_>>();
-        probes.sort_by(|left, right| left.definition.name.cmp(&right.definition.name));
+        probes.sort_by(|left, right| left.definition.alias.cmp(&right.definition.alias));
         probes
     }
 
-    fn current_audit_file(supervisor: &SupervisorHandle) -> String {
-        supervisor.active_audit_file_name()
+    fn slot_mutation_probe(supervisor: &SupervisorHandle, name: &str) -> SlotMutationProbe {
+        slots_mutation_probe(supervisor)
+            .into_iter()
+            .find(|probe| {
+                probe.definition.alias == name || probe.definition.label.eq_ignore_ascii_case(name)
+            })
+            .unwrap_or_else(|| panic!("missing mutation probe for session '{name}'"))
     }
 
-    fn append_audit_event(
-        supervisor: &SupervisorHandle,
-        audit_file: &str,
-        event: &RuntimeEvent,
-    ) -> PathBuf {
-        let path = supervisor.runtime_dir().join("audit").join(audit_file);
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .unwrap();
-        writeln!(file, "{}", serde_json::to_string(event).unwrap()).unwrap();
-        path
+    fn runtime_file_manifest(supervisor: &SupervisorHandle) -> Vec<(String, Vec<u8>)> {
+        fn collect(root: &Path, current: &Path, files: &mut Vec<(String, Vec<u8>)>) {
+            let mut entries = fs::read_dir(current)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .collect::<Vec<_>>();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let file_type = entry.file_type().unwrap();
+                if file_type.is_dir() {
+                    collect(root, &path, files);
+                } else if file_type.is_file() {
+                    files.push((
+                        path.strip_prefix(root)
+                            .unwrap()
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                        fs::read(path).unwrap(),
+                    ));
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        collect(
+            supervisor.runtime_dir(),
+            supervisor.runtime_dir(),
+            &mut files,
+        );
+        files
     }
 
     fn make_test_event(label: &str) -> RuntimeEvent {
@@ -7300,25 +9074,6 @@ mod tests {
             level: LogLevel::Info,
             message: label.into(),
             timestamp: "2026-04-20T00:00:00Z".into(),
-        }
-    }
-
-    fn unwrap_events_since(
-        response: SidebandResponse,
-    ) -> (Vec<RuntimeEvent>, EventCursor, bool, String) {
-        assert!(
-            response.ok,
-            "events_since response failed: {}",
-            response.message
-        );
-        match response.payload {
-            Some(SidebandResponsePayload::EventsSince {
-                events,
-                next_cursor,
-                gap_detected,
-                as_of,
-            }) => (events, next_cursor, gap_detected, as_of),
-            other => panic!("unexpected events_since payload: {other:?}"),
         }
     }
 
@@ -7419,66 +9174,6 @@ mod tests {
     }
 
     #[test]
-    fn events_since_spans_rotated_archive_and_active_file() {
-        use chrono::TimeZone;
-
-        let day_one = Utc.with_ymd_and_hms(2026, 4, 19, 12, 0, 0).unwrap();
-        let day_two = Utc.with_ymd_and_hms(2026, 4, 20, 0, 0, 30).unwrap();
-        let supervisor = test_supervisor();
-        {
-            let mut inner = supervisor.inner.audit.inner.lock();
-            inner.active_date = day_one.date_naive();
-            inner.path = supervisor
-                .runtime_dir()
-                .join("audit")
-                .join(audit_file_name(day_one.date_naive()));
-        }
-
-        let event_a = make_test_event("A");
-        let event_b = make_test_event("B");
-        let event_c = make_test_event("C");
-        let event_d = make_test_event("D");
-        let event_e = make_test_event("E");
-        supervisor.inner.audit.append_at(&event_a, day_one).unwrap();
-        supervisor.inner.audit.append_at(&event_b, day_one).unwrap();
-        supervisor.inner.audit.append_at(&event_c, day_one).unwrap();
-        let cursor_after_a = serde_json::to_string(&event_a).unwrap().len() as u64 + 1;
-
-        supervisor.inner.audit.append_at(&event_d, day_two).unwrap();
-        supervisor.inner.audit.append_at(&event_e, day_two).unwrap();
-
-        let result = supervisor
-            .read_events_since(
-                Some(EventCursor {
-                    audit_file: audit_file_name(day_one.date_naive()),
-                    byte_offset: cursor_after_a,
-                }),
-                &EventFilter {
-                    include_kinds: vec!["system_log".into()],
-                    include_sessions: Vec::new(),
-                    include_scopes: Vec::new(),
-                },
-                10,
-            )
-            .unwrap();
-        let messages = result
-            .events
-            .iter()
-            .filter_map(|event| match event {
-                RuntimeEvent::SystemLog { message, .. } => Some(message.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(messages, vec!["B", "C", "D", "E"]);
-        assert_eq!(
-            result.next_cursor.audit_file,
-            audit_file_name(day_two.date_naive())
-        );
-        assert!(!result.gap_detected);
-    }
-
-    #[test]
     fn audit_append_is_single_writer_under_concurrent_load() {
         use chrono::TimeZone;
 
@@ -7514,328 +9209,82 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_contains_default_sessions() {
+    fn durable_audit_omits_terminal_and_message_content_but_keeps_route_metadata() {
         let supervisor = test_supervisor();
-
-        let snapshot = supervisor.snapshot();
-        let names = snapshot
-            .sessions
-            .iter()
-            .map(|session| session.name.clone())
-            .collect::<Vec<_>>();
-
-        assert_eq!(names, vec!["claude".to_string(), "codex".to_string(),]);
-    }
-
-    #[test]
-    fn create_pair_inserts_two_closed_slots_and_emits_audit() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let cursor = supervisor.current_eof_cursor().unwrap();
-
-        let snapshots = supervisor.create_pair("foo").unwrap();
-
-        assert_eq!(snapshots.len(), 2);
-        assert_eq!(snapshots[0].name, "foo-claude");
-        assert_eq!(snapshots[1].name, "foo-codex");
-        assert!(snapshots.iter().all(|snapshot| {
-            snapshot.lifecycle_state == LifecycleState::Closed && !snapshot.running
-        }));
-
-        let routed = supervisor.apply_sideband_request(SidebandRequest::EventsSince {
-            token: status.token,
-            cursor: Some(cursor),
-            max_events: Some(10),
-            max_wait_seconds: Some(0),
-            filter: Some(EventFilter {
-                include_kinds: vec!["pair_created".into()],
-                include_sessions: Vec::new(),
-                include_scopes: Vec::new(),
-            }),
-        });
-        let (events, _, _, _) = unwrap_events_since(routed);
-
-        assert_eq!(events.len(), 1);
-        assert!(matches!(
-            &events[0],
-            RuntimeEvent::PairCreated { name, .. } if name == "foo"
-        ));
-    }
-
-    #[test]
-    fn create_pair_rejects_name_collision() {
-        let supervisor = test_supervisor();
-        {
-            let mut slots = supervisor.inner.slots.lock();
-            let working_dir = slots.get("claude").unwrap().definition.working_dir.clone();
-            let [foo_claude_definition, _] = pair_session_definitions("foo", &working_dir);
-            slots.insert(
-                foo_claude_definition.name.clone(),
-                closed_session_slot(foo_claude_definition),
-            );
-        }
-        let (foo_claude_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
-        install_mock_running_session(
-            &supervisor,
-            "foo-claude",
-            DriverKind::Claude,
-            foo_claude_pty,
-        );
-        let initial_count = supervisor.snapshot().sessions.len();
-
-        let error = supervisor.create_pair("foo").unwrap_err();
-
-        assert!(error.to_string().contains("pair 'foo' already exists"));
-        assert_eq!(supervisor.snapshot().sessions.len(), initial_count);
-    }
-
-    #[test]
-    fn start_session_passes_extra_args_to_spawned_launch_spec() {
-        let supervisor = test_supervisor();
-        let (pty, _, _) = reacting_pty_session(&supervisor, "codex", "Working 1s");
-        let (spawner, specs) = CapturingPtySpawner::new(vec![pty]);
-        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
-
-        let snapshot = supervisor
-            .start_session("claude", vec!["--resume".into(), "abc-123".into()])
-            .unwrap();
-
-        assert_eq!(snapshot.lifecycle_state, LifecycleState::Ready);
-        let specs = specs.lock();
-        assert_eq!(specs.len(), 1);
-        assert_eq!(
-            &specs[0].args[specs[0].args.len() - 2..],
-            &["--resume".to_string(), "abc-123".to_string()]
-        );
-        assert!(
-            supervisor
-                .inner
-                .slots
-                .lock()
-                .get("claude")
-                .unwrap()
-                .definition
-                .args
-                .is_empty(),
-            "registered SessionDefinition must remain pristine"
-        );
-    }
-
-    #[test]
-    fn start_session_without_extra_args_keeps_baseline_launch_spec() {
-        let supervisor = test_supervisor();
-        let baseline_definition = {
-            supervisor
-                .inner
-                .slots
-                .lock()
-                .get("claude")
-                .unwrap()
-                .definition
-                .clone()
+        let audit_baseline = fs::read_to_string(supervisor.audit_log_path())
+            .unwrap_or_default()
+            .lines()
+            .count();
+        let session_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let output_sentinel = "PRIM1_OUTPUT_SECRET_7f44d1";
+        let route_sentinel = "PRIM1_ROUTE_SECRET_3bc29a";
+        let work_sentinel = "PRIM1_WORK_SECRET_ee810c";
+        let identity = |sequence| RunEventIdentity {
+            session_id,
+            run_id,
+            generation: 7,
+            sequence,
         };
-        let expected = build_launch_spec(&baseline_definition);
-        let (pty, _, _) = reacting_pty_session(&supervisor, "codex", "Working 1s");
-        let (spawner, specs) = CapturingPtySpawner::new(vec![pty]);
-        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
 
-        let snapshot = supervisor.start_session("claude", Vec::new()).unwrap();
-
-        assert_eq!(snapshot.lifecycle_state, LifecycleState::Ready);
-        let specs = specs.lock();
-        assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0].program, expected.program);
-        assert_eq!(specs[0].args, expected.args);
-    }
-
-    #[test]
-    fn start_session_rejects_whitespace_only_extra_args() {
-        let supervisor = test_supervisor();
-
-        let error = supervisor
-            .start_session("claude", vec!["--resume".into(), "   ".into()])
-            .unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("extra_args[1] must not be empty or whitespace-only")
-        );
-    }
-
-    #[test]
-    fn sideband_start_session_audit_omits_nonempty_extra_args_when_retention_is_off() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let (pty, _, _) = reacting_pty_session(&supervisor, "codex", "Working 1s");
-        let (spawner, _) = CapturingPtySpawner::new(vec![pty]);
-        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
-
-        let response = supervisor.apply_sideband_request(SidebandRequest::StartSession {
-            token: status.token,
-            name: "claude".into(),
-            extra_args: vec!["--resume".into(), "abc-123".into()],
+        supervisor.emit(RuntimeEvent::SessionOutput {
+            identity: identity(1),
+            session: "claude".into(),
+            chunk: output_sentinel.into(),
+            synthetic: false,
+            timestamp: now_rfc3339(),
         });
-
-        assert!(response.ok, "start response failed: {}", response.message);
-        let raw = fs::read_to_string(supervisor.audit_log_path()).unwrap();
-        let started = raw
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .find(|event| {
-                event["event"] == "sideband_request_lifecycle"
-                    && event["action"] == "start_session"
-                    && event["phase"] == "started"
-            })
-            .expect("start_session lifecycle event not found");
-
-        assert!(started.get("extra_args").is_none());
-    }
-
-    #[test]
-    fn sideband_start_session_audit_omits_empty_extra_args() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let (pty, _, _) = reacting_pty_session(&supervisor, "codex", "Working 1s");
-        let (spawner, _) = CapturingPtySpawner::new(vec![pty]);
-        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
-
-        let response = supervisor.apply_sideband_request(SidebandRequest::StartSession {
-            token: status.token,
-            name: "claude".into(),
-            extra_args: Vec::new(),
+        let route_id = Uuid::new_v4();
+        supervisor.emit(RuntimeEvent::RoutedMessage {
+            id: route_id,
+            from: "operator".into(),
+            to: "claude".into(),
+            scope: MessageScope::Direct,
+            content: route_sentinel.into(),
+            timestamp: now_rfc3339(),
         });
+        supervisor.emit(RuntimeEvent::SessionWorkState {
+            identity: identity(2),
+            session: "claude".into(),
+            state: WorkState::Thinking,
+            detail: Some(work_sentinel.into()),
+            previous_state: Some(WorkState::Idle),
+            timestamp: now_rfc3339(),
+        });
+        supervisor
+            .shutdown()
+            .expect("shutdown audit privacy fixture");
 
-        assert!(response.ok, "start response failed: {}", response.message);
-        let raw = fs::read_to_string(supervisor.audit_log_path()).unwrap();
-        let started = raw
+        let audit_text = fs::read_to_string(supervisor.audit_log_path()).unwrap();
+        let audit_events = audit_text
             .lines()
+            .skip(audit_baseline)
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .find(|event| {
-                event["event"] == "sideband_request_lifecycle"
-                    && event["action"] == "start_session"
-                    && event["phase"] == "started"
-            })
-            .expect("start_session lifecycle event not found");
+            .collect::<Vec<_>>();
+        assert_eq!(audit_events.len(), 2, "SessionOutput must not be durable");
+        let route = audit_events
+            .iter()
+            .find(|event| event["event"] == "routed_message")
+            .expect("route metadata must remain durable");
+        assert_eq!(route["id"], route_id.to_string());
+        assert_eq!(route["from"], "operator");
+        assert_eq!(route["to"], "claude");
+        assert_eq!(route["content"], "[content omitted]");
+        let work = audit_events
+            .iter()
+            .find(|event| event["event"] == "session_work_state")
+            .expect("work-state metadata must remain durable");
+        assert!(work.get("detail").is_none() || work["detail"].is_null());
 
-        assert!(started.get("extra_args").is_none());
-    }
-
-    #[test]
-    fn create_pair_rejects_invalid_names() {
-        let supervisor = test_supervisor();
-        let invalid_names = vec![
-            String::new(),
-            "main".to_string(),
-            "claude".to_string(),
-            "codex".to_string(),
-            "room".to_string(),
-            "operator".to_string(),
-            "with space".to_string(),
-            "with/slash".to_string(),
-            "with.dot".to_string(),
-            "x".repeat(PAIR_NAME_MAX_LEN + 1),
-        ];
-
-        for invalid in invalid_names {
-            let error = supervisor.create_pair(&invalid).unwrap_err();
-            assert!(!error.to_string().is_empty());
-            assert_eq!(supervisor.snapshot().sessions.len(), 2);
+        for (path, bytes) in runtime_file_manifest(&supervisor) {
+            let content = String::from_utf8_lossy(&bytes);
+            for sentinel in [output_sentinel, route_sentinel, work_sentinel] {
+                assert!(
+                    !content.contains(sentinel),
+                    "durable runtime file {path} leaked sentinel {sentinel}"
+                );
+            }
         }
-    }
-
-    #[test]
-    fn rename_pair_refuses_when_running() {
-        let supervisor = test_supervisor();
-        supervisor.create_pair("foo").unwrap();
-        let (foo_claude_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
-        install_mock_running_session(
-            &supervisor,
-            "foo-claude",
-            DriverKind::Claude,
-            foo_claude_pty,
-        );
-
-        let error = supervisor.rename_pair("foo", "bar").unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("pair 'foo' has running sessions; stop both panes first")
-        );
-        let snapshot_names = supervisor
-            .snapshot()
-            .sessions
-            .into_iter()
-            .map(|session| session.name)
-            .collect::<Vec<_>>();
-        assert!(snapshot_names.contains(&"foo-claude".to_string()));
-        assert!(snapshot_names.contains(&"foo-codex".to_string()));
-        assert!(!snapshot_names.contains(&"bar-claude".to_string()));
-        assert!(!snapshot_names.contains(&"bar-codex".to_string()));
-    }
-
-    #[test]
-    fn rename_pair_moves_both_slots_when_stopped() {
-        let supervisor = test_supervisor();
-        supervisor.create_pair("foo").unwrap();
-        let foo_claude_generation = supervisor.bump_session_generation("foo-claude").unwrap();
-        let foo_codex_generation = supervisor.bump_session_generation("foo-codex").unwrap();
-
-        let snapshots = supervisor.rename_pair("foo", "bar").unwrap();
-
-        assert_eq!(snapshots.len(), 2);
-        assert_eq!(snapshots[0].name, "bar-claude");
-        assert_eq!(snapshots[1].name, "bar-codex");
-        assert_eq!(
-            supervisor.current_generation("bar-claude"),
-            Some(foo_claude_generation)
-        );
-        assert_eq!(
-            supervisor.current_generation("bar-codex"),
-            Some(foo_codex_generation)
-        );
-        assert_eq!(supervisor.current_generation("foo-claude"), None);
-        assert_eq!(supervisor.current_generation("foo-codex"), None);
-    }
-
-    #[test]
-    fn delete_pair_stops_running_panes_and_removes_slots() {
-        let supervisor = test_supervisor();
-        supervisor.create_pair("foo").unwrap();
-        let (foo_claude_pty, _, foo_claude_kill_count) =
-            mock_pty_session(None, MockKillBehavior::Immediate);
-        let (foo_codex_pty, _, foo_codex_kill_count) =
-            mock_pty_session(None, MockKillBehavior::Immediate);
-        install_mock_running_session(
-            &supervisor,
-            "foo-claude",
-            DriverKind::Claude,
-            foo_claude_pty,
-        );
-        install_mock_running_session(&supervisor, "foo-codex", DriverKind::Codex, foo_codex_pty);
-
-        supervisor.delete_pair("foo").unwrap();
-
-        assert_eq!(foo_claude_kill_count.load(Ordering::SeqCst), 1);
-        assert_eq!(foo_codex_kill_count.load(Ordering::SeqCst), 1);
-        let snapshot_names = supervisor
-            .snapshot()
-            .sessions
-            .into_iter()
-            .map(|session| session.name)
-            .collect::<Vec<_>>();
-        assert!(!snapshot_names.contains(&"foo-claude".to_string()));
-        assert!(!snapshot_names.contains(&"foo-codex".to_string()));
-    }
-
-    #[test]
-    fn delete_pair_refuses_main() {
-        let supervisor = test_supervisor();
-
-        let error = supervisor.delete_pair("main").unwrap_err();
-
-        assert!(error.to_string().contains("cannot delete the main pair"));
     }
 
     #[test]
@@ -7856,11 +9305,64 @@ mod tests {
             assert!(
                 !session.running,
                 "{} must not be running after shutdown",
-                session.name
+                session.label
             );
             assert_eq!(session.lifecycle_state, LifecycleState::Closed);
             assert_eq!(session.process_id, None);
         }
+    }
+
+    #[test]
+    fn shutdown_invalidates_in_flight_spawn_and_rejects_future_starts() {
+        let supervisor = test_supervisor();
+        let events = capture_runtime_events(&supervisor);
+        let (pty, _, kill_count) = mock_pty_session(None, MockKillBehavior::Immediate);
+        let (spawner, entered, release) = gated_pty_spawner(pty);
+        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+
+        let start_supervisor = supervisor.clone();
+        let start_thread = thread::spawn(move || start_test_session(&start_supervisor, "claude"));
+        entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("start never reached the gated PTY spawner");
+
+        let shutdown_error = supervisor
+            .shutdown()
+            .expect_err("shutdown must report the still in-flight spawn");
+        assert!(
+            shutdown_error.to_string().contains("spawn in flight"),
+            "unexpected shutdown error: {shutdown_error:#}"
+        );
+        release.send(()).unwrap();
+
+        let error = start_thread
+            .join()
+            .expect("start thread panicked")
+            .unwrap_err();
+        assert_eq!(error.to_string(), "supervisor has shut down");
+        assert_eq!(kill_count.load(Ordering::SeqCst), 1);
+
+        let claude = supervisor
+            .snapshot()
+            .sessions
+            .into_iter()
+            .find(|session| session.label == "claude")
+            .unwrap();
+        assert!(!claude.running);
+        assert_eq!(claude.lifecycle_state, LifecycleState::Closed);
+        assert_eq!(claude.process_id, None);
+        assert!(!events.lock().iter().any(|event| match event {
+            RuntimeEvent::SessionState {
+                state: LifecycleState::Ready,
+                ..
+            } => true,
+            RuntimeEvent::SystemLog { message, .. } => message.starts_with("Started "),
+            _ => false,
+        }));
+
+        let error = start_test_session(&supervisor, "claude").unwrap_err();
+        assert_eq!(error.to_string(), "supervisor has shut down");
+        supervisor.shutdown().unwrap();
     }
 
     #[test]
@@ -7892,227 +9394,27 @@ mod tests {
     }
 
     #[test]
-    fn pair_of_main_pair_panes() {
-        assert_eq!(pair_of("claude"), "main");
-        assert_eq!(pair_of("codex"), "main");
-    }
-
-    #[test]
-    fn pair_of_named_pair_panes() {
-        assert_eq!(pair_of("FrontendQA-claude"), "FrontendQA");
-        assert_eq!(pair_of("FrontendQA-codex"), "FrontendQA");
-        assert_eq!(pair_of("foo-bar-claude"), "foo-bar");
-        assert_eq!(pair_of("foo_bar-codex"), "foo_bar");
-    }
-
-    #[test]
-    fn pair_of_singleton_for_non_convention_names() {
-        assert_eq!(pair_of("operator"), "operator");
-        assert_eq!(pair_of("supervisor"), "supervisor");
-    }
-
-    #[test]
-    fn pair_of_empty_string_is_singleton() {
-        assert_eq!(pair_of(""), "");
-    }
-
-    #[test]
-    fn pair_of_pathological_inputs_do_not_collapse_to_main() {
-        assert_eq!(pair_of("claude-claude"), "claude");
-        assert_eq!(pair_of("claude-codex"), "claude");
-        assert_eq!(pair_of("-claude"), "-claude");
-        assert_eq!(pair_of("-codex"), "-codex");
-    }
-
-    #[test]
-    fn pair_of_main_pair_name_is_reserved_against_user_pairs() {
-        assert_eq!(pair_of("claude"), "main");
-        assert_eq!(pair_of("codex"), "main");
-
-        assert_eq!(pair_of("default-claude"), "default");
-        assert_eq!(pair_of("default-codex"), "default");
-        assert_ne!(pair_of("default-claude"), pair_of("claude"));
-
-        assert!(validate_pair_name("main").is_err());
-        assert_eq!(pair_of("main-claude"), "main");
-        assert_eq!(pair_of("main-codex"), "main");
-    }
-
-    #[test]
-    fn room_targets_only_running_sessions() {
-        let supervisor = test_supervisor();
-
-        let recipients = supervisor.resolve_recipients("room", MessageScope::Room, Some("claude"));
-        assert!(recipients.is_empty());
-    }
-
-    #[test]
-    fn room_targets_exclude_claude_sender() {
-        let supervisor = test_supervisor();
-        install_stale_running_session(&supervisor, "claude");
-        install_stale_running_session(&supervisor, "codex");
-
-        let recipients = supervisor.resolve_recipients("room", MessageScope::Room, Some("claude"));
-
-        assert_eq!(recipients, vec!["codex".to_string()]);
-    }
-
-    #[test]
-    fn room_targets_exclude_codex_sender() {
-        let supervisor = test_supervisor();
-        install_stale_running_session(&supervisor, "claude");
-        install_stale_running_session(&supervisor, "codex");
-
-        let recipients = supervisor.resolve_recipients("room", MessageScope::Room, Some("codex"));
-
-        assert_eq!(recipients, vec!["claude".to_string()]);
-    }
-
-    #[test]
-    fn room_targets_isolate_cross_pair_when_flag_off() {
-        let supervisor = test_supervisor();
-        supervisor.create_pair("FrontendQA").unwrap();
-        install_stale_running_session(&supervisor, "claude");
-        install_stale_running_session(&supervisor, "codex");
-        install_stale_running_session(&supervisor, "FrontendQA-claude");
-        install_stale_running_session(&supervisor, "FrontendQA-codex");
-
-        let recipients =
-            supervisor.resolve_recipients("room", MessageScope::Room, Some("FrontendQA-claude"));
-
-        assert_eq!(recipients, vec!["FrontendQA-codex".to_string()]);
-    }
-
-    #[test]
-    fn room_targets_main_pair_unaffected_by_isolation() {
-        let supervisor = test_supervisor();
-        supervisor.create_pair("FrontendQA").unwrap();
-        install_stale_running_session(&supervisor, "claude");
-        install_stale_running_session(&supervisor, "codex");
-        install_stale_running_session(&supervisor, "FrontendQA-claude");
-        install_stale_running_session(&supervisor, "FrontendQA-codex");
-
-        let recipients = supervisor.resolve_recipients("room", MessageScope::Room, Some("claude"));
-
-        assert_eq!(recipients, vec!["codex".to_string()]);
-    }
-
-    #[test]
-    fn room_targets_broadcast_all_panes_when_flag_on() {
-        let supervisor = test_supervisor_with_cross_pair_room_broadcast(true);
-        supervisor.create_pair("FrontendQA").unwrap();
-        install_stale_running_session(&supervisor, "claude");
-        install_stale_running_session(&supervisor, "codex");
-        install_stale_running_session(&supervisor, "FrontendQA-claude");
-        install_stale_running_session(&supervisor, "FrontendQA-codex");
-
-        let mut recipients =
-            supervisor.resolve_recipients("room", MessageScope::Room, Some("FrontendQA-claude"));
-        recipients.sort();
+    fn routed_payload_preserves_multiline_whitespace_for_harness_drivers() {
+        let request = RouteMessageRequest {
+            from: "operator".into(),
+            to: "codex".into(),
+            scope: MessageScope::Direct,
+            content: "  tell  me\r\n\ta joke 👩‍💻  ".into(),
+        };
+        let expected = "[Direct message from operator]\n  tell  me\r\n\ta joke 👩‍💻  ";
 
         assert_eq!(
-            recipients,
-            vec![
-                "FrontendQA-codex".to_string(),
-                "claude".to_string(),
-                "codex".to_string(),
-            ]
+            routed_message_payload(&request, routed_message_submit_behavior(DriverKind::Claude)),
+            expected
         );
-    }
-
-    #[test]
-    fn room_targets_sender_none_broadcasts_to_all_running() {
-        let supervisor = test_supervisor();
-        supervisor.create_pair("FrontendQA").unwrap();
-        install_stale_running_session(&supervisor, "claude");
-        install_stale_running_session(&supervisor, "FrontendQA-codex");
-
-        let mut recipients = supervisor.resolve_recipients("room", MessageScope::Room, None);
-        recipients.sort();
-
         assert_eq!(
-            recipients,
-            vec!["FrontendQA-codex".to_string(), "claude".to_string()]
+            routed_message_payload(&request, routed_message_submit_behavior(DriverKind::Codex)),
+            expected
         );
     }
 
     #[test]
-    fn direct_targets_ignore_sender_filter() {
-        let supervisor = test_supervisor();
-        install_stale_running_session(&supervisor, "claude");
-
-        let recipients =
-            supervisor.resolve_recipients("claude", MessageScope::Direct, Some("claude"));
-
-        assert_eq!(recipients, vec!["claude".to_string()]);
-    }
-
-    #[test]
-    fn direct_targets_cross_pair_unchanged_by_flag() {
-        let supervisor = test_supervisor();
-        supervisor.create_pair("FrontendQA").unwrap();
-        install_stale_running_session(&supervisor, "claude");
-        install_stale_running_session(&supervisor, "FrontendQA-codex");
-
-        let recipients =
-            supervisor.resolve_recipients("FrontendQA-codex", MessageScope::Direct, Some("claude"));
-
-        assert_eq!(recipients, vec!["FrontendQA-codex".to_string()]);
-    }
-
-    #[test]
-    fn routed_message_payload_ends_with_terminal_submit() {
-        let payload = routed_message_payload(
-            &RouteMessageRequest {
-                from: "operator".into(),
-                to: "claude".into(),
-                scope: MessageScope::Direct,
-                content: "tell me a joke".into(),
-            },
-            routed_message_submit_behavior(DriverKind::Claude),
-        );
-
-        assert!(payload.ends_with('\n'));
-        assert!(payload.contains("[Direct message from operator]"));
-        assert!(payload.contains("tell me a joke"));
-    }
-
-    #[test]
-    fn codex_payload_is_single_line() {
-        let payload = routed_message_payload(
-            &RouteMessageRequest {
-                from: "operator".into(),
-                to: "codex".into(),
-                scope: MessageScope::Direct,
-                content: "tell me\na joke".into(),
-            },
-            routed_message_submit_behavior(DriverKind::Codex),
-        );
-
-        assert!(!payload.contains('\n'));
-        assert_eq!(payload, "[Direct message from operator] tell me a joke");
-    }
-
-    #[test]
-    fn claude_payload_stays_multiline_even_with_delayed_submit() {
-        let payload = routed_message_payload(
-            &RouteMessageRequest {
-                from: "operator".into(),
-                to: "claude".into(),
-                scope: MessageScope::Direct,
-                content: "tell me\na joke".into(),
-            },
-            routed_message_submit_behavior(DriverKind::Claude),
-        );
-
-        assert!(payload.starts_with('\n'));
-        assert!(payload.ends_with('\n'));
-        assert!(payload.contains("[Direct message from operator]"));
-        assert!(payload.contains("tell me\na joke"));
-    }
-
-    #[test]
-    fn generic_terminal_payload_uses_multiline_prompt_shape() {
+    fn generic_terminal_route_stays_single_line() {
         let payload = routed_message_payload(
             &RouteMessageRequest {
                 from: "operator".into(),
@@ -8123,134 +9425,547 @@ mod tests {
             routed_message_submit_behavior(DriverKind::GenericTerminal),
         );
 
-        assert!(payload.starts_with('\n'));
-        assert!(payload.ends_with('\n'));
-        assert!(payload.contains("[Direct message from operator]"));
-        assert!(payload.contains("hello"));
+        assert_eq!(payload, "[Direct message from operator] hello");
     }
 
     #[test]
-    fn collapse_inline_content_reduces_whitespace() {
+    fn harness_message_frame_is_content_faithful_before_observed_submit() {
+        let content = "  alpha\r\n\tbeta 👩‍💻  ";
+        for driver in [DriverKind::Claude, DriverKind::Codex] {
+            let behavior = routed_message_submit_behavior(driver);
+            validate_message_body(content).unwrap();
+            validate_message_framing(content, behavior).unwrap();
+            assert_eq!(
+                frame_message_payload(content, behavior.framing),
+                format!("{BRACKETED_PASTE_START}{content}{BRACKETED_PASTE_END}")
+            );
+            assert_eq!(behavior.sequence, "\r");
+        }
+    }
+
+    #[test]
+    fn message_validation_is_bounded_and_fail_closed() {
+        validate_message_body(&"x".repeat(MESSAGE_BODY_MAX_BYTES)).unwrap();
+
+        let too_large = "x".repeat(MESSAGE_BODY_MAX_BYTES + 1);
         assert_eq!(
-            collapse_inline_content("  tell   me \n a\tjoke  "),
-            "tell me a joke"
+            validate_message_body(&too_large).unwrap_err().to_string(),
+            format!(
+                "message body is {} bytes; maximum is {} bytes",
+                MESSAGE_BODY_MAX_BYTES + 1,
+                MESSAGE_BODY_MAX_BYTES
+            )
         );
-    }
-
-    #[test]
-    fn prepare_direct_message_claude_single_line_preserves_content() {
+        let multibyte_too_large = "é".repeat(MESSAGE_BODY_MAX_BYTES / 2 + 1);
+        assert!(multibyte_too_large.chars().count() < MESSAGE_BODY_MAX_BYTES);
+        assert_eq!(multibyte_too_large.len(), MESSAGE_BODY_MAX_BYTES + 2);
+        assert!(
+            validate_message_body(&multibyte_too_large)
+                .unwrap_err()
+                .to_string()
+                .contains(&format!("maximum is {MESSAGE_BODY_MAX_BYTES} bytes"))
+        );
         assert_eq!(
-            prepare_direct_message(DriverKind::Claude, "tell me a joke"),
-            vec!["tell me a joke".to_string()]
+            validate_message_body("before\x1b[201~after")
+                .unwrap_err()
+                .to_string(),
+            "message body contains disallowed control character U+001B at byte offset 6"
         );
-    }
-
-    #[test]
-    fn prepare_direct_message_claude_multiline_no_chunking_under_limit() {
         assert_eq!(
-            prepare_direct_message(DriverKind::Claude, "tell me\na joke"),
-            vec!["tell me\na joke".to_string()]
+            validate_message_body("before\0after")
+                .unwrap_err()
+                .to_string(),
+            "message body contains disallowed control character U+0000 at byte offset 6"
         );
-    }
-
-    #[test]
-    fn prepare_direct_message_codex_flattens_newlines_to_spaces() {
         assert_eq!(
-            prepare_direct_message(DriverKind::Codex, "tell me\na joke"),
-            vec!["tell me a joke".to_string()]
+            validate_message_body("before\x03after")
+                .unwrap_err()
+                .to_string(),
+            "message body contains disallowed control character U+0003 at byte offset 6"
         );
-    }
-
-    #[test]
-    fn prepare_direct_message_codex_flattens_carriage_returns() {
         assert_eq!(
-            prepare_direct_message(DriverKind::Codex, "tell\rme\r\na joke"),
-            vec!["tell me a joke".to_string()]
+            validate_message_body("before\x7fafter")
+                .unwrap_err()
+                .to_string(),
+            "message body contains disallowed control character U+007F at byte offset 6"
+        );
+        assert_eq!(
+            validate_message_body("before\u{009b}after")
+                .unwrap_err()
+                .to_string(),
+            "message body contains disallowed control character U+009B at byte offset 6"
         );
     }
 
     #[test]
-    fn long_claude_payloads_are_chunked_with_part_headers() {
-        let long_content = (0..120)
-            .map(|index| format!("segment-{index:03}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let payloads = routed_message_payloads(
-            &RouteMessageRequest {
-                from: "codex".into(),
-                to: "claude".into(),
-                scope: MessageScope::Room,
-                content: long_content.clone(),
-            },
-            routed_message_submit_behavior(DriverKind::Claude),
+    fn generic_terminal_rejects_multiline_delivery() {
+        let behavior = routed_message_submit_behavior(DriverKind::GenericTerminal);
+        assert_eq!(
+            validate_message_framing("first\nsecond", behavior)
+                .unwrap_err()
+                .to_string(),
+            "generic terminal delivery supports only printable single-line message bodies"
+        );
+        assert_eq!(
+            validate_message_framing("first\tsecond", behavior)
+                .unwrap_err()
+                .to_string(),
+            "generic terminal delivery supports only printable single-line message bodies"
+        );
+        assert_eq!(
+            validate_message_framing("first\u{009b}second", behavior)
+                .unwrap_err()
+                .to_string(),
+            "generic terminal delivery supports only printable single-line message bodies"
+        );
+        assert_eq!(frame_message_payload("hello", behavior.framing), "hello");
+        assert_eq!(behavior.sequence, "\r");
+    }
+
+    #[test]
+    fn operator_route_writes_one_exact_frame_then_observed_submit() {
+        let content = format!("  {}\r\n\tUnicode 👩‍💻 e\u{301} 終  ", "segment ".repeat(200));
+        assert!(content.len() > 800);
+
+        for (name, driver) in [("claude", DriverKind::Claude), ("codex", DriverKind::Codex)] {
+            let supervisor = test_supervisor();
+            let (pty, inputs) = recording_pty_session(std::process::id());
+            install_mock_running_session_with_bracketed_paste_enabled(
+                &supervisor,
+                name,
+                driver,
+                pty,
+            );
+
+            route_operator_to_test_session(&supervisor, name, content.clone()).unwrap();
+            let expected_payload = format!("[Direct message from operator]\n{content}");
+
+            assert_eq!(
+                inputs.lock().as_slice(),
+                &[
+                    format!("{BRACKETED_PASTE_START}{expected_payload}{BRACKETED_PASTE_END}"),
+                    "\r".to_string(),
+                ],
+                "{name} delivery did not preserve the paste/submit boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn bracketed_delivery_waits_for_compatibility_delay_and_keeps_submit_ahead_of_queued_input() {
+        let supervisor = test_supervisor();
+        let (first_write_tx, first_write_rx) = mpsc::sync_channel(1);
+        let FirstWriteSignalFixture {
+            pty,
+            inputs,
+            write_times,
+        } = first_write_signal_pty_session(std::process::id(), first_write_tx);
+        install_mock_running_session_with_process_id_and_mode(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            None,
+            pty,
+            BracketedPasteMode::Enabled,
         );
 
-        assert!(payloads.len() > 1);
-        assert!(payloads[0].contains("[Room message from codex | part 1/"));
-        assert!(payloads.last().unwrap().contains("| part "));
-        let reassembled = payloads
-            .iter()
-            .map(|payload| {
-                payload
-                    .lines()
-                    .skip(2)
-                    .collect::<Vec<_>>()
-                    .join("\n")
-                    .trim()
-                    .to_string()
+        let delivery_supervisor = supervisor.clone();
+        let delivery = thread::spawn(move || {
+            route_operator_to_test_session(&delivery_supervisor, "claude", "paste before submit")
+        });
+        first_write_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("paste frame did not reach the PTY");
+        assert_eq!(
+            inputs.lock().as_slice(),
+            &[format!(
+                "{BRACKETED_PASTE_START}[Direct message from operator]\npaste before submit{BRACKETED_PASTE_END}"
+            )]
+        );
+
+        let queued_session_id = test_session_id(&supervisor, "claude");
+        let queued_supervisor = supervisor.clone();
+        let queued = thread::spawn(move || {
+            queued_supervisor.send_input(SendInputRequest {
+                session_id: queued_session_id,
+                input: "queued raw input".into(),
             })
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert_eq!(collapse_inline_content(&reassembled), long_content);
+        });
+        let input_gate = supervisor
+            .inner
+            .slots
+            .lock()
+            .get("claude")
+            .unwrap()
+            .running
+            .as_ref()
+            .unwrap()
+            .input_gate
+            .clone();
+        let queued_deadline = Instant::now() + Duration::from_secs(1);
+        while input_gate.queued_writes() < 1 && Instant::now() < queued_deadline {
+            thread::yield_now();
+        }
+        assert_eq!(input_gate.queued_writes(), 1);
+        thread::sleep(BRACKETED_PASTE_SUBMIT_DELAY / 2);
+        assert_eq!(
+            inputs.lock().len(),
+            1,
+            "submit ran before the compatibility delay elapsed"
+        );
+        delivery.join().unwrap().unwrap();
+        queued.join().unwrap().unwrap();
+
+        assert_eq!(
+            inputs.lock().as_slice(),
+            &[
+                format!(
+                    "{BRACKETED_PASTE_START}[Direct message from operator]\npaste before submit{BRACKETED_PASTE_END}"
+                ),
+                "\r".to_string(),
+                "queued raw input".to_string(),
+            ]
+        );
+        let write_times = write_times.lock();
+        assert!(
+            write_times[1].duration_since(write_times[0]) >= BRACKETED_PASTE_SUBMIT_DELAY,
+            "submit was not delayed for the measured compatibility interval"
+        );
     }
 
     #[test]
-    fn long_codex_payloads_are_chunked_with_part_headers() {
-        let long_content = (0..120)
-            .map(|index| format!("segment-{index:03}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let payloads = routed_message_payloads(
-            &RouteMessageRequest {
-                from: "codex".into(),
-                to: "codex".into(),
-                scope: MessageScope::Room,
-                content: long_content.clone(),
-            },
-            routed_message_submit_behavior(DriverKind::Codex),
+    fn bracketed_delivery_submits_after_terminal_disables_paste_mode() {
+        let supervisor = test_supervisor();
+        let (first_write_tx, first_write_rx) = mpsc::sync_channel(1);
+        let FirstWriteSignalFixture {
+            pty,
+            inputs,
+            write_times,
+        } = first_write_signal_pty_session(std::process::id(), first_write_tx);
+        install_mock_running_session_with_process_id_and_mode(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            None,
+            pty,
+            BracketedPasteMode::Enabled,
         );
 
-        assert!(payloads.len() > 1);
-        assert!(payloads[0].starts_with("[Room message from codex | part 1/"));
-        assert!(payloads.last().unwrap().contains("| part "));
-        assert!(payloads.iter().all(|payload| !payload.contains('\n')));
-        let reassembled = payloads
-            .iter()
-            .map(|payload| {
-                payload
-                    .split_once("] ")
-                    .map(|(_, content)| content)
-                    .unwrap_or("")
-                    .to_string()
+        let delivery_supervisor = supervisor.clone();
+        let delivery = thread::spawn(move || {
+            route_operator_to_test_session(
+                &delivery_supervisor,
+                "codex",
+                "submit after completed paste",
+            )
+        });
+        first_write_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("paste frame did not reach the PTY");
+        handle_current_pty_event(
+            &supervisor,
+            "codex",
+            0,
+            PtyEvent::Output("\x1b[?2004l".into()),
+        );
+
+        delivery.join().unwrap().unwrap();
+        assert_eq!(
+            inputs.lock().as_slice(),
+            &[
+                format!(
+                    "{BRACKETED_PASTE_START}[Direct message from operator]\nsubmit after completed paste{BRACKETED_PASTE_END}"
+                ),
+                "\r".to_string(),
+            ],
+            "a terminal may legitimately disable paste mode after consuming the completed frame"
+        );
+        let write_times = write_times.lock();
+        assert!(
+            write_times[1].duration_since(write_times[0]) >= BRACKETED_PASTE_SUBMIT_DELAY,
+            "Codex submit ran before its measured compatibility interval elapsed"
+        );
+    }
+
+    #[test]
+    fn bracketed_delivery_revalidates_unsafe_work_state_before_submit() {
+        let supervisor = test_supervisor();
+        let events = capture_runtime_events(&supervisor);
+        let (first_write_tx, first_write_rx) = mpsc::sync_channel(1);
+        let FirstWriteSignalFixture {
+            pty,
+            inputs,
+            write_times: _write_times,
+        } = first_write_signal_pty_session(std::process::id(), first_write_tx);
+        install_mock_running_session_with_process_id_and_mode(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            None,
+            pty,
+            BracketedPasteMode::Enabled,
+        );
+
+        let delivery_supervisor = supervisor.clone();
+        let delivery = thread::spawn(move || {
+            route_operator_to_test_session(
+                &delivery_supervisor,
+                "codex",
+                "do not submit into a blocked prompt",
+            )
+        });
+        first_write_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("paste frame did not reach the PTY");
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_mut("codex").unwrap();
+            slot.work_state = WorkState::Blocked;
+            slot.work_state_observed = true;
+            slot.work_detail = Some("trust_prompt".into());
+        }
+
+        let error = delivery.join().unwrap().unwrap_err();
+        assert!(
+            error.to_string().contains("work state is blocked"),
+            "{error:#}"
+        );
+        assert_eq!(
+            inputs.lock().len(),
+            1,
+            "submit reached a driver-observed blocked prompt"
+        );
+        let committed = inputs.lock()[0].len();
+        assert!(events.lock().iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RouteDelivery {
+                phase: RouteDeliveryPhase::Failed,
+                bytes_written,
+                ..
+            } if *bytes_written == committed
+        )));
+    }
+
+    #[test]
+    fn routed_bracketed_submission_never_enters_a_replacement_run_after_paste() {
+        let supervisor = test_supervisor();
+        let events = capture_runtime_events(&supervisor);
+        let (first_write_tx, first_write_rx) = mpsc::sync_channel(1);
+        let FirstWriteSignalFixture {
+            pty,
+            inputs: original_inputs,
+            write_times: _write_times,
+        } = first_write_signal_pty_session(std::process::id(), first_write_tx);
+        install_mock_running_session_with_process_id_and_mode(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            None,
+            pty,
+            BracketedPasteMode::Enabled,
+        );
+
+        let route_supervisor = supervisor.clone();
+        let route = thread::spawn(move || {
+            route_operator_to_test_session(
+                &route_supervisor,
+                "claude",
+                "must not submit into a replacement run",
+            )
+        });
+        first_write_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("paste frame did not reach the original PTY");
+
+        let (replacement_pty, replacement_inputs) = recording_pty_session(std::process::id());
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_mut("claude").unwrap();
+            slot.running = Some(RunningSession::new(Some(Arc::from(replacement_pty))));
+            let replacement_run_id = Uuid::new_v4();
+            set_test_bracketed_paste_mode(slot, replacement_run_id, BracketedPasteMode::Enabled);
+            slot.run_id = Some(replacement_run_id);
+            slot.last_run_id = Some(replacement_run_id);
+        }
+
+        let error = route.join().unwrap().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("run identity changed before input"),
+            "{error:#}"
+        );
+        assert_eq!(
+            original_inputs.lock().len(),
+            1,
+            "Enter reached the retired run"
+        );
+        assert!(replacement_inputs.lock().is_empty());
+        let paste_bytes = original_inputs.lock()[0].len();
+        let deliveries = route_delivery_events(&events);
+        assert!(deliveries.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RouteDelivery {
+                phase: RouteDeliveryPhase::Failed,
+                bytes_written,
+                error: Some(error),
+                ..
+            } if *bytes_written == paste_bytes
+                && error.contains("run identity changed before input")
+        )));
+        assert!(!deliveries.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RouteDelivery {
+                phase: RouteDeliveryPhase::Written,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn oversized_delivery_writes_nothing() {
+        let supervisor = test_supervisor();
+        let (pty, inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            pty,
+        );
+
+        let error = supervisor
+            .route_operator_message(OperatorRouteMessageRequest {
+                recipient_id: test_session_id(&supervisor, "codex"),
+                content: "x".repeat(MESSAGE_BODY_MAX_BYTES + 1),
             })
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert_eq!(collapse_inline_content(&reassembled), long_content);
+            .unwrap_err();
+
+        assert!(error.to_string().contains("maximum is 1048576 bytes"));
+        assert!(inputs.lock().is_empty());
     }
 
     #[test]
-    fn codex_payload_keeps_flattened_provenance_marker() {
-        let payload = routed_message_payload(
-            &RouteMessageRequest {
-                from: "claude".into(),
-                to: "codex".into(),
-                scope: MessageScope::Room,
-                content: "status update".into(),
-            },
-            routed_message_submit_behavior(DriverKind::Codex),
+    fn one_mib_delivery_is_one_exact_paste_then_submit_for_each_harness_driver() {
+        let prefix = "  \r\n\tUnicode 👩‍💻 e\u{301} 終  ";
+        let content = format!(
+            "{prefix}{}",
+            "x".repeat(MESSAGE_BODY_MAX_BYTES - prefix.len())
         );
+        assert_eq!(content.len(), MESSAGE_BODY_MAX_BYTES);
 
-        assert_eq!(payload, "[Room message from claude] status update");
+        for (name, driver) in [("claude", DriverKind::Claude), ("codex", DriverKind::Codex)] {
+            let supervisor = test_supervisor();
+            let (pty, inputs) = recording_pty_session(std::process::id());
+            install_mock_running_session_with_bracketed_paste_enabled(
+                &supervisor,
+                name,
+                driver,
+                pty,
+            );
+
+            route_operator_to_test_session(&supervisor, name, content.clone()).unwrap();
+
+            let inputs = inputs.lock();
+            assert_eq!(inputs.len(), 2);
+            let written = &inputs[0];
+            assert!(written.starts_with(BRACKETED_PASTE_START));
+            assert!(written.ends_with(BRACKETED_PASTE_END));
+            let expected_payload = format!("[Direct message from operator]\n{content}");
+            assert_eq!(
+                &written[BRACKETED_PASTE_START.len()..written.len() - BRACKETED_PASTE_END.len()],
+                expected_payload
+            );
+            assert_eq!(inputs[1], "\r");
+        }
+    }
+
+    #[test]
+    fn operator_route_writes_exact_provenance_paste_then_submit_at_required_sizes() {
+        let prefix = "  \r\n\tUnicode 👩‍💻 e\u{301} 終  ";
+        for size in [1024, 64 * 1024, MESSAGE_BODY_MAX_BYTES] {
+            let content = format!("{prefix}{}", "x".repeat(size - prefix.len()));
+            assert_eq!(content.len(), size);
+
+            for driver in [DriverKind::Claude, DriverKind::Codex] {
+                let supervisor = test_supervisor();
+                let (pty, inputs) = recording_pty_session(std::process::id());
+                install_mock_running_session_with_bracketed_paste_enabled(
+                    &supervisor,
+                    "codex",
+                    driver,
+                    pty,
+                );
+                let session_id = test_session_id(&supervisor, "codex");
+
+                supervisor
+                    .route_operator_message(OperatorRouteMessageRequest {
+                        recipient_id: session_id,
+                        content: content.clone(),
+                    })
+                    .unwrap();
+
+                let expected_payload = format!("[Direct message from operator]\n{content}");
+                assert_eq!(
+                    inputs.lock().as_slice(),
+                    &[
+                        format!("{BRACKETED_PASTE_START}{expected_payload}{BRACKETED_PASTE_END}"),
+                        "\r".to_string(),
+                    ],
+                    "{driver:?} route of {size} source bytes did not preserve the paste/submit boundary"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generic_operator_route_is_one_printable_single_line_write() {
+        let supervisor = test_supervisor();
+        let (pty, inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session(&supervisor, "codex", DriverKind::GenericTerminal, pty);
+        let session_id = test_session_id(&supervisor, "codex");
+
+        supervisor
+            .route_operator_message(OperatorRouteMessageRequest {
+                recipient_id: session_id,
+                content: "printable only".into(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            inputs.lock().as_slice(),
+            &["[Direct message from operator] printable only\r".to_string()]
+        );
+    }
+
+    #[test]
+    fn operator_route_rejects_oversize_and_control_bodies_before_writing() {
+        for content in [
+            "x".repeat(MESSAGE_BODY_MAX_BYTES + 1),
+            "before\u{1b}[201~after".to_string(),
+            "before\0after".to_string(),
+            "before\u{009b}after".to_string(),
+        ] {
+            let supervisor = test_supervisor();
+            let events = capture_runtime_events(&supervisor);
+            let (pty, inputs) = recording_pty_session(std::process::id());
+            install_mock_running_session_with_bracketed_paste_enabled(
+                &supervisor,
+                "codex",
+                DriverKind::Codex,
+                pty,
+            );
+            let session_id = test_session_id(&supervisor, "codex");
+
+            supervisor
+                .route_operator_message(OperatorRouteMessageRequest {
+                    recipient_id: session_id,
+                    content,
+                })
+                .unwrap_err();
+
+            assert!(inputs.lock().is_empty());
+            assert!(events.lock().is_empty());
+        }
     }
 
     #[test]
@@ -8287,1740 +10002,38 @@ mod tests {
 
     #[test]
     fn routed_message_submit_behavior_is_driver_aware() {
+        let bracketed = SubmitBehavior {
+            sequence: "\r",
+            framing: MessageFraming::BracketedPaste,
+            submit_delay: BRACKETED_PASTE_SUBMIT_DELAY,
+        };
         assert_eq!(
             routed_message_submit_behavior(DriverKind::Claude),
+            bracketed
+        );
+        assert_eq!(routed_message_submit_behavior(DriverKind::Codex), bracketed);
+        assert_eq!(
+            routed_message_submit_behavior(DriverKind::GenericTerminal),
             SubmitBehavior {
                 sequence: "\r",
-                delay: Duration::from_millis(200),
-                flatten_payload: false,
-                max_chunk_chars: Some(CLAUDE_ROUTED_MESSAGE_MAX_CHARS),
+                framing: MessageFraming::RawSingleLine,
+                submit_delay: Duration::ZERO,
             }
         );
-        assert_eq!(
-            routed_message_submit_behavior(DriverKind::Codex),
-            SubmitBehavior {
-                sequence: "\r",
-                delay: Duration::from_millis(500),
-                flatten_payload: true,
-                max_chunk_chars: Some(CODEX_ROUTED_MESSAGE_MAX_CHARS),
-            }
-        );
-    }
-
-    #[test]
-    fn start_control_plane_persists_status_file_and_snapshot() {
-        let supervisor = test_supervisor();
-
-        let status = supervisor.start_control_plane().unwrap();
-        let persisted: ControlPlaneStatus = serde_json::from_str(
-            &fs::read_to_string(supervisor.runtime_dir().join("control-plane.json")).unwrap(),
-        )
-        .unwrap();
-        let snapshot = supervisor.snapshot();
-
-        assert_eq!(persisted.endpoint, status.endpoint);
-        assert_eq!(persisted.token, status.token);
-        let snapshot_json = serde_json::to_value(&snapshot).unwrap();
-        assert!(snapshot_json.pointer("/control_plane/token").is_none());
-        assert!(snapshot_json.pointer("/control_plane/info_path").is_none());
-        assert!(!snapshot_json.to_string().contains(&status.token));
-        assert!(!snapshot_json.to_string().contains(&status.info_path));
-        assert_eq!(
-            snapshot_json
-                .pointer("/control_plane")
-                .and_then(serde_json::Value::as_object)
-                .unwrap()
-                .keys()
-                .cloned()
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from(["endpoint".to_string(), "transport".to_string()])
-        );
-        assert_eq!(
-            snapshot
-                .control_plane
-                .as_ref()
-                .map(|item| item.endpoint.as_str()),
-            Some(status.endpoint.as_str())
-        );
-    }
-
-    #[test]
-    fn control_plane_ready_event_excludes_internal_credentials() {
-        let supervisor = test_supervisor();
-        let events = capture_runtime_events(&supervisor);
-
-        let status = supervisor.start_control_plane().unwrap();
-        let event_json = events
-            .lock()
-            .iter()
-            .find(|event| matches!(event, RuntimeEvent::ControlPlaneReady { .. }))
-            .map(|event| serde_json::to_value(event).unwrap())
-            .expect("control plane ready event");
-
-        assert!(event_json.pointer("/token").is_none());
-        assert!(event_json.pointer("/info_path").is_none());
-        assert!(!event_json.to_string().contains(&status.token));
-        assert!(!event_json.to_string().contains(&status.info_path));
-        assert_eq!(
-            event_json
-                .as_object()
-                .unwrap()
-                .keys()
-                .cloned()
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from([
-                "endpoint".to_string(),
-                "event".to_string(),
-                "timestamp".to_string(),
-                "transport".to_string(),
-            ])
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn runtime_credentials_and_named_pipe_have_current_user_only_dacls() {
-        use std::os::windows::io::AsRawHandle;
-
-        let supervisor = test_supervisor();
-        let master = supervisor.start_control_plane().unwrap();
-        let pane = supervisor
-            .rotate_session_control_plane_status("claude")
-            .unwrap()
-            .unwrap();
-        let current_sid = current_user_sid_string().unwrap();
-
-        for path in [
-            supervisor.runtime_dir(),
-            Path::new(&master.info_path),
-            Path::new(&pane.info_path),
-        ] {
-            assert_current_user_only_sddl(&security_descriptor_sddl_for_path(path), &current_sid);
-        }
-
-        let endpoint = format!(r"\\.\pipe\prim1-acl-test-{}", Uuid::new_v4());
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .build()
-            .unwrap();
-        let _guard = runtime.enter();
-        let server = create_windows_pipe_server(&endpoint, true).unwrap();
-        assert_current_user_only_sddl(
-            &security_descriptor_sddl_for_handle(server.as_raw_handle().cast()),
-            &current_sid,
-        );
-        assert!(create_windows_pipe_server(&endpoint, true).is_err());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn control_plane_start_fails_closed_when_pipe_name_is_squatted() {
-        let endpoint = format!(r"\\.\pipe\prim1-squat-test-{}", Uuid::new_v4());
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .build()
-            .unwrap();
-        let _guard = runtime.enter();
-        let _squatter = create_windows_pipe_server(&endpoint, true).unwrap();
-        let supervisor = test_supervisor();
-        let info_path = supervisor.runtime_dir().join("control-plane.json");
-
-        let error = supervisor
-            .start_control_plane_at(Some(endpoint))
-            .unwrap_err();
-
-        assert!(error.to_string().contains("failed to create named pipe"));
-        assert!(!info_path.exists());
-        assert!(supervisor.inner.control_plane.read().is_none());
-        assert!(supervisor.inner.token_bindings.lock().is_empty());
-    }
-
-    #[test]
-    fn renderer_event_projection_redacts_master_and_pane_credentials() {
-        let supervisor = test_supervisor();
-        let master = supervisor.start_control_plane().unwrap();
-        let pane = supervisor
-            .rotate_session_control_plane_status("claude")
-            .unwrap()
-            .unwrap();
-        let raw = RuntimeEvent::SystemLog {
-            level: LogLevel::Error,
-            message: format!(
-                "master={} master_path={} pane={} pane_path={}",
-                master.token, master.info_path, pane.token, pane.info_path
-            ),
-            timestamp: now_rfc3339(),
-        };
-
-        let projected = supervisor.renderer_event_projector().project(raw);
-        let projected_json = serde_json::to_string(&projected).unwrap();
-
-        for secret in [master.token, master.info_path, pane.token, pane.info_path] {
-            assert!(!projected_json.contains(&secret));
-        }
-        assert_eq!(projected_json.matches("[redacted]").count(), 4);
-    }
-
-    #[test]
-    fn renderer_output_redactor_blocks_every_secret_split_and_rotation_race() {
-        let supervisor = test_supervisor();
-        let master = supervisor.start_control_plane().unwrap();
-        let first_pane = supervisor
-            .rotate_session_control_plane_status("claude")
-            .unwrap()
-            .unwrap();
-        let projector = supervisor.renderer_event_projector();
-
-        for secret in [
-            master.token.clone(),
-            master.info_path.clone(),
-            first_pane.token.clone(),
-            first_pane.info_path.clone(),
-        ] {
-            let mut one_chunk = projector.output_redactor();
-            let one_chunk_output = [one_chunk.push(&secret), one_chunk.finish()].concat();
-            assert!(!one_chunk_output.contains(&secret));
-            assert_eq!(one_chunk_output, "[redacted]");
-
-            for control_wrapped in [
-                format!("\x1b]0;{secret}\x07ordinary"),
-                format!("\x1bP{secret}\x1b\\ordinary"),
-            ] {
-                let mut control_redactor = projector.output_redactor();
-                let output = [
-                    control_redactor.push(&control_wrapped),
-                    control_redactor.finish(),
-                ]
-                .concat();
-                assert!(!output.contains(&secret));
-                assert!(output.contains("[redacted]"));
-            }
-
-            for split in secret
-                .char_indices()
-                .map(|(index, _)| index)
-                .filter(|index| *index > 0)
-            {
-                let mut redactor = projector.output_redactor();
-                let output = [
-                    redactor.push(&secret[..split]),
-                    redactor.push(&secret[split..]),
-                    redactor.finish(),
-                ]
-                .concat();
-                assert!(!output.contains(&secret), "secret leaked at split {split}");
-                assert_eq!(output, "[redacted]", "wrong output at split {split}");
-
-                let ansi_interleaved = format!("{}\x1b[31m{}", &secret[..split], &secret[split..]);
-                let mut ansi_redactor = projector.output_redactor();
-                let ansi_output = [
-                    ansi_redactor.push(&ansi_interleaved),
-                    ansi_redactor.finish(),
-                ]
-                .concat();
-                assert_eq!(
-                    ansi_output, "[redacted]",
-                    "ANSI-interleaved secret leaked at split {split}"
-                );
-
-                let mut split_ansi_redactor = projector.output_redactor();
-                let split_ansi_output = [
-                    split_ansi_redactor.push(&format!("{}\x1b", &secret[..split])),
-                    split_ansi_redactor.push("[31"),
-                    split_ansi_redactor.push(&format!("m{}", &secret[split..])),
-                    split_ansi_redactor.finish(),
-                ]
-                .concat();
-                assert_eq!(
-                    split_ansi_output, "[redacted]",
-                    "chunk-split ANSI secret leaked at split {split}"
-                );
-
-                let mut split_dcs_redactor = projector.output_redactor();
-                let split_dcs_output = [
-                    split_dcs_redactor.push(&format!("\x1bP{}", &secret[..split])),
-                    split_dcs_redactor.push(&format!("{}\x1b", &secret[split..])),
-                    split_dcs_redactor.push("\\ordinary"),
-                    split_dcs_redactor.finish(),
-                ]
-                .concat();
-                assert!(!split_dcs_output.contains(&secret));
-                assert!(split_dcs_output.contains("[redacted]"));
-            }
-
-            let mut partial = projector.output_redactor();
-            let partial_len = secret
-                .char_indices()
-                .nth(secret.chars().count() / 2)
-                .map(|(index, _)| index)
-                .unwrap_or(secret.len());
-            let partial_output = [partial.push(&secret[..partial_len]), partial.finish()].concat();
-            assert_eq!(partial_output, "[redacted]");
-        }
-
-        let mut harmless_ansi = projector.output_redactor();
-        let harmless_output = [
-            harmless_ansi.push("\x1b[31mordinary output\x1b[0m"),
-            harmless_ansi.finish(),
-        ]
-        .concat();
-        assert_eq!(harmless_output, "\x1b[31mordinary output\x1b[0m");
-
-        let split = first_pane.token.len() / 2;
-        let mut delayed = projector.output_redactor();
-        assert!(delayed.push(&first_pane.token[..split]).is_empty());
-        let second_pane = supervisor
-            .rotate_session_control_plane_status("claude")
-            .unwrap()
-            .unwrap();
-        let output = [delayed.push(&first_pane.token[split..]), delayed.finish()].concat();
-        assert_eq!(output, "[redacted]");
-        assert!(!output.contains(&first_pane.token));
-        assert_ne!(first_pane.token, second_pane.token);
-    }
-
-    #[test]
-    fn audit_and_events_since_exclude_content_and_every_control_plane_secret() {
-        let supervisor = test_supervisor();
-        let master = supervisor.start_control_plane().unwrap();
-        let pane = supervisor
-            .rotate_session_control_plane_status("claude")
-            .unwrap()
-            .unwrap();
-        let cursor = supervisor.current_eof_cursor().unwrap();
-        let secrets = [
-            master.token.clone(),
-            master.info_path.clone(),
-            pane.token.clone(),
-            pane.info_path.clone(),
-        ];
-        let joined = secrets.join("|");
-        let timestamp = now_rfc3339();
-
-        supervisor.emit(RuntimeEvent::SessionOutput {
-            session: "codex".into(),
-            chunk: joined.clone(),
-            synthetic: false,
-            timestamp: timestamp.clone(),
-        });
-        supervisor.emit(RuntimeEvent::RoutedMessage {
-            id: Uuid::new_v4(),
-            from: "claude".into(),
-            to: "codex".into(),
-            scope: MessageScope::Direct,
-            content: joined.clone(),
-            timestamp: timestamp.clone(),
-        });
-        supervisor.emit(RuntimeEvent::PaneSignal {
-            request_id: "audit-secret-pane".into(),
-            session: "claude".into(),
-            task_id: joined.clone(),
-            signal_type: PaneSignalType::Progress,
-            summary: joined.clone(),
-            artifact_paths: vec![joined.clone()],
-            commit_sha: Some(joined.clone()),
-            timestamp: timestamp.clone(),
-        });
-        supervisor.emit(RuntimeEvent::SessionWorkState {
-            session: "claude".into(),
-            state: WorkState::Thinking,
-            detail: Some(joined.clone()),
-            previous_state: Some(WorkState::Idle),
-            timestamp: timestamp.clone(),
-        });
-        supervisor.emit(RuntimeEvent::SidebandRequestLifecycle {
-            request_id: "audit-secret-lifecycle".into(),
-            action: "start_session".into(),
-            session: Some("claude".into()),
-            extra_args: vec![joined.clone()],
-            phase: SidebandPhase::Failed,
-            error: Some(joined),
-            elapsed_ms: 1,
-            timestamp,
-        });
-
-        let response = supervisor.apply_sideband_request(SidebandRequest::EventsSince {
-            token: pane.token.clone(),
-            cursor: Some(cursor),
-            max_events: Some(100),
-            max_wait_seconds: Some(0),
-            filter: None,
-        });
-        let (events, _, _, _) = unwrap_events_since(response);
-        let events_json = serde_json::to_string(&events).unwrap();
-        let raw_audit = fs::read_to_string(supervisor.audit_log_path()).unwrap();
-        for secret in &secrets {
-            let encoded = serde_json::to_string(secret).unwrap();
-            let escaped = &encoded[1..encoded.len() - 1];
-            assert!(!events_json.contains(escaped));
-            assert!(!raw_audit.contains(escaped));
-        }
-        assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, RuntimeEvent::SessionOutput { .. }))
-        );
-        assert!(events.iter().any(|event| matches!(
-            event,
-            RuntimeEvent::RoutedMessage { content, .. } if content == "[content omitted]"
-        )));
-        assert!(events.iter().any(|event| matches!(
-            event,
-            RuntimeEvent::PaneSignal {
-                task_id,
-                summary,
-                artifact_paths,
-                commit_sha: None,
-                ..
-            } if task_id.is_empty() && summary.is_empty() && artifact_paths.is_empty()
-        )));
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, RuntimeEvent::SessionWorkState { detail: None, .. }))
-        );
-        assert!(events.iter().any(|event| matches!(
-            event,
-            RuntimeEvent::SidebandRequestLifecycle { extra_args, error: Some(error), .. }
-                if extra_args.is_empty() && !error.contains(&pane.token)
-        )));
-    }
-
-    #[test]
-    fn pane_credential_persistence_failure_is_safe_and_transactional() {
-        let supervisor = test_supervisor();
-        supervisor.start_control_plane().unwrap();
-        let credential_path = supervisor.runtime_dir().join("control-plane-claude.json");
-        fs::create_dir_all(&credential_path).unwrap();
-        let token_count_before = supervisor.inner.token_bindings.lock().len();
-
-        let error = supervisor
-            .rotate_session_control_plane_status("claude")
-            .unwrap_err();
-
-        assert_eq!(error.to_string(), "failed to persist session credentials");
-        assert!(
-            !error
-                .to_string()
-                .contains(&credential_path.display().to_string())
-        );
-        assert_eq!(
-            supervisor.inner.token_bindings.lock().len(),
-            token_count_before
-        );
-        assert!(
-            !supervisor
-                .inner
-                .session_control_planes
-                .lock()
-                .contains_key("claude")
-        );
-    }
-
-    #[test]
-    fn rotating_pane_credentials_revokes_prior_token_and_keeps_it_redactable() {
-        let supervisor = test_supervisor();
-        let first = supervisor
-            .rotate_session_control_plane_status("claude")
-            .unwrap();
-        assert!(first.is_none());
-        supervisor.start_control_plane().unwrap();
-        let first = supervisor
-            .rotate_session_control_plane_status("claude")
-            .unwrap()
-            .unwrap();
-        let second = supervisor
-            .rotate_session_control_plane_status("claude")
-            .unwrap()
-            .unwrap();
-
-        assert_ne!(first.token, second.token);
-        assert!(
-            !supervisor
-                .inner
-                .token_bindings
-                .lock()
-                .contains_key(&first.token)
-        );
-        assert_eq!(
-            supervisor
-                .inner
-                .token_bindings
-                .lock()
-                .get(&second.token)
-                .cloned(),
-            Some(Some("claude".into()))
-        );
-        let response = supervisor.apply_sideband_request(SidebandRequest::StopSession {
-            token: first.token.clone(),
-            name: "claude".into(),
-        });
-        assert!(!response.ok);
-        assert_eq!(response.message, "invalid control plane token");
-
-        let projected = supervisor
-            .renderer_event_projector()
-            .project(RuntimeEvent::SystemLog {
-                level: LogLevel::Error,
-                message: format!("retired={} retired_path={}", first.token, first.info_path),
-                timestamp: now_rfc3339(),
-            });
-        let projected_json = serde_json::to_string(&projected).unwrap();
-        assert!(!projected_json.contains(&first.token));
-        assert!(!projected_json.contains(&first.info_path));
-    }
-
-    #[test]
-    fn stop_rename_delete_and_shutdown_revoke_credentials() {
-        let supervisor = test_supervisor();
-        let master = supervisor.start_control_plane().unwrap();
-
-        let claude = supervisor
-            .rotate_session_control_plane_status("claude")
-            .unwrap()
-            .unwrap();
-        let stop_response = supervisor.apply_sideband_request(SidebandRequest::StopSession {
-            token: claude.token.clone(),
-            name: "claude".into(),
-        });
-        assert!(stop_response.ok, "{}", stop_response.message);
-        assert!(
-            !supervisor
-                .inner
-                .token_bindings
-                .lock()
-                .contains_key(&claude.token)
-        );
-        assert!(!Path::new(&claude.info_path).exists());
-
-        supervisor.create_pair("foo").unwrap();
-        let foo = supervisor
-            .rotate_session_control_plane_status("foo-claude")
-            .unwrap()
-            .unwrap();
-        supervisor.rename_pair("foo", "bar").unwrap();
-        assert!(
-            !supervisor
-                .inner
-                .token_bindings
-                .lock()
-                .contains_key(&foo.token)
-        );
-        assert!(!Path::new(&foo.info_path).exists());
-
-        let bar = supervisor
-            .rotate_session_control_plane_status("bar-claude")
-            .unwrap()
-            .unwrap();
-        supervisor.delete_pair("bar").unwrap();
-        assert!(
-            !supervisor
-                .inner
-                .token_bindings
-                .lock()
-                .contains_key(&bar.token)
-        );
-        assert!(!Path::new(&bar.info_path).exists());
-
-        let codex = supervisor
-            .rotate_session_control_plane_status("codex")
-            .unwrap()
-            .unwrap();
-        supervisor.shutdown().unwrap();
-        assert!(supervisor.inner.control_plane.read().is_none());
-        assert!(supervisor.inner.token_bindings.lock().is_empty());
-        assert!(supervisor.inner.session_control_planes.lock().is_empty());
-        assert!(!Path::new(&master.info_path).exists());
-        assert!(!Path::new(&codex.info_path).exists());
-    }
-
-    #[test]
-    fn credential_cleanup_failure_cannot_skip_pty_termination_or_truthful_state() {
-        let supervisor = test_supervisor();
-        supervisor.start_control_plane().unwrap();
-        let pane = supervisor
-            .rotate_session_control_plane_status("codex")
-            .unwrap()
-            .unwrap();
-        let credential_path = PathBuf::from(&pane.info_path);
-        let (pty, _, kill_count) = mock_pty_session(None, MockKillBehavior::Immediate);
-        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
-        let events = capture_runtime_events(&supervisor);
-        fs::remove_file(&credential_path).unwrap();
-        fs::create_dir(&credential_path).unwrap();
-
-        let error = supervisor.stop_session("codex").unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "failed to remove 1 revoked credential file(s)"
-        );
-        assert_eq!(kill_count.load(Ordering::SeqCst), 1);
-        assert!(
-            !supervisor
-                .inner
-                .token_bindings
-                .lock()
-                .contains_key(&pane.token)
-        );
-        let slots = supervisor.inner.slots.lock();
-        let slot = slots.get("codex").unwrap();
-        assert_eq!(slot.state, LifecycleState::Closed);
-        assert!(slot.running.is_none());
-        assert!(slot.process_id.is_none());
-        drop(slots);
-        assert!(events.lock().iter().any(|event| matches!(
-            event,
-            RuntimeEvent::SessionExit { session, .. } if session == "codex"
-        )));
-        assert!(events.lock().iter().any(|event| matches!(
-            event,
-            RuntimeEvent::SessionState {
-                session,
-                state: LifecycleState::Closed,
-                ..
-            } if session == "codex"
-        )));
-        fs::remove_dir(&credential_path).unwrap();
-    }
-
-    #[test]
-    fn start_control_plane_is_idempotent() {
-        let supervisor = test_supervisor();
-
-        let first = supervisor.start_control_plane().unwrap();
-        let second = supervisor.start_control_plane().unwrap();
-
-        assert_eq!(first.endpoint, second.endpoint);
-        assert_eq!(first.token, second.token);
-    }
-
-    #[test]
-    fn startup_removes_legacy_disk_mailbox_and_control_plane_does_not_recreate_it() {
-        let root = std::env::temp_dir().join(format!(
-            "cli-master-wrapper-mailbox-removal-test-{}",
-            Uuid::new_v4()
-        ));
-        let runtime_dir = root.join("runtime");
-        let legacy_inbox = runtime_dir.join("sideband").join("inbox");
-        let sentinel = "PRIM1_MAILBOX_SENTINEL_7F4C2D0B";
-        fs::create_dir_all(&legacy_inbox).unwrap();
-        fs::write(legacy_inbox.join(format!("{sentinel}.json")), sentinel).unwrap();
-
-        let supervisor = test_supervisor_with_root(root);
-        assert!(!runtime_dir.join("sideband").exists());
-
-        supervisor.start_control_plane().unwrap();
-        thread::sleep(Duration::from_millis(150));
-        assert!(!runtime_dir.join("sideband").exists());
-    }
-
-    fn wait_for_live_probe(status: &ControlPlaneStatus) {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            if probe_control_plane_owner(status, Duration::from_millis(250)).unwrap() {
-                return;
-            }
-
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for control-plane probe response at {}",
-                status.endpoint
-            );
-            thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    #[test]
-    fn start_control_plane_refuses_to_overwrite_live_owner() {
-        let root = std::env::temp_dir().join(format!(
-            "cli-master-wrapper-live-owner-test-{}",
-            Uuid::new_v4()
-        ));
-        let first = test_supervisor_with_root(root.clone());
-        let first_status = first.start_control_plane().unwrap();
-        wait_for_live_probe(&first_status);
-        let control_plane_path = first.runtime_dir().join("control-plane.json");
-        let before = fs::read_to_string(&control_plane_path).unwrap();
-
-        let second = test_supervisor_with_root(root);
-        let error = second.start_control_plane().unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("another wrapper instance is already holding the control plane"),
-            "unexpected error: {error}"
-        );
-        assert_eq!(fs::read_to_string(&control_plane_path).unwrap(), before);
-    }
-
-    #[test]
-    fn start_control_plane_overwrites_dead_owner_file() {
-        let root = std::env::temp_dir().join(format!(
-            "cli-master-wrapper-dead-owner-test-{}",
-            Uuid::new_v4()
-        ));
-        let supervisor = test_supervisor_with_root(root);
-        let info_path = supervisor.runtime_dir().join("control-plane.json");
-        fs::create_dir_all(supervisor.runtime_dir()).unwrap();
-        let stale = ControlPlaneStatus {
-            transport: control_plane_transport().into(),
-            endpoint: format!("{DEFAULT_ENDPOINT}-dead-{}", Uuid::new_v4()),
-            token: "stale-token".into(),
-            info_path: info_path.display().to_string(),
-        };
-        fs::write(&info_path, serde_json::to_string_pretty(&stale).unwrap()).unwrap();
-
-        let status = supervisor.start_control_plane().unwrap();
-        let persisted: ControlPlaneStatus =
-            serde_json::from_str(&fs::read_to_string(&info_path).unwrap()).unwrap();
-
-        assert_eq!(persisted.endpoint, status.endpoint);
-        assert_eq!(persisted.token, status.token);
-        assert_ne!(persisted.endpoint, stale.endpoint);
-        assert_ne!(persisted.token, stale.token);
-    }
-
-    #[test]
-    fn apply_sideband_request_rejects_invalid_token() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-
-        let response = supervisor.apply_sideband_request(SidebandRequest::Ping {
-            token: format!("{}-wrong", status.token),
-        });
-
-        assert!(!response.ok);
-        assert_eq!(response.message, "invalid control plane token");
-    }
-
-    #[test]
-    fn async_lifecycle_denial_rejects_invalid_token_without_mutation() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let (spawner, specs) = CapturingPtySpawner::new(Vec::new());
-        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
-        arm_test_quiesce_timer(&supervisor, "claude");
-        install_stale_running_session(&supervisor, "codex");
-        let slots_before = slots_mutation_probe(&supervisor);
-
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap();
-        for token in [String::new(), " ".into(), format!("{}-wrong", status.token)] {
-            let response = runtime.block_on(supervisor.run_detached_with_timeout_async(
-                SidebandRequest::StartSession {
-                    token,
-                    name: "claude".into(),
-                    extra_args: Vec::new(),
-                },
-                Duration::from_secs(1),
-                "req-invalid-async",
-                "start_session",
-                Some("claude"),
-                &[],
-            ));
-
-            assert!(!response.ok);
-            assert_eq!(response.message, "invalid control plane token");
-            assert!(response.snapshot.is_none());
-            assert_eq!(slots_mutation_probe(&supervisor), slots_before);
-        }
-        assert!(specs.lock().is_empty());
-    }
-
-    #[test]
-    fn async_lifecycle_denial_rejects_peer_token_without_mutation() {
-        let supervisor = test_supervisor();
-        let claude_token = session_token(&supervisor, "claude");
-        let (spawner, specs) = CapturingPtySpawner::new(Vec::new());
-        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
-        arm_test_quiesce_timer(&supervisor, "codex");
-        let slots_before = slots_mutation_probe(&supervisor);
-
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap();
-        let response = runtime.block_on(supervisor.run_detached_with_timeout_async(
-            SidebandRequest::StartSession {
-                token: claude_token,
-                name: "codex".into(),
-                extra_args: Vec::new(),
-            },
-            Duration::from_secs(1),
-            "req-peer-async",
-            "start_session",
-            Some("codex"),
-            &[],
-        ));
-
-        assert!(!response.ok);
-        assert_eq!(
-            response.message,
-            "lifecycle action: pane-bound token cannot target other sessions"
-        );
-        assert!(response.snapshot.is_none());
-        assert_eq!(slots_mutation_probe(&supervisor), slots_before);
-        assert!(specs.lock().is_empty());
-    }
-
-    #[test]
-    fn async_lifecycle_accepts_pane_token_for_its_own_session() {
-        let supervisor = test_supervisor();
-        let claude_token = session_token(&supervisor, "claude");
-        let generation_before = supervisor.current_generation("claude").unwrap();
-
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap();
-        let response = runtime.block_on(supervisor.run_detached_with_timeout_async(
-            SidebandRequest::StopSession {
-                token: claude_token,
-                name: "claude".into(),
-            },
-            Duration::from_secs(1),
-            "req-own-async",
-            "stop_session",
-            Some("claude"),
-            &[],
-        ));
-
-        assert!(response.ok, "{}", response.message);
-        assert_eq!(response.message, "stopped claude");
-        assert_eq!(
-            supervisor.current_generation("claude"),
-            Some(generation_before + 1)
-        );
-    }
-
-    #[test]
-    fn async_lifecycle_ingress_rejects_peer_without_slot_mutation() {
-        let supervisor = test_supervisor();
-        let claude_token = session_token(&supervisor, "claude");
-        let (spawner, specs) = CapturingPtySpawner::new(Vec::new());
-        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
-        arm_test_quiesce_timer(&supervisor, "codex");
-        install_stale_running_session(&supervisor, "codex");
-        let slots_before = slots_mutation_probe(&supervisor);
-
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap();
-        let response = runtime.block_on(supervisor.apply_sideband_request_async(
-            SidebandRequest::StartSession {
-                token: claude_token,
-                name: "codex".into(),
-                extra_args: Vec::new(),
-            },
-        ));
-
-        assert!(!response.ok);
-        assert_eq!(
-            response.message,
-            "lifecycle action: pane-bound token cannot target other sessions"
-        );
-        assert!(response.snapshot.is_none());
-        assert_eq!(slots_mutation_probe(&supervisor), slots_before);
-        assert!(specs.lock().is_empty());
-    }
-
-    #[test]
-    fn pipe_lifecycle_ingress_rejects_invalid_token_without_slot_mutation() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let (spawner, specs) = CapturingPtySpawner::new(Vec::new());
-        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
-        arm_test_quiesce_timer(&supervisor, "claude");
-        install_stale_running_session(&supervisor, "codex");
-        let slots_before = slots_mutation_probe(&supervisor);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .enable_time()
-            .build()
-            .unwrap();
-
-        let response = runtime.block_on(async {
-            let (client, server) = tokio::io::duplex(4096);
-            let handle = supervisor.clone();
-            let request_payload = format!(
-                "{}\n",
-                encode_request(&SidebandRequest::StartSession {
-                    token: format!("{}-wrong", status.token),
-                    name: "claude".into(),
-                    extra_args: Vec::new(),
-                })
-                .unwrap()
-            );
-            let server_task =
-                tokio::spawn(async move { handle_sideband_stream(handle, server).await });
-            let (read_half, mut write_half) = tokio::io::split(client);
-            write_half
-                .write_all(request_payload.as_bytes())
-                .await
-                .unwrap();
-            write_half.flush().await.unwrap();
-            let mut reader = BufReader::new(read_half);
-            let mut line = String::new();
-            reader.read_line(&mut line).await.unwrap();
-            server_task.await.unwrap().unwrap();
-            decode_response(line.trim()).unwrap()
-        });
-
-        assert!(!response.ok);
-        assert_eq!(response.message, "invalid control plane token");
-        assert!(response.snapshot.is_none());
-        assert_eq!(slots_mutation_probe(&supervisor), slots_before);
-        assert!(specs.lock().is_empty());
-    }
-
-    #[test]
-    fn failed_sideband_lifecycle_event_carries_error_message() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let events = Arc::new(Mutex::new(Vec::<RuntimeEvent>::new()));
-        let captured = events.clone();
-        supervisor.set_event_sink(move |event| {
-            captured.lock().push(event);
-        });
-
-        let response = supervisor.apply_sideband_request(SidebandRequest::Ping {
-            token: format!("{}-wrong", status.token),
-        });
-
-        assert!(!response.ok);
-        let request_id = response.request_id.as_deref().unwrap();
-        let failed = events
-            .lock()
-            .iter()
-            .find_map(|event| match event {
-                RuntimeEvent::SidebandRequestLifecycle {
-                    request_id: event_request_id,
-                    phase: SidebandPhase::Failed,
-                    error,
-                    ..
-                } => Some((event_request_id.clone(), error.clone())),
-                _ => None,
-            })
-            .expect("failed lifecycle event");
-
-        assert_eq!(failed.0, request_id);
-        assert_eq!(failed.1.as_deref(), Some("invalid control plane token"));
-    }
-
-    #[test]
-    fn pane_bound_send_input_rejects_peer_target() {
-        let supervisor = test_supervisor();
-        let claude_token = session_token(&supervisor, "claude");
-
-        let error = supervisor
-            .validate_session_action_token(&claude_token, "codex")
-            .unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "session action: pane-bound token cannot target other sessions"
-        );
-    }
-
-    #[test]
-    fn pane_bound_send_input_allows_same_session() {
-        let supervisor = test_supervisor();
-        let claude_token = session_token(&supervisor, "claude");
-
-        supervisor
-            .validate_session_action_token(&claude_token, "claude")
-            .unwrap();
-    }
-
-    #[test]
-    fn master_token_can_target_any_session() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-
-        supervisor
-            .validate_session_action_token(&status.token, "codex")
-            .unwrap();
-    }
-
-    #[test]
-    fn side_effect_scope_denials_precede_snapshot_and_all_slot_mutation() {
-        for action in ["deliver_message", "send_input", "send_key", "create_pair"] {
-            let supervisor = test_supervisor();
-            let claude_token = session_token(&supervisor, "claude");
-            install_stale_running_session(&supervisor, "claude");
-            arm_test_quiesce_timer(&supervisor, "claude");
-            let (codex_pty, codex_send_count, _) =
-                mock_pty_session(None, MockKillBehavior::Immediate);
-            install_mock_running_session(&supervisor, "codex", DriverKind::Codex, codex_pty);
-            let (spawner, spawn_specs) = CapturingPtySpawner::new(Vec::new());
-            supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
-            let slots_before = slots_mutation_probe(&supervisor);
-
-            let request = match action {
-                "deliver_message" => SidebandRequest::DeliverMessage {
-                    token: claude_token,
-                    name: "codex".into(),
-                    content: "must not be delivered".into(),
-                    require_idle: false,
-                },
-                "send_input" => SidebandRequest::SendInput {
-                    token: claude_token,
-                    name: "codex".into(),
-                    input: "must not be sent".into(),
-                    require_idle: false,
-                },
-                "send_key" => SidebandRequest::SendKey {
-                    token: claude_token,
-                    name: "codex".into(),
-                    key: ControlKey::Enter,
-                    require_idle: false,
-                },
-                "create_pair" => SidebandRequest::CreatePair {
-                    token: claude_token,
-                    name: "unauthorised".into(),
-                },
-                _ => unreachable!(),
-            };
-
-            let response = supervisor.apply_sideband_request(request);
-            let expected_message = match action {
-                "deliver_message" => {
-                    "deliver_message: pane-bound token cannot target other sessions; use route_message instead"
-                }
-                "send_input" | "send_key" => {
-                    "session action: pane-bound token cannot target other sessions"
-                }
-                "create_pair" => {
-                    "create_pair: pane-bound tokens are not authorised; master token required"
-                }
-                _ => unreachable!(),
-            };
-
-            assert!(!response.ok, "{action} unexpectedly succeeded");
-            assert_eq!(response.message, expected_message, "wrong {action} error");
-            assert!(response.snapshot.is_none(), "{action} exposed a snapshot");
-            assert_eq!(
-                slots_mutation_probe(&supervisor),
-                slots_before,
-                "{action} mutated slots before rejection"
-            );
-            assert_eq!(codex_send_count.load(Ordering::SeqCst), 0);
-            assert!(spawn_specs.lock().is_empty());
-            assert!(!supervisor.runtime_dir().join("signals").exists());
-        }
-    }
-
-    #[test]
-    fn pane_token_dispatches_own_input_key_and_delivery_only() {
-        for action in ["deliver_message", "send_input", "send_key"] {
-            let supervisor = test_supervisor();
-            let claude_token = session_token(&supervisor, "claude");
-            let (claude_pty, send_count, _) =
-                reacting_pty_session(&supervisor, "claude", "Working 1s");
-            install_mock_running_session(&supervisor, "claude", DriverKind::Claude, claude_pty);
-
-            let request = match action {
-                "deliver_message" => SidebandRequest::DeliverMessage {
-                    token: claude_token,
-                    name: "claude".into(),
-                    content: "authorised delivery".into(),
-                    require_idle: false,
-                },
-                "send_input" => SidebandRequest::SendInput {
-                    token: claude_token,
-                    name: "claude".into(),
-                    input: "authorised input".into(),
-                    require_idle: false,
-                },
-                "send_key" => SidebandRequest::SendKey {
-                    token: claude_token,
-                    name: "claude".into(),
-                    key: ControlKey::Enter,
-                    require_idle: false,
-                },
-                _ => unreachable!(),
-            };
-
-            let response = supervisor.apply_sideband_request(request);
-            assert!(response.ok, "{action} failed: {}", response.message);
-            let expected_writes = if action == "deliver_message" { 2 } else { 1 };
-            assert_eq!(
-                send_count.load(Ordering::SeqCst),
-                expected_writes,
-                "wrong write count for {action}"
-            );
-        }
-    }
-
-    #[test]
-    fn create_pair_request_inserts_closed_slots() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-
-        let response = supervisor.apply_sideband_request(SidebandRequest::CreatePair {
-            token: status.token.clone(),
-            name: "frontend-qa".into(),
-        });
-
-        assert!(response.ok, "response: {:?}", response);
-        let snapshot = response.snapshot.expect("snapshot present");
-        let by_name: HashMap<&str, &SessionSnapshot> = snapshot
-            .sessions
-            .iter()
-            .map(|session| (session.name.as_str(), session))
-            .collect();
-
-        let new_claude = by_name
-            .get("frontend-qa-claude")
-            .expect("frontend-qa-claude slot inserted");
-        let new_codex = by_name
-            .get("frontend-qa-codex")
-            .expect("frontend-qa-codex slot inserted");
-
-        assert_eq!(new_claude.lifecycle_state, LifecycleState::Closed);
-        assert!(!new_claude.running);
-        assert_eq!(new_codex.lifecycle_state, LifecycleState::Closed);
-        assert!(!new_codex.running);
-        assert!(by_name.contains_key("claude"));
-        assert!(by_name.contains_key("codex"));
-    }
-
-    #[test]
-    fn create_pair_rejects_pane_bound_token() {
-        let supervisor = test_supervisor();
-        let _status = supervisor.start_control_plane().unwrap();
-        let claude_token = session_token(&supervisor, "claude");
-
-        let response = supervisor.apply_sideband_request(SidebandRequest::CreatePair {
-            token: claude_token,
-            name: "frontend-qa".into(),
-        });
-
-        assert!(!response.ok);
-        assert!(
-            response.message.contains("master token required"),
-            "unexpected message: {}",
-            response.message
-        );
-    }
-
-    #[test]
-    fn create_pair_rejects_invalid_token() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-
-        let response = supervisor.apply_sideband_request(SidebandRequest::CreatePair {
-            token: format!("{}-wrong", status.token),
-            name: "frontend-qa".into(),
-        });
-
-        assert!(!response.ok);
-        assert_eq!(response.message, "invalid control plane token");
-    }
-
-    #[test]
-    fn create_pair_rejects_reserved_name() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-
-        let response = supervisor.apply_sideband_request(SidebandRequest::CreatePair {
-            token: status.token,
-            name: "main".into(),
-        });
-
-        assert!(!response.ok);
-        assert!(
-            response.message.to_lowercase().contains("reserved")
-                || response.message.to_lowercase().contains("name"),
-            "unexpected message: {}",
-            response.message
-        );
-    }
-
-    #[test]
-    fn deliver_message_rejects_slash_command() {
-        let supervisor = test_supervisor();
-
-        let error = supervisor
-            .deliver_message(DeliverMessageRequest {
-                name: "claude".into(),
-                content: "/compact".into(),
-            })
-            .unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "deliver_message: slash commands are not supported; use send_input"
-        );
-    }
-
-    #[test]
-    fn deliver_message_rejects_slash_command_with_leading_whitespace() {
-        let supervisor = test_supervisor();
-
-        let error = supervisor
-            .deliver_message(DeliverMessageRequest {
-                name: "claude".into(),
-                content: "  /compact".into(),
-            })
-            .unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "deliver_message: slash commands are not supported; use send_input"
-        );
-    }
-
-    #[test]
-    fn deliver_message_pane_bound_token_rejects_other_session() {
-        let supervisor = test_supervisor();
-        let claude_token = session_token(&supervisor, "claude");
-
-        let response = supervisor.apply_sideband_request(SidebandRequest::DeliverMessage {
-            token: claude_token,
-            name: "codex".into(),
-            content: "status update".into(),
-            require_idle: false,
-        });
-
-        assert!(!response.ok);
-        assert_eq!(
-            response.message,
-            "deliver_message: pane-bound token cannot target other sessions; use route_message instead"
-        );
-    }
-
-    #[test]
-    fn deliver_message_pane_bound_token_accepts_own_session() {
-        let supervisor = test_supervisor();
-        let claude_token = session_token(&supervisor, "claude");
-        install_stale_running_session(&supervisor, "claude");
-
-        supervisor
-            .validate_deliver_message_token(&claude_token, "claude")
-            .unwrap();
-    }
-
-    #[test]
-    fn deliver_message_master_token_accepts_any_session() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        install_stale_running_session(&supervisor, "codex");
-
-        supervisor
-            .validate_deliver_message_token(&status.token, "codex")
-            .unwrap();
-    }
-
-    #[test]
-    fn pane_signal_pane_bound_token_records_bound_session_and_files() {
-        let supervisor = test_supervisor();
-        let _status = supervisor.start_control_plane().unwrap();
-        let codex_token = session_token(&supervisor, "codex");
-        let events = capture_runtime_events(&supervisor);
-
-        let response = supervisor.apply_sideband_request(SidebandRequest::PaneSignal {
-            token: codex_token,
-            task_id: "task-418".into(),
-            signal_type: PaneSignalType::Done,
-            summary: "signal complete".into(),
-            artifact_paths: vec!["evidence/task-418.md".into()],
-            commit_sha: Some("abc123".into()),
-        });
-
-        assert!(response.ok, "response: {:?}", response);
-        let request_id = response.request_id.clone().expect("request id");
-        let (signal_path, legacy_touch_path) = match response.payload {
-            Some(SidebandResponsePayload::PaneSignal {
-                signal_path,
-                legacy_touch_path,
-            }) => (PathBuf::from(signal_path), PathBuf::from(legacy_touch_path)),
-            other => panic!("unexpected response payload: {other:?}"),
-        };
-        assert!(signal_path.exists(), "missing {}", signal_path.display());
-        assert!(
-            signal_path
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with(&format!("{request_id}__done__"))
-        );
-        assert!(
-            legacy_touch_path.exists(),
-            "missing {}",
-            legacy_touch_path.display()
-        );
-        assert_eq!(
-            legacy_touch_path.file_name().unwrap().to_string_lossy(),
-            format!("{request_id}.done")
-        );
-
-        let signals = pane_signal_events(&events);
-        assert_eq!(signals.len(), 1);
-        match &signals[0] {
-            RuntimeEvent::PaneSignal {
-                request_id: event_request_id,
-                session,
-                task_id,
-                signal_type,
-                summary,
-                artifact_paths,
-                commit_sha,
-                ..
-            } => {
-                assert_eq!(event_request_id, &request_id);
-                assert_eq!(session, "codex");
-                assert_eq!(task_id, "task-418");
-                assert_eq!(*signal_type, PaneSignalType::Done);
-                assert_eq!(summary, "signal complete");
-                assert_eq!(artifact_paths, &vec!["evidence/task-418.md".to_string()]);
-                assert_eq!(commit_sha.as_deref(), Some("abc123"));
-            }
-            other => panic!("unexpected event: {other:?}"),
-        }
-
-        let persisted: RuntimeEvent =
-            serde_json::from_str(&fs::read_to_string(signal_path).unwrap()).unwrap();
-        assert!(matches!(
-            persisted,
-            RuntimeEvent::PaneSignal {
-                request_id: persisted_request_id,
-                session,
-                task_id,
-                signal_type: PaneSignalType::Done,
-                summary,
-                artifact_paths,
-                commit_sha: None,
-                ..
-            } if persisted_request_id == request_id
-                && session == "codex"
-                && task_id.is_empty()
-                && summary.is_empty()
-                && artifact_paths.is_empty()
-        ));
-    }
-
-    #[test]
-    fn pane_signal_master_token_records_supervisor_session() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let events = capture_runtime_events(&supervisor);
-
-        let response = supervisor.apply_sideband_request(SidebandRequest::PaneSignal {
-            token: status.token,
-            task_id: "smoke".into(),
-            signal_type: PaneSignalType::Heartbeat,
-            summary: "still alive".into(),
-            artifact_paths: Vec::new(),
-            commit_sha: None,
-        });
-
-        assert!(response.ok, "response: {:?}", response);
-        let signals = pane_signal_events(&events);
-        assert_eq!(signals.len(), 1);
-        assert!(matches!(
-            &signals[0],
-            RuntimeEvent::PaneSignal {
-                session,
-                signal_type: PaneSignalType::Heartbeat,
-                ..
-            } if session == "supervisor"
-        ));
-    }
-
-    #[test]
-    fn pane_signal_rejects_invalid_token() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-
-        let response = supervisor.apply_sideband_request(SidebandRequest::PaneSignal {
-            token: format!("{}-wrong", status.token),
-            task_id: "task-418".into(),
-            signal_type: PaneSignalType::Blocked,
-            summary: "blocked".into(),
-            artifact_paths: Vec::new(),
-            commit_sha: None,
-        });
-
-        assert!(!response.ok);
-        assert_eq!(response.message, "invalid control plane token");
-    }
-
-    #[test]
-    fn deliver_message_claude_delivers_multi_line_intact() {
-        let supervisor = test_supervisor();
-        install_synthetic_running_session(&supervisor, "claude", DriverKind::Claude);
-
-        let (snapshot, submit_behavior, payloads) = supervisor
-            .prepare_delivery_for_session("claude", "line one\nline two")
-            .unwrap();
-
-        assert_eq!(snapshot.name, "claude");
-        assert_eq!(
-            submit_behavior,
-            routed_message_submit_behavior(DriverKind::Claude)
-        );
-        assert_eq!(payloads, vec!["line one\nline two".to_string()]);
-    }
-
-    #[test]
-    fn deliver_message_codex_delivers_flattened_single_line() {
-        let supervisor = test_supervisor();
-        install_synthetic_running_session(&supervisor, "codex", DriverKind::Codex);
-
-        let (snapshot, submit_behavior, payloads) = supervisor
-            .prepare_delivery_for_session("codex", "line one\nline two")
-            .unwrap();
-
-        assert_eq!(snapshot.name, "codex");
-        assert_eq!(
-            submit_behavior,
-            routed_message_submit_behavior(DriverKind::Codex)
-        );
-        assert_eq!(payloads, vec!["line one line two".to_string()]);
-    }
-
-    #[test]
-    fn deliver_message_codex_chunks_large_flattened_content() {
-        let supervisor = test_supervisor();
-        install_synthetic_running_session(&supervisor, "codex", DriverKind::Codex);
-        let long_content = (0..120)
-            .map(|index| format!("segment-{index:03}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        let (_, submit_behavior, payloads) = supervisor
-            .prepare_delivery_for_session("codex", &long_content)
-            .unwrap();
-
-        assert_eq!(
-            submit_behavior,
-            routed_message_submit_behavior(DriverKind::Codex)
-        );
-        assert!(payloads.len() > 1);
-        assert!(
-            payloads
-                .iter()
-                .all(|payload| payload.chars().count() <= CODEX_ROUTED_MESSAGE_MAX_CHARS)
-        );
-        assert_eq!(payloads.join(" "), long_content);
-    }
-
-    #[test]
-    fn events_since_returns_emitted_events() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let cursor = supervisor.current_eof_cursor().unwrap();
-
-        supervisor.emit(RuntimeEvent::SystemLog {
-            level: LogLevel::Info,
-            message: "first".into(),
-            timestamp: now_rfc3339(),
-        });
-        supervisor.emit(RuntimeEvent::SessionState {
-            session: "claude".into(),
-            state: LifecycleState::Ready,
-            reason: "ready".into(),
-            timestamp: now_rfc3339(),
-        });
-
-        let response = supervisor.apply_sideband_request(SidebandRequest::EventsSince {
-            token: status.token,
-            cursor: Some(cursor),
-            max_events: Some(10),
-            max_wait_seconds: Some(0),
-            filter: Some(EventFilter {
-                include_kinds: vec!["system_log".into(), "session_state".into()],
-                include_sessions: Vec::new(),
-                include_scopes: Vec::new(),
-            }),
-        });
-
-        let (events, next_cursor, gap_detected, _) = unwrap_events_since(response);
-
-        assert_eq!(events.len(), 2);
-        assert_eq!(event_kind(&events[0]), "system_log");
-        assert_eq!(event_kind(&events[1]), "session_state");
-        assert_eq!(next_cursor.audit_file, current_audit_file(&supervisor));
-        assert!(next_cursor.byte_offset > 0);
-        assert!(!gap_detected);
-    }
-
-    #[test]
-    fn events_filter_accepts_script_default_signal_kinds() {
-        let supervisor = test_supervisor();
-        let filter = EventFilter {
-            include_kinds: vec![
-                "routed_message".into(),
-                "route_delivery".into(),
-                "dispatch_attempt".into(),
-                "pane_signal".into(),
-                "session_state".into(),
-                "session_exit".into(),
-                "session_work_state".into(),
-                "system_log".into(),
-                "sideband_request_lifecycle".into(),
-                "request_ack".into(),
-                "request_ack_timeout".into(),
-            ],
-            include_sessions: Vec::new(),
-            include_scopes: Vec::new(),
-        };
-
-        supervisor.validate_events_filter(&filter).unwrap();
-    }
-
-    #[test]
-    fn events_since_respects_max_events() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let cursor = supervisor.current_eof_cursor().unwrap();
-
-        for index in 0..25 {
-            supervisor.emit(RuntimeEvent::SystemLog {
-                level: LogLevel::Info,
-                message: format!("event-{index}"),
-                timestamp: now_rfc3339(),
-            });
-        }
-
-        let filter = EventFilter {
-            include_kinds: vec!["system_log".into()],
-            include_sessions: Vec::new(),
-            include_scopes: Vec::new(),
-        };
-
-        let first = supervisor.apply_sideband_request(SidebandRequest::EventsSince {
-            token: status.token.clone(),
-            cursor: Some(cursor),
-            max_events: Some(10),
-            max_wait_seconds: Some(0),
-            filter: Some(filter.clone()),
-        });
-        let (first_events, next_cursor, _, _) = unwrap_events_since(first);
-        assert_eq!(first_events.len(), 10);
-
-        let second = supervisor.apply_sideband_request(SidebandRequest::EventsSince {
-            token: status.token,
-            cursor: Some(next_cursor),
-            max_events: Some(10),
-            max_wait_seconds: Some(0),
-            filter: Some(filter),
-        });
-        let (second_events, _, _, _) = unwrap_events_since(second);
-        assert_eq!(second_events.len(), 10);
-    }
-
-    #[test]
-    fn events_since_long_poll_wakes_on_emit() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let cursor = supervisor.current_eof_cursor().unwrap();
-        let filter = EventFilter {
-            include_kinds: vec!["system_log".into()],
-            include_sessions: Vec::new(),
-            include_scopes: Vec::new(),
-        };
-        let handle = supervisor.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        thread::spawn(move || {
-            let started = Instant::now();
-            let response = handle.apply_sideband_request(SidebandRequest::EventsSince {
-                token: status.token,
-                cursor: Some(cursor),
-                max_events: Some(10),
-                max_wait_seconds: Some(5),
-                filter: Some(filter),
-            });
-            tx.send((started.elapsed(), response)).unwrap();
-        });
-
-        thread::sleep(Duration::from_millis(1000));
-        supervisor.emit(RuntimeEvent::SystemLog {
-            level: LogLevel::Info,
-            message: "wake".into(),
-            timestamp: now_rfc3339(),
-        });
-
-        let (elapsed, response) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        let (events, _, _, _) = unwrap_events_since(response);
-
-        assert!(elapsed >= Duration::from_millis(900));
-        assert!(elapsed < Duration::from_secs(3));
-        assert_eq!(events.len(), 1);
-        assert!(matches!(
-            &events[0],
-            RuntimeEvent::SystemLog { message, .. } if message == "wake"
-        ));
-    }
-
-    #[test]
-    fn events_since_handles_cross_restart_file_advance() {
-        let supervisor = test_supervisor();
-        let active_file = current_audit_file(&supervisor);
-        let prior_file = if active_file == "2026-04-18.jsonl" {
-            "2026-04-17.jsonl".to_string()
-        } else {
-            "2026-04-18.jsonl".to_string()
-        };
-        let filter = EventFilter {
-            include_kinds: vec!["system_log".into()],
-            include_sessions: Vec::new(),
-            include_scopes: Vec::new(),
-        };
-
-        append_audit_event(
-            &supervisor,
-            &prior_file,
-            &RuntimeEvent::SystemLog {
-                level: LogLevel::Info,
-                message: "old-1".into(),
-                timestamp: now_rfc3339(),
-            },
-        );
-        let old_path = append_audit_event(
-            &supervisor,
-            &prior_file,
-            &RuntimeEvent::SystemLog {
-                level: LogLevel::Info,
-                message: "old-2".into(),
-                timestamp: now_rfc3339(),
-            },
-        );
-        append_audit_event(
-            &supervisor,
-            &active_file,
-            &RuntimeEvent::SystemLog {
-                level: LogLevel::Info,
-                message: "new-1".into(),
-                timestamp: now_rfc3339(),
-            },
-        );
-
-        let full = supervisor
-            .read_events_since(
-                Some(EventCursor {
-                    audit_file: prior_file.clone(),
-                    byte_offset: 0,
-                }),
-                &filter,
-                10,
-            )
-            .unwrap();
-
-        let messages = full
-            .events
-            .iter()
-            .filter_map(|event| match event {
-                RuntimeEvent::SystemLog { message, .. } => Some(message.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(messages, vec!["old-1", "old-2", "new-1"]);
-        assert_eq!(full.next_cursor.audit_file, active_file);
-
-        let limited = supervisor
-            .read_events_since(
-                Some(EventCursor {
-                    audit_file: prior_file.clone(),
-                    byte_offset: 0,
-                }),
-                &filter,
-                1,
-            )
-            .unwrap();
-
-        assert_eq!(limited.events.len(), 1);
-        assert_eq!(limited.next_cursor.audit_file, prior_file);
-        assert!(limited.next_cursor.byte_offset < fs::metadata(old_path).unwrap().len());
-    }
-
-    #[test]
-    fn events_since_gap_detected() {
-        let supervisor = test_supervisor();
-        let active_file = current_audit_file(&supervisor);
-        let filter = EventFilter {
-            include_kinds: vec!["system_log".into()],
-            include_sessions: Vec::new(),
-            include_scopes: Vec::new(),
-        };
-
-        append_audit_event(
-            &supervisor,
-            &active_file,
-            &RuntimeEvent::SystemLog {
-                level: LogLevel::Info,
-                message: "current".into(),
-                timestamp: now_rfc3339(),
-            },
-        );
-
-        let result = supervisor
-            .read_events_since(
-                Some(EventCursor {
-                    audit_file: "2026-04-01.jsonl".into(),
-                    byte_offset: 0,
-                }),
-                &filter,
-                10,
-            )
-            .unwrap();
-
-        assert!(result.gap_detected);
-        assert_eq!(result.next_cursor.audit_file, active_file);
-        assert!(matches!(
-            &result.events[0],
-            RuntimeEvent::SystemLog { message, .. } if message == "current"
-        ));
-    }
-
-    #[test]
-    fn events_since_error_payload_echoes_cursor() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let cursor = EventCursor {
-            audit_file: current_audit_file(&supervisor),
-            byte_offset: 0,
-        };
-
-        let response = supervisor.apply_sideband_request(SidebandRequest::EventsSince {
-            token: status.token,
-            cursor: Some(cursor.clone()),
-            max_events: Some(10),
-            max_wait_seconds: Some(0),
-            filter: Some(EventFilter {
-                include_kinds: vec!["bogus".into()],
-                include_sessions: Vec::new(),
-                include_scopes: Vec::new(),
-            }),
-        });
-
-        assert!(!response.ok);
-        match response.payload {
-            Some(SidebandResponsePayload::EventsSinceError { echoed_cursor }) => {
-                assert_eq!(echoed_cursor, serde_json::to_value(cursor).unwrap());
-            }
-            other => panic!("unexpected error payload: {other:?}"),
-        }
     }
 
     #[test]
     fn idle_emitted_after_quiesce_threshold() {
         let supervisor = test_supervisor();
         install_synthetic_running_session(&supervisor, "codex", DriverKind::Codex);
+        let codex_alias = test_session_alias(&supervisor, "codex");
         let events = Arc::new(Mutex::new(Vec::<RuntimeEvent>::new()));
         let captured = events.clone();
         supervisor.set_event_sink(move |event| {
             captured.lock().push(event);
         });
 
-        supervisor.handle_pty_event("codex", 0, PtyEvent::Output("Working".into()));
+        handle_current_pty_event(&supervisor, "codex", 0, PtyEvent::Output("Working".into()));
 
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
@@ -10028,7 +10041,7 @@ mod tests {
                 matches!(
                     event,
                     RuntimeEvent::SessionState { session, state, .. }
-                        if session == "codex" && *state == LifecycleState::Idle
+                        if session == &codex_alias && *state == LifecycleState::Idle
                 )
             }) {
                 break;
@@ -10045,22 +10058,28 @@ mod tests {
     fn idle_cancelled_on_new_output() {
         let supervisor = test_supervisor();
         install_synthetic_running_session(&supervisor, "codex", DriverKind::Codex);
+        let codex_alias = test_session_alias(&supervisor, "codex");
         let events = Arc::new(Mutex::new(Vec::<RuntimeEvent>::new()));
         let captured = events.clone();
         supervisor.set_event_sink(move |event| {
             captured.lock().push(event);
         });
 
-        supervisor.handle_pty_event("codex", 0, PtyEvent::Output("Working".into()));
+        handle_current_pty_event(&supervisor, "codex", 0, PtyEvent::Output("Working".into()));
         thread::sleep(Duration::from_millis(1200));
-        supervisor.handle_pty_event("codex", 0, PtyEvent::Output("Still working".into()));
+        handle_current_pty_event(
+            &supervisor,
+            "codex",
+            0,
+            PtyEvent::Output("Still working".into()),
+        );
         thread::sleep(Duration::from_millis(1300));
 
         assert!(
             !events.lock().iter().any(|event| matches!(
                 event,
                 RuntimeEvent::SessionState { session, state, .. }
-                    if session == "codex" && *state == LifecycleState::Idle
+                    if session == &codex_alias && *state == LifecycleState::Idle
             )),
             "idle fired before the reset timer elapsed"
         );
@@ -10071,7 +10090,7 @@ mod tests {
                 matches!(
                     event,
                     RuntimeEvent::SessionState { session, state, .. }
-                        if session == "codex" && *state == LifecycleState::Idle
+                        if session == &codex_alias && *state == LifecycleState::Idle
                 )
             }) {
                 break;
@@ -10088,25 +10107,35 @@ mod tests {
     fn idle_suppressed_on_stale_generation() {
         let supervisor = test_supervisor();
         install_synthetic_running_session(&supervisor, "codex", DriverKind::Codex);
+        let codex_alias = test_session_alias(&supervisor, "codex");
         let events = Arc::new(Mutex::new(Vec::<RuntimeEvent>::new()));
         let captured = events.clone();
         supervisor.set_event_sink(move |event| {
             captured.lock().push(event);
         });
 
-        supervisor.handle_pty_event("codex", 0, PtyEvent::Output("Working".into()));
+        handle_current_pty_event(&supervisor, "codex", 0, PtyEvent::Output("Working".into()));
         let armed_at = {
             let slots = supervisor.inner.slots.lock();
             slots.get("codex").unwrap().last_real_output_at.unwrap()
         };
-        supervisor.bump_session_generation("codex").unwrap();
-        supervisor.fire_quiesce_timer("codex".into(), 0, armed_at, Duration::from_secs(2));
+        let stale_run_id = current_run_id(&supervisor, "codex");
+        supervisor
+            .bump_session_generation_for_tests(test_session_id(&supervisor, "codex"))
+            .unwrap();
+        supervisor.fire_quiesce_timer(
+            test_session_id(&supervisor, "codex"),
+            0,
+            stale_run_id,
+            armed_at,
+            Duration::from_secs(2),
+        );
         thread::sleep(Duration::from_millis(50));
 
         assert!(!events.lock().iter().any(|event| matches!(
             event,
             RuntimeEvent::SessionState { session, state, .. }
-                if session == "codex" && *state == LifecycleState::Idle
+                if session == &codex_alias && *state == LifecycleState::Idle
         )));
         assert!(events.lock().iter().any(|event| matches!(
             event,
@@ -10119,14 +10148,27 @@ mod tests {
     fn work_state_transitions_idle_thinking_idle() {
         let supervisor = test_supervisor();
         install_synthetic_running_session(&supervisor, "codex", DriverKind::Codex);
+        let codex_alias = test_session_alias(&supervisor, "codex");
         let events = capture_runtime_events(&supervisor);
 
-        supervisor.handle_pty_event("codex", 0, PtyEvent::Output("Working 12s".into()));
+        handle_current_pty_event(
+            &supervisor,
+            "codex",
+            0,
+            PtyEvent::Output("Working 12s".into()),
+        );
         let armed_at = {
             let slots = supervisor.inner.slots.lock();
             slots.get("codex").unwrap().last_real_output_at.unwrap()
         };
-        supervisor.fire_quiesce_timer("codex".into(), 0, armed_at, Duration::from_secs(2));
+        let stale_run_id = current_run_id(&supervisor, "codex");
+        supervisor.fire_quiesce_timer(
+            test_session_id(&supervisor, "codex"),
+            0,
+            stale_run_id,
+            armed_at,
+            Duration::from_secs(2),
+        );
 
         let work_events = work_state_events(&events);
         assert_eq!(work_events.len(), 2);
@@ -10138,7 +10180,7 @@ mod tests {
                 detail,
                 ..
             } => {
-                assert_eq!(session, "codex");
+                assert_eq!(session, &codex_alias);
                 assert_eq!(*state, WorkState::Thinking);
                 assert_eq!(*previous_state, Some(WorkState::Idle));
                 assert_eq!(detail.as_deref(), Some("Working 12s"));
@@ -10153,7 +10195,7 @@ mod tests {
                 detail,
                 ..
             } => {
-                assert_eq!(session, "codex");
+                assert_eq!(session, &codex_alias);
                 assert_eq!(*state, WorkState::Idle);
                 assert_eq!(*previous_state, Some(WorkState::Thinking));
                 assert_eq!(detail, &None);
@@ -10169,7 +10211,12 @@ mod tests {
         let events = capture_runtime_events(&supervisor);
 
         for idx in 0..5 {
-            supervisor.handle_pty_event("codex", 0, PtyEvent::Output(format!("Working {idx}s")));
+            handle_current_pty_event(
+                &supervisor,
+                "codex",
+                0,
+                PtyEvent::Output(format!("Working {idx}s")),
+            );
         }
 
         let work_events = work_state_events(&events);
@@ -10190,7 +10237,8 @@ mod tests {
         let events = capture_runtime_events(&supervisor);
 
         for _ in 0..3 {
-            supervisor.handle_pty_event(
+            handle_current_pty_event(
+                &supervisor,
                 "codex",
                 0,
                 PtyEvent::Output("You've hit your usage limit.".into()),
@@ -10220,55 +10268,6 @@ mod tests {
     }
 
     #[test]
-    fn terminal_work_state_suppresses_quiesce_and_blocks_require_idle_dispatch() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let events = capture_runtime_events(&supervisor);
-        install_synthetic_running_session(&supervisor, "codex", DriverKind::Codex);
-
-        supervisor.handle_pty_event(
-            "codex",
-            0,
-            PtyEvent::Output("PS C:\\Projects\\PRIM-1>".into()),
-        );
-
-        {
-            let slots = supervisor.inner.slots.lock();
-            let slot = slots.get("codex").unwrap();
-            assert_eq!(slot.work_state, WorkState::Exited);
-            assert!(slot.work_state_observed);
-            assert!(slot.quiesce_timer.is_none());
-        }
-        assert!(work_state_events(&events).iter().any(|event| matches!(
-            event,
-            RuntimeEvent::SessionWorkState {
-                session,
-                state: WorkState::Exited,
-                detail: Some(detail),
-                ..
-            } if session == "codex" && detail == "shell_prompt"
-        )));
-        assert!(!events.lock().iter().any(|event| matches!(
-            event,
-            RuntimeEvent::SessionState {
-                session,
-                state: LifecycleState::Idle,
-                ..
-            } if session == "codex"
-        )));
-
-        let response = supervisor.apply_sideband_request(SidebandRequest::SendInput {
-            token: status.token,
-            name: "codex".into(),
-            input: "hello".into(),
-            require_idle: true,
-        });
-
-        assert!(!response.ok);
-        assert_eq!(response.message, "dispatch aborted: target target_exited");
-    }
-
-    #[test]
     fn supervisor_heartbeat_fires_at_configured_interval_with_session_summary() {
         let supervisor =
             test_supervisor_with_wrapper_defaults(Some(Duration::from_millis(25)), None, None);
@@ -10279,6 +10278,7 @@ mod tests {
             LifecycleState::Ready,
             Some(WorkState::Thinking),
         );
+        let codex_alias = test_session_alias(&supervisor, "codex");
         {
             let mut slots = supervisor.inner.slots.lock();
             let slot = slots.get_mut("codex").unwrap();
@@ -10287,7 +10287,18 @@ mod tests {
         }
 
         wait_for_event_count(&events, 1, |event| {
-            matches!(event, RuntimeEvent::SupervisorHeartbeat { .. })
+            matches!(
+                event,
+                RuntimeEvent::SupervisorHeartbeat { sessions, .. }
+                    if sessions.iter().any(|summary| {
+                        summary.name == codex_alias
+                            && summary.lifecycle_state == LifecycleState::Ready
+                            && summary.work_state == Some(WorkState::Thinking)
+                            && summary.process_id == Some(4242)
+                            && summary.last_activity_at.as_deref()
+                                == Some("2026-05-18T00:00:00Z")
+                    })
+            )
         });
 
         let heartbeats = events
@@ -10304,191 +10315,15 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!heartbeats.is_empty());
         assert_eq!(heartbeats[0].0, std::process::id());
-        assert!(heartbeats[0].1.iter().any(|summary| {
-            summary.name == "codex"
-                && summary.lifecycle_state == LifecycleState::Ready
-                && summary.work_state == Some(WorkState::Thinking)
-                && summary.process_id == Some(4242)
-                && summary.last_activity_at.as_deref() == Some("2026-05-18T00:00:00Z")
+        assert!(heartbeats.iter().any(|(_, sessions)| {
+            sessions.iter().any(|summary| {
+                summary.name == codex_alias
+                    && summary.lifecycle_state == LifecycleState::Ready
+                    && summary.work_state == Some(WorkState::Thinking)
+                    && summary.process_id == Some(4242)
+                    && summary.last_activity_at.as_deref() == Some("2026-05-18T00:00:00Z")
+            })
         }));
-    }
-
-    #[test]
-    fn request_ack_timeout_co_emits_supervisor_alert() {
-        let supervisor = test_supervisor();
-        let events = capture_runtime_events(&supervisor);
-        set_session_dispatch_state(
-            &supervisor,
-            "codex",
-            LifecycleState::Ready,
-            Some(WorkState::Blocked),
-        );
-        let context = RequestAckContext {
-            request_id: "req-timeout".into(),
-            action: "deliver_message".into(),
-        };
-
-        supervisor.emit_request_ack_timeout(&context, "codex", Duration::from_secs(60));
-
-        assert!(events.lock().iter().any(|event| matches!(
-            event,
-            RuntimeEvent::RequestAckTimeout {
-                request_id,
-                session,
-                action,
-                elapsed_ms,
-                ..
-            } if request_id == "req-timeout"
-                && session == "codex"
-                && action == "deliver_message"
-                && *elapsed_ms == 60000
-        )));
-        let alerts = supervisor_alert_events(&events);
-        assert_eq!(alerts.len(), 1);
-        assert!(matches!(
-            &alerts[0],
-            RuntimeEvent::SupervisorAlert {
-                alert_type: SupervisorAlertType::AckTimeout,
-                request_id: Some(request_id),
-                session: Some(session),
-                action: Some(action),
-                last_work_state: Some(WorkState::Blocked),
-                last_session_state: Some(LifecycleState::Ready),
-                severity: AlertSeverity::Warn,
-                message,
-                ..
-            } if request_id == "req-timeout"
-                && session == "codex"
-                && action == "deliver_message"
-                && message.contains("didn't ACK in 60s")
-        ));
-    }
-
-    #[test]
-    fn deliver_message_with_completion_signal_text_emits_no_template_warning() {
-        let supervisor = test_supervisor();
-        let events = capture_runtime_events(&supervisor);
-        let (pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
-        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
-
-        let snapshot = supervisor
-            .deliver_message(DeliverMessageRequest {
-                name: "codex".into(),
-                content: "Task must call pane_signal with task_id task-410 when done.".into(),
-            })
-            .unwrap();
-
-        assert_eq!(snapshot.name, "codex");
-        assert!(dispatch_template_warning_events(&events).is_empty());
-    }
-
-    #[test]
-    fn deliver_message_without_completion_signal_text_emits_template_warning() {
-        let supervisor = test_supervisor();
-        let events = capture_runtime_events(&supervisor);
-        let (pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
-        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
-
-        supervisor
-            .deliver_message(DeliverMessageRequest {
-                name: "codex".into(),
-                content: "Please inspect the repo and report back.".into(),
-            })
-            .unwrap();
-
-        let warnings = dispatch_template_warning_events(&events);
-        assert_eq!(warnings.len(), 1);
-        let expected_missing = DISPATCH_TEMPLATE_PATTERNS
-            .iter()
-            .map(|pattern| pattern.to_string())
-            .collect::<Vec<_>>();
-        match &warnings[0] {
-            RuntimeEvent::DispatchTemplateWarning {
-                session,
-                detected_patterns,
-                missing_patterns,
-                severity: AlertSeverity::Info,
-                ..
-            } => {
-                assert_eq!(session, "codex");
-                assert!(detected_patterns.is_empty());
-                assert_eq!(missing_patterns, &expected_missing);
-            }
-            other => panic!("unexpected event: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn wait_quiet_returns_after_no_real_content_for_n_sec() {
-        let supervisor = test_supervisor();
-        install_synthetic_running_session(&supervisor, "claude", DriverKind::Claude);
-        let status = supervisor.start_control_plane().unwrap();
-        let started = Instant::now();
-
-        let response = supervisor.apply_sideband_request(SidebandRequest::WaitQuiet {
-            token: status.token,
-            name: "claude".into(),
-            quiet_seconds: 1,
-            timeout_seconds: 2,
-        });
-
-        assert!(started.elapsed() >= Duration::from_millis(900));
-        assert!(response.ok);
-        match response.payload {
-            Some(SidebandResponsePayload::WaitQuiet { quiet_duration_ms }) => {
-                assert!(quiet_duration_ms >= 1000);
-            }
-            other => panic!("unexpected wait_quiet payload: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn wait_quiet_timeout_reports_last_output_age() {
-        let supervisor = test_supervisor();
-        install_synthetic_running_session(&supervisor, "claude", DriverKind::Claude);
-        {
-            let mut slots = supervisor.inner.slots.lock();
-            slots.get_mut("claude").unwrap().last_real_output_at = Some(Instant::now());
-        }
-        let status = supervisor.start_control_plane().unwrap();
-
-        let response = supervisor.apply_sideband_request(SidebandRequest::WaitQuiet {
-            token: status.token,
-            name: "claude".into(),
-            quiet_seconds: 2,
-            timeout_seconds: 1,
-        });
-
-        assert!(!response.ok);
-        match response.payload {
-            Some(SidebandResponsePayload::WaitQuietTimeout { last_output_age_ms }) => {
-                assert!(last_output_age_ms < 2000);
-            }
-            other => panic!("unexpected wait_quiet timeout payload: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn wait_quiet_real_content_resets_timer() {
-        let supervisor = test_supervisor();
-        install_synthetic_running_session(&supervisor, "claude", DriverKind::Claude);
-        let status = supervisor.start_control_plane().unwrap();
-        let refresher = supervisor.clone();
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(200));
-            refresher.handle_pty_event("claude", 0, PtyEvent::Output("Working".into()));
-        });
-        let started = Instant::now();
-
-        let response = supervisor.apply_sideband_request(SidebandRequest::WaitQuiet {
-            token: status.token,
-            name: "claude".into(),
-            quiet_seconds: 1,
-            timeout_seconds: 3,
-        });
-
-        assert!(response.ok);
-        assert!(started.elapsed() >= Duration::from_millis(1100));
     }
 
     #[test]
@@ -10507,9 +10342,12 @@ mod tests {
             captured.lock().push(event);
         });
 
-        supervisor.handle_pty_event("claude", 1, PtyEvent::Output("Working".into()));
+        handle_current_pty_event(&supervisor, "claude", 1, PtyEvent::Output("Working".into()));
 
-        assert_eq!(supervisor.current_generation("claude"), Some(2));
+        assert_eq!(
+            supervisor.current_generation_for_tests(test_session_id(&supervisor, "claude")),
+            Some(2)
+        );
         let slot = supervisor
             .inner
             .slots
@@ -10532,17 +10370,277 @@ mod tests {
     }
 
     #[test]
-    fn pty_closed_clean_exit_emits_session_exit() {
+    fn run_event_sequence_exhaustion_rejects_before_pty_state_mutation() {
         let supervisor = test_supervisor();
-        let codex_token = session_token(&supervisor, "codex");
-        let credential_path = supervisor
+        let (pty, inputs) = recording_pty_session(101);
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            None,
+            pty,
+        );
+        supervisor
             .inner
-            .session_control_planes
+            .slots
+            .lock()
+            .get_mut("codex")
+            .unwrap()
+            .run_event_sequence = u64::MAX - 2;
+        let events = capture_runtime_events(&supervisor);
+        let slots_before = slots_mutation_probe(&supervisor);
+
+        handle_current_pty_event(
+            &supervisor,
+            "codex",
+            0,
+            PtyEvent::Output("real output".into()),
+        );
+
+        assert_eq!(slots_mutation_probe(&supervisor), slots_before);
+        assert!(events.lock().is_empty());
+        assert!(inputs.lock().is_empty());
+    }
+
+    #[test]
+    fn run_event_publisher_restores_sequence_order_before_the_sink() {
+        let supervisor = test_supervisor();
+        let (session_id, run_id) = {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get("claude").unwrap();
+            (slot.session_id, Uuid::new_v4())
+        };
+        let events = capture_runtime_events(&supervisor);
+        let output_event = |sequence, chunk: &str| RuntimeEvent::SessionOutput {
+            identity: RunEventIdentity {
+                session_id,
+                run_id,
+                generation: 0,
+                sequence,
+            },
+            session: "claude".into(),
+            chunk: chunk.into(),
+            synthetic: false,
+            timestamp: now_rfc3339(),
+        };
+
+        supervisor.emit_run_event(output_event(2, "second"));
+        assert!(
+            events.lock().is_empty(),
+            "a sequence gap must not publish a later event"
+        );
+        supervisor.emit_run_event(output_event(1, "first"));
+
+        let observed = events
+            .lock()
+            .iter()
+            .map(|event| match event {
+                RuntimeEvent::SessionOutput {
+                    identity, chunk, ..
+                } => (identity.sequence, chunk.clone()),
+                other => panic!("unexpected event: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(observed, vec![(1, "first".into()), (2, "second".into())]);
+    }
+
+    #[test]
+    fn pty_event_revalidates_generation_at_branch_commit() {
+        for event in [
+            PtyEvent::Output("late output".into()),
+            PtyEvent::Closed,
+            PtyEvent::Error("late error".into()),
+        ] {
+            let supervisor = test_supervisor();
+            let (old_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+            install_mock_running_session(&supervisor, "claude", DriverKind::Claude, old_pty);
+            let old_run_id = current_run_id(&supervisor, "claude");
+            let events = capture_runtime_events(&supervisor);
+            let (hook_entered_tx, hook_entered_rx) = mpsc::sync_channel(1);
+            let (hook_release_tx, hook_release_rx) = mpsc::sync_channel(1);
+            supervisor.set_pty_event_before_commit_for_tests(move || {
+                hook_entered_tx.send(()).unwrap();
+                hook_release_rx.recv().unwrap();
+            });
+
+            let event_supervisor = supervisor.clone();
+            let event_thread = thread::spawn(move || {
+                event_supervisor.handle_pty_event("claude", 0, old_run_id, event)
+            });
+            hook_entered_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("PTY event never reached the branch-commit barrier");
+
+            let (replacement, _) = recording_pty_session(std::process::id());
+            {
+                let mut slots = supervisor.inner.slots.lock();
+                let slot = slots.get_mut("claude").unwrap();
+                slot.generation = 1;
+                slot.state = LifecycleState::Ready;
+                slot.process_id = Some(std::process::id());
+                slot.running = Some(RunningSession::new(Some(Arc::from(replacement))));
+                let replacement_run_id = Uuid::new_v4();
+                slot.run_id = Some(replacement_run_id);
+                slot.last_run_id = Some(replacement_run_id);
+            }
+            let replacement_probe = slots_mutation_probe(&supervisor);
+            hook_release_tx.send(()).unwrap();
+            event_thread.join().unwrap();
+
+            assert_eq!(slots_mutation_probe(&supervisor), replacement_probe);
+            assert!(events.lock().is_empty());
+        }
+    }
+
+    #[test]
+    fn replaced_run_cannot_inherit_old_work_state_side_effects() {
+        let supervisor = test_supervisor_with_wrapper_defaults(
+            None,
+            Some(vec!["codex".into()]),
+            Some(Duration::from_secs(60)),
+        );
+        let (old_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, old_pty);
+        let old_run_id = current_run_id(&supervisor, "codex");
+        let events = capture_runtime_events(&supervisor);
+        let (hook_entered_tx, hook_entered_rx) = mpsc::sync_channel(1);
+        let (hook_release_tx, hook_release_rx) = mpsc::sync_channel(1);
+        supervisor.set_work_state_before_side_effect_for_tests(move || {
+            hook_entered_tx.send(()).unwrap();
+            hook_release_rx.recv().unwrap();
+        });
+
+        let event_supervisor = supervisor.clone();
+        let event_thread = thread::spawn(move || {
+            event_supervisor.handle_pty_event(
+                "codex",
+                0,
+                old_run_id,
+                PtyEvent::Output("You've hit your usage limit.".into()),
+            )
+        });
+        hook_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("work-state side effect barrier was not reached");
+
+        let (replacement, _) = recording_pty_session(std::process::id());
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_mut("codex").unwrap();
+            cancel_quiesce_timer_locked(slot);
+            if let Some(running) = slot.running.take() {
+                running.close_input();
+            }
+            slot.running = Some(RunningSession::new(Some(Arc::from(replacement))));
+            let replacement_run_id = Uuid::new_v4();
+            slot.run_id = Some(replacement_run_id);
+            slot.last_run_id = Some(replacement_run_id);
+            slot.state = LifecycleState::Busy;
+            slot.process_id = Some(std::process::id());
+            slot.last_activity_at = None;
+            slot.last_real_output_at = None;
+            slot.last_error = None;
+            reset_work_state_locked(slot);
+        }
+        let replacement_probe = slots_mutation_probe(&supervisor);
+        hook_release_tx.send(()).unwrap();
+        event_thread.join().unwrap();
+
+        assert_eq!(slots_mutation_probe(&supervisor), replacement_probe);
+        let run_events = events
+            .lock()
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::SessionState { identity, .. }
+                | RuntimeEvent::SessionOutput { identity, .. }
+                | RuntimeEvent::SessionWorkState { identity, .. } => Some(*identity),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(run_events.len(), 3);
+        assert!(
+            run_events
+                .iter()
+                .all(|identity| identity.run_id == old_run_id)
+        );
+        assert_eq!(
+            run_events
+                .iter()
+                .map(|identity| identity.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn generation_exhaustion_does_not_close_or_mutate_the_live_run() {
+        let supervisor = test_supervisor();
+        let (pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
+        arm_test_quiesce_timer(&supervisor, "codex");
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            slots.get_mut("codex").unwrap().generation = SessionGeneration::MAX;
+        }
+        let gate = supervisor
+            .inner
+            .slots
             .lock()
             .get("codex")
             .unwrap()
-            .info_path
+            .running
+            .as_ref()
+            .unwrap()
+            .input_gate
             .clone();
+        let before = slots_mutation_probe(&supervisor);
+
+        let error = supervisor
+            .bump_session_generation_for_tests(test_session_id(&supervisor, "codex"))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("generation exhausted"));
+        assert_eq!(slots_mutation_probe(&supervisor), before);
+        assert!(gate.is_accepting());
+    }
+
+    #[test]
+    fn post_shutdown_pty_callbacks_are_dropped_even_at_max_generation() {
+        let supervisor = test_supervisor();
+        let (pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "claude", DriverKind::Claude, pty);
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            slots.get_mut("claude").unwrap().generation = SessionGeneration::MAX;
+        }
+        let old_run_id = current_run_id(&supervisor, "claude");
+        let events = capture_runtime_events(&supervisor);
+        supervisor.shutdown().unwrap();
+        events.lock().clear();
+
+        for event in [
+            PtyEvent::Output("post-shutdown output".into()),
+            PtyEvent::Closed,
+            PtyEvent::Error("post-shutdown error".into()),
+        ] {
+            supervisor.handle_pty_event("claude", SessionGeneration::MAX, old_run_id, event);
+        }
+
+        let claude = supervisor
+            .snapshot()
+            .sessions
+            .into_iter()
+            .find(|session| session.label == "claude")
+            .unwrap();
+        assert_eq!(claude.lifecycle_state, LifecycleState::Closed);
+        assert!(!claude.running);
+        assert_eq!(claude.process_id, None);
+        assert!(events.lock().is_empty());
+    }
+
+    #[test]
+    fn pty_closed_clean_exit_emits_session_exit() {
+        let supervisor = test_supervisor();
         let (pty, _, _) = mock_pty_session_with_exit_status(
             Some(1201),
             Some(pty_exit_status(0, None, true)),
@@ -10555,16 +10653,17 @@ mod tests {
             Some(1201),
             pty,
         );
+        let codex_alias = test_session_alias(&supervisor, "codex");
         let events = capture_runtime_events(&supervisor);
 
-        supervisor.handle_pty_event("codex", 0, PtyEvent::Closed);
+        handle_current_pty_event(&supervisor, "codex", 0, PtyEvent::Closed);
 
         let exits = session_exit_events(&events);
         assert_eq!(exits.len(), 1);
         match &exits[0] {
             RuntimeEvent::SessionExit {
                 session,
-                generation,
+                identity,
                 process_id,
                 exit_code,
                 signal,
@@ -10573,8 +10672,8 @@ mod tests {
                 requested,
                 timestamp,
             } => {
-                assert_eq!(session, "codex");
-                assert_eq!(*generation, 0);
+                assert_eq!(session, &codex_alias);
+                assert_eq!(identity.generation, 0);
                 assert_eq!(*process_id, Some(1201));
                 assert_eq!(*exit_code, Some(0));
                 assert_eq!(*signal, None);
@@ -10588,7 +10687,8 @@ mod tests {
                         state: LifecycleState::Closed,
                         reason,
                         timestamp: state_timestamp,
-                    } if session == "codex"
+                        ..
+                    } if session == &codex_alias
                         && reason == "session output closed"
                         && state_timestamp == timestamp
                 )));
@@ -10604,46 +10704,25 @@ mod tests {
             .unwrap()
             .snapshot();
         assert_eq!(slot.last_error, None);
-        assert!(
-            !supervisor
-                .inner
-                .token_bindings
-                .lock()
-                .contains_key(&codex_token)
-        );
-        assert!(!Path::new(&credential_path).exists());
-        let response =
-            supervisor.apply_sideband_request(SidebandRequest::Ping { token: codex_token });
-        assert!(!response.ok);
-        assert_eq!(response.message, "invalid control plane token");
     }
 
     #[test]
-    fn failed_spawn_revokes_new_pane_credentials() {
+    fn failed_spawn_creates_no_control_plane_credentials() {
         let supervisor = test_supervisor();
         supervisor.start_control_plane().unwrap();
         supervisor.set_pty_spawner_for_tests(Arc::new(QueuePtySpawner::new(Vec::new())));
-        let credential_path = supervisor.runtime_dir().join("control-plane-claude.json");
 
-        let error = supervisor.start_session("claude", Vec::new()).unwrap_err();
+        let error = start_test_session(&supervisor, "claude").unwrap_err();
 
         assert!(error.to_string().contains("no queued PTY sessions"));
         assert!(
-            !supervisor
-                .inner
-                .session_control_planes
-                .lock()
-                .contains_key("claude")
+            fs::read_dir(supervisor.runtime_dir())
+                .unwrap()
+                .all(|entry| {
+                    let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+                    !name.starts_with("control-plane") || !name.ends_with(".json")
+                })
         );
-        assert!(
-            supervisor
-                .inner
-                .token_bindings
-                .lock()
-                .values()
-                .all(|binding| binding.as_deref() != Some("claude"))
-        );
-        assert!(!credential_path.exists());
     }
 
     #[test]
@@ -10663,7 +10742,7 @@ mod tests {
         );
         let events = capture_runtime_events(&supervisor);
 
-        supervisor.handle_pty_event("codex", 0, PtyEvent::Closed);
+        handle_current_pty_event(&supervisor, "codex", 0, PtyEvent::Closed);
 
         let exits = session_exit_events(&events);
         assert_eq!(exits.len(), 1);
@@ -10705,7 +10784,7 @@ mod tests {
         );
         let events = capture_runtime_events(&supervisor);
 
-        let snapshot = supervisor.stop_session("codex").unwrap();
+        let snapshot = stop_test_session(&supervisor, "codex").unwrap();
 
         assert_eq!(snapshot.lifecycle_state, LifecycleState::Closed);
         assert_eq!(kill_count.load(Ordering::SeqCst), 1);
@@ -10714,7 +10793,7 @@ mod tests {
         assert!(matches!(
             &exits[0],
             RuntimeEvent::SessionExit {
-                generation: 1,
+                identity: RunEventIdentity { generation: 1, .. },
                 process_id: Some(id),
                 reason: SessionExitReason::OperatorStop,
                 requested: true,
@@ -10752,8 +10831,9 @@ mod tests {
         let (new_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
         supervisor.set_pty_spawner_for_tests(Arc::new(QueuePtySpawner::new(vec![new_pty])));
         let events = capture_runtime_events(&supervisor);
+        let codex_alias = test_session_alias(&supervisor, "codex");
 
-        let snapshot = supervisor.restart_session("codex").unwrap();
+        let snapshot = restart_test_session(&supervisor, "codex").unwrap();
 
         assert_eq!(snapshot.lifecycle_state, LifecycleState::Ready);
         let exits = session_exit_events(&events);
@@ -10775,7 +10855,7 @@ mod tests {
                     state: LifecycleState::Ready,
                     reason,
                     ..
-                } if session == "codex" && reason == "session ready"
+                } if session == &codex_alias && reason == "session ready"
             )
         });
     }
@@ -10796,8 +10876,10 @@ mod tests {
         supervisor.set_pty_spawner_for_tests(Arc::new(QueuePtySpawner::new(vec![new_pty])));
         install_mock_running_session(&supervisor, "codex", DriverKind::Codex, old_pty);
         let events = capture_runtime_events(&supervisor);
+        let codex_alias = test_session_alias(&supervisor, "codex");
 
-        supervisor.handle_pty_event(
+        handle_current_pty_event(
+            &supervisor,
             "codex",
             0,
             PtyEvent::Output("You've hit your usage limit.".into()),
@@ -10811,7 +10893,7 @@ mod tests {
                     session: Some(session),
                     severity: AlertSeverity::Critical,
                     ..
-                } if session == "codex"
+                } if session == &codex_alias
             )
         });
         wait_for_event_count(&events, 1, |event| {
@@ -10821,7 +10903,7 @@ mod tests {
                     session,
                     reason: SessionExitReason::RestartStop,
                     ..
-                } if session == "codex"
+                } if session == &codex_alias
             )
         });
         wait_for_event_count(&events, 1, |event| {
@@ -10832,7 +10914,7 @@ mod tests {
                     state: LifecycleState::Ready,
                     reason,
                     ..
-                } if session == "codex" && reason == "session ready"
+                } if session == &codex_alias && reason == "session ready"
             )
         });
         assert_eq!(
@@ -10852,17 +10934,153 @@ mod tests {
         install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
         let events = capture_runtime_events(&supervisor);
 
-        supervisor.handle_pty_event(
+        handle_current_pty_event(
+            &supervisor,
             "codex",
             0,
             PtyEvent::Output("You've hit your usage limit.".into()),
         );
-        supervisor.handle_pty_event("codex", 0, PtyEvent::Output("Working 1s".into()));
+        handle_current_pty_event(
+            &supervisor,
+            "codex",
+            0,
+            PtyEvent::Output("Working 1s".into()),
+        );
         thread::sleep(Duration::from_millis(150));
 
         assert_eq!(kill_count.load(Ordering::SeqCst), 0);
         assert!(supervisor_alert_events(&events).is_empty());
         assert!(session_exit_events(&events).is_empty());
+    }
+
+    #[test]
+    fn stale_stall_detector_cannot_consume_replacement_restart_budget_or_alert() {
+        let supervisor = test_supervisor_with_wrapper_defaults(
+            None,
+            Some(vec!["codex".into()]),
+            Some(Duration::from_millis(25)),
+        );
+        let (old_pty, _, old_kill_count) = mock_pty_session(None, MockKillBehavior::Immediate);
+        let (replacement_pty, _, replacement_kill_count) =
+            mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, old_pty);
+        let events = capture_runtime_events(&supervisor);
+        let replacement_supervisor = supervisor.clone();
+        let (replaced_tx, replaced_rx) = mpsc::sync_channel(1);
+        supervisor.set_stall_before_reservation_for_tests(move || {
+            let mut slots = replacement_supervisor.inner.slots.lock();
+            let slot = slots.get_mut("codex").unwrap();
+            slot.generation = slot.generation.checked_add(1).unwrap();
+            let replacement_run_id = Uuid::new_v4();
+            slot.run_id = Some(replacement_run_id);
+            slot.last_run_id = Some(replacement_run_id);
+            slot.running = Some(RunningSession::new(Some(Arc::from(replacement_pty))));
+            slot.state = LifecycleState::Ready;
+            slot.work_state = WorkState::Idle;
+            slot.work_state_observed = true;
+            slot.work_detail = None;
+            slot.stall_detector = None;
+            replaced_tx.send(()).unwrap();
+        });
+
+        handle_current_pty_event(
+            &supervisor,
+            "codex",
+            0,
+            PtyEvent::Output("You've hit your usage limit.".into()),
+        );
+        replaced_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("stall detector never reached the pre-reservation barrier");
+        thread::sleep(Duration::from_millis(50));
+
+        assert_eq!(old_kill_count.load(Ordering::SeqCst), 0);
+        assert_eq!(replacement_kill_count.load(Ordering::SeqCst), 0);
+        assert!(supervisor_alert_events(&events).is_empty());
+        assert!(session_exit_events(&events).is_empty());
+        assert!(
+            supervisor
+                .inner
+                .auto_restart_history
+                .lock()
+                .get(&test_session_id(&supervisor, "codex"))
+                .is_none()
+        );
+        let slot = supervisor
+            .inner
+            .slots
+            .lock()
+            .get("codex")
+            .unwrap()
+            .snapshot();
+        assert_eq!(slot.generation, 1);
+        assert_eq!(slot.lifecycle_state, LifecycleState::Ready);
+        assert!(slot.running);
+    }
+
+    #[test]
+    fn reserved_stall_restart_rolls_back_when_the_run_is_replaced_before_action() {
+        let supervisor = test_supervisor_with_wrapper_defaults(
+            None,
+            Some(vec!["codex".into()]),
+            Some(Duration::from_millis(25)),
+        );
+        let (old_pty, _, old_kill_count) = mock_pty_session(None, MockKillBehavior::Immediate);
+        let (replacement_pty, _, replacement_kill_count) =
+            mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, old_pty);
+        let events = capture_runtime_events(&supervisor);
+        let replacement_supervisor = supervisor.clone();
+        let (replaced_tx, replaced_rx) = mpsc::sync_channel(1);
+        supervisor.set_stall_after_reservation_for_tests(move || {
+            let mut slots = replacement_supervisor.inner.slots.lock();
+            let slot = slots.get_mut("codex").unwrap();
+            slot.generation = slot.generation.checked_add(1).unwrap();
+            let replacement_run_id = Uuid::new_v4();
+            slot.run_id = Some(replacement_run_id);
+            slot.last_run_id = Some(replacement_run_id);
+            slot.running = Some(RunningSession::new(Some(Arc::from(replacement_pty))));
+            slot.state = LifecycleState::Ready;
+            slot.work_state = WorkState::Idle;
+            slot.work_state_observed = true;
+            slot.work_detail = None;
+            slot.stall_detector = None;
+            replaced_tx.send(()).unwrap();
+        });
+
+        handle_current_pty_event(
+            &supervisor,
+            "codex",
+            0,
+            PtyEvent::Output("You've hit your usage limit.".into()),
+        );
+        replaced_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("stall action never reached the post-reservation barrier");
+        thread::sleep(Duration::from_millis(50));
+
+        assert_eq!(old_kill_count.load(Ordering::SeqCst), 0);
+        assert_eq!(replacement_kill_count.load(Ordering::SeqCst), 0);
+        assert!(supervisor_alert_events(&events).is_empty());
+        assert!(session_exit_events(&events).is_empty());
+        assert!(
+            supervisor
+                .inner
+                .auto_restart_history
+                .lock()
+                .get(&test_session_id(&supervisor, "codex"))
+                .is_none()
+        );
+        let slot = supervisor
+            .inner
+            .slots
+            .lock()
+            .get("codex")
+            .unwrap()
+            .snapshot();
+        assert_eq!(slot.generation, 1);
+        assert_eq!(slot.lifecycle_state, LifecycleState::Ready);
+        assert!(slot.running);
     }
 
     #[test]
@@ -10875,7 +11093,7 @@ mod tests {
         {
             let mut history = supervisor.inner.auto_restart_history.lock();
             history.insert(
-                "codex".into(),
+                test_session_id(&supervisor, "codex"),
                 AutoRestartHistory {
                     attempts: vec![Instant::now(), Instant::now(), Instant::now()],
                     disabled: false,
@@ -10885,8 +11103,10 @@ mod tests {
         let (pty, _, kill_count) = mock_pty_session(None, MockKillBehavior::Immediate);
         install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
         let events = capture_runtime_events(&supervisor);
+        let codex_alias = test_session_alias(&supervisor, "codex");
 
-        supervisor.handle_pty_event(
+        handle_current_pty_event(
+            &supervisor,
             "codex",
             0,
             PtyEvent::Output("You've hit your usage limit.".into()),
@@ -10901,7 +11121,7 @@ mod tests {
                     severity: AlertSeverity::Critical,
                     message,
                     ..
-                } if session == "codex" && message.contains("cap reached")
+                } if session == &codex_alias && message.contains("cap reached")
             )
         });
         thread::sleep(Duration::from_millis(50));
@@ -10912,7 +11132,7 @@ mod tests {
                 .inner
                 .auto_restart_history
                 .lock()
-                .get("codex")
+                .get(&test_session_id(&supervisor, "codex"))
                 .unwrap()
                 .disabled
         );
@@ -10929,7 +11149,8 @@ mod tests {
         install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
         let events = capture_runtime_events(&supervisor);
 
-        supervisor.handle_pty_event(
+        handle_current_pty_event(
+            &supervisor,
             "codex",
             0,
             PtyEvent::Output("You've hit your usage limit.".into()),
@@ -10944,11 +11165,6 @@ mod tests {
     #[test]
     fn liveness_pruning_without_exit_status_emits_process_disappeared() {
         let supervisor = test_supervisor();
-        supervisor.start_control_plane().unwrap();
-        let pane = supervisor
-            .rotate_session_control_plane_status("codex")
-            .unwrap()
-            .unwrap();
         let (pty, _, _) =
             mock_pty_session_with_exit_status(Some(u32::MAX), None, MockKillBehavior::Immediate);
         install_mock_running_session_with_process_id(
@@ -10965,7 +11181,7 @@ mod tests {
         let codex = snapshot
             .sessions
             .into_iter()
-            .find(|session| session.name == "codex")
+            .find(|session| session.label == "codex")
             .unwrap();
         assert!(!codex.running);
         let exits = session_exit_events(&events);
@@ -10987,29 +11203,21 @@ mod tests {
             .unwrap()
             .snapshot();
         assert_eq!(slot.last_error, Some("process no longer running".into()));
-        assert!(
-            !supervisor
-                .inner
-                .token_bindings
-                .lock()
-                .contains_key(&pane.token)
-        );
-        assert!(!Path::new(&pane.info_path).exists());
     }
 
     #[test]
     fn pty_error_emits_session_exit_and_last_error() {
         let supervisor = test_supervisor();
-        supervisor.start_control_plane().unwrap();
-        let pane = supervisor
-            .rotate_session_control_plane_status("codex")
-            .unwrap()
-            .unwrap();
         let (pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
         install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
         let events = capture_runtime_events(&supervisor);
 
-        supervisor.handle_pty_event("codex", 0, PtyEvent::Error("pipe broke".into()));
+        handle_current_pty_event(
+            &supervisor,
+            "codex",
+            0,
+            PtyEvent::Error("pipe broke".into()),
+        );
 
         let exits = session_exit_events(&events);
         assert_eq!(exits.len(), 1);
@@ -11030,90 +11238,2075 @@ mod tests {
             .unwrap()
             .snapshot();
         assert_eq!(slot.last_error, Some("pipe broke".into()));
-        assert!(
-            !supervisor
-                .inner
-                .token_bindings
-                .lock()
-                .contains_key(&pane.token)
-        );
-        assert!(!Path::new(&pane.info_path).exists());
     }
 
     #[test]
-    fn sideband_lifecycle_events_emitted_for_pipe_ping() {
+    fn unknown_route_target_rejects_without_emitting_delivery() {
         let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let events = Arc::new(Mutex::new(Vec::<RuntimeEvent>::new()));
-        let captured = events.clone();
+        let events = capture_runtime_events(&supervisor);
+        let missing_id = Uuid::new_v4();
+
+        let error = supervisor
+            .route_operator_message(OperatorRouteMessageRequest {
+                recipient_id: missing_id,
+                content: "hello".into(),
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!("unknown session id '{missing_id}'")
+        );
+        assert!(events.lock().is_empty());
+    }
+
+    #[test]
+    fn one_recipient_write_failure_emits_failed_delivery_and_returns_error() {
+        let supervisor = test_supervisor();
+        let codex_alias = test_session_alias(&supervisor, "codex");
+        let events = capture_runtime_events(&supervisor);
+        let (codex_pty, send_count) = failing_pty_session("synthetic route write failure");
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            codex_pty,
+        );
+        let codex_id = test_session_id(&supervisor, "codex");
+
+        let error = supervisor
+            .route_operator_message(OperatorRouteMessageRequest {
+                recipient_id: codex_id,
+                content: "hello".into(),
+            })
+            .unwrap_err();
+
+        assert_eq!(send_count.load(Ordering::SeqCst), 1);
+        let error = error.to_string();
+        assert!(error.contains(&codex_alias));
+        assert!(error.contains("synthetic route write failure"));
+
+        let deliveries = route_delivery_events(&events);
+        assert_eq!(deliveries.len(), 2);
+        assert!(matches!(
+            &deliveries[0],
+            RuntimeEvent::RouteDelivery {
+                phase: RouteDeliveryPhase::Resolved,
+                recipient_count: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &deliveries[1],
+            RuntimeEvent::RouteDelivery {
+                phase: RouteDeliveryPhase::Failed,
+                recipient: Some(recipient),
+                recipient_count: 1,
+                payload_part_count: 1,
+                bytes_written: 0,
+                error: Some(message),
+                ..
+            } if recipient == &codex_alias && message.contains("synthetic route write failure")
+        ));
+    }
+
+    #[test]
+    fn partial_recipient_write_failure_reports_the_committed_prefix() {
+        let supervisor = test_supervisor();
+        let codex_alias = test_session_alias(&supervisor, "codex");
+        let events = capture_runtime_events(&supervisor);
+        let committed_prefix = 17;
+        let (codex_pty, send_count) =
+            write_failing_pty_session(committed_prefix, "synthetic partial PTY write failure");
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            codex_pty,
+        );
+        let codex_id = test_session_id(&supervisor, "codex");
+
+        let error = supervisor
+            .route_operator_message(OperatorRouteMessageRequest {
+                recipient_id: codex_id,
+                content: "hello".into(),
+            })
+            .unwrap_err();
+
+        assert_eq!(send_count.load(Ordering::SeqCst), 1);
+        let error = error.to_string();
+        assert!(error.contains("synthetic partial PTY write failure"));
+        assert!(error.contains("after 17 bytes were accepted by the PTY"));
+        assert!(error.contains("content may be partial"));
+        let deliveries = route_delivery_events(&events);
+        assert!(matches!(
+            deliveries.last().unwrap(),
+            RuntimeEvent::RouteDelivery {
+                phase: RouteDeliveryPhase::Failed,
+                recipient: Some(recipient),
+                bytes_written,
+                error: Some(message),
+                ..
+            } if recipient == &codex_alias
+                && *bytes_written == committed_prefix
+                && message.contains("synthetic partial PTY write failure")
+        ));
+    }
+
+    #[test]
+    fn successful_short_write_is_failed_closed_with_truthful_progress() {
+        let supervisor = test_supervisor();
+        let events = capture_runtime_events(&supervisor);
+        let accepted_prefix = 5;
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            Box::new(ShortOkPtySession {
+                bytes_written: accepted_prefix,
+            }),
+        );
+        let codex_id = test_session_id(&supervisor, "codex");
+
+        let error = supervisor
+            .route_operator_message(OperatorRouteMessageRequest {
+                recipient_id: codex_id,
+                content: "hello".into(),
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("successful short write"));
+        let deliveries = route_delivery_events(&events);
+        assert!(deliveries.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RouteDelivery {
+                phase: RouteDeliveryPhase::Failed,
+                bytes_written,
+                ..
+            } if *bytes_written == accepted_prefix
+        )));
+        assert!(!deliveries.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RouteDelivery {
+                phase: RouteDeliveryPhase::Written,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn route_never_writes_to_a_replacement_identity_at_the_same_generation() {
+        let supervisor = test_supervisor();
+        let codex_alias = test_session_alias(&supervisor, "codex");
+        let (original_pty, original_inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            original_pty,
+        );
+        let codex_id = test_session_id(&supervisor, "codex");
+
+        let replacement_inputs = Arc::new(Mutex::new(Vec::<String>::new()));
+        let replacement_inputs_for_sink = replacement_inputs.clone();
+        let supervisor_for_sink = supervisor.clone();
+        let replaced = Arc::new(AtomicBool::new(false));
+        let replaced_for_sink = replaced.clone();
         supervisor.set_event_sink(move |event| {
-            captured.lock().push(event);
+            if matches!(
+                event,
+                RuntimeEvent::DispatchAttempt {
+                    action,
+                    target_session,
+                    ..
+                } if action == "route_message" && target_session == codex_alias
+            ) && !replaced_for_sink.swap(true, Ordering::SeqCst)
+            {
+                let mut slots = supervisor_for_sink.inner.slots.lock();
+                let slot = slots.get_mut("codex").unwrap();
+                slot.running = Some(RunningSession::new(Some(Arc::new(RecordingPtySession {
+                    process_id: std::process::id(),
+                    inputs: replacement_inputs_for_sink.clone(),
+                }))));
+                let replacement_run_id = Uuid::new_v4();
+                set_test_bracketed_paste_mode(
+                    slot,
+                    replacement_run_id,
+                    BracketedPasteMode::Enabled,
+                );
+                slot.run_id = Some(replacement_run_id);
+                slot.last_run_id = Some(replacement_run_id);
+            }
         });
 
+        let error = supervisor
+            .route_operator_message(OperatorRouteMessageRequest {
+                recipient_id: codex_id,
+                content: "must not cross a run boundary".into(),
+            })
+            .unwrap_err();
+
+        assert!(replaced.load(Ordering::SeqCst));
+        assert!(
+            error
+                .to_string()
+                .contains("run identity changed before input")
+        );
+        assert!(original_inputs.lock().is_empty());
+        assert!(replacement_inputs.lock().is_empty());
+    }
+
+    #[test]
+    fn route_revalidates_its_run_gate_after_lifecycle_wins() {
+        let supervisor = test_supervisor();
+        let process_id = std::process::id();
+        let (old_pty, old_inputs) = recording_pty_session(process_id);
+        install_mock_running_session_with_process_id_and_bracketed_paste_enabled(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            Some(process_id),
+            old_pty,
+        );
+        let (replacement_pty, replacement_inputs) = recording_pty_session(process_id);
+        supervisor.set_pty_spawner_for_tests(Arc::new(QueuePtySpawner::new(vec![replacement_pty])));
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        supervisor.set_run_input_before_commit_for_tests(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        let route_supervisor = supervisor.clone();
+        let route_thread = thread::spawn(move || {
+            route_operator_to_test_session(&route_supervisor, "codex", "must not cross lifecycle")
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("route never reached the run-input commit barrier");
+
+        let replacement = restart_test_session(&supervisor, "codex").unwrap();
+        assert_eq!(replacement.lifecycle_state, LifecycleState::Ready);
+        release_tx.send(()).unwrap();
+
+        let error = route_thread.join().unwrap().unwrap_err().to_string();
+        assert!(error.contains("run changed before input") || error.contains("run is closed"));
+        assert!(old_inputs.lock().is_empty());
+        assert!(replacement_inputs.lock().is_empty());
+    }
+
+    #[test]
+    fn operator_input_revalidates_its_run_gate_after_lifecycle_wins() {
+        let supervisor = test_supervisor();
+        let process_id = std::process::id();
+        let (old_pty, old_inputs) = recording_pty_session(process_id);
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            Some(process_id),
+            old_pty,
+        );
+        let (replacement_pty, replacement_inputs) = recording_pty_session(process_id);
+        supervisor.set_pty_spawner_for_tests(Arc::new(QueuePtySpawner::new(vec![replacement_pty])));
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        supervisor.set_run_input_before_commit_for_tests(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        let input_session_id = test_session_id(&supervisor, "codex");
+        let input_supervisor = supervisor.clone();
+        let input_thread = thread::spawn(move || {
+            input_supervisor.send_input(SendInputRequest {
+                session_id: input_session_id,
+                input: "must not cross lifecycle".into(),
+            })
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("operator input never reached the run-input commit barrier");
+
+        let replacement = restart_test_session(&supervisor, "codex").unwrap();
+        assert_eq!(replacement.lifecycle_state, LifecycleState::Ready);
+        release_tx.send(()).unwrap();
+
+        let error = input_thread.join().unwrap().unwrap_err().to_string();
+        assert!(error.contains("run changed before input") || error.contains("run is closed"));
+        assert!(old_inputs.lock().is_empty());
+        assert!(replacement_inputs.lock().is_empty());
+    }
+
+    #[test]
+    fn lifecycle_declaration_closes_old_run_input_before_stop_commit() {
+        let supervisor = test_supervisor();
+        let process_id = std::process::id();
+        let (old_pty, old_inputs) = recording_pty_session(process_id);
+        install_mock_running_session_with_process_id_and_bracketed_paste_enabled(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            Some(process_id),
+            old_pty,
+        );
+        let caller = supervisor
+            .resolve_pane_caller(TestPaneProcess::new(7011, [process_id]))
+            .unwrap();
+
+        let session_id = test_session_id(&supervisor, "codex");
+        let (_, declared_generation) = supervisor
+            .declare_stop_operation(session_id, None, StopIntentKind::Operator)
+            .unwrap();
+        assert!(
+            supervisor
+                .inner
+                .slots
+                .lock()
+                .get("codex")
+                .unwrap()
+                .running
+                .is_some()
+        );
+        assert!(
+            !supervisor
+                .inner
+                .slots
+                .lock()
+                .get("codex")
+                .unwrap()
+                .running
+                .as_ref()
+                .unwrap()
+                .input_gate
+                .is_accepting(),
+            "lifecycle declaration must close the old run's input gate atomically"
+        );
+
+        let operator_error = supervisor
+            .send_input(SendInputRequest {
+                session_id: test_session_id(&supervisor, "codex"),
+                input: "operator after declaration".into(),
+            })
+            .unwrap_err();
+        assert!(
+            operator_error
+                .to_string()
+                .contains("run is closed for input")
+                || operator_error
+                    .to_string()
+                    .contains("has no active run identity"),
+            "unexpected operator rejection: {operator_error:#}"
+        );
+
+        let route_error = supervisor
+            .route_operator_message(OperatorRouteMessageRequest {
+                recipient_id: session_id,
+                content: "route after declaration".into(),
+            })
+            .unwrap_err();
+        let route_error_chain = format!("{route_error:#}");
+        assert!(
+            route_error_chain.contains("run is closed for input")
+                || route_error_chain.contains("has no active run identity"),
+            "unexpected route rejection: {route_error:#}"
+        );
+
+        let sideband = supervisor.apply_sideband_request(
+            &caller,
+            SidebandRequest::SendInput {
+                name: caller.session.clone(),
+                input: "sideband after declaration".into(),
+            },
+        );
+        assert!(!sideband.ok);
+        assert_eq!(sideband.message, "sideband caller run is stale");
+        assert!(old_inputs.lock().is_empty());
+
+        supervisor
+            .stop_session_at(session_id, declared_generation)
+            .unwrap();
+    }
+
+    #[test]
+    fn in_flight_stop_excludes_concurrent_start_restart_and_second_stop() {
+        let supervisor = test_supervisor();
+        let session_id = test_session_id(&supervisor, "codex");
+        let (kill_entered_tx, kill_entered_rx) = mpsc::sync_channel(1);
+        let (kill_release_tx, kill_release_rx) = mpsc::sync_channel(1);
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            Some(std::process::id()),
+            Box::new(GatedKillPtySession {
+                process_id: std::process::id(),
+                kill_entered: Mutex::new(Some(kill_entered_tx)),
+                kill_release: Mutex::new(kill_release_rx),
+            }),
+        );
+        let (spawner, spawn_specs) =
+            CapturingPtySpawner::new(Vec::<Box<dyn PtySessionTrait>>::new());
+        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+
+        let stop_supervisor = supervisor.clone();
+        let stop_thread = thread::spawn(move || stop_supervisor.stop_session_by_id(session_id));
+        kill_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("stop did not reach gated process-scope termination");
+        let in_flight_probe = slots_mutation_probe(&supervisor);
+
+        let start_supervisor = supervisor.clone();
+        let start = thread::spawn(move || start_supervisor.start_session_by_id(session_id));
+        let restart_supervisor = supervisor.clone();
+        let restart = thread::spawn(move || restart_supervisor.restart_session_by_id(session_id));
+        let second_stop_supervisor = supervisor.clone();
+        let second_stop =
+            thread::spawn(move || second_stop_supervisor.stop_session_by_id(session_id));
+
+        for error in [
+            start.join().unwrap().unwrap_err(),
+            restart.join().unwrap().unwrap_err(),
+            second_stop.join().unwrap().unwrap_err(),
+        ] {
+            assert!(
+                error
+                    .to_string()
+                    .contains("lifecycle operation in progress"),
+                "unexpected concurrent lifecycle error: {error:#}"
+            );
+        }
+        assert_eq!(slots_mutation_probe(&supervisor), in_flight_probe);
+        assert!(
+            spawn_specs.lock().is_empty(),
+            "no replacement spawn may begin while stop proof is in flight"
+        );
+
+        kill_release_tx.send(()).unwrap();
+        let stopped = stop_thread.join().unwrap().unwrap();
+        assert_eq!(stopped.lifecycle_state, LifecycleState::Closed);
+        let slots = supervisor.inner.slots.lock();
+        let slot = slots.get_by_id(session_id).unwrap();
+        assert!(slot.lifecycle_operation.is_none());
+        assert!(!slot.termination_uncertain);
+    }
+
+    #[test]
+    fn restart_crossing_terminal_shutdown_never_spawns_or_leaves_starting_state() {
+        let supervisor = test_supervisor();
+        let session_id = test_session_id(&supervisor, "codex");
+        let (kill_entered_tx, kill_entered_rx) = mpsc::sync_channel(1);
+        let (kill_release_tx, kill_release_rx) = mpsc::sync_channel(1);
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            Some(std::process::id()),
+            Box::new(GatedKillPtySession {
+                process_id: std::process::id(),
+                kill_entered: Mutex::new(Some(kill_entered_tx)),
+                kill_release: Mutex::new(kill_release_rx),
+            }),
+        );
+        let (spawner, spawn_specs) =
+            CapturingPtySpawner::new(Vec::<Box<dyn PtySessionTrait>>::new());
+        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+
+        let restart_supervisor = supervisor.clone();
+        let restart = thread::spawn(move || restart_supervisor.restart_session_by_id(session_id));
+        kill_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("restart stop did not reach gated process-scope termination");
+
+        let shutdown_error = supervisor
+            .shutdown()
+            .expect_err("shutdown must report the in-flight restart reservation");
+        assert!(
+            shutdown_error
+                .to_string()
+                .contains("in-flight lifecycle operation"),
+            "unexpected shutdown error: {shutdown_error:#}"
+        );
+
+        kill_release_tx.send(()).unwrap();
+        let restart_error = restart.join().unwrap().unwrap_err();
+        assert!(
+            format!("{restart_error:#}").contains("supervisor has shut down"),
+            "unexpected restart error: {restart_error:#}"
+        );
+        assert!(
+            spawn_specs.lock().is_empty(),
+            "a restart crossing terminal shutdown must not spawn a replacement"
+        );
+
+        let snapshot = supervisor
+            .snapshot()
+            .sessions
+            .into_iter()
+            .find(|session| session.session_id == session_id)
+            .unwrap();
+        assert_eq!(snapshot.lifecycle_state, LifecycleState::Closed);
+        assert!(!snapshot.running);
+        assert!(snapshot.run_id.is_none());
+        let slots = supervisor.inner.slots.lock();
+        let slot = slots.get_by_id(session_id).unwrap();
+        assert!(slot.lifecycle_operation.is_none());
+        assert!(slot.spawn_in_flight.is_none());
+        assert!(!slot.termination_uncertain);
+        drop(slots);
+
+        supervisor
+            .shutdown()
+            .expect("repeated shutdown must accept the proved closed state");
+    }
+
+    #[test]
+    fn restart_reserves_all_run_events_before_stopping_the_old_process_scope() {
+        let supervisor = test_supervisor();
+        let session_id = test_session_id(&supervisor, "codex");
+        let (pty, _, kill_count) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            None,
+            pty,
+        );
+        supervisor
+            .inner
+            .slots
+            .lock()
+            .get_by_id_mut(session_id)
+            .unwrap()
+            .run_event_sequence = u64::MAX - 4;
+        let before = slots_mutation_probe(&supervisor);
+
+        let error = supervisor
+            .restart_session_by_id(session_id)
+            .expect_err("restart without full event capacity must fail before declaration");
+        assert!(
+            error.to_string().contains("run event sequence exhausted"),
+            "unexpected restart error: {error:#}"
+        );
+        assert_eq!(slots_mutation_probe(&supervisor), before);
+        assert_eq!(kill_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn post_spawn_event_exhaustion_terminates_the_returned_process_scope() {
+        let supervisor = test_supervisor();
+        let session_id = test_session_id(&supervisor, "claude");
+        let (pty, _, kill_count) =
+            mock_pty_session(Some(std::process::id()), MockKillBehavior::Immediate);
+        supervisor.set_pty_spawner_for_tests(Arc::new(QueuePtySpawner::new(vec![pty])));
+        supervisor
+            .inner
+            .slots
+            .lock()
+            .get_by_id_mut(session_id)
+            .unwrap()
+            .run_event_sequence = u64::MAX - 1;
+
+        let error = supervisor
+            .start_session_by_id(session_id)
+            .expect_err("ready-event exhaustion must reject the spawned PTY");
+        assert!(
+            error.to_string().contains("run event sequence exhausted"),
+            "unexpected start error: {error:#}"
+        );
+        assert_eq!(kill_count.load(Ordering::SeqCst), 1);
+        let slots = supervisor.inner.slots.lock();
+        let slot = slots.get_by_id(session_id).unwrap();
+        assert_eq!(slot.state, LifecycleState::Closed);
+        assert!(slot.running.is_none());
+        assert!(slot.spawn_in_flight.is_none());
+        assert!(!slot.termination_uncertain);
+    }
+
+    #[test]
+    fn spawn_error_cleanup_cannot_be_skipped_by_terminal_event_exhaustion() {
+        let supervisor = test_supervisor();
+        let session_id = test_session_id(&supervisor, "claude");
+        let (spawner, spawn_specs) =
+            CapturingPtySpawner::new(Vec::<Box<dyn PtySessionTrait>>::new());
+        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+        supervisor
+            .inner
+            .slots
+            .lock()
+            .get_by_id_mut(session_id)
+            .unwrap()
+            .run_event_sequence = u64::MAX - 1;
+
+        let error = supervisor
+            .start_session_by_id(session_id)
+            .expect_err("injected spawn failure must remain visible");
+        assert!(
+            error.to_string().contains("no queued PTY sessions"),
+            "unexpected spawn error: {error:#}"
+        );
+        assert_eq!(spawn_specs.lock().len(), 1);
+        let slots = supervisor.inner.slots.lock();
+        let slot = slots.get_by_id(session_id).unwrap();
+        assert_eq!(slot.state, LifecycleState::Failed);
+        assert!(slot.running.is_none());
+        assert!(slot.spawn_in_flight.is_none());
+        assert!(!slot.termination_uncertain);
+    }
+
+    #[test]
+    fn run_input_gate_serializes_submissions_in_arrival_order() {
+        let supervisor = test_supervisor();
+        let inputs = Arc::new(Mutex::new(Vec::<String>::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (first_entered_tx, first_entered_rx) = mpsc::sync_channel(1);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            Some(std::process::id()),
+            Box::new(FirstWriteBlockingPtySession {
+                process_id: std::process::id(),
+                inputs: inputs.clone(),
+                calls: calls.clone(),
+                first_entered: first_entered_tx,
+                release: release.clone(),
+            }),
+        );
+        let input_gate = supervisor
+            .inner
+            .slots
+            .lock()
+            .get("codex")
+            .unwrap()
+            .running
+            .as_ref()
+            .unwrap()
+            .input_gate
+            .clone();
+
+        let session_id = test_session_id(&supervisor, "codex");
+        let first_supervisor = supervisor.clone();
+        let first = thread::spawn(move || {
+            first_supervisor.send_input(SendInputRequest {
+                session_id,
+                input: "first".into(),
+            })
+        });
+        first_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first input never reached the PTY");
+
+        let second_supervisor = supervisor.clone();
+        let second = thread::spawn(move || {
+            second_supervisor.send_input(SendInputRequest {
+                session_id,
+                input: "second".into(),
+            })
+        });
+        let second_deadline = Instant::now() + Duration::from_secs(2);
+        while input_gate.queued_writes() < 1 && Instant::now() < second_deadline {
+            thread::yield_now();
+        }
+        assert_eq!(input_gate.queued_writes(), 1);
+
+        let third_supervisor = supervisor.clone();
+        let third = thread::spawn(move || {
+            third_supervisor.send_input(SendInputRequest {
+                session_id,
+                input: "third".into(),
+            })
+        });
+        let third_deadline = Instant::now() + Duration::from_secs(2);
+        while input_gate.queued_writes() < 2 && Instant::now() < third_deadline {
+            thread::yield_now();
+        }
+        assert_eq!(input_gate.queued_writes(), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let (released, ready) = &*release;
+        *released.lock() = true;
+        ready.notify_all();
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+        third.join().unwrap().unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(inputs.lock().as_slice(), &["first", "second", "third"]);
+    }
+
+    #[test]
+    fn route_message_requires_running_recipient() {
+        let supervisor = test_supervisor();
+        let claude_id = test_session_id(&supervisor, "claude");
+        let claude_alias = test_session_alias(&supervisor, "claude");
+
+        let error = supervisor
+            .route_operator_message(OperatorRouteMessageRequest {
+                recipient_id: claude_id,
+                content: "hello".into(),
+            })
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("session '{claude_alias}' is not running"))
+        );
+    }
+
+    #[test]
+    fn send_control_key_rejects_non_running_session() {
+        let supervisor = test_supervisor();
+        let claude_id = test_session_id(&supervisor, "claude");
+        let claude_alias = test_session_alias(&supervisor, "claude");
+
+        let error = supervisor
+            .send_control_key_by_id(claude_id, ControlKey::Enter)
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("session '{claude_alias}' is not running"))
+        );
+    }
+
+    #[test]
+    fn agent_liveness_prunes_dead_inner_child_while_wrapper_pid_lives() {
+        let supervisor = test_supervisor();
+        let codex_alias = test_session_alias(&supervisor, "codex");
+        let events = capture_runtime_events(&supervisor);
+        let wrapper_pid = std::process::id();
+        let (pty, _, _) = mock_pty_session_full(
+            Some(wrapper_pid),
+            None,
+            MockKillBehavior::Immediate,
+            AgentLiveness::Exited {
+                last_agent_pids: vec![4242],
+                live_processes: vec![pty_host::ProcessIdentity {
+                    process_id: wrapper_pid,
+                    image_name: Some("cmd.exe".into()),
+                }],
+            },
+            None,
+        );
+        install_mock_running_session_with_process_id_and_bracketed_paste_enabled(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            Some(wrapper_pid),
+            pty,
+        );
+
+        let snapshot = supervisor.snapshot();
+        let codex = snapshot
+            .sessions
+            .into_iter()
+            .find(|session| session.label == "codex")
+            .unwrap();
+        assert!(!codex.running);
+        assert_eq!(codex.lifecycle_state, LifecycleState::Closed);
+        assert_eq!(codex.process_id, None);
+        assert!(session_exit_events(&events).iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SessionExit {
+                session,
+                process_id: Some(pid),
+                reason: SessionExitReason::ProcessDisappeared,
+                ..
+            } if session == &codex_alias && *pid == wrapper_pid
+        )));
+
+        let error = supervisor
+            .route_operator_message(OperatorRouteMessageRequest {
+                recipient_id: test_session_id(&supervisor, "codex"),
+                content: "hello".into(),
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("session '{codex_alias}' is not running"))
+        );
+    }
+
+    #[test]
+    fn delayed_agent_start_does_not_prune_cmd_only_window() {
+        let supervisor = test_supervisor();
+        let wrapper_pid = std::process::id();
+        let (pty, _, _) = mock_pty_session_full(
+            Some(wrapper_pid),
+            None,
+            MockKillBehavior::Immediate,
+            AgentLiveness::NotYetObserved(vec![pty_host::ProcessIdentity {
+                process_id: wrapper_pid,
+                image_name: Some("cmd.exe".into()),
+            }]),
+            None,
+        );
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            Some(wrapper_pid),
+            pty,
+        );
+
+        let snapshot = supervisor.snapshot();
+        let codex = snapshot
+            .sessions
+            .into_iter()
+            .find(|session| session.label == "codex")
+            .unwrap();
+        assert!(codex.running);
+        assert_eq!(codex.process_id, Some(wrapper_pid));
+    }
+
+    #[test]
+    fn terminal_text_cannot_close_session_without_process_evidence() {
+        let supervisor = test_supervisor();
+        let events = capture_runtime_events(&supervisor);
+        let wrapper_pid = std::process::id();
+        let (pty, _, _) = mock_pty_session_full(
+            Some(wrapper_pid),
+            None,
+            MockKillBehavior::Immediate,
+            AgentLiveness::NotYetObserved(vec![pty_host::ProcessIdentity {
+                process_id: wrapper_pid,
+                image_name: Some("cmd.exe".into()),
+            }]),
+            None,
+        );
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            Some(wrapper_pid),
+            pty,
+        );
+
+        for text in [
+            "codex: command not found",
+            "[process exited with code 1]",
+            "Codex CLI v0.147.0",
+            "Codex CLI v0.147.0",
+            "Codex CLI v0.147.0",
+        ] {
+            handle_current_pty_event(&supervisor, "codex", 0, PtyEvent::Output(text.into()));
+        }
+
+        let snapshot = supervisor.snapshot();
+        let codex = snapshot
+            .sessions
+            .into_iter()
+            .find(|session| session.label == "codex")
+            .unwrap();
+        assert!(codex.running);
+        assert_eq!(codex.lifecycle_state, LifecycleState::Ready);
+        assert!(!work_state_events(&events).iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SessionWorkState {
+                state: WorkState::Exited,
+                ..
+            }
+        )));
+        assert!(session_exit_events(&events).is_empty());
+    }
+
+    #[test]
+    fn snapshot_prunes_exited_running_session() {
+        let supervisor = test_supervisor();
+        install_stale_running_session(&supervisor, "codex");
+
+        let snapshot = supervisor.snapshot();
+        let codex = snapshot
+            .sessions
+            .into_iter()
+            .find(|session| session.label == "codex")
+            .unwrap();
+
+        assert!(!codex.running);
+        assert_eq!(codex.lifecycle_state, LifecycleState::Closed);
+        assert_eq!(codex.process_id, None);
+    }
+
+    #[test]
+    fn send_input_rejects_exited_session_after_liveness_refresh() {
+        let supervisor = test_supervisor();
+        install_stale_running_session(&supervisor, "codex");
+        let codex_alias = test_session_alias(&supervisor, "codex");
+
+        let error = supervisor
+            .send_input(SendInputRequest {
+                session_id: test_session_id(&supervisor, "codex"),
+                input: "hello".into(),
+            })
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("session '{codex_alias}' is not running"))
+        );
+    }
+
+    #[test]
+    fn pane_caller_resolution_requires_one_fully_verified_live_job() {
+        struct Case {
+            members: Vec<u32>,
+            failing_job: Option<u32>,
+            missing_pty: bool,
+            expected_error: &'static str,
+            expected_queries: Vec<u32>,
+        }
+
+        let cases = [
+            Case {
+                members: Vec::new(),
+                failing_job: None,
+                missing_pty: false,
+                expected_error: "is not owned by a live pane",
+                expected_queries: vec![101, 102],
+            },
+            Case {
+                members: vec![101, 102],
+                failing_job: None,
+                missing_pty: false,
+                expected_error: "belongs to multiple live panes",
+                expected_queries: vec![101, 102],
+            },
+            Case {
+                members: vec![101],
+                failing_job: Some(102),
+                missing_pty: false,
+                expected_error: "membership could not be verified",
+                expected_queries: vec![101, 102],
+            },
+            Case {
+                members: vec![101],
+                failing_job: None,
+                missing_pty: true,
+                expected_error: "membership could not be verified",
+                expected_queries: vec![101],
+            },
+        ];
+
+        for case in cases {
+            let supervisor = test_supervisor();
+            let (claude_pty, _) = recording_pty_session(101);
+            install_mock_running_session_with_process_id(
+                &supervisor,
+                "claude",
+                DriverKind::Claude,
+                Some(101),
+                claude_pty,
+            );
+            if case.missing_pty {
+                install_synthetic_running_session(&supervisor, "codex", DriverKind::Codex);
+            } else {
+                let (codex_pty, _) = recording_pty_session(102);
+                install_mock_running_session_with_process_id(
+                    &supervisor,
+                    "codex",
+                    DriverKind::Codex,
+                    Some(102),
+                    codex_pty,
+                );
+            }
+
+            let process = TestPaneProcess::new(7001, case.members);
+            if let Some(process_id) = case.failing_job {
+                process.fail_membership_for(process_id);
+            }
+            let error = supervisor
+                .resolve_pane_caller(process.clone())
+                .err()
+                .expect("ambiguous or unverifiable caller must be rejected");
+
+            assert!(
+                error.to_string().contains(case.expected_error),
+                "unexpected error: {error:#}"
+            );
+            assert_eq!(process.queried_process_ids(), case.expected_queries);
+        }
+    }
+
+    #[test]
+    fn pane_caller_resolution_pins_exact_session_and_generation() {
+        let supervisor = test_supervisor();
+        let (claude_pty, _) = recording_pty_session(101);
+        let (codex_pty, _) = recording_pty_session(102);
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            Some(101),
+            claude_pty,
+        );
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            None,
+            codex_pty,
+        );
+        let process = TestPaneProcess::new(7002, [101]);
+
+        let caller = supervisor.resolve_pane_caller(process.clone()).unwrap();
+
+        assert_eq!(caller.session, test_session_alias(&supervisor, "claude"));
+        assert_eq!(caller.generation, 0);
+        assert_eq!(process.queried_process_ids(), vec![101, 102]);
+    }
+
+    #[test]
+    fn exited_process_is_rejected_before_any_job_query() {
+        let supervisor = test_supervisor();
+        let (claude_pty, _) = recording_pty_session(101);
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            Some(101),
+            claude_pty,
+        );
+        let process = TestPaneProcess::new(7003, [101]);
+        process.exit();
+
+        let error = supervisor
+            .resolve_pane_caller(process.clone())
+            .err()
+            .expect("exited process must be rejected");
+
+        assert!(error.to_string().contains("has exited"));
+        assert!(process.queried_process_ids().is_empty());
+    }
+
+    #[test]
+    fn peer_sideband_actions_reject_before_events_files_or_slot_mutation() {
+        let supervisor = test_supervisor();
+        let events = capture_runtime_events(&supervisor);
+        let (claude_pty, claude_inputs) = recording_pty_session(101);
+        let (codex_pty, codex_inputs) = recording_pty_session(102);
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            Some(101),
+            claude_pty,
+        );
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            Some(102),
+            codex_pty,
+        );
+        arm_test_quiesce_timer(&supervisor, "codex");
+        let caller = supervisor
+            .resolve_pane_caller(TestPaneProcess::new(7004, [101]))
+            .unwrap();
+        let slots_before = slots_mutation_probe(&supervisor);
+        let files_before = runtime_file_manifest(&supervisor);
+
+        for request in [
+            SidebandRequest::SendInput {
+                name: "codex".into(),
+                input: "blocked".into(),
+            },
+            SidebandRequest::SendKey {
+                name: "codex".into(),
+                key: ControlKey::Enter,
+            },
+            SidebandRequest::WaitQuiet {
+                name: "codex".into(),
+                quiet_seconds: 1,
+                timeout_seconds: 1,
+            },
+        ] {
+            let response = supervisor.apply_sideband_request(&caller, request);
+            assert!(!response.ok);
+            assert_eq!(
+                response.message,
+                "sideband request may target only the calling session"
+            );
+            assert!(response.request_id.is_none());
+        }
+
+        assert_eq!(slots_mutation_probe(&supervisor), slots_before);
+        assert_eq!(runtime_file_manifest(&supervisor), files_before);
+        assert!(events.lock().is_empty());
+        assert!(claude_inputs.lock().is_empty());
+        assert!(codex_inputs.lock().is_empty());
+    }
+
+    #[test]
+    fn pane_sideband_allows_only_its_live_run_input_key_and_ping() {
+        let supervisor = test_supervisor();
+        let events = capture_runtime_events(&supervisor);
+        let (claude_pty, inputs) = recording_pty_session(101);
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            Some(101),
+            claude_pty,
+        );
+        let caller = supervisor
+            .resolve_pane_caller(TestPaneProcess::new(7005, [101]))
+            .unwrap();
+
+        let ping = supervisor.apply_sideband_request(&caller, SidebandRequest::Ping {});
+        let input = supervisor.apply_sideband_request(
+            &caller,
+            SidebandRequest::SendInput {
+                name: caller.session.clone(),
+                input: "hello".into(),
+            },
+        );
+        let key = supervisor.apply_sideband_request(
+            &caller,
+            SidebandRequest::SendKey {
+                name: caller.session.clone(),
+                key: ControlKey::Enter,
+            },
+        );
+
+        assert!(ping.ok);
+        assert_eq!(ping.message, "pong");
+        assert!(input.ok);
+        assert!(key.ok);
+        assert!(ping.request_id.is_some());
+        assert!(input.request_id.is_some());
+        assert!(key.request_id.is_some());
+        assert_eq!(&*inputs.lock(), &["hello".to_string(), "\r".to_string()]);
+        let caller_alias = caller.session.clone();
+        let attempts = events
+            .lock()
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::DispatchAttempt {
+                    action,
+                    from,
+                    target_session,
+                    ..
+                } => Some((action.clone(), from.clone(), target_session.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            attempts,
+            vec![
+                ("ping".into(), caller_alias.clone(), caller_alias.clone(),),
+                (
+                    "send_input".into(),
+                    caller_alias.clone(),
+                    caller_alias.clone(),
+                ),
+                (
+                    "send_key".into(),
+                    caller_alias.clone(),
+                    caller_alias.clone()
+                ),
+            ]
+        );
+        let audit = fs::read_to_string(supervisor.audit_log_path()).unwrap();
+        assert!(audit.contains("\"event\":\"dispatch_attempt\""));
+        assert!(audit.contains(&format!("\"from\":\"{caller_alias}\"")));
+        assert!(!audit.contains("hello"));
+    }
+
+    #[test]
+    fn pane_sideband_revalidates_caller_before_dispatch_metadata_or_ping() {
+        let supervisor = test_supervisor();
+        let events = capture_runtime_events(&supervisor);
+        let (old_pty, _) = recording_pty_session(101);
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            Some(101),
+            old_pty,
+        );
+        let caller = supervisor
+            .resolve_pane_caller(TestPaneProcess::new(7020, [101]))
+            .unwrap();
+        let audit_before = fs::read(supervisor.audit_log_path()).unwrap_or_default();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        *supervisor.inner.sideband_after_initial_authorization.lock() = Some(Box::new(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }));
+
+        let request_supervisor = supervisor.clone();
+        let request_thread = thread::spawn(move || {
+            request_supervisor.apply_sideband_request(&caller, SidebandRequest::Ping {})
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("sideband request did not reach the authorization barrier");
+        let (replacement_pty, replacement_inputs) = recording_pty_session(101);
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_mut("claude").unwrap();
+            slot.session_id = Uuid::new_v4();
+            let replacement_run_id = Uuid::new_v4();
+            slot.run_id = Some(replacement_run_id);
+            slot.last_run_id = Some(replacement_run_id);
+            slot.running = Some(RunningSession::new(Some(Arc::from(replacement_pty))));
+        }
+        let slots_after_replacement = slots_mutation_probe(&supervisor);
+        release_tx.send(()).unwrap();
+
+        let response = request_thread.join().unwrap();
+        assert!(!response.ok);
+        assert_eq!(response.message, "sideband caller run is stale");
+        assert!(response.request_id.is_none());
+        assert!(replacement_inputs.lock().is_empty());
+        assert_eq!(slots_mutation_probe(&supervisor), slots_after_replacement);
+        assert!(events.lock().is_empty());
+        assert_eq!(
+            fs::read(supervisor.audit_log_path()).unwrap_or_default(),
+            audit_before
+        );
+    }
+
+    #[test]
+    fn pane_wait_quiet_is_server_bounded_and_rejects_before_dispatch() {
+        let supervisor = test_supervisor();
+        let events = capture_runtime_events(&supervisor);
+        let (pty, _) = recording_pty_session(101);
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            Some(101),
+            pty,
+        );
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            slots.get_mut("claude").unwrap().last_real_output_at =
+                Some(Instant::now() - Duration::from_secs(61));
+        }
+        let caller = supervisor
+            .resolve_pane_caller(TestPaneProcess::new(7021, [101]))
+            .unwrap();
+
+        let at_limit = supervisor.apply_sideband_request(
+            &caller,
+            SidebandRequest::WaitQuiet {
+                name: caller.session.clone(),
+                quiet_seconds: SIDEBAND_WAIT_QUIET_MAX_QUIET_SECONDS,
+                timeout_seconds: SIDEBAND_WAIT_QUIET_MAX_TIMEOUT_SECONDS,
+            },
+        );
+        assert!(at_limit.ok, "maximum bounded wait should be admitted");
+        events.lock().clear();
+        let audit_before_invalid = fs::read(supervisor.audit_log_path()).unwrap_or_default();
+        let slots_before_invalid = slots_mutation_probe(&supervisor);
+
+        let invalid_cases = [
+            (
+                0,
+                1,
+                format!(
+                    "wait_quiet quiet_seconds must be between 1 and {SIDEBAND_WAIT_QUIET_MAX_QUIET_SECONDS}"
+                ),
+            ),
+            (
+                SIDEBAND_WAIT_QUIET_MAX_QUIET_SECONDS + 1,
+                SIDEBAND_WAIT_QUIET_MAX_TIMEOUT_SECONDS,
+                format!(
+                    "wait_quiet quiet_seconds must be between 1 and {SIDEBAND_WAIT_QUIET_MAX_QUIET_SECONDS}"
+                ),
+            ),
+            (
+                1,
+                SIDEBAND_WAIT_QUIET_MAX_TIMEOUT_SECONDS + 1,
+                format!(
+                    "wait_quiet timeout_seconds must be between 1 and {SIDEBAND_WAIT_QUIET_MAX_TIMEOUT_SECONDS}"
+                ),
+            ),
+            (
+                2,
+                1,
+                "wait_quiet quiet_seconds must not exceed timeout_seconds".into(),
+            ),
+        ];
+        for (quiet_seconds, timeout_seconds, expected_error) in invalid_cases {
+            let response = supervisor.apply_sideband_request(
+                &caller,
+                SidebandRequest::WaitQuiet {
+                    name: caller.session.clone(),
+                    quiet_seconds,
+                    timeout_seconds,
+                },
+            );
+            assert!(!response.ok);
+            assert_eq!(response.message, expected_error);
+            assert!(response.request_id.is_none());
+        }
+
+        assert!(events.lock().is_empty());
+        assert_eq!(slots_mutation_probe(&supervisor), slots_before_invalid);
+        assert_eq!(
+            fs::read(supervisor.audit_log_path()).unwrap_or_default(),
+            audit_before_invalid
+        );
+    }
+
+    #[test]
+    fn pane_sideband_revalidates_generation_immediately_before_pty_write() {
+        let supervisor = test_supervisor();
+        let (old_pty, _) = recording_pty_session(101);
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            Some(101),
+            old_pty,
+        );
+        let process = TestPaneProcess::new(7006, [101]);
+        let caller = supervisor.resolve_pane_caller(process).unwrap();
+        let (replacement_pty, replacement_inputs) = recording_pty_session(101);
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_mut("claude").unwrap();
+            slot.generation = slot.generation.checked_add(1).unwrap();
+            slot.running = Some(RunningSession::new(Some(Arc::from(replacement_pty))));
+            let replacement_run_id = Uuid::new_v4();
+            slot.run_id = Some(replacement_run_id);
+            slot.last_run_id = Some(replacement_run_id);
+        }
+        let slots_before = slots_mutation_probe(&supervisor);
+
+        let response = supervisor.apply_sideband_request(
+            &caller,
+            SidebandRequest::SendInput {
+                name: caller.session.clone(),
+                input: "must not reach replacement".into(),
+            },
+        );
+
+        assert!(!response.ok);
+        assert_eq!(response.message, "sideband caller run is stale");
+        assert!(response.request_id.is_none());
+        assert!(replacement_inputs.lock().is_empty());
+        assert_eq!(slots_mutation_probe(&supervisor), slots_before);
+    }
+
+    #[test]
+    fn pane_sideband_revalidates_its_run_gate_after_lifecycle_wins() {
+        let supervisor = test_supervisor();
+        let (old_pty, old_inputs) = recording_pty_session(101);
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            Some(101),
+            old_pty,
+        );
+        let caller = supervisor
+            .resolve_pane_caller(TestPaneProcess::new(7010, [101]))
+            .unwrap();
+        let (replacement_pty, replacement_inputs) = recording_pty_session(102);
+        supervisor.set_pty_spawner_for_tests(Arc::new(QueuePtySpawner::new(vec![replacement_pty])));
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        supervisor.set_run_input_before_commit_for_tests(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        let input_supervisor = supervisor.clone();
+        let input_thread = thread::spawn(move || {
+            input_supervisor.apply_sideband_request(
+                &caller,
+                SidebandRequest::SendInput {
+                    name: caller.session.clone(),
+                    input: "must not cross lifecycle".into(),
+                },
+            )
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("sideband input never reached the run-input commit barrier");
+
+        let replacement = restart_test_session(&supervisor, "claude").unwrap();
+        assert_eq!(replacement.lifecycle_state, LifecycleState::Ready);
+        release_tx.send(()).unwrap();
+
+        let response = input_thread.join().unwrap();
+        assert!(!response.ok);
+        assert!(old_inputs.lock().is_empty());
+        assert!(replacement_inputs.lock().is_empty());
+    }
+
+    #[test]
+    fn pane_sideband_revalidates_process_liveness_immediately_before_pty_write() {
+        let supervisor = test_supervisor();
+        let (pty, inputs) = recording_pty_session(101);
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            Some(101),
+            pty,
+        );
+        let process = TestPaneProcess::new(7007, [101]);
+        let caller = supervisor.resolve_pane_caller(process.clone()).unwrap();
+        process.exit();
+        let slots_before = slots_mutation_probe(&supervisor);
+
+        let response = supervisor.apply_sideband_request(
+            &caller,
+            SidebandRequest::SendInput {
+                name: caller.session.clone(),
+                input: "must not be written".into(),
+            },
+        );
+
+        assert!(!response.ok);
+        assert!(response.message.contains("has exited"));
+        assert!(response.request_id.is_none());
+        assert!(inputs.lock().is_empty());
+        assert_eq!(slots_mutation_probe(&supervisor), slots_before);
+    }
+
+    #[test]
+    fn wait_quiet_revalidates_caller_while_waiting() {
+        let supervisor = test_supervisor();
+        let (pty, _) = recording_pty_session(101);
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            Some(101),
+            pty,
+        );
+        supervisor
+            .inner
+            .slots
+            .lock()
+            .get_mut("claude")
+            .unwrap()
+            .last_real_output_at = Some(Instant::now());
+        let process = TestPaneProcess::new(7008, [101]);
+        let caller = supervisor.resolve_pane_caller(process.clone()).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
             .enable_time()
             .build()
             .unwrap();
 
         let response = runtime.block_on(async {
-            let (client, server) = tokio::io::duplex(4096);
             let handle = supervisor.clone();
-            let request_payload = format!(
-                "{}\n",
-                encode_request(&SidebandRequest::Ping {
-                    token: status.token.clone(),
-                })
-                .unwrap()
-            );
-
-            let server_task = tokio::spawn(async move {
-                handle_sideband_stream(handle, server).await.unwrap();
+            let wait_caller = caller.clone();
+            let task = tokio::spawn(async move {
+                handle
+                    .apply_sideband_request_async(
+                        &wait_caller,
+                        SidebandRequest::WaitQuiet {
+                            name: wait_caller.session.clone(),
+                            quiet_seconds: 1,
+                            timeout_seconds: 2,
+                        },
+                    )
+                    .await
             });
-
-            let (read_half, mut write_half) = tokio::io::split(client);
-            write_half
-                .write_all(request_payload.as_bytes())
-                .await
-                .unwrap();
-            write_half.flush().await.unwrap();
-
-            let mut reader = BufReader::new(read_half);
-            let mut line = String::new();
-            reader.read_line(&mut line).await.unwrap();
-            server_task.await.unwrap();
-
-            decode_response(line.trim()).unwrap()
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            process.exit();
+            task.await.unwrap()
         });
 
-        assert!(response.ok);
-        assert_eq!(response.message, "pong");
-
-        let lifecycle_events = events
-            .lock()
-            .iter()
-            .filter_map(|event| match event {
-                RuntimeEvent::SidebandRequestLifecycle {
-                    request_id,
-                    action,
-                    phase,
-                    ..
-                } => Some((request_id.clone(), action.clone(), *phase)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(lifecycle_events.len(), 2);
-        assert_eq!(lifecycle_events[0].1, "ping");
-        assert_eq!(lifecycle_events[0].2, SidebandPhase::Started);
-        assert_eq!(lifecycle_events[1].2, SidebandPhase::Completed);
-        assert_eq!(lifecycle_events[0].0, lifecycle_events[1].0);
+        assert!(!response.ok);
+        assert!(!response.timed_out);
+        assert!(response.message.contains("has exited"));
     }
 
     #[test]
-    fn sideband_pipe_rejects_malformed_payload_without_slot_mutation() {
+    fn sideband_write_timeout_falls_back_to_terminating_only_the_exact_run() {
         let supervisor = test_supervisor();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let writes_started = Arc::new(AtomicUsize::new(0));
+        let writes_finished = Arc::new(AtomicUsize::new(0));
+        let timed_out_inputs = Arc::new(Mutex::new(Vec::new()));
+        let cancel_count = Arc::new(AtomicUsize::new(0));
+        let kill_count = Arc::new(AtomicUsize::new(0));
+        let rescue_fired = Arc::new(AtomicBool::new(false));
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            None,
+            Box::new(TimedOutWritePtySession {
+                process_id: 101,
+                entered: Mutex::new(Some(entered_tx)),
+                release: release.clone(),
+                writes_started: writes_started.clone(),
+                writes_finished: writes_finished.clone(),
+                inputs: timed_out_inputs.clone(),
+                cancel_supported: false,
+                cancel_count: cancel_count.clone(),
+                kill_count: kill_count.clone(),
+                first_write_error_bytes: 0,
+            }),
+        );
+        let (codex_pty, codex_inputs) = recording_pty_session(102);
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            None,
+            codex_pty,
+        );
+        let caller = supervisor
+            .resolve_pane_caller(TestPaneProcess::new(7012, [101]))
+            .unwrap();
+        supervisor.set_sideband_write_timeout_for_tests(Duration::from_millis(50));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_time()
+            .build()
+            .unwrap();
+        let started_at = Instant::now();
+        let rescue_release = release.clone();
+        let rescue_flag = rescue_fired.clone();
+        let (disarm_rescue_tx, disarm_rescue_rx) = mpsc::channel();
+        let rescue = thread::spawn(move || {
+            if disarm_rescue_rx
+                .recv_timeout(Duration::from_secs(3))
+                .is_ok()
+            {
+                return;
+            }
+            let (released, ready) = &*rescue_release;
+            let mut released = released.lock();
+            if !*released {
+                rescue_flag.store(true, Ordering::SeqCst);
+                *released = true;
+                ready.notify_all();
+            }
+        });
+
+        let response = runtime.block_on(async {
+            let request_supervisor = supervisor.clone();
+            let request_caller = caller.clone();
+            let request = tokio::spawn(async move {
+                request_supervisor
+                    .apply_sideband_request_async(
+                        &request_caller,
+                        SidebandRequest::SendInput {
+                            name: request_caller.session.clone(),
+                            input: "must time out".into(),
+                        },
+                    )
+                    .await
+            });
+            tokio::task::spawn_blocking(move || {
+                entered_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("sideband write never entered the blocking PTY")
+            })
+            .await
+            .unwrap();
+
+            supervisor
+                .send_input(SendInputRequest {
+                    session_id: test_session_id(&supervisor, "codex"),
+                    input: "other run remains writable".into(),
+                })
+                .expect("unrelated run was blocked by the timed-out write");
+            request.await.unwrap()
+        });
+        let _ = disarm_rescue_tx.send(());
+
+        assert!(!response.ok);
+        assert!(response.timed_out);
+        assert!(response.message.contains("timed out after 50ms"));
+        assert!(
+            response
+                .message
+                .contains("isolated input cancellation failed"),
+            "{}",
+            response.message
+        );
+        assert!(
+            response
+                .message
+                .contains("exact run terminated as cancellation fallback"),
+            "{}",
+            response.message
+        );
+        assert!(started_at.elapsed() < Duration::from_secs(2));
+        assert_eq!(writes_started.load(Ordering::SeqCst), 1);
+        assert_eq!(writes_finished.load(Ordering::SeqCst), 1);
+        assert_eq!(cancel_count.load(Ordering::SeqCst), 1);
+        assert_eq!(kill_count.load(Ordering::SeqCst), 1);
+        rescue.join().unwrap();
+        assert!(!rescue_fired.load(Ordering::SeqCst));
+        assert_eq!(
+            &*codex_inputs.lock(),
+            &["other run remains writable".to_string()]
+        );
+
+        let claude = supervisor
+            .inner
+            .slots
+            .lock()
+            .get("claude")
+            .unwrap()
+            .snapshot();
+        assert!(!claude.running);
+        assert_eq!(claude.lifecycle_state, LifecycleState::Closed);
+        assert_eq!(claude.run_id, None);
+        let final_started = writes_started.load(Ordering::SeqCst);
+        let final_finished = writes_finished.load(Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(writes_started.load(Ordering::SeqCst), final_started);
+        assert_eq!(writes_finished.load(Ordering::SeqCst), final_finished);
+    }
+
+    #[test]
+    fn sideband_write_timeout_cancels_input_and_preserves_the_live_conversation() {
+        let supervisor = test_supervisor();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let writes_started = Arc::new(AtomicUsize::new(0));
+        let writes_finished = Arc::new(AtomicUsize::new(0));
+        let inputs = Arc::new(Mutex::new(Vec::new()));
+        let cancel_count = Arc::new(AtomicUsize::new(0));
+        let kill_count = Arc::new(AtomicUsize::new(0));
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            None,
+            Box::new(TimedOutWritePtySession {
+                process_id: 101,
+                entered: Mutex::new(Some(entered_tx)),
+                release,
+                writes_started: writes_started.clone(),
+                writes_finished: writes_finished.clone(),
+                inputs: inputs.clone(),
+                cancel_supported: true,
+                cancel_count: cancel_count.clone(),
+                kill_count: kill_count.clone(),
+                first_write_error_bytes: 4,
+            }),
+        );
+        let caller = supervisor
+            .resolve_pane_caller(TestPaneProcess::new(7013, [101]))
+            .unwrap();
+        let original_snapshot = supervisor
+            .inner
+            .slots
+            .lock()
+            .get("claude")
+            .unwrap()
+            .snapshot();
+        supervisor.set_sideband_write_timeout_for_tests(Duration::from_millis(50));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_time()
+            .build()
+            .unwrap();
+
+        let response = runtime.block_on(async {
+            let request_supervisor = supervisor.clone();
+            let request_caller = caller.clone();
+            let request = tokio::spawn(async move {
+                request_supervisor
+                    .apply_sideband_request_async(
+                        &request_caller,
+                        SidebandRequest::SendInput {
+                            name: request_caller.session.clone(),
+                            input: "partial timed write".into(),
+                        },
+                    )
+                    .await
+            });
+            tokio::task::spawn_blocking(move || {
+                entered_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("sideband write never entered the blocking PTY")
+            })
+            .await
+            .unwrap();
+            request.await.unwrap()
+        });
+
+        assert!(!response.ok);
+        assert!(response.timed_out);
+        assert!(
+            response.message.contains("run preserved"),
+            "{}",
+            response.message
+        );
+        assert!(
+            response
+                .message
+                .contains("4 bytes reached the PTY before cancellation"),
+            "{}",
+            response.message
+        );
+        assert_eq!(cancel_count.load(Ordering::SeqCst), 1);
+        assert_eq!(kill_count.load(Ordering::SeqCst), 0);
+        assert_eq!(writes_started.load(Ordering::SeqCst), 1);
+        assert_eq!(writes_finished.load(Ordering::SeqCst), 1);
+        let after_timeout = supervisor
+            .inner
+            .slots
+            .lock()
+            .get("claude")
+            .unwrap()
+            .snapshot();
+        assert_eq!(after_timeout.session_id, original_snapshot.session_id);
+        assert_eq!(after_timeout.run_id, original_snapshot.run_id);
+        assert_eq!(after_timeout.generation, original_snapshot.generation);
+        assert!(after_timeout.running);
+
+        let second = runtime.block_on(supervisor.apply_sideband_request_async(
+            &caller,
+            SidebandRequest::SendInput {
+                name: caller.session.clone(),
+                input: "conversation continues".into(),
+            },
+        ));
+        assert!(second.ok, "{}", second.message);
+        assert!(!second.timed_out);
+        assert_eq!(writes_started.load(Ordering::SeqCst), 2);
+        assert_eq!(writes_finished.load(Ordering::SeqCst), 2);
+        assert_eq!(kill_count.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            &*inputs.lock(),
+            &[
+                "partial timed write".to_string(),
+                "conversation continues".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn timeout_cancellation_barrier_prevents_a_late_cancel_from_hitting_the_next_write() {
+        let supervisor = test_supervisor();
+        let (first_entered_tx, first_entered_rx) = mpsc::sync_channel(1);
+        let (second_entered_tx, second_entered_rx) = mpsc::sync_channel(1);
+        let (cancel_entered_tx, cancel_entered_rx) = mpsc::sync_channel(1);
+        let first_release = Arc::new((Mutex::new(false), Condvar::new()));
+        let cancel_release = Arc::new((Mutex::new(false), Condvar::new()));
+        let inputs = Arc::new(Mutex::new(Vec::new()));
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            None,
+            Box::new(DelayedCancelPtySession {
+                process_id: 101,
+                calls: AtomicUsize::new(0),
+                inputs: inputs.clone(),
+                first_entered: first_entered_tx,
+                first_release: first_release.clone(),
+                second_entered: Mutex::new(Some(second_entered_tx)),
+                cancel_entered: Mutex::new(Some(cancel_entered_tx)),
+                cancel_release: cancel_release.clone(),
+            }),
+        );
+        let caller = supervisor
+            .resolve_pane_caller(TestPaneProcess::new(7014, [101]))
+            .unwrap();
+        supervisor.set_sideband_write_timeout_for_tests(Duration::from_millis(50));
+
+        let timed_supervisor = supervisor.clone();
+        let timed_caller = caller.clone();
+        let timed_request = thread::spawn(move || {
+            timed_supervisor.apply_sideband_request(
+                &timed_caller,
+                SidebandRequest::SendInput {
+                    name: timed_caller.session.clone(),
+                    input: "first completes late".into(),
+                },
+            )
+        });
+        first_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first write did not enter");
+        cancel_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("isolated cancellation did not enter");
+
+        let successor_session_id = test_session_id(&supervisor, "claude");
+        let successor_supervisor = supervisor.clone();
+        let successor = thread::spawn(move || {
+            successor_supervisor.send_input(SendInputRequest {
+                session_id: successor_session_id,
+                input: "successor write".into(),
+            })
+        });
+        {
+            let (released, ready) = &*first_release;
+            *released.lock() = true;
+            ready.notify_all();
+        }
+        assert!(
+            second_entered_rx
+                .recv_timeout(Duration::from_millis(150))
+                .is_err(),
+            "successor entered PTY input before the late cancellation completed"
+        );
+
+        {
+            let (released, ready) = &*cancel_release;
+            *released.lock() = true;
+            ready.notify_all();
+        }
+        let timed_response = timed_request.join().unwrap();
+        successor.join().unwrap().unwrap();
+        second_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("successor did not resume after cancellation barrier cleared");
+
+        assert!(timed_response.ok, "{}", timed_response.message);
+        assert!(timed_response.timed_out);
+        assert!(
+            timed_response.message.contains("completed after the 50ms"),
+            "{}",
+            timed_response.message
+        );
+        assert_eq!(
+            &*inputs.lock(),
+            &[
+                "first completes late".to_string(),
+                "successor write".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn queued_timeout_cannot_clear_an_older_inflight_cancellation_barrier() {
+        let supervisor = test_supervisor();
+        let (first_entered_tx, first_entered_rx) = mpsc::sync_channel(1);
+        let (successor_entered_tx, successor_entered_rx) = mpsc::sync_channel(1);
+        let (cancel_entered_tx, cancel_entered_rx) = mpsc::sync_channel(1);
+        let first_release = Arc::new((Mutex::new(false), Condvar::new()));
+        let cancel_release = Arc::new((Mutex::new(false), Condvar::new()));
+        let inputs = Arc::new(Mutex::new(Vec::new()));
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            None,
+            Box::new(DelayedCancelPtySession {
+                process_id: 101,
+                calls: AtomicUsize::new(0),
+                inputs: inputs.clone(),
+                first_entered: first_entered_tx,
+                first_release: first_release.clone(),
+                second_entered: Mutex::new(Some(successor_entered_tx)),
+                cancel_entered: Mutex::new(Some(cancel_entered_tx)),
+                cancel_release: cancel_release.clone(),
+            }),
+        );
+        let caller = supervisor
+            .resolve_pane_caller(TestPaneProcess::new(7016, [101]))
+            .unwrap();
+        supervisor.set_sideband_write_timeout_for_tests(Duration::from_millis(25));
+        let input_gate = supervisor
+            .inner
+            .slots
+            .lock()
+            .get("claude")
+            .unwrap()
+            .running
+            .as_ref()
+            .unwrap()
+            .input_gate
+            .clone();
+
+        let first_supervisor = supervisor.clone();
+        let first_caller = caller.clone();
+        let first = thread::spawn(move || {
+            first_supervisor.apply_sideband_request(
+                &first_caller,
+                SidebandRequest::SendInput {
+                    name: first_caller.session.clone(),
+                    input: "inflight A".into(),
+                },
+            )
+        });
+        first_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("inflight writer A did not enter");
+        cancel_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("A cancellation did not enter");
+
+        let queued_supervisor = supervisor.clone();
+        let queued_caller = caller.clone();
+        let queued = thread::spawn(move || {
+            queued_supervisor.apply_sideband_request(
+                &queued_caller,
+                SidebandRequest::SendInput {
+                    name: queued_caller.session.clone(),
+                    input: "queued timeout B".into(),
+                },
+            )
+        });
+        let queued_deadline = Instant::now() + Duration::from_secs(2);
+        while input_gate.queued_writes() < 1 && Instant::now() < queued_deadline {
+            thread::yield_now();
+        }
+        assert_eq!(input_gate.queued_writes(), 1);
+
+        {
+            let (released, ready) = &*first_release;
+            *released.lock() = true;
+            ready.notify_all();
+        }
+        let queued_response = queued.join().unwrap();
+        assert!(!queued_response.ok);
+        assert!(queued_response.timed_out);
+        assert!(
+            queued_response
+                .message
+                .contains("cancelled before PTY input began"),
+            "{}",
+            queued_response.message
+        );
+
+        let successor_session_id = test_session_id(&supervisor, "claude");
+        let successor_supervisor = supervisor.clone();
+        let successor = thread::spawn(move || {
+            successor_supervisor.send_input(SendInputRequest {
+                session_id: successor_session_id,
+                input: "successor C".into(),
+            })
+        });
+        assert!(
+            successor_entered_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "queued timeout B cleared A's still-owned cancellation barrier"
+        );
+
+        {
+            let (released, ready) = &*cancel_release;
+            *released.lock() = true;
+            ready.notify_all();
+        }
+        let first_response = first.join().unwrap();
+        assert!(first_response.ok);
+        assert!(first_response.timed_out);
+        successor.join().unwrap().unwrap();
+        successor_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("successor C did not enter after A released its barrier");
+        assert_eq!(
+            &*inputs.lock(),
+            &["inflight A".to_string(), "successor C".to_string()]
+        );
+    }
+
+    #[test]
+    fn queued_sideband_timeout_never_enters_the_pty_or_cancels_the_active_writer() {
+        let supervisor = test_supervisor();
+        let inputs = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (first_entered_tx, first_entered_rx) = mpsc::sync_channel(1);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            None,
+            Box::new(FirstWriteBlockingPtySession {
+                process_id: 101,
+                inputs: inputs.clone(),
+                calls: calls.clone(),
+                first_entered: first_entered_tx,
+                release: release.clone(),
+            }),
+        );
+        let caller = supervisor
+            .resolve_pane_caller(TestPaneProcess::new(7015, [101]))
+            .unwrap();
+        supervisor.set_sideband_write_timeout_for_tests(Duration::from_millis(50));
+
+        let active_session_id = test_session_id(&supervisor, "claude");
+        let active_supervisor = supervisor.clone();
+        let active_write = thread::spawn(move || {
+            active_supervisor.send_input(SendInputRequest {
+                session_id: active_session_id,
+                input: "active operator write".into(),
+            })
+        });
+        first_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("active writer did not enter the PTY");
+
+        let response = supervisor.apply_sideband_request(
+            &caller,
+            SidebandRequest::SendInput {
+                name: caller.session.clone(),
+                input: "must never reach PTY".into(),
+            },
+        );
+        assert!(!response.ok);
+        assert!(response.timed_out);
+        assert!(
+            response
+                .message
+                .contains("cancelled before PTY input began"),
+            "{}",
+            response.message
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(&*inputs.lock(), &["active operator write".to_string()]);
+
+        {
+            let (released, ready) = &*release;
+            *released.lock() = true;
+            ready.notify_all();
+        }
+        active_write.join().unwrap().unwrap();
+
+        let continued = supervisor.apply_sideband_request(
+            &caller,
+            SidebandRequest::SendInput {
+                name: caller.session.clone(),
+                input: "conversation still writable".into(),
+            },
+        );
+        assert!(continued.ok, "{}", continued.message);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            &*inputs.lock(),
+            &[
+                "active operator write".to_string(),
+                "conversation still writable".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn sideband_stream_rejects_malformed_payload_without_mutation() {
+        let supervisor = test_supervisor();
+        let (pty, _) = recording_pty_session(101);
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            Some(101),
+            pty,
+        );
+        let caller = supervisor
+            .resolve_pane_caller(TestPaneProcess::new(7009, [101]))
+            .unwrap();
         let slots_before = slots_mutation_probe(&supervisor);
+        let files_before = runtime_file_manifest(&supervisor);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
             .enable_time()
@@ -11124,10 +13317,9 @@ mod tests {
             let (mut client, server) = tokio::io::duplex(4096);
             let handle = supervisor.clone();
             let server_task =
-                tokio::spawn(async move { handle_sideband_stream(handle, server).await });
+                tokio::spawn(async move { handle_sideband_stream(handle, caller, server).await });
             client.write_all(b"{not json}\n").await.unwrap();
             client.flush().await.unwrap();
-
             tokio::time::timeout(Duration::from_secs(1), server_task)
                 .await
                 .unwrap()
@@ -11137,10 +13329,11 @@ mod tests {
 
         assert!(error.to_string().contains("invalid sideband payload"));
         assert_eq!(slots_mutation_probe(&supervisor), slots_before);
+        assert_eq!(runtime_file_manifest(&supervisor), files_before);
     }
 
     #[test]
-    fn sideband_frame_reader_enforces_size_termination_utf8_and_deadline() {
+    fn sideband_frame_reader_enforces_boundaries_and_deadline() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
             .enable_time()
@@ -11216,9 +13409,19 @@ mod tests {
     }
 
     #[test]
-    fn sideband_stream_admits_required_payload_sizes_before_authorization() {
+    fn sideband_stream_admits_required_payload_sizes() {
         let supervisor = test_supervisor();
-        supervisor.start_control_plane().unwrap();
+        let (pty, inputs) = recording_pty_session(101);
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            Some(101),
+            pty,
+        );
+        let caller = supervisor
+            .resolve_pane_caller(TestPaneProcess::new(7010, [101]))
+            .unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
             .enable_time()
@@ -11226,30 +13429,28 @@ mod tests {
             .unwrap();
 
         runtime.block_on(async {
-            let payloads = [
+            for content in [
                 "x".repeat(1024),
                 "x".repeat(64 * 1024),
                 "x".repeat(1024 * 1024),
                 "\0".repeat(1024 * 1024),
-            ];
-            for content in payloads {
+            ] {
                 let request_payload = format!(
                     "{}\n",
-                    encode_request(&SidebandRequest::DeliverMessage {
-                        token: "forged-token".into(),
-                        name: "claude".into(),
-                        content,
-                        require_idle: false,
+                    encode_request(&SidebandRequest::SendInput {
+                        name: caller.session.clone(),
+                        input: content.clone(),
                     })
                     .unwrap()
                 );
                 assert!(request_payload.len() <= SIDEBAND_FRAME_MAX_BYTES);
 
-                let capacity = 16 * 1024;
-                let (client, server) = tokio::io::duplex(capacity);
+                let (client, server) = tokio::io::duplex(16 * 1024);
                 let handle = supervisor.clone();
-                let server_task =
-                    tokio::spawn(async move { handle_sideband_stream(handle, server).await });
+                let request_caller = caller.clone();
+                let server_task = tokio::spawn(async move {
+                    handle_sideband_stream(handle, request_caller, server).await
+                });
                 let (read_half, mut write_half) = tokio::io::split(client);
                 let writer = tokio::spawn(async move {
                     write_half
@@ -11258,7 +13459,6 @@ mod tests {
                         .unwrap();
                     write_half.flush().await.unwrap();
                 });
-
                 let mut response_reader = BufReader::new(read_half);
                 let mut response_line = String::new();
                 response_reader.read_line(&mut response_line).await.unwrap();
@@ -11266,9 +13466,8 @@ mod tests {
                 server_task.await.unwrap().unwrap();
 
                 let response = decode_response(response_line.trim()).unwrap();
-                assert!(!response.ok);
-                assert_eq!(response.message, "invalid control plane token");
-                assert!(response.snapshot.is_none());
+                assert!(response.ok, "unexpected response: {response:?}");
+                assert_eq!(inputs.lock().pop(), Some(content));
             }
         });
     }
@@ -11309,1382 +13508,3333 @@ mod tests {
     }
 
     #[test]
-    fn sideband_send_input_emits_request_ack_and_response_request_id() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let events = Arc::new(Mutex::new(Vec::<RuntimeEvent>::new()));
-        let captured = events.clone();
-        supervisor.set_event_sink(move |event| {
-            captured.lock().push(event);
-        });
-        let (pty, _, _) = reacting_pty_session(&supervisor, "codex", "Working 1s");
-        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
+    fn supervisor_startup_removes_legacy_bearer_artifacts_only() {
+        let root = tempfile::tempdir().expect("create legacy cleanup root");
+        let runtime_dir = root.path().join("runtime");
+        let legacy_mailbox = runtime_dir.join("sideband");
+        fs::create_dir_all(&legacy_mailbox).expect("create legacy mailbox");
+        fs::write(legacy_mailbox.join("master-token"), b"legacy bearer")
+            .expect("write legacy mailbox bearer");
+        fs::write(
+            runtime_dir.join("control-plane.json"),
+            b"legacy master bearer",
+        )
+        .expect("write legacy master control-plane file");
+        fs::write(
+            runtime_dir.join("control-plane-claude.json"),
+            b"legacy pane bearer",
+        )
+        .expect("write legacy pane control-plane file");
+        fs::write(runtime_dir.join("keep.txt"), b"unrelated")
+            .expect("write unrelated runtime file");
 
-        let response = supervisor.apply_sideband_request(SidebandRequest::SendInput {
-            token: status.token,
-            name: "codex".into(),
-            input: "/fast".into(),
-            require_idle: false,
-        });
+        let supervisor = test_supervisor_with_root(root.path().to_path_buf());
 
-        assert!(response.ok, "got: {}", response.message);
-        let response_request_id = response.request_id.as_deref().unwrap();
-
-        let events = events.lock();
-        let ack_events = events
-            .iter()
-            .filter_map(|event| match event {
-                RuntimeEvent::RequestAck {
-                    request_id,
-                    session,
-                    action,
-                    bytes_written,
-                    ..
-                } => Some((
-                    request_id.as_str(),
-                    session.as_str(),
-                    action.as_str(),
-                    *bytes_written,
-                )),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let timeout_count = events
-            .iter()
-            .filter(|event| matches!(event, RuntimeEvent::RequestAckTimeout { .. }))
-            .count();
-
-        assert_eq!(ack_events.len(), 1);
-        assert_eq!(timeout_count, 0);
+        assert!(!legacy_mailbox.exists());
+        assert!(!runtime_dir.join("control-plane.json").exists());
+        assert!(!runtime_dir.join("control-plane-claude.json").exists());
         assert_eq!(
-            ack_events[0],
-            (response_request_id, "codex", "send_input", 5)
+            fs::read(runtime_dir.join("keep.txt")).expect("read unrelated runtime file"),
+            b"unrelated"
         );
+        drop(supervisor);
     }
 
     #[test]
-    fn no_output_dispatch_emits_no_reaction_and_does_not_force_busy() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let events = capture_runtime_events(&supervisor);
-        let (pty, send_count, _) = mock_pty_session(None, MockKillBehavior::Immediate);
-        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
-        set_session_dispatch_state(
-            &supervisor,
-            "codex",
-            LifecycleState::Ready,
-            Some(WorkState::Idle),
-        );
+    fn supervisor_refuses_to_recursively_delete_a_legacy_named_directory() {
+        let root = tempfile::tempdir().expect("create legacy directory cleanup root");
+        let runtime_dir = root.path().join("runtime");
+        let working_root = root.path().join("work");
+        fs::create_dir_all(&working_root).expect("create cleanup test working root");
+        let legacy_directory = runtime_dir.join("control-plane.json");
+        fs::create_dir_all(&legacy_directory).expect("create legacy-named directory");
+        let sentinel = legacy_directory.join("must-remain.txt");
+        fs::write(&sentinel, b"not a legacy credential file").expect("write directory sentinel");
 
-        let response = supervisor.apply_sideband_request(SidebandRequest::SendInput {
-            token: status.token,
-            name: "codex".into(),
-            input: "hello".into(),
-            require_idle: false,
+        let result = SupervisorHandle::new(SupervisorConfig {
+            working_root,
+            runtime_dir,
+            heartbeat_interval: None,
+            auto_restart_on_stall_sessions: None,
+            auto_restart_stall_threshold: None,
         });
-
-        assert!(!response.ok);
-        assert_eq!(send_count.load(Ordering::SeqCst), 1);
-        assert!(request_ack_events(&events).is_empty());
-        assert_eq!(dispatch_no_reaction_events(&events).len(), 1);
-        assert!(
-            supervisor_alert_events(&events)
-                .iter()
-                .any(|event| matches!(
-                    event,
-                    RuntimeEvent::SupervisorAlert {
-                        alert_type: SupervisorAlertType::DispatchNoReaction,
-                        request_id: Some(request_id),
-                        session: Some(session),
-                        action: Some(action),
-                        severity: AlertSeverity::Critical,
-                        ..
-                    } if request_id == response.request_id.as_deref().unwrap()
-                        && session == "codex"
-                        && action == "send_input"
-                ))
-        );
-        let slots = supervisor.inner.slots.lock();
-        assert_eq!(slots.get("codex").unwrap().state, LifecycleState::Ready);
-    }
-
-    #[test]
-    fn request_ack_is_emitted_only_after_reaction_output() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let events = capture_runtime_events(&supervisor);
-        let (pty, send_count, _) = reacting_pty_session(&supervisor, "codex", "Working 1s");
-        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
-        set_session_dispatch_state(
-            &supervisor,
-            "codex",
-            LifecycleState::Ready,
-            Some(WorkState::Idle),
-        );
-
-        let response = supervisor.apply_sideband_request(SidebandRequest::SendInput {
-            token: status.token,
-            name: "codex".into(),
-            input: "hello".into(),
-            require_idle: false,
-        });
-
-        assert!(response.ok, "got: {}", response.message);
-        assert_eq!(send_count.load(Ordering::SeqCst), 1);
-        let events = events.lock();
-        let output_index = events
-            .iter()
-            .position(|event| matches!(event, RuntimeEvent::SessionOutput { .. }))
-            .unwrap();
-        let ack_index = events
-            .iter()
-            .position(|event| matches!(event, RuntimeEvent::RequestAck { .. }))
-            .unwrap();
-        assert!(output_index < ack_index);
-    }
-
-    #[test]
-    fn terminal_output_is_negative_reaction_not_ack() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let events = capture_runtime_events(&supervisor);
-        let handle = supervisor.clone();
-        let (pty, send_count, _) = mock_pty_session_full(
-            None,
-            None,
-            MockKillBehavior::Immediate,
-            AgentLiveness::Alive(Vec::new()),
-            Some(Arc::new(move || {
-                handle.handle_pty_event(
-                    "codex",
-                    0,
-                    PtyEvent::Output("PS C:\\Projects\\PRIM-1>".into()),
-                );
-            })),
-        );
-        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
-        set_session_dispatch_state(
-            &supervisor,
-            "codex",
-            LifecycleState::Ready,
-            Some(WorkState::Idle),
-        );
-
-        let response = supervisor.apply_sideband_request(SidebandRequest::SendInput {
-            token: status.token,
-            name: "codex".into(),
-            input: "hello".into(),
-            require_idle: false,
-        });
-
-        assert!(!response.ok);
-        assert_eq!(send_count.load(Ordering::SeqCst), 1);
-        assert!(request_ack_events(&events).is_empty());
-        assert_eq!(dispatch_no_reaction_events(&events).len(), 1);
-        assert!(work_state_events(&events).iter().any(|event| matches!(
-            event,
-            RuntimeEvent::SessionWorkState {
-                session,
-                state: WorkState::Exited,
-                detail: Some(detail),
-                ..
-            } if session == "codex" && detail == "shell_prompt"
-        )));
-    }
-
-    #[test]
-    fn output_before_dispatch_baseline_does_not_resolve_reaction() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let events = capture_runtime_events(&supervisor);
-        let (pty, send_count, _) = mock_pty_session(None, MockKillBehavior::Immediate);
-        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
-        set_session_dispatch_state(
-            &supervisor,
-            "codex",
-            LifecycleState::Ready,
-            Some(WorkState::Idle),
-        );
-        supervisor.handle_pty_event("codex", 0, PtyEvent::Output("Working 1s".into()));
-
-        let response = supervisor.apply_sideband_request(SidebandRequest::SendInput {
-            token: status.token,
-            name: "codex".into(),
-            input: "hello".into(),
-            require_idle: false,
-        });
-
-        assert!(!response.ok);
-        assert_eq!(send_count.load(Ordering::SeqCst), 1);
-        assert!(request_ack_events(&events).is_empty());
-        assert_eq!(dispatch_no_reaction_events(&events).len(), 1);
-    }
-
-    #[test]
-    fn route_fails_when_any_recipient_does_not_react() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let events = capture_runtime_events(&supervisor);
-        let (claude_pty, claude_send_count, _) =
-            reacting_pty_session(&supervisor, "claude", "Thinking...");
-        let (codex_pty, codex_send_count, _) = mock_pty_session(None, MockKillBehavior::Immediate);
-        install_mock_running_session(&supervisor, "claude", DriverKind::Claude, claude_pty);
-        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, codex_pty);
-        set_session_dispatch_state(
-            &supervisor,
-            "claude",
-            LifecycleState::Ready,
-            Some(WorkState::Idle),
-        );
-        set_session_dispatch_state(
-            &supervisor,
-            "codex",
-            LifecycleState::Ready,
-            Some(WorkState::Idle),
-        );
-
-        let response = supervisor.apply_sideband_request(SidebandRequest::RouteMessage {
-            token: status.token,
-            request: RouteMessageRequest {
-                from: "operator".into(),
-                to: "room".into(),
-                scope: MessageScope::Room,
-                content: "status".into(),
-            },
-            require_idle: false,
-        });
-
-        assert!(!response.ok);
-        assert!(claude_send_count.load(Ordering::SeqCst) > 0);
-        assert!(codex_send_count.load(Ordering::SeqCst) > 0);
-        assert_eq!(request_ack_events(&events).len(), 1);
-        assert_eq!(dispatch_no_reaction_events(&events).len(), 1);
-        assert!(route_delivery_events(&events).iter().any(|event| matches!(
-            event,
-            RuntimeEvent::RouteDelivery {
-                phase: RouteDeliveryPhase::Failed,
-                recipient: Some(recipient),
-                error: Some(error),
-                ..
-            } if recipient == "codex" && error.contains("dispatch no reaction")
-        )));
-    }
-
-    #[test]
-    fn dispatch_attempt_idle_ready_proceeds_without_overlap() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let events = capture_runtime_events(&supervisor);
-        let (pty, send_count, _) = reacting_pty_session(&supervisor, "codex", "Working 1s");
-        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
-        set_session_dispatch_state(
-            &supervisor,
-            "codex",
-            LifecycleState::Ready,
-            Some(WorkState::Idle),
-        );
-
-        let response = supervisor.apply_sideband_request(SidebandRequest::SendInput {
-            token: status.token,
-            name: "codex".into(),
-            input: "hello".into(),
-            require_idle: false,
-        });
-
-        assert!(response.ok, "got: {}", response.message);
-        assert_eq!(send_count.load(Ordering::SeqCst), 1);
-        let attempts = dispatch_attempt_events(&events);
-        assert_eq!(attempts.len(), 1);
-        assert!(matches!(
-            &attempts[0],
-            RuntimeEvent::DispatchAttempt {
-                request_id,
-                action,
-                from,
-                target_session,
-                target_lifecycle_state_before,
-                target_work_state_before,
-                overlap,
-                reason,
-                ..
-            } if request_id == response.request_id.as_deref().unwrap()
-                && action == "send_input"
-                && from == "operator"
-                && target_session == "codex"
-                && *target_lifecycle_state_before == LifecycleState::Ready
-                && *target_work_state_before == Some(WorkState::Idle)
-                && !overlap
-                && reason.is_none()
-        ));
-    }
-
-    #[test]
-    fn dispatch_attempt_require_idle_aborts_thinking_without_ack_or_write() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let events = capture_runtime_events(&supervisor);
-        let (pty, send_count, _) = reacting_pty_session(&supervisor, "codex", "Working 1s");
-        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
-        set_session_dispatch_state(
-            &supervisor,
-            "codex",
-            LifecycleState::Ready,
-            Some(WorkState::Thinking),
-        );
-
-        let response = supervisor.apply_sideband_request(SidebandRequest::SendInput {
-            token: status.token,
-            name: "codex".into(),
-            input: "hello".into(),
-            require_idle: true,
-        });
-
-        assert!(!response.ok);
-        assert_eq!(response.message, "dispatch aborted: target target_thinking");
-        assert_eq!(send_count.load(Ordering::SeqCst), 0);
-        assert!(request_ack_events(&events).is_empty());
-        let attempts = dispatch_attempt_events(&events);
-        assert_eq!(attempts.len(), 1);
-        assert!(matches!(
-            &attempts[0],
-            RuntimeEvent::DispatchAttempt {
-                overlap: true,
-                reason: Some(reason),
-                target_work_state_before: Some(WorkState::Thinking),
-                ..
-            } if reason == "target_thinking"
-        ));
-    }
-
-    #[test]
-    fn dispatch_attempt_allow_busy_semantics_proceed_when_thinking() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let events = capture_runtime_events(&supervisor);
-        let (pty, send_count, _) = reacting_pty_session(&supervisor, "codex", "Working 1s");
-        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
-        set_session_dispatch_state(
-            &supervisor,
-            "codex",
-            LifecycleState::Ready,
-            Some(WorkState::Thinking),
-        );
-
-        let response = supervisor.apply_sideband_request(SidebandRequest::SendInput {
-            token: status.token,
-            name: "codex".into(),
-            input: "hello".into(),
-            require_idle: false,
-        });
-
-        assert!(response.ok, "got: {}", response.message);
-        assert_eq!(send_count.load(Ordering::SeqCst), 1);
-        assert_eq!(request_ack_events(&events).len(), 1);
-        let attempts = dispatch_attempt_events(&events);
-        assert_eq!(attempts.len(), 1);
-        assert!(matches!(
-            &attempts[0],
-            RuntimeEvent::DispatchAttempt {
-                overlap: true,
-                reason: Some(reason),
-                ..
-            } if reason == "target_thinking"
-        ));
-    }
-
-    #[test]
-    fn dispatch_attempt_default_mode_proceeds_when_thinking() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let events = capture_runtime_events(&supervisor);
-        let (pty, send_count, _) = reacting_pty_session(&supervisor, "codex", "Working 1s");
-        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
-        set_session_dispatch_state(
-            &supervisor,
-            "codex",
-            LifecycleState::Ready,
-            Some(WorkState::Thinking),
-        );
-
-        let request_json = serde_json::json!({
-            "kind": "send_input",
-            "token": status.token,
-            "name": "codex",
-            "input": "hello"
-        });
-        let request: SidebandRequest = serde_json::from_value(request_json).unwrap();
-        let response = supervisor.apply_sideband_request(request);
-
-        assert!(response.ok, "got: {}", response.message);
-        assert_eq!(send_count.load(Ordering::SeqCst), 1);
-        assert_eq!(request_ack_events(&events).len(), 1);
-        assert!(matches!(
-            &dispatch_attempt_events(&events)[0],
-            RuntimeEvent::DispatchAttempt {
-                overlap: true,
-                reason: Some(reason),
-                ..
-            } if reason == "target_thinking"
-        ));
-    }
-
-    #[test]
-    fn dispatch_attempt_recent_route_reason_takes_precedence() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let events = capture_runtime_events(&supervisor);
-        let (pty, send_count, _) = mock_pty_session(None, MockKillBehavior::Immediate);
-        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
-        set_session_dispatch_state(
-            &supervisor,
-            "codex",
-            LifecycleState::Ready,
-            Some(WorkState::Thinking),
-        );
-        mark_recent_route_from_session(&supervisor, "codex");
-
-        let response = supervisor.apply_sideband_request(SidebandRequest::SendInput {
-            token: status.token,
-            name: "codex".into(),
-            input: "hello".into(),
-            require_idle: true,
-        });
-
-        assert!(!response.ok);
-        assert_eq!(
-            response.message,
-            "dispatch aborted: target recent_route_from_target"
-        );
-        assert_eq!(send_count.load(Ordering::SeqCst), 0);
-        let attempts = dispatch_attempt_events(&events);
-        assert_eq!(attempts.len(), 1);
-        assert!(matches!(
-            &attempts[0],
-            RuntimeEvent::DispatchAttempt {
-                overlap: true,
-                reason: Some(reason),
-                last_route_from_target_at: Some(_),
-                ..
-            } if reason == "recent_route_from_target"
-        ));
-    }
-
-    #[test]
-    fn detached_stop_late_events_filtered_by_generation() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let (old_pty, _, old_kill_count) =
-            mock_pty_session(None, MockKillBehavior::Sleep(Duration::from_millis(200)));
-        install_mock_running_session(&supervisor, "claude", DriverKind::Claude, old_pty);
-        let (new_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
-        supervisor.set_pty_spawner_for_tests(Arc::new(QueuePtySpawner::new(vec![new_pty])));
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap();
-
-        let response = runtime.block_on(supervisor.run_detached_with_timeout_async(
-            SidebandRequest::StopSession {
-                token: status.token.clone(),
-                name: "claude".into(),
-            },
-            Duration::from_millis(50),
-            "req-stop",
-            "stop_session",
-            Some("claude"),
-            &[],
-        ));
-        assert!(response.timed_out);
-        wait_until(Duration::from_secs(1), || {
-            let slots = supervisor.inner.slots.lock();
-            slots
-                .get("claude")
-                .map(|slot| slot.running.is_none())
-                .unwrap_or(false)
-        });
-
-        let snapshot = supervisor.start_session("claude", Vec::new()).unwrap();
-        assert_eq!(snapshot.lifecycle_state, LifecycleState::Ready);
-        wait_until(Duration::from_secs(1), || {
-            old_kill_count.load(Ordering::SeqCst) >= 1
-        });
-        assert_eq!(supervisor.current_generation("claude"), Some(2));
-        assert!(old_kill_count.load(Ordering::SeqCst) >= 1);
-
-        let slots = supervisor.inner.slots.lock();
-        let slot = slots.get("claude").unwrap();
-        assert_eq!(slot.state, LifecycleState::Ready);
-        assert_eq!(slot.generation, 2);
-    }
-
-    #[test]
-    fn detached_start_orphan_pty_killed_on_generation_mismatch() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let gate = Arc::new((Mutex::new(false), Condvar::new()));
-        let (first_pty, _, first_kill_count) = mock_pty_session(None, MockKillBehavior::Immediate);
-        let (second_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
-        supervisor.set_pty_spawner_for_tests(Arc::new(StagedPtySpawner::new(
-            gate.clone(),
-            vec![first_pty, second_pty],
-        )));
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap();
-
-        let response = runtime.block_on(supervisor.run_detached_with_timeout_async(
-            SidebandRequest::StartSession {
-                token: status.token.clone(),
-                name: "claude".into(),
-                extra_args: Vec::new(),
-            },
-            Duration::from_millis(50),
-            "req-start",
-            "start_session",
-            Some("claude"),
-            &[],
-        ));
-        assert!(response.timed_out);
-
-        let snapshot = supervisor.start_session("claude", Vec::new()).unwrap();
-        assert_eq!(snapshot.lifecycle_state, LifecycleState::Ready);
-        {
-            let (lock, cvar) = &*gate;
-            let mut released = lock.lock();
-            *released = true;
-            cvar.notify_all();
-        }
-
-        wait_until(Duration::from_secs(1), || {
-            first_kill_count.load(Ordering::SeqCst) == 1
-        });
-        assert_eq!(first_kill_count.load(Ordering::SeqCst), 1);
-        assert_eq!(supervisor.current_generation("claude"), Some(2));
-
-        let slots = supervisor.inner.slots.lock();
-        let slot = slots.get("claude").unwrap();
-        assert_eq!(slot.state, LifecycleState::Ready);
-        assert_eq!(slot.generation, 2);
-    }
-
-    #[test]
-    fn prepare_definition_for_spawn_injects_pane_credentials_env() {
-        let supervisor = test_supervisor();
-        supervisor.start_control_plane().unwrap();
-        let definition = {
-            let slots = supervisor.inner.slots.lock();
-            slots.get("claude").unwrap().definition.clone()
+        let error = match result {
+            Ok(_) => panic!("startup must reject a legacy-named directory"),
+            Err(error) => error,
         };
 
-        let prepared = supervisor
-            .prepare_definition_for_spawn(&definition)
-            .unwrap();
-        let credentials = supervisor.runtime_dir().join("control-plane-claude.json");
-
         assert!(
-            prepared
-                .env
-                .iter()
-                .any(|env| { env.key == "PRIM1_PANE_IDENTITY" && env.value == "claude" })
+            error
+                .to_string()
+                .contains("refusing to recursively remove legacy control-plane directory"),
+            "{error:#}"
         );
-        assert!(prepared.env.iter().any(|env| {
-            env.key == "PRIM1_PANE_CREDENTIALS" && env.value == credentials.display().to_string()
-        }));
-        assert!(credentials.exists());
+        assert_eq!(
+            fs::read(&sentinel).expect("directory sentinel must remain"),
+            b"not a legacy credential file"
+        );
     }
 
     #[test]
-    fn apply_sideband_list_sessions_returns_snapshot() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
+    fn legacy_control_plane_symlink_is_removed_without_following_its_target() {
+        let root = tempfile::tempdir().expect("create legacy symlink cleanup root");
+        let runtime_dir = root.path().join("runtime");
+        let working_root = root.path().join("work");
+        fs::create_dir_all(&working_root).expect("create symlink test working root");
+        fs::create_dir_all(&runtime_dir).expect("create runtime directory");
+        let target = root.path().join("outside-target");
+        fs::create_dir_all(&target).expect("create symlink target directory");
+        let sentinel = target.join("must-remain.txt");
+        fs::write(&sentinel, b"target sentinel").expect("write symlink target");
+        let link = runtime_dir.join("control-plane-pane.json");
+        #[cfg(windows)]
+        create_windows_junction(&link, &target);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).expect("create Unix legacy credential symlink");
 
-        let response = supervisor.apply_sideband_request(SidebandRequest::ListSessions {
-            token: status.token,
-        });
+        let supervisor = SupervisorHandle::new(SupervisorConfig {
+            working_root,
+            runtime_dir,
+            heartbeat_interval: None,
+            auto_restart_on_stall_sessions: None,
+            auto_restart_stall_threshold: None,
+        })
+        .expect("startup should remove the symlink itself");
 
-        assert!(response.ok);
-        assert_eq!(response.message, "sessions listed");
-        assert_eq!(response.snapshot.unwrap().sessions.len(), 2);
+        assert!(!link.exists());
+        assert_eq!(
+            fs::read(&sentinel).expect("symlink target must remain"),
+            b"target sentinel"
+        );
+        drop(supervisor);
     }
 
+    #[cfg(windows)]
     #[test]
-    fn route_message_overrides_from_with_bound_session_identity() {
-        let supervisor = test_supervisor();
-        let claude_token = session_token(&supervisor, "claude");
-        let cursor = supervisor.current_eof_cursor().unwrap();
-        let (claude_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
-        let (codex_pty, _, _) = reacting_pty_session(&supervisor, "codex", "Working 1s");
-        install_mock_running_session(&supervisor, "claude", DriverKind::Claude, claude_pty);
-        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, codex_pty);
+    fn supervisor_rejects_a_runtime_junction_before_touching_its_target() {
+        let root = tempfile::tempdir().expect("create runtime-junction test root");
+        let working_root = root.path().join("work");
+        let junction_target = root.path().join("outside-runtime-target");
+        fs::create_dir_all(&working_root).expect("create junction test working root");
+        fs::create_dir_all(&junction_target).expect("create runtime junction target");
+        let sentinel = junction_target.join("must-remain.txt");
+        fs::write(&sentinel, b"runtime target sentinel").expect("write runtime sentinel");
+        let target_sddl_before = windows_path_sddl(&junction_target);
+        let runtime_junction = root.path().join("runtime");
+        create_windows_junction(&runtime_junction, &junction_target);
 
-        let response = supervisor.apply_sideband_request(SidebandRequest::RouteMessage {
-            token: claude_token.clone(),
-            request: RouteMessageRequest {
-                from: "spoofed-name".into(),
-                to: "codex".into(),
-                scope: MessageScope::Direct,
-                content: "hi".into(),
-            },
-            require_idle: false,
+        let result = SupervisorHandle::new(SupervisorConfig {
+            working_root,
+            runtime_dir: runtime_junction.clone(),
+            heartbeat_interval: None,
+            auto_restart_on_stall_sessions: None,
+            auto_restart_stall_threshold: None,
         });
-
-        assert!(response.ok, "got: {}", response.message);
-
-        let routed = supervisor.apply_sideband_request(SidebandRequest::EventsSince {
-            token: claude_token,
-            cursor: Some(cursor),
-            max_events: Some(10),
-            max_wait_seconds: Some(0),
-            filter: Some(EventFilter {
-                include_kinds: vec!["routed_message".into()],
-                include_sessions: Vec::new(),
-                include_scopes: Vec::new(),
-            }),
-        });
-        let (events, _, _, _) = unwrap_events_since(routed);
-
-        assert_eq!(events.len(), 1);
-        assert!(matches!(
-            &events[0],
-            RuntimeEvent::RoutedMessage {
-                from,
-                to,
-                scope,
-                content,
-                ..
-            } if from == "claude"
-                && to == "codex"
-                && *scope == MessageScope::Direct
-                && content == "[content omitted]"
-        ));
-    }
-
-    #[test]
-    fn route_message_preserves_user_from_for_root_token() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let cursor = supervisor.current_eof_cursor().unwrap();
-        let (claude_pty, _, _) = reacting_pty_session(&supervisor, "claude", "Thinking...");
-        install_mock_running_session(&supervisor, "claude", DriverKind::Claude, claude_pty);
-
-        let response = supervisor.apply_sideband_request(SidebandRequest::RouteMessage {
-            token: status.token.clone(),
-            request: RouteMessageRequest {
-                from: "operator".into(),
-                to: "claude".into(),
-                scope: MessageScope::Direct,
-                content: "hi".into(),
-            },
-            require_idle: false,
-        });
-
-        assert!(response.ok, "got: {}", response.message);
-
-        let routed = supervisor.apply_sideband_request(SidebandRequest::EventsSince {
-            token: status.token,
-            cursor: Some(cursor),
-            max_events: Some(10),
-            max_wait_seconds: Some(0),
-            filter: Some(EventFilter {
-                include_kinds: vec!["routed_message".into()],
-                include_sessions: Vec::new(),
-                include_scopes: Vec::new(),
-            }),
-        });
-        let (events, _, _, _) = unwrap_events_since(routed);
-
-        assert_eq!(events.len(), 1);
-        assert!(matches!(
-            &events[0],
-            RuntimeEvent::RoutedMessage {
-                from,
-                to,
-                scope,
-                content,
-                ..
-            } if from == "operator"
-                && to == "claude"
-                && *scope == MessageScope::Direct
-                && content == "[content omitted]"
-        ));
-    }
-
-    #[test]
-    fn sideband_direct_route_emits_resolved_and_written_delivery() {
-        let supervisor = test_supervisor();
-        let claude_token = session_token(&supervisor, "claude");
-        let events = capture_runtime_events(&supervisor);
-        let (codex_pty, _, _) = reacting_pty_session(&supervisor, "codex", "Working 1s");
-        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, codex_pty);
-        let long_content = (0..120)
-            .map(|index| format!("segment-{index:03}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        let response = supervisor.apply_sideband_request(SidebandRequest::RouteMessage {
-            token: claude_token,
-            request: RouteMessageRequest {
-                from: "spoofed".into(),
-                to: "codex".into(),
-                scope: MessageScope::Direct,
-                content: long_content,
-            },
-            require_idle: false,
-        });
-
-        assert!(response.ok, "got: {}", response.message);
-        let response_request_id = response.request_id.as_deref().unwrap();
-        let deliveries = route_delivery_events(&events);
-        assert_eq!(deliveries.len(), 2);
-
-        let route_id = match &deliveries[0] {
-            RuntimeEvent::RouteDelivery {
-                request_id,
-                route_id,
-                from,
-                logical_to,
-                scope,
-                recipient,
-                recipient_index,
-                recipient_count,
-                payload_part_count,
-                phase,
-                bytes_written,
-                error,
-                ..
-            } => {
-                assert_eq!(request_id, response_request_id);
-                assert_eq!(from, "claude");
-                assert_eq!(logical_to, "codex");
-                assert_eq!(*scope, MessageScope::Direct);
-                assert_eq!(recipient, &None);
-                assert_eq!(*recipient_index, 0);
-                assert_eq!(*recipient_count, 1);
-                assert_eq!(*payload_part_count, 0);
-                assert_eq!(*phase, RouteDeliveryPhase::Resolved);
-                assert_eq!(*bytes_written, 0);
-                assert_eq!(error, &None);
-                route_id.clone()
-            }
-            other => panic!("unexpected event: {other:?}"),
+        let error = match result {
+            Ok(_) => panic!("startup must reject a runtime-directory junction"),
+            Err(error) => error,
         };
 
-        match &deliveries[1] {
-            RuntimeEvent::RouteDelivery {
-                request_id,
-                route_id: written_route_id,
-                from,
-                logical_to,
-                scope,
-                recipient,
-                recipient_index,
-                recipient_count,
-                payload_part_count,
-                phase,
-                bytes_written,
-                error,
-                ..
-            } => {
-                assert_eq!(request_id, response_request_id);
-                assert_eq!(written_route_id, &route_id);
-                assert_eq!(from, "claude");
-                assert_eq!(logical_to, "codex");
-                assert_eq!(*scope, MessageScope::Direct);
-                assert_eq!(recipient.as_deref(), Some("codex"));
-                assert_eq!(*recipient_index, 0);
-                assert_eq!(*recipient_count, 1);
-                assert!(*payload_part_count > 1);
-                assert_eq!(*phase, RouteDeliveryPhase::Written);
-                assert!(*bytes_written > 0);
-                assert_eq!(error, &None);
-            }
-            other => panic!("unexpected event: {other:?}"),
+        assert!(
+            error.to_string().contains("symlink or reparse point"),
+            "{error:#}"
+        );
+        assert_eq!(
+            fs::read(&sentinel).expect("runtime target sentinel must remain"),
+            b"runtime target sentinel"
+        );
+        assert_eq!(windows_path_sddl(&junction_target), target_sddl_before);
+        assert!(!junction_target.join("audit.jsonl").exists());
+        assert!(!junction_target.join("desktop-instance.lock").exists());
+        fs::remove_dir(&runtime_junction).expect("remove runtime test junction");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_sideband_junction_is_unlinked_without_touching_its_target() {
+        let root = tempfile::tempdir().expect("create sideband-junction test root");
+        let runtime_dir = root.path().join("runtime");
+        let working_root = root.path().join("work");
+        let target = root.path().join("outside-sideband-target");
+        fs::create_dir_all(&runtime_dir).expect("create safe runtime directory");
+        fs::create_dir_all(&working_root).expect("create sideband test working root");
+        fs::create_dir_all(&target).expect("create sideband junction target");
+        let sentinel = target.join("must-remain.txt");
+        fs::write(&sentinel, b"sideband target sentinel").expect("write sideband sentinel");
+        let target_sddl_before = windows_path_sddl(&target);
+        let sideband_junction = runtime_dir.join("sideband");
+        create_windows_junction(&sideband_junction, &target);
+
+        let supervisor = SupervisorHandle::new(SupervisorConfig {
+            working_root,
+            runtime_dir,
+            heartbeat_interval: None,
+            auto_restart_on_stall_sessions: None,
+            auto_restart_stall_threshold: None,
+        })
+        .expect("startup should unlink the legacy sideband junction itself");
+
+        assert!(!sideband_junction.exists());
+        assert_eq!(
+            fs::read(&sentinel).expect("sideband target sentinel must remain"),
+            b"sideband target sentinel"
+        );
+        assert_eq!(windows_path_sddl(&target), target_sddl_before);
+        drop(supervisor);
+    }
+
+    #[cfg(windows)]
+    struct KillWindowsChild(std::process::Child);
+
+    #[cfg(windows)]
+    impl Drop for KillWindowsChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
         }
     }
 
-    #[test]
-    fn operator_room_route_emits_two_pane_delivery_receipts() {
-        let supervisor = test_supervisor();
-        let events = capture_runtime_events(&supervisor);
-        let (claude_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
-        let (codex_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
-        install_mock_running_session(&supervisor, "claude", DriverKind::Claude, claude_pty);
-        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, codex_pty);
-
-        supervisor
-            .route_message(RouteMessageRequest {
-                from: "operator".into(),
-                to: "room".into(),
-                scope: MessageScope::Room,
-                content: "status".into(),
-            })
-            .unwrap();
-
-        let deliveries = route_delivery_events(&events);
-        assert_eq!(deliveries.len(), 3);
-        assert!(matches!(
-            &deliveries[0],
-            RuntimeEvent::RouteDelivery {
-                phase: RouteDeliveryPhase::Resolved,
-                recipient: None,
-                recipient_count: 2,
-                ..
-            }
-        ));
-
-        let mut written_recipients = deliveries
-            .iter()
-            .filter_map(|event| match event {
-                RuntimeEvent::RouteDelivery {
-                    phase: RouteDeliveryPhase::Written,
-                    recipient: Some(recipient),
-                    recipient_count,
-                    payload_part_count,
-                    bytes_written,
-                    error,
-                    ..
-                } => {
-                    assert_eq!(*recipient_count, 2);
-                    assert_eq!(*payload_part_count, 1);
-                    assert!(*bytes_written > 0);
-                    assert_eq!(error, &None);
-                    Some(recipient.clone())
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        written_recipients.sort();
-
-        assert_eq!(
-            written_recipients,
-            vec!["claude".to_string(), "codex".to_string()]
-        );
+    #[cfg(windows)]
+    struct WindowsJobBackedPty {
+        job: pty_host::ProcessJob,
+        process_id: u32,
     }
 
-    #[test]
-    fn route_message_default_emits_dispatch_attempt_per_recipient_and_proceeds() {
-        let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let events = capture_runtime_events(&supervisor);
-        let (claude_pty, claude_send_count, _) =
-            reacting_pty_session(&supervisor, "claude", "Thinking...");
-        let (codex_pty, codex_send_count, _) =
-            reacting_pty_session(&supervisor, "codex", "Working 1s");
-        install_mock_running_session(&supervisor, "claude", DriverKind::Claude, claude_pty);
-        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, codex_pty);
-        set_session_dispatch_state(
-            &supervisor,
-            "claude",
-            LifecycleState::Ready,
-            Some(WorkState::Idle),
-        );
-        set_session_dispatch_state(
-            &supervisor,
-            "codex",
-            LifecycleState::Ready,
-            Some(WorkState::Thinking),
-        );
+    #[cfg(windows)]
+    impl PtySessionTrait for WindowsJobBackedPty {
+        fn send_input(&self, input: &str) -> pty_host::PtyWriteResult {
+            Ok(input.len())
+        }
 
-        let response = supervisor.apply_sideband_request(SidebandRequest::RouteMessage {
-            token: status.token,
-            request: RouteMessageRequest {
-                from: "operator".into(),
-                to: "room".into(),
-                scope: MessageScope::Room,
-                content: "status".into(),
-            },
-            require_idle: false,
+        fn resize(&self, _cols: u16, _rows: u16) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill(&self) -> Result<()> {
+            self.job.terminate()
+        }
+
+        fn try_wait(&self) -> Result<Option<pty_host::PtyExitStatus>> {
+            Ok(None)
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            Some(self.process_id)
+        }
+
+        fn contains_process(&self, process: &pty_host::PinnedProcess) -> Result<bool> {
+            self.job.contains_process(process)
+        }
+    }
+
+    #[cfg(windows)]
+    struct BlockingWindowsJobPty {
+        job: pty_host::ProcessJob,
+        process_id: u32,
+        entered: Mutex<Option<mpsc::Sender<()>>>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+        killed: Arc<AtomicBool>,
+    }
+
+    #[cfg(windows)]
+    struct NonReleasingBlockingWindowsJobPty {
+        job: pty_host::ProcessJob,
+        process_id: u32,
+        entered: Mutex<Option<mpsc::Sender<()>>>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+        kill_count: Arc<AtomicUsize>,
+    }
+
+    #[cfg(windows)]
+    impl PtySessionTrait for BlockingWindowsJobPty {
+        fn send_input(&self, _input: &str) -> pty_host::PtyWriteResult {
+            if let Some(entered) = self.entered.lock().take() {
+                let _ = entered.send(());
+            }
+            let (released, signal) = &*self.release;
+            let mut released = released.lock();
+            while !*released {
+                signal.wait(&mut released);
+            }
+            Err(PtyWriteError::new(
+                0,
+                "blocking PTY write interrupted by shutdown",
+            ))
+        }
+
+        fn resize(&self, _cols: u16, _rows: u16) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill(&self) -> Result<()> {
+            self.killed.store(true, Ordering::SeqCst);
+            let (released, signal) = &*self.release;
+            *released.lock() = true;
+            signal.notify_all();
+            self.job.terminate()
+        }
+
+        fn try_wait(&self) -> Result<Option<pty_host::PtyExitStatus>> {
+            Ok(None)
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            Some(self.process_id)
+        }
+
+        fn contains_process(&self, process: &pty_host::PinnedProcess) -> Result<bool> {
+            self.job.contains_process(process)
+        }
+    }
+
+    #[cfg(windows)]
+    impl PtySessionTrait for NonReleasingBlockingWindowsJobPty {
+        fn send_input(&self, _input: &str) -> pty_host::PtyWriteResult {
+            if let Some(entered) = self.entered.lock().take() {
+                let _ = entered.send(());
+            }
+            let (released, signal) = &*self.release;
+            let mut released = released.lock();
+            while !*released {
+                signal.wait(&mut released);
+            }
+            Err(PtyWriteError::new(
+                0,
+                "blocking PTY write released after bounded shutdown",
+            ))
+        }
+
+        fn resize(&self, _cols: u16, _rows: u16) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill(&self) -> Result<()> {
+            if self.kill_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(anyhow!(
+                    "injected process-scope termination failure without writer release"
+                ));
+            }
+            self.job.terminate()
+        }
+
+        fn try_wait(&self) -> Result<Option<pty_host::PtyExitStatus>> {
+            Ok(None)
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            Some(self.process_id)
+        }
+
+        fn contains_process(&self, process: &pty_host::PinnedProcess) -> Result<bool> {
+            self.job.contains_process(process)
+        }
+    }
+
+    #[cfg(windows)]
+    fn windows_test_pipe_endpoint(label: &str) -> String {
+        format!(
+            r"\\.\pipe\prim1-{label}-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        )
+    }
+
+    #[cfg(windows)]
+    fn windows_pipe_name(endpoint: &str) -> &str {
+        endpoint
+            .strip_prefix(r"\\.\pipe\")
+            .expect("test endpoint must be a local Windows pipe")
+    }
+
+    #[cfg(windows)]
+    fn powershell_single_quoted(value: &str) -> String {
+        value.replace('\'', "''")
+    }
+
+    #[cfg(windows)]
+    fn spawn_pipe_client_that_waits(endpoint: &str) -> KillWindowsChild {
+        let script = format!(
+            "$client = [System.IO.Pipes.NamedPipeClientStream]::new('.', '{}', [System.IO.Pipes.PipeDirection]::InOut); \
+             $client.Connect(5000); \
+             Start-Sleep -Seconds 60",
+            powershell_single_quoted(windows_pipe_name(endpoint)),
+        );
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command"])
+            .arg(script)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(KillWindowsChild)
+            .expect("spawn real Windows pipe client")
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_named_pipe_reports_kernel_client_process_id_and_exit() {
+        let endpoint = windows_test_pipe_endpoint("caller-pid");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("build pipe test runtime");
+        let server = runtime.block_on(async {
+            create_windows_pipe_server(&endpoint, true).expect("create real named-pipe server")
+        });
+        let mut child = spawn_pipe_client_that_waits(&endpoint);
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), server.connect())
+                .await
+                .expect("real pipe client did not connect")
+                .expect("connect real pipe client");
         });
 
-        assert!(response.ok, "got: {}", response.message);
-        assert!(claude_send_count.load(Ordering::SeqCst) > 0);
-        assert!(codex_send_count.load(Ordering::SeqCst) > 0);
-        let attempts = dispatch_attempt_events(&events);
-        assert_eq!(attempts.len(), 2);
-        assert!(attempts.iter().any(|event| matches!(
-            event,
-            RuntimeEvent::DispatchAttempt {
-                target_session,
-                overlap: false,
-                reason: None,
-                ..
-            } if target_session == "claude"
-        )));
-        assert!(attempts.iter().any(|event| matches!(
-            event,
-            RuntimeEvent::DispatchAttempt {
-                target_session,
-                overlap: true,
-                reason: Some(reason),
-                ..
-            } if target_session == "codex" && reason == "target_thinking"
-        )));
-        let deliveries = route_delivery_events(&events);
-        assert_eq!(deliveries.len(), 3);
+        let process = pane_process_from_windows_pipe(&server)
+            .expect("derive caller from GetNamedPipeClientProcessId");
+        assert_eq!(process.pid(), child.0.id());
+        assert!(process.is_alive().expect("query live pipe caller"));
+
+        child.0.kill().expect("kill real pipe client");
+        child.0.wait().expect("wait for real pipe client exit");
+        assert!(!process.is_alive().expect("query exited pipe caller"));
+
+        let supervisor = test_supervisor();
+        let error = supervisor
+            .resolve_pane_caller(process)
+            .err()
+            .expect("exited pipe caller must be rejected");
+        assert!(error.to_string().contains("has exited"), "{error:#}");
     }
 
+    #[cfg(windows)]
     #[test]
-    fn route_message_require_idle_aborts_entire_route_before_delivery_events_or_writes() {
+    fn unaffiliated_named_pipe_client_is_rejected_before_sending_a_frame() {
         let supervisor = test_supervisor();
-        let status = supervisor.start_control_plane().unwrap();
-        let events = capture_runtime_events(&supervisor);
-        let (claude_pty, claude_send_count, _) =
-            mock_pty_session(None, MockKillBehavior::Immediate);
-        let (codex_pty, codex_send_count, _) = mock_pty_session(None, MockKillBehavior::Immediate);
-        install_mock_running_session(&supervisor, "claude", DriverKind::Claude, claude_pty);
-        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, codex_pty);
-        set_session_dispatch_state(
-            &supervisor,
-            "claude",
-            LifecycleState::Ready,
-            Some(WorkState::Idle),
-        );
-        set_session_dispatch_state(
-            &supervisor,
-            "codex",
-            LifecycleState::Ready,
-            Some(WorkState::Thinking),
-        );
+        let endpoint = windows_test_pipe_endpoint("unaffiliated");
+        let status = supervisor
+            .start_control_plane_at(Some(endpoint))
+            .expect("start real control plane");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("build pipe client runtime");
 
-        let response = supervisor.apply_sideband_request(SidebandRequest::RouteMessage {
-            token: status.token,
-            request: RouteMessageRequest {
-                from: "operator".into(),
-                to: "room".into(),
-                scope: MessageScope::Room,
-                content: "status".into(),
-            },
-            require_idle: true,
+        let response = runtime.block_on(async {
+            let client = tokio::net::windows::named_pipe::ClientOptions::new()
+                .open(&status.endpoint)
+                .expect("connect unaffiliated client");
+            let mut reader = BufReader::new(client);
+            let mut response_line = String::new();
+            tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut response_line))
+                .await
+                .expect("server waited for a request frame before rejecting caller")
+                .expect("read access-denied response");
+            decode_response(response_line.trim()).expect("decode access-denied response")
         });
 
         assert!(!response.ok);
-        assert!(response.message.contains("codex"));
-        assert!(response.message.contains("target_thinking"));
-        assert_eq!(claude_send_count.load(Ordering::SeqCst), 0);
-        assert_eq!(codex_send_count.load(Ordering::SeqCst), 0);
-        assert_eq!(dispatch_attempt_events(&events).len(), 2);
-        assert!(route_delivery_events(&events).is_empty());
-        assert!(request_ack_events(&events).is_empty());
+        assert_eq!(response.message, "sideband access denied");
+        supervisor.shutdown().expect("stop real control plane");
     }
 
+    #[cfg(windows)]
     #[test]
-    fn cross_pair_room_route_emits_delivery_for_each_resolved_recipient() {
-        let supervisor = test_supervisor_with_cross_pair_room_broadcast(true);
-        supervisor.create_pair("FrontendQA").unwrap();
-        let events = capture_runtime_events(&supervisor);
-        let (claude_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
-        let (codex_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
-        let (frontend_claude_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
-        let (frontend_codex_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
-        install_mock_running_session(&supervisor, "claude", DriverKind::Claude, claude_pty);
-        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, codex_pty);
-        install_mock_running_session(
+    fn job_assigned_named_pipe_child_is_accepted_end_to_end() {
+        use std::io::Write as _;
+
+        let root = tempfile::tempdir().expect("create assigned-client test root");
+        let supervisor = test_supervisor_with_root(root.path().to_path_buf());
+        let endpoint = windows_test_pipe_endpoint("assigned");
+        let status = supervisor
+            .start_control_plane_at(Some(endpoint))
+            .expect("start real control plane");
+        let response_path = root.path().join("assigned-response.json");
+        let request = encode_request(&SidebandRequest::Ping {}).expect("encode ping request");
+        let script = format!(
+            "[void][Console]::In.ReadLine(); \
+             $client = [System.IO.Pipes.NamedPipeClientStream]::new('.', '{}', [System.IO.Pipes.PipeDirection]::InOut); \
+             $client.Connect(5000); \
+             $writer = [System.IO.StreamWriter]::new($client); \
+             $writer.AutoFlush = $true; \
+             $writer.WriteLine('{}'); \
+             $reader = [System.IO.StreamReader]::new($client); \
+             $response = $reader.ReadLine(); \
+             [System.IO.File]::WriteAllText('{}', $response)",
+            powershell_single_quoted(windows_pipe_name(&status.endpoint)),
+            powershell_single_quoted(&request),
+            powershell_single_quoted(&response_path.display().to_string()),
+        );
+        let mut child = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command"])
+            .arg(script)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(KillWindowsChild)
+            .expect("spawn assigned pipe child");
+        let process_id = child.0.id();
+        let mut release = child.0.stdin.take().expect("capture assigned child stdin");
+        let job = pty_host::ProcessJob::new().expect("create assigned child job");
+        let pinned_child = PinnedProcess::open(process_id).expect("pin assigned pipe child");
+        job.assign_process(&pinned_child)
+            .expect("assign pipe child to session job");
+        install_mock_running_session_with_process_id(
             &supervisor,
-            "FrontendQA-claude",
+            "claude",
             DriverKind::Claude,
-            frontend_claude_pty,
+            Some(process_id),
+            Box::new(WindowsJobBackedPty { job, process_id }),
         );
-        install_mock_running_session(
-            &supervisor,
-            "FrontendQA-codex",
-            DriverKind::Codex,
-            frontend_codex_pty,
-        );
+        release
+            .write_all(b"connect\n")
+            .expect("release assigned pipe child");
+        release.flush().expect("flush assigned child gate");
+        drop(release);
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let response_text = loop {
+            match fs::read_to_string(&response_path) {
+                Ok(response) if !response.is_empty() => break response,
+                Ok(_) | Err(_) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Ok(_) | Err(_) => panic!("assigned pipe child did not receive a response"),
+            }
+        };
+        let response = decode_response(&response_text).expect("decode assigned child response");
+        assert!(response.ok, "assigned child was rejected: {response:?}");
+        assert_eq!(response.message, "pong");
 
         supervisor
-            .route_message(RouteMessageRequest {
-                from: "claude".into(),
-                to: "room".into(),
-                scope: MessageScope::Room,
-                content: "status".into(),
-            })
-            .unwrap();
+            .shutdown()
+            .expect("stop assigned-client supervisor");
+    }
 
-        let deliveries = route_delivery_events(&events);
-        assert_eq!(deliveries.len(), 4);
-        assert!(matches!(
-            &deliveries[0],
-            RuntimeEvent::RouteDelivery {
-                phase: RouteDeliveryPhase::Resolved,
-                recipient_count: 3,
-                ..
+    #[cfg(windows)]
+    #[test]
+    fn shutdown_interrupts_authorized_blocking_pipe_write_before_listener_join() {
+        use std::io::Write as _;
+
+        let root = tempfile::tempdir().expect("create blocking-write test root");
+        let supervisor = test_supervisor_with_root(root.path().to_path_buf());
+        let endpoint = windows_test_pipe_endpoint("blocking-write");
+        let status = supervisor
+            .start_control_plane_at(Some(endpoint.clone()))
+            .expect("start blocking-write control plane");
+        let claude_alias = test_session_alias(&supervisor, "claude");
+        let request = encode_request(&SidebandRequest::SendInput {
+            name: claude_alias,
+            input: "force blocking PTY write".into(),
+        })
+        .expect("encode blocking input request");
+        let script = format!(
+            "[void][Console]::In.ReadLine(); \
+             $client = [System.IO.Pipes.NamedPipeClientStream]::new('.', '{}', [System.IO.Pipes.PipeDirection]::InOut); \
+             $client.Connect(5000); \
+             $writer = [System.IO.StreamWriter]::new($client); \
+             $writer.AutoFlush = $true; \
+             $writer.WriteLine('{}'); \
+             $reader = [System.IO.StreamReader]::new($client); \
+             [void]$reader.ReadLine()",
+            powershell_single_quoted(windows_pipe_name(&status.endpoint)),
+            powershell_single_quoted(&request),
+        );
+        let mut child = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command"])
+            .arg(script)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(KillWindowsChild)
+            .expect("spawn blocking pipe child");
+        let process_id = child.0.id();
+        let mut release_child = child.0.stdin.take().expect("capture child gate");
+        let job = pty_host::ProcessJob::new().expect("create blocking child job");
+        let pinned_child = PinnedProcess::open(process_id).expect("pin blocking pipe child");
+        job.assign_process(&pinned_child)
+            .expect("assign blocking child to session job");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let release_write = Arc::new((Mutex::new(false), Condvar::new()));
+        let killed = Arc::new(AtomicBool::new(false));
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            Some(process_id),
+            Box::new(BlockingWindowsJobPty {
+                job,
+                process_id,
+                entered: Mutex::new(Some(entered_tx)),
+                release: release_write.clone(),
+                killed: killed.clone(),
+            }),
+        );
+        release_child
+            .write_all(b"connect\n")
+            .expect("release blocking pipe child");
+        release_child.flush().expect("flush child gate");
+        drop(release_child);
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("authorized sideband request never entered the blocking PTY write");
+
+        let shutdown_supervisor = supervisor.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let shutdown = thread::spawn(move || {
+            let _ = done_tx.send(shutdown_supervisor.shutdown());
+        });
+        let shutdown_result = done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap_or_else(|_| {
+                let (released, signal) = &*release_write;
+                *released.lock() = true;
+                signal.notify_all();
+                panic!("shutdown did not interrupt the blocked PTY write before listener join")
+            });
+        shutdown_result.expect("shutdown after blocking write failed");
+        shutdown.join().expect("shutdown thread panicked");
+        assert!(killed.load(Ordering::SeqCst));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("build replacement pipe runtime");
+        runtime.block_on(async {
+            let replacement = create_windows_pipe_server(&endpoint, true)
+                .expect("control-plane endpoint was not reusable after shutdown");
+            drop(replacement);
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shutdown_retains_an_unjoined_listener_when_a_pipe_writer_cannot_be_interrupted() {
+        use std::io::Write as _;
+
+        let root = tempfile::tempdir().expect("create bounded-listener test root");
+        let supervisor = test_supervisor_with_root(root.path().to_path_buf());
+        supervisor.set_sideband_write_timeout_for_tests(Duration::from_secs(60));
+        supervisor.set_stop_kill_timeout_for_tests(Duration::from_millis(50));
+        let session_id = test_session_id(&supervisor, "claude");
+        let endpoint = windows_test_pipe_endpoint("bounded-listener-stop");
+        let status = supervisor
+            .start_control_plane_at(Some(endpoint.clone()))
+            .expect("start bounded-listener control plane");
+        let claude_alias = test_session_alias(&supervisor, "claude");
+        let request = encode_request(&SidebandRequest::SendInput {
+            name: claude_alias,
+            input: "hold the listener runtime open".into(),
+        })
+        .expect("encode blocking input request");
+        let script = format!(
+            "[void][Console]::In.ReadLine(); \
+             $client = [System.IO.Pipes.NamedPipeClientStream]::new('.', '{}', [System.IO.Pipes.PipeDirection]::InOut); \
+             $client.Connect(5000); \
+             $writer = [System.IO.StreamWriter]::new($client); \
+             $writer.AutoFlush = $true; \
+             $writer.WriteLine('{}'); \
+             $reader = [System.IO.StreamReader]::new($client); \
+             [void]$reader.ReadLine()",
+            powershell_single_quoted(windows_pipe_name(&status.endpoint)),
+            powershell_single_quoted(&request),
+        );
+        let mut child = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command"])
+            .arg(script)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(KillWindowsChild)
+            .expect("spawn bounded-listener pipe child");
+        let process_id = child.0.id();
+        let mut release_child = child.0.stdin.take().expect("capture child gate");
+        let job = pty_host::ProcessJob::new().expect("create blocking child job");
+        let pinned_child = PinnedProcess::open(process_id).expect("pin blocking pipe child");
+        job.assign_process(&pinned_child)
+            .expect("assign blocking child to session job");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let release_write = Arc::new((Mutex::new(false), Condvar::new()));
+        let kill_count = Arc::new(AtomicUsize::new(0));
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            Some(process_id),
+            Box::new(NonReleasingBlockingWindowsJobPty {
+                job,
+                process_id,
+                entered: Mutex::new(Some(entered_tx)),
+                release: release_write.clone(),
+                kill_count: kill_count.clone(),
+            }),
+        );
+        release_child
+            .write_all(b"connect\n")
+            .expect("release blocking pipe child");
+        release_child.flush().expect("flush child gate");
+        drop(release_child);
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("authorized request never entered the non-releasing writer");
+
+        let started = Instant::now();
+        let error = supervisor
+            .shutdown()
+            .expect_err("unproved PTY cleanup and listener join must be reported");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "shutdown exceeded its bounded listener deadline: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("control-plane listener did not stop"),
+            "unexpected bounded shutdown error: {error:#}"
+        );
+        assert_eq!(kill_count.load(Ordering::SeqCst), 1);
+        assert!(
+            supervisor.inner.control_plane_listener.lock().is_some(),
+            "a timed-out listener join must retain the exact join handle for retry"
+        );
+
+        let (released, signal) = &*release_write;
+        *released.lock() = true;
+        signal.notify_all();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let retry_ready = {
+                let listener_finished = supervisor
+                    .inner
+                    .control_plane_listener
+                    .lock()
+                    .as_ref()
+                    .and_then(|listener| listener.thread.as_ref())
+                    .is_some_and(thread::JoinHandle::is_finished);
+                let lifecycle_clear = supervisor
+                    .inner
+                    .slots
+                    .lock()
+                    .get_by_id(session_id)
+                    .unwrap()
+                    .lifecycle_operation
+                    .is_none();
+                listener_finished && lifecycle_clear
+            };
+            if retry_ready {
+                break;
             }
-        ));
+            assert!(
+                Instant::now() < deadline,
+                "released listener or termination worker did not finish"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
 
-        let mut written_recipients = deliveries
-            .iter()
-            .filter_map(|event| match event {
-                RuntimeEvent::RouteDelivery {
-                    phase: RouteDeliveryPhase::Written,
-                    recipient: Some(recipient),
-                    recipient_count,
-                    ..
-                } => {
-                    assert_eq!(*recipient_count, 3);
-                    Some(recipient.clone())
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        written_recipients.sort();
+        supervisor.set_stop_kill_timeout_for_tests(Duration::from_secs(2));
+        supervisor
+            .shutdown()
+            .expect("repeated shutdown must join the retained listener and prove termination");
+        assert_eq!(kill_count.load(Ordering::SeqCst), 2);
+        assert!(supervisor.inner.control_plane_listener.lock().is_none());
+        drop(pinned_child);
+    }
 
+    #[cfg(windows)]
+    #[test]
+    fn tokenless_control_plane_start_is_idempotent_and_shutdown_joins_listener() {
+        let supervisor = test_supervisor();
+        let events = capture_runtime_events(&supervisor);
+        let endpoint = windows_test_pipe_endpoint("lifecycle");
+        let first = supervisor
+            .start_control_plane_at(Some(endpoint.clone()))
+            .expect("start tokenless control plane");
+        let second = supervisor
+            .start_control_plane_at(Some(windows_test_pipe_endpoint("ignored")))
+            .expect("repeat tokenless control-plane startup");
+
+        assert_eq!(first, second);
         assert_eq!(
-            written_recipients,
-            vec![
-                "FrontendQA-claude".to_string(),
-                "FrontendQA-codex".to_string(),
-                "codex".to_string(),
-            ]
+            events
+                .lock()
+                .iter()
+                .filter(|event| matches!(event, RuntimeEvent::ControlPlaneReady { .. }))
+                .count(),
+            1
         );
-    }
-
-    #[test]
-    fn no_recipient_route_still_emits_resolved_delivery() {
-        let supervisor = test_supervisor();
-        let events = capture_runtime_events(&supervisor);
-
-        let error = supervisor
-            .route_message(RouteMessageRequest {
-                from: "operator".into(),
-                to: "missing".into(),
-                scope: MessageScope::Direct,
-                content: "hello".into(),
-            })
-            .unwrap_err();
-
         assert!(
-            error
-                .to_string()
-                .contains("no running recipients available for 'missing'")
+            fs::read_dir(supervisor.runtime_dir())
+                .expect("read tokenless runtime directory")
+                .filter_map(|entry| entry.ok())
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("control-plane")),
+            "tokenless startup must not recreate bearer files"
         );
-        let deliveries = route_delivery_events(&events);
-        assert_eq!(deliveries.len(), 1);
-        assert!(matches!(
-            &deliveries[0],
-            RuntimeEvent::RouteDelivery {
-                phase: RouteDeliveryPhase::Resolved,
-                recipient: None,
-                recipient_count: 0,
-                payload_part_count: 0,
-                bytes_written: 0,
-                ..
-            }
-        ));
-    }
 
-    #[test]
-    fn one_recipient_write_failure_emits_failed_delivery_and_returns_error() {
-        let supervisor = test_supervisor();
-        let events = capture_runtime_events(&supervisor);
-        let (codex_pty, send_count) = failing_pty_session("synthetic route write failure");
-        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, codex_pty);
+        supervisor.shutdown().expect("join control-plane listener");
+        assert!(supervisor.snapshot().control_plane.is_none());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("build replacement pipe runtime");
+        runtime.block_on(async {
+            let replacement = create_windows_pipe_server(&endpoint, true)
+                .expect("listener handle survived shutdown join");
+            drop(replacement);
+        });
 
         let error = supervisor
-            .route_message(RouteMessageRequest {
-                from: "claude".into(),
-                to: "codex".into(),
-                scope: MessageScope::Direct,
-                content: "hello".into(),
-            })
-            .unwrap_err();
-
-        assert_eq!(send_count.load(Ordering::SeqCst), 1);
-        let error = error.to_string();
-        assert!(error.contains("codex"));
-        assert!(error.contains("synthetic route write failure"));
-
-        let deliveries = route_delivery_events(&events);
-        assert_eq!(deliveries.len(), 2);
-        assert!(matches!(
-            &deliveries[0],
-            RuntimeEvent::RouteDelivery {
-                phase: RouteDeliveryPhase::Resolved,
-                recipient_count: 1,
-                ..
-            }
-        ));
-        assert!(matches!(
-            &deliveries[1],
-            RuntimeEvent::RouteDelivery {
-                phase: RouteDeliveryPhase::Failed,
-                recipient: Some(recipient),
-                recipient_count: 1,
-                payload_part_count: 1,
-                bytes_written: 0,
-                error: Some(message),
-                ..
-            } if recipient == "codex" && message.contains("synthetic route write failure")
-        ));
+            .start_control_plane_at(Some(endpoint))
+            .expect_err("terminal supervisor must not restart its listener");
+        assert_eq!(error.to_string(), "supervisor has shut down");
+        supervisor
+            .shutdown()
+            .expect("repeated shutdown is idempotent");
     }
 
+    #[cfg(windows)]
     #[test]
-    fn mixed_room_delivery_failure_preserves_success_receipt_and_returns_error() {
+    fn control_plane_start_and_shutdown_share_one_terminal_lifecycle_order() {
         let supervisor = test_supervisor();
         let events = capture_runtime_events(&supervisor);
-        let (claude_pty, claude_send_count, _) =
-            mock_pty_session(None, MockKillBehavior::Immediate);
-        let (codex_pty, codex_send_count) = failing_pty_session("synthetic route write failure");
-        install_mock_running_session(&supervisor, "claude", DriverKind::Claude, claude_pty);
-        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, codex_pty);
-
-        let error = supervisor
-            .route_message(RouteMessageRequest {
-                from: "operator".into(),
-                to: "room".into(),
-                scope: MessageScope::Room,
-                content: "hello".into(),
-            })
-            .unwrap_err();
-
-        assert_eq!(claude_send_count.load(Ordering::SeqCst), 2);
-        assert_eq!(codex_send_count.load(Ordering::SeqCst), 1);
-        let error = error.to_string();
-        assert!(error.contains("codex"));
-        assert!(error.contains("synthetic route write failure"));
-
-        let deliveries = route_delivery_events(&events);
-        assert_eq!(deliveries.len(), 3);
-        assert!(matches!(
-            &deliveries[0],
-            RuntimeEvent::RouteDelivery {
-                phase: RouteDeliveryPhase::Resolved,
-                recipient_count: 2,
-                ..
-            }
-        ));
-        assert!(deliveries.iter().any(|event| {
-            matches!(
-                event,
-                RuntimeEvent::RouteDelivery {
-                    phase: RouteDeliveryPhase::Written,
-                    recipient: Some(recipient),
-                    recipient_count: 2,
-                    ..
-                } if recipient == "claude"
-            )
+        let endpoint = windows_test_pipe_endpoint("start-shutdown-order");
+        let (prepared_tx, prepared_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        *supervisor.inner.control_plane_after_prepare.lock() = Some(Box::new(move || {
+            prepared_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
         }));
-        assert!(deliveries.iter().any(|event| {
-            matches!(
-                event,
-                RuntimeEvent::RouteDelivery {
-                    phase: RouteDeliveryPhase::Failed,
-                    recipient: Some(recipient),
-                    recipient_count: 2,
-                    bytes_written: 0,
-                    error: Some(message),
-                    ..
-                } if recipient == "codex" && message.contains("synthetic route write failure")
-            )
-        }));
+
+        let start_supervisor = supervisor.clone();
+        let start_endpoint = endpoint.clone();
+        let start =
+            thread::spawn(move || start_supervisor.start_control_plane_at(Some(start_endpoint)));
+        prepared_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("control-plane start did not reach the prepared barrier");
+        assert!(
+            supervisor.inner.shutdown_lifecycle.try_lock().is_none(),
+            "start must hold the terminal lifecycle lock through listener preparation"
+        );
+
+        let shutdown_supervisor = supervisor.clone();
+        let (shutdown_invoked_tx, shutdown_invoked_rx) = mpsc::sync_channel(1);
+        let (shutdown_done_tx, shutdown_done_rx) = mpsc::sync_channel(1);
+        let shutdown = thread::spawn(move || {
+            shutdown_invoked_tx.send(()).unwrap();
+            shutdown_done_tx
+                .send(shutdown_supervisor.shutdown())
+                .unwrap();
+        });
+        shutdown_invoked_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("shutdown thread did not start");
+        assert!(
+            shutdown_done_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "shutdown must not overtake an admitted control-plane start"
+        );
+        assert!(!supervisor.inner.shutdown_started.load(Ordering::Acquire));
+
+        release_tx.send(()).unwrap();
+        let started = start.join().expect("control-plane start thread panicked");
+        assert!(started.is_ok(), "admitted start should linearize first");
+        shutdown_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("shutdown did not complete after start released")
+            .expect("shutdown failed");
+        shutdown.join().expect("shutdown thread panicked");
+
+        assert!(supervisor.snapshot().control_plane.is_none());
+        assert_eq!(
+            events
+                .lock()
+                .iter()
+                .filter(|event| matches!(event, RuntimeEvent::ControlPlaneReady { .. }))
+                .count(),
+            1
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("build endpoint reuse runtime");
+        runtime.block_on(async {
+            let replacement = create_windows_pipe_server(&endpoint, true)
+                .expect("ordered shutdown must release the prepared endpoint");
+            drop(replacement);
+        });
     }
 
+    #[cfg(windows)]
     #[test]
-    fn route_message_requires_running_recipient() {
+    fn control_plane_refuses_first_instance_squatting() {
+        let endpoint = windows_test_pipe_endpoint("squatting");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("build squatter runtime");
+        let squatter = runtime.block_on(async {
+            create_windows_pipe_server(&endpoint, false).expect("create preexisting pipe squatter")
+        });
         let supervisor = test_supervisor();
 
         let error = supervisor
-            .route_message(RouteMessageRequest {
-                from: "operator".into(),
-                to: "claude".into(),
-                scope: MessageScope::Direct,
-                content: "hello".into(),
-            })
-            .unwrap_err();
-
+            .start_control_plane_at(Some(endpoint.clone()))
+            .expect_err("first-instance startup must reject a preexisting pipe");
         assert!(
-            error
-                .to_string()
-                .contains("no running recipients available for 'claude'")
+            error.to_string().contains("failed to create named pipe"),
+            "unexpected squatting error: {error:#}"
         );
+        assert!(supervisor.snapshot().control_plane.is_none());
+
+        drop(squatter);
+        supervisor
+            .start_control_plane_at(Some(endpoint))
+            .expect("start after squatter releases endpoint");
+        supervisor.shutdown().expect("stop post-squatter listener");
     }
 
+    #[cfg(windows)]
     #[test]
-    fn send_control_key_rejects_non_running_session() {
-        let supervisor = test_supervisor();
-
-        let error = supervisor
-            .send_control_key("claude", ControlKey::Enter)
-            .unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("session 'claude' is not running")
-        );
-    }
-
-    #[test]
-    fn agent_liveness_prunes_dead_inner_child_while_wrapper_pid_lives() {
-        let supervisor = test_supervisor();
+    fn production_spawn_identity_authenticates_the_real_powershell_client_to_the_rust_listener() {
+        let root = tempfile::tempdir().expect("create cross-boundary identity test root");
+        let supervisor = test_supervisor_with_root(root.path().to_path_buf());
         let events = capture_runtime_events(&supervisor);
-        let wrapper_pid = std::process::id();
-        let (pty, _, _) = mock_pty_session_full(
-            Some(wrapper_pid),
-            None,
-            MockKillBehavior::Immediate,
-            AgentLiveness::Exited {
-                last_agent_pids: vec![4242],
-                live_processes: vec![pty_host::ProcessIdentity {
-                    process_id: wrapper_pid,
-                    image_name: Some("cmd.exe".into()),
-                }],
+        let endpoint = windows_test_pipe_endpoint("rust-powershell-identity");
+        let status = supervisor
+            .start_control_plane_at(Some(endpoint))
+            .expect("start real Rust control-plane listener");
+        let control_plane_script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("scripts")
+            .join("control-plane.ps1");
+        assert!(
+            control_plane_script.is_file(),
+            "actual control-plane.ps1 was not found at {}",
+            control_plane_script.display()
+        );
+
+        let rust_server = pty_host::PinnedProcess::open(std::process::id())
+            .expect("pin Rust control-plane server process");
+        let expected_identity_receipt = format!(
+            "PRIM1_SERVER_IDENTITY={}|{}|{}",
+            rust_server.pid(),
+            rust_server.creation_time_filetime(),
+            status.endpoint
+        );
+        let child_command = format!(
+            "$ErrorActionPreference = 'Stop'; \
+             Write-Output ('PRIM1_SERVER_IDENTITY=' + $env:PRIM1_CONTROL_PLANE_SERVER_PID + '|' + $env:PRIM1_CONTROL_PLANE_SERVER_STARTED_FILETIME + '|' + $env:PRIM1_CONTROL_PLANE_ENDPOINT); \
+             & '{}' -Action ping -Quiet -PassThruJson; \
+             exit $LASTEXITCODE",
+            powershell_single_quoted(&control_plane_script.display().to_string()),
+        );
+        let powershell = find_direct_executable(&["powershell.exe"])
+            .expect("resolve a concrete PowerShell executable");
+        supervisor.set_executable_resolver_for_tests(Arc::new(FixedExecutableResolver(
+            ResolvedLaunchProgram {
+                program: powershell,
+                prefix_args: vec![
+                    "-NoProfile".into(),
+                    "-NonInteractive".into(),
+                    "-ExecutionPolicy".into(),
+                    "Bypass".into(),
+                    "-Command".into(),
+                    child_command,
+                ],
             },
-            None,
-        );
-        install_mock_running_session_with_process_id(
-            &supervisor,
-            "codex",
-            DriverKind::Codex,
-            Some(wrapper_pid),
-            pty,
-        );
-
-        let snapshot = supervisor.snapshot();
-        let codex = snapshot
-            .sessions
-            .into_iter()
-            .find(|session| session.name == "codex")
-            .unwrap();
-        assert!(!codex.running);
-        assert_eq!(codex.lifecycle_state, LifecycleState::Closed);
-        assert_eq!(codex.process_id, None);
-        assert!(session_exit_events(&events).iter().any(|event| matches!(
-            event,
-            RuntimeEvent::SessionExit {
-                session,
-                process_id: Some(pid),
-                reason: SessionExitReason::ProcessDisappeared,
-                ..
-            } if session == "codex" && *pid == wrapper_pid
         )));
+        let (session_id, session_alias) = {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get("claude").expect("test Claude slot");
+            (slot.session_id, slot.definition.alias.clone())
+        };
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            let definition = &mut slots
+                .get_mut("claude")
+                .expect("default claude slot")
+                .definition;
+            definition.label = "Rust-to-PowerShell identity receipt".into();
+            definition.driver = DriverKind::GenericTerminal;
+        }
 
-        let error = supervisor
-            .deliver_message(DeliverMessageRequest {
-                name: "codex".into(),
-                content: "hello".into(),
+        let started = supervisor
+            .start_session_by_id(session_id)
+            .expect("spawn PowerShell through the production PTY path");
+        assert_eq!(started.lifecycle_state, LifecycleState::Ready);
+        wait_for_event_count(&events, 1, |event| {
+            matches!(
+                event,
+                RuntimeEvent::SessionOutput { session, chunk, .. }
+                    if session == &session_alias && chunk.contains("\u{1b}[6n")
+            )
+        });
+        supervisor
+            .send_input(SendInputRequest {
+                session_id,
+                input: "\u{1b}[1;1R".into(),
             })
-            .unwrap_err();
-        assert!(error.to_string().contains("session 'codex' is not running"));
+            .expect("release the real ConPTY cursor handshake");
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let observed_output = loop {
+            let output = events
+                .lock()
+                .iter()
+                .filter_map(|event| match event {
+                    RuntimeEvent::SessionOutput { session, chunk, .. }
+                        if session == &session_alias =>
+                    {
+                        Some(chunk.as_str())
+                    }
+                    _ => None,
+                })
+                .collect::<String>();
+            if output.contains(&expected_identity_receipt)
+                && output.contains("\"ok\":true")
+                && output.contains("\"message\":\"pong\"")
+            {
+                break output;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "production-injected identity did not authenticate scripts/control-plane.ps1 to the real Rust listener; output: {output:?}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+
+        assert!(
+            observed_output.contains(&expected_identity_receipt),
+            "child did not receive the Rust-generated server identity: {observed_output:?}"
+        );
+        assert!(
+            observed_output.contains("pong"),
+            "authenticated PowerShell client did not reach the listener response: {observed_output:?}"
+        );
+        supervisor
+            .shutdown()
+            .expect("stop cross-boundary identity supervisor");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn control_plane_pipe_dacl_is_protected_and_current_user_only() {
+        use std::os::windows::io::AsRawHandle as _;
+
+        let endpoint = windows_test_pipe_endpoint("private-dacl");
+        let current_sid = current_user_sid_string().expect("resolve current test SID");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("build private-pipe runtime");
+        let sddl = runtime.block_on(async {
+            let server =
+                create_windows_pipe_server(&endpoint, true).expect("create private named pipe");
+            security_descriptor_sddl_for_handle(server.as_raw_handle() as _)
+        });
+
+        assert_current_user_only_sddl(&sddl, &current_sid);
+    }
+
+    fn bracketed_paste_test_binding() -> RunBinding {
+        RunBinding {
+            session_id: Uuid::new_v4(),
+            run_id: Uuid::new_v4(),
+            generation: 7,
+        }
+    }
+
+    fn bracketed_paste_tracker(binding: RunBinding) -> BracketedPasteRunState {
+        let mut tracker = BracketedPasteRunState::default();
+        tracker.begin_run(binding);
+        tracker
+    }
+
+    fn valid_character_boundaries(value: &str) -> Vec<usize> {
+        value
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain(std::iter::once(value.len()))
+            .collect()
     }
 
     #[test]
-    fn delayed_agent_start_does_not_prune_cmd_only_window() {
-        let supervisor = test_supervisor();
-        let wrapper_pid = std::process::id();
-        let (pty, _, _) = mock_pty_session_full(
-            Some(wrapper_pid),
-            None,
-            MockKillBehavior::Immediate,
-            AgentLiveness::NotYetObserved(vec![pty_host::ProcessIdentity {
-                process_id: wrapper_pid,
-                image_name: Some("cmd.exe".into()),
-            }]),
-            None,
-        );
-        install_mock_running_session_with_process_id(
-            &supervisor,
-            "codex",
-            DriverKind::Codex,
-            Some(wrapper_pid),
-            pty,
-        );
+    fn bracketed_paste_parser_accepts_every_split_combined_parameters_and_c1_csi() {
+        for (sequence, expected) in [
+            ("\x1b[?1;2004;25h", BracketedPasteMode::Enabled),
+            ("\x1b[?25;2004l", BracketedPasteMode::Disabled),
+            ("\u{009b}?1;2004;25h", BracketedPasteMode::Enabled),
+            ("\u{009b}?2004l", BracketedPasteMode::Disabled),
+        ] {
+            for split in valid_character_boundaries(sequence) {
+                let binding = bracketed_paste_test_binding();
+                let mut tracker = bracketed_paste_tracker(binding);
+                tracker.observe_output(binding, &sequence[..split]);
+                tracker.observe_output(binding, &sequence[split..]);
+                assert_eq!(
+                    tracker.mode_for(binding),
+                    expected,
+                    "sequence {sequence:?} failed at split {split}"
+                );
+            }
+        }
 
-        let snapshot = supervisor.snapshot();
-        let codex = snapshot
-            .sessions
-            .into_iter()
-            .find(|session| session.name == "codex")
-            .unwrap();
-        assert!(codex.running);
-        assert_eq!(codex.process_id, Some(wrapper_pid));
+        let binding = bracketed_paste_test_binding();
+        let mut tracker = bracketed_paste_tracker(binding);
+        tracker.observe_output(binding, "\x1b[?2004h\x1b[?2004l\u{009b}?2004h");
+        assert_eq!(
+            tracker.mode_for(binding),
+            BracketedPasteMode::Enabled,
+            "the last complete DECSET/DECRST must win"
+        );
     }
 
     #[test]
-    fn wrapper_only_command_not_found_terminal_output_closes_session() {
-        let supervisor = test_supervisor();
-        let events = capture_runtime_events(&supervisor);
-        let wrapper_pid = std::process::id();
-        let (pty, _, _) = mock_pty_session_full(
-            Some(wrapper_pid),
-            None,
-            MockKillBehavior::Immediate,
-            AgentLiveness::NotYetObserved(vec![pty_host::ProcessIdentity {
-                process_id: wrapper_pid,
-                image_name: Some("cmd.exe".into()),
-            }]),
-            None,
+    fn bracketed_paste_parser_matches_xterm_string_exits_at_every_character_boundary() {
+        let fixtures = [
+            (
+                "\x1b]hidden\x1b[?2004l\x07",
+                BracketedPasteMode::Disabled,
+                "OSC ESC exits into ESCAPE before DECRST and BEL",
+            ),
+            (
+                "\x1b]hidden\x1b[?2004l\x1b\\",
+                BracketedPasteMode::Disabled,
+                "OSC ESC exits into ESCAPE before DECRST and ST",
+            ),
+            (
+                "\x1bPhidden\x1b[?2004l\x1b\\",
+                BracketedPasteMode::Disabled,
+                "DCS ESC exits into ESCAPE before DECRST",
+            ),
+            (
+                "\x1bXhidden\x1b[?2004l\x1b\\",
+                BracketedPasteMode::Disabled,
+                "SOS ESC enters ESCAPE",
+            ),
+            (
+                "\x1b^hidden\x1b[?2004l\x1b\\",
+                BracketedPasteMode::Disabled,
+                "PM ESC enters ESCAPE",
+            ),
+            (
+                "\x1b_hidden\x1b[?2004l\x1b\\",
+                BracketedPasteMode::Disabled,
+                "APC ESC enters ESCAPE",
+            ),
+            (
+                "\u{009d}hidden\u{009b}?2004l\x07",
+                BracketedPasteMode::Disabled,
+                "C1 CSI globally exits C1 OSC before BEL",
+            ),
+            (
+                "\u{009d}hidden\u{009b}?2004l\u{009c}",
+                BracketedPasteMode::Disabled,
+                "C1 CSI globally exits C1 OSC before ST",
+            ),
+            (
+                "\u{0090}hidden\u{009b}?2004l\u{009c}",
+                BracketedPasteMode::Disabled,
+                "C1 CSI globally exits C1 DCS",
+            ),
+            (
+                "\u{0098}hidden\u{009b}?2004l\u{009c}",
+                BracketedPasteMode::Disabled,
+                "C1 CSI globally exits C1 SOS",
+            ),
+            (
+                "\u{009e}hidden\u{009b}?2004l\u{009c}",
+                BracketedPasteMode::Disabled,
+                "C1 CSI globally exits C1 PM",
+            ),
+            (
+                "\u{009f}hidden\u{009b}?2004l\u{009c}",
+                BracketedPasteMode::Disabled,
+                "C1 CSI globally exits C1 APC",
+            ),
+        ];
+
+        for (fixture, expected, label) in fixtures {
+            for split in valid_character_boundaries(fixture) {
+                let binding = bracketed_paste_test_binding();
+                let mut tracker = bracketed_paste_tracker(binding);
+                tracker.observe_output(binding, "\x1b[?2004h");
+                tracker.observe_output(binding, &fixture[..split]);
+                tracker.observe_output(binding, &fixture[split..]);
+                assert_eq!(
+                    tracker.mode_for(binding),
+                    expected,
+                    "{label} diverged at split {split}"
+                );
+            }
+        }
+
+        let binding = bracketed_paste_test_binding();
+        let mut tracker = bracketed_paste_tracker(binding);
+        tracker.observe_output(binding, "\x1b[?2004h");
+        tracker.observe_output(binding, "\x1b]hidden\x1bnot-a-CSI\x07");
+        assert_eq!(tracker.mode_for(binding), BracketedPasteMode::Enabled);
+        tracker.observe_output(binding, "\x1b[?2004l");
+        assert_eq!(
+            tracker.mode_for(binding),
+            BracketedPasteMode::Disabled,
+            "a real DECRST after OSC's ESC exit was not observed"
         );
-        install_mock_running_session_with_process_id(
+    }
+
+    #[test]
+    fn bracketed_paste_parser_matches_xterm_c0_del_and_cancel_transitions() {
+        let ignored_controls = ('\u{0000}'..='\u{0017}')
+            .chain(std::iter::once('\u{0019}'))
+            .chain('\u{001c}'..='\u{001f}')
+            .chain(std::iter::once('\u{007f}'));
+        for ignored in ignored_controls {
+            let binding = bracketed_paste_test_binding();
+            let mut tracker = bracketed_paste_tracker(binding);
+            tracker.observe_output(binding, "\x1b[?2004h");
+            tracker.observe_output(binding, &format!("\x1b[?2004{ignored}l"));
+            assert_eq!(
+                tracker.mode_for(binding),
+                BracketedPasteMode::Disabled,
+                "CSI did not remain active across {ignored:?}"
+            );
+
+            let mut tracker = bracketed_paste_tracker(binding);
+            tracker.observe_output(binding, "\x1b[?2004h");
+            tracker.observe_output(binding, &format!("\x1b{ignored}[?2004l"));
+            assert_eq!(
+                tracker.mode_for(binding),
+                BracketedPasteMode::Disabled,
+                "ESCAPE did not remain active across {ignored:?}"
+            );
+
+            let overflow = format!(
+                "\x1b[?{}",
+                "2".repeat(usize::from(TERMINAL_MODE_CONTROL_MAX_CHARS) + 8)
+            );
+            let mut tracker = bracketed_paste_tracker(binding);
+            tracker.observe_output(binding, "\x1b[?2004h");
+            tracker.observe_output(binding, &overflow);
+            assert_eq!(tracker.parser, TerminalModeParserState::CsiDiscard);
+            let mut encoded = [0; 4];
+            tracker.observe_output(binding, ignored.encode_utf8(&mut encoded));
+            assert_eq!(
+                tracker.parser,
+                TerminalModeParserState::CsiDiscard,
+                "CSI discard did not remain active across {ignored:?}"
+            );
+            tracker.observe_output(binding, "h");
+            assert_eq!(tracker.parser, TerminalModeParserState::Ground);
+            assert_eq!(tracker.mode_for(binding), BracketedPasteMode::Unknown);
+        }
+
+        for cancel in ['\u{0018}', '\u{001a}'] {
+            let binding = bracketed_paste_test_binding();
+            let mut tracker = bracketed_paste_tracker(binding);
+            tracker.observe_output(binding, "\x1b[?2004h");
+            tracker.observe_output(binding, &format!("\x1b[?2004{cancel}l"));
+            assert_eq!(
+                tracker.mode_for(binding),
+                BracketedPasteMode::Enabled,
+                "{cancel:?} did not cancel the partial CSI"
+            );
+            assert_eq!(tracker.parser, TerminalModeParserState::Ground);
+
+            tracker.observe_output(binding, &format!("\x1bPopaque{cancel}\x1b[?2004l"));
+            assert_eq!(
+                tracker.mode_for(binding),
+                BracketedPasteMode::Disabled,
+                "{cancel:?} did not cancel DCS before the following real DECRST"
+            );
+        }
+    }
+
+    #[test]
+    fn every_relevant_c1_control_is_global_from_every_parser_state() {
+        let overflow = format!(
+            "\x1b[?{}",
+            "2".repeat(usize::from(TERMINAL_MODE_CONTROL_MAX_CHARS) + 8)
+        );
+        let overlong_osc = format!(
+            "\x1b]{}",
+            "x".repeat(usize::from(TERMINAL_MODE_CONTROL_MAX_CHARS) + 1)
+        );
+        let starting_states = [
+            ("ground", String::new()),
+            ("escape", "\x1b".to_string()),
+            ("csi", "\x1b[?20".to_string()),
+            ("csi-discard", overflow),
+            ("osc", "\x1b]text".to_string()),
+            ("dcs", "\x1bPtext".to_string()),
+            ("sos", "\x1bXtext".to_string()),
+            ("pm", "\x1b^text".to_string()),
+            ("apc", "\x1b_text".to_string()),
+            ("string-discard", overlong_osc),
+        ];
+        let global_transitions = [
+            (
+                '\u{009b}',
+                TerminalModeParserState::Csi(DecPrivateModeParser::new()),
+                "CSI",
+            ),
+            (
+                '\u{009d}',
+                BracketedPasteRunState::terminal_string(TerminalStringKind::Osc),
+                "OSC",
+            ),
+            (
+                '\u{0090}',
+                BracketedPasteRunState::terminal_string(TerminalStringKind::Dcs),
+                "DCS",
+            ),
+            (
+                '\u{0098}',
+                BracketedPasteRunState::terminal_string(TerminalStringKind::Sos),
+                "SOS",
+            ),
+            (
+                '\u{009e}',
+                BracketedPasteRunState::terminal_string(TerminalStringKind::Pm),
+                "PM",
+            ),
+            (
+                '\u{009f}',
+                BracketedPasteRunState::terminal_string(TerminalStringKind::Apc),
+                "APC",
+            ),
+            ('\u{009c}', TerminalModeParserState::Ground, "ST"),
+        ];
+        let global_executables = ('\u{0080}'..='\u{008f}')
+            .chain('\u{0091}'..='\u{0097}')
+            .chain('\u{0099}'..='\u{009a}')
+            .collect::<Vec<_>>();
+
+        for (state_label, prefix) in starting_states {
+            for (control, expected, control_label) in global_transitions {
+                let binding = bracketed_paste_test_binding();
+                let mut tracker = bracketed_paste_tracker(binding);
+                tracker.observe_output(binding, &prefix);
+                let mut encoded = [0; 4];
+                tracker.observe_output(binding, control.encode_utf8(&mut encoded));
+                assert_eq!(
+                    tracker.parser, expected,
+                    "C1 {control_label} was not global from {state_label}"
+                );
+            }
+            for control in &global_executables {
+                let binding = bracketed_paste_test_binding();
+                let mut tracker = bracketed_paste_tracker(binding);
+                tracker.observe_output(binding, &prefix);
+                let mut encoded = [0; 4];
+                tracker.observe_output(binding, control.encode_utf8(&mut encoded));
+                assert_eq!(
+                    tracker.parser,
+                    TerminalModeParserState::Ground,
+                    "executable C1 {control:?} was not global from {state_label}"
+                );
+            }
+            for cancel in ['\u{0018}', '\u{001a}'] {
+                let binding = bracketed_paste_test_binding();
+                let mut tracker = bracketed_paste_tracker(binding);
+                tracker.observe_output(binding, &prefix);
+                let mut encoded = [0; 4];
+                tracker.observe_output(binding, cancel.encode_utf8(&mut encoded));
+                assert_eq!(
+                    tracker.parser,
+                    TerminalModeParserState::Ground,
+                    "{cancel:?} was not global from {state_label}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dcs_escape_enters_escape_and_dispatches_real_csi_at_every_boundary() {
+        let sequence = "\x1bPhidden\x1b[?2004h\x1b\\";
+        for split in valid_character_boundaries(sequence) {
+            let binding = bracketed_paste_test_binding();
+            let mut tracker = bracketed_paste_tracker(binding);
+            tracker.observe_output(binding, "\x1b[?2004l");
+            tracker.observe_output(binding, &sequence[..split]);
+            tracker.observe_output(binding, &sequence[split..]);
+            assert_eq!(
+                tracker.mode_for(binding),
+                BracketedPasteMode::Enabled,
+                "DCS ESC did not enter ESCAPE at split {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn normal_string_terminators_preserve_mode_at_every_character_boundary() {
+        for (sequence, label) in [
+            ("\x1b]hidden\x07", "OSC BEL"),
+            ("\x1b]hidden\x1b\\", "OSC ST"),
+            ("\x1bPhidden\x1b\\", "DCS ST"),
+            ("\x1bXhidden\x1b\\", "SOS ST"),
+            ("\x1b^hidden\x1b\\", "PM ST"),
+            ("\x1b_hidden\x1b\\", "APC ST"),
+            ("\u{009d}hidden\x07", "C1 OSC BEL"),
+            ("\u{009d}hidden\u{009c}", "C1 OSC ST"),
+            ("\u{0090}hidden\u{009c}", "C1 DCS ST"),
+            ("\u{0098}hidden\u{009c}", "C1 SOS ST"),
+            ("\u{009e}hidden\u{009c}", "C1 PM ST"),
+            ("\u{009f}hidden\u{009c}", "C1 APC ST"),
+        ] {
+            for split in valid_character_boundaries(sequence) {
+                let binding = bracketed_paste_test_binding();
+                let mut tracker = bracketed_paste_tracker(binding);
+                tracker.observe_output(binding, "\x1b[?2004h");
+                tracker.observe_output(binding, &sequence[..split]);
+                tracker.observe_output(binding, &sequence[split..]);
+                assert_eq!(
+                    tracker.mode_for(binding),
+                    BracketedPasteMode::Enabled,
+                    "{label} changed mode at split {split}"
+                );
+                assert_eq!(tracker.parser, TerminalModeParserState::Ground);
+            }
+        }
+    }
+
+    #[test]
+    fn overflow_discard_and_real_decset_recover_at_every_string_and_character_boundary() {
+        let fixtures = [
+            ("\x1b]hidden\x07", "OSC BEL"),
+            ("\x1b]hidden\x1b\\", "OSC ST"),
+            ("\x1bPhidden\x1b\\", "DCS"),
+            ("\x1bXhidden\x1b\\", "SOS"),
+            ("\x1b^hidden\x1b\\", "PM"),
+            ("\x1b_hidden\x1b\\", "APC"),
+            ("\u{009d}hidden\x07", "C1 OSC/BEL"),
+            ("\u{009d}hidden\u{009c}", "C1 OSC/ST"),
+            ("\u{0090}hidden\u{009c}", "C1 DCS/ST"),
+            ("\u{0098}hidden\u{009c}", "C1 SOS/ST"),
+            ("\u{009e}hidden\u{009c}", "C1 PM/ST"),
+            ("\u{009f}hidden\u{009c}", "C1 APC/ST"),
+        ];
+        let overflow = format!(
+            "\x1b[?{}",
+            "2".repeat(usize::from(TERMINAL_MODE_CONTROL_MAX_CHARS) + 8)
+        );
+        let recovery = "\x1b[?2004h";
+
+        for (fixture, label) in fixtures {
+            let discarded_sequence = format!("{overflow}{fixture}");
+            for discard_split in valid_character_boundaries(&discarded_sequence) {
+                let binding = bracketed_paste_test_binding();
+                let mut tracker = bracketed_paste_tracker(binding);
+                tracker.observe_output(binding, "\x1b[?2004h");
+                tracker.observe_output(binding, &discarded_sequence[..discard_split]);
+                tracker.observe_output(binding, &discarded_sequence[discard_split..]);
+                assert_eq!(
+                    tracker.mode_for(binding),
+                    BracketedPasteMode::Unknown,
+                    "{label} escaped overflow discard at split {discard_split}"
+                );
+
+                let discarded = tracker;
+                for recovery_split in valid_character_boundaries(recovery) {
+                    let mut recovering = discarded;
+                    recovering.observe_output(binding, &recovery[..recovery_split]);
+                    recovering.observe_output(binding, &recovery[recovery_split..]);
+                    assert_eq!(
+                        recovering.mode_for(binding),
+                        BracketedPasteMode::Enabled,
+                        "{label} failed recovery at discard split {discard_split}, DECSET split {recovery_split}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bracketed_paste_parser_fails_unknown_on_csi_overflow_and_recovers_after_a_real_final() {
+        let binding = bracketed_paste_test_binding();
+        let mut tracker = bracketed_paste_tracker(binding);
+        tracker.observe_output(binding, "\x1b[?2004h");
+        assert_eq!(tracker.mode_for(binding), BracketedPasteMode::Enabled);
+
+        let overlong = format!(
+            "\x1b[?{}h",
+            "2".repeat(usize::from(TERMINAL_MODE_CONTROL_MAX_CHARS) + 8)
+        );
+        for character in overlong.chars() {
+            let mut encoded = [0; 4];
+            tracker.observe_output(binding, character.encode_utf8(&mut encoded));
+        }
+        assert_eq!(
+            tracker.mode_for(binding),
+            BracketedPasteMode::Unknown,
+            "overlong partial control must fail closed"
+        );
+
+        tracker.observe_output(binding, "\x1b[?2004h");
+        assert_eq!(
+            tracker.mode_for(binding),
+            BracketedPasteMode::Enabled,
+            "parser did not recover after consuming the overlong CSI final"
+        );
+        tracker.observe_output(binding, "\x1b[?2004:1l");
+        assert_eq!(
+            tracker.mode_for(binding),
+            BracketedPasteMode::Enabled,
+            "malformed subparameter lookalike must not toggle mode"
+        );
+        tracker.observe_output(binding, "\x1b[?2004l");
+        assert_eq!(tracker.mode_for(binding), BracketedPasteMode::Disabled);
+
+        tracker.observe_output(binding, "\x1b[?2004h");
+        tracker.observe_output(
+            binding,
+            &format!(
+                "\x1b]{}",
+                "unterminated".repeat(usize::from(TERMINAL_MODE_CONTROL_MAX_CHARS))
+            ),
+        );
+        assert_eq!(
+            tracker.mode_for(binding),
+            BracketedPasteMode::Enabled,
+            "bounded terminal-string discard must preserve the last observed mode"
+        );
+        tracker.observe_output(binding, "still discarded\x07");
+        assert_eq!(
+            tracker.mode_for(binding),
+            BracketedPasteMode::Enabled,
+            "terminal-string discard changed mode while waiting for BEL"
+        );
+        tracker.observe_output(binding, "\x1b[?2004l");
+        assert_eq!(
+            tracker.mode_for(binding),
+            BracketedPasteMode::Disabled,
+            "a real DECRST after terminal-string discard was not observed"
+        );
+    }
+
+    #[test]
+    fn terminal_string_discard_preserves_mode_and_real_transitions_at_every_boundary() {
+        let payload = format!(
+            "{}[?2004l",
+            "x".repeat(usize::from(TERMINAL_MODE_CONTROL_MAX_CHARS) + 1)
+        );
+        let fixtures = [
+            (format!("\x1b]{payload}\x07"), "OSC BEL"),
+            (format!("\x1b]{payload}\x1b\\"), "OSC ST"),
+            (format!("\x1bP{payload}\x1b\\"), "DCS ST"),
+            (format!("\x1bX{payload}\x1b\\"), "SOS ST"),
+            (format!("\x1b^{payload}\x1b\\"), "PM ST"),
+            (format!("\x1b_{payload}\x1b\\"), "APC ST"),
+            (format!("\u{009d}{payload}\u{009c}"), "C1 OSC ST"),
+            (format!("\u{0090}{payload}\u{009c}"), "C1 DCS ST"),
+            (format!("\u{0098}{payload}\u{009c}"), "C1 SOS ST"),
+            (format!("\u{009e}{payload}\u{009c}"), "C1 PM ST"),
+            (format!("\u{009f}{payload}\u{009c}"), "C1 APC ST"),
+        ];
+
+        for (sequence, label) in fixtures {
+            for split in valid_character_boundaries(&sequence) {
+                let binding = bracketed_paste_test_binding();
+                let mut tracker = bracketed_paste_tracker(binding);
+                tracker.observe_output(binding, "\x1b[?2004h");
+                tracker.observe_output(binding, &sequence[..split]);
+                tracker.observe_output(binding, &sequence[split..]);
+                assert_eq!(
+                    tracker.mode_for(binding),
+                    BracketedPasteMode::Enabled,
+                    "{label} discard changed mode at split {split}"
+                );
+                assert_eq!(
+                    tracker.parser,
+                    TerminalModeParserState::Ground,
+                    "{label} discard did not terminate at split {split}"
+                );
+
+                tracker.observe_output(binding, "\x1b[?2004l");
+                assert_eq!(
+                    tracker.mode_for(binding),
+                    BracketedPasteMode::Disabled,
+                    "{label} made the retained mode sticky at split {split}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_string_discard_honors_xterm_global_exits() {
+        let overflow = "x".repeat(usize::from(TERMINAL_MODE_CONTROL_MAX_CHARS) + 1);
+        for sequence in [
+            format!("\x1b]{overflow}\x1b[?2004l"),
+            format!("\x1bP{overflow}\u{009b}?2004l"),
+            format!("\x1bX{overflow}\u{0018}\x1b[?2004l"),
+            format!("\x1b^{overflow}\u{001a}\x1b[?2004l"),
+        ] {
+            let binding = bracketed_paste_test_binding();
+            let mut tracker = bracketed_paste_tracker(binding);
+            tracker.observe_output(binding, "\x1b[?2004h");
+            tracker.observe_output(binding, &sequence);
+            assert_eq!(
+                tracker.mode_for(binding),
+                BracketedPasteMode::Disabled,
+                "discard ignored a real xterm global exit followed by DECRST"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_ready_mode_survives_bounded_terminal_metadata() {
+        let binding = bracketed_paste_test_binding();
+        let mut tracker = bracketed_paste_tracker(binding);
+        tracker.observe_output(
+            binding,
+            "\x1b[?25h\x1b[?25l\x1b[?2004h\x1b[?1004h\x1b[?2031h",
+        );
+        tracker.observe_output(
+            binding,
+            &format!(
+                "\x1b]{}\x07",
+                "terminal metadata ".repeat(usize::from(TERMINAL_MODE_CONTROL_MAX_CHARS) / 4 + 1)
+            ),
+        );
+        assert_eq!(
+            tracker.mode_for(binding),
+            BracketedPasteMode::Enabled,
+            "prompt-ready DECSET was lost while discarding bounded terminal metadata"
+        );
+    }
+
+    #[test]
+    fn csi_overflow_discard_routes_every_c1_string_opener_without_parsing_lookalikes() {
+        for (opener, label) in [
+            ('\u{009d}', "OSC"),
+            ('\u{0090}', "DCS"),
+            ('\u{0098}', "SOS"),
+            ('\u{009e}', "PM"),
+            ('\u{009f}', "APC"),
+        ] {
+            let binding = bracketed_paste_test_binding();
+            let mut tracker = bracketed_paste_tracker(binding);
+            tracker.observe_output(binding, "\x1b[?2004h");
+            tracker.observe_output(
+                binding,
+                &format!(
+                    "\x1b[?{}",
+                    "2".repeat(usize::from(TERMINAL_MODE_CONTROL_MAX_CHARS) + 8)
+                ),
+            );
+            assert_eq!(tracker.mode_for(binding), BracketedPasteMode::Unknown);
+
+            tracker.observe_output(binding, &format!("{opener}hidden[?2004h\u{009c}"));
+            assert_eq!(
+                tracker.mode_for(binding),
+                BracketedPasteMode::Unknown,
+                "{label} lookalike escaped CSI overflow discard"
+            );
+            tracker.observe_output(binding, "\x1b[?2004h");
+            assert_eq!(
+                tracker.mode_for(binding),
+                BracketedPasteMode::Enabled,
+                "real DECSET after {label} ST did not recover"
+            );
+        }
+    }
+
+    #[test]
+    fn bracketed_paste_state_resets_and_rejects_every_stale_run_binding_component() {
+        let old = bracketed_paste_test_binding();
+        let mut tracker = bracketed_paste_tracker(old);
+        tracker.observe_output(old, "\x1b[?2004h");
+        assert_eq!(tracker.mode_for(old), BracketedPasteMode::Enabled);
+
+        for stale in [
+            RunBinding {
+                session_id: Uuid::new_v4(),
+                ..old
+            },
+            RunBinding {
+                run_id: Uuid::new_v4(),
+                ..old
+            },
+            RunBinding {
+                generation: old.generation + 1,
+                ..old
+            },
+        ] {
+            tracker.observe_output(stale, "\x1b[?2004l");
+            assert_eq!(
+                tracker.mode_for(old),
+                BracketedPasteMode::Enabled,
+                "stale binding mutated the active run"
+            );
+        }
+
+        let successor = RunBinding {
+            session_id: Uuid::new_v4(),
+            run_id: Uuid::new_v4(),
+            generation: old.generation,
+        };
+        tracker.begin_run(successor);
+        assert_eq!(
+            tracker.mode_for(successor),
+            BracketedPasteMode::Unknown,
+            "new run inherited predecessor mode"
+        );
+        tracker.observe_output(old, "\x1b[?2004h");
+        assert_eq!(tracker.mode_for(successor), BracketedPasteMode::Unknown);
+        tracker.observe_output(successor, "\x1b[?2004l");
+        assert_eq!(tracker.mode_for(successor), BracketedPasteMode::Disabled);
+    }
+
+    #[test]
+    fn raw_pty_output_updates_only_the_exact_active_run_bracketed_paste_tracker() {
+        let supervisor = test_supervisor();
+        let (pty, _inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_process_id_and_mode(
             &supervisor,
             "codex",
             DriverKind::Codex,
-            Some(wrapper_pid),
+            None,
             pty,
+            BracketedPasteMode::Unknown,
+        );
+        let (generation, run_id, binding) = {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get("codex").unwrap();
+            let run_id = slot.run_id.unwrap();
+            (
+                slot.generation,
+                run_id,
+                RunBinding {
+                    session_id: slot.session_id,
+                    run_id,
+                    generation: slot.generation,
+                },
+            )
+        };
+
+        supervisor.handle_pty_event(
+            "codex",
+            generation,
+            run_id,
+            PtyEvent::Output("\x1b[?20".into()),
+        );
+        supervisor.handle_pty_event("codex", generation, run_id, PtyEvent::Output("04h".into()));
+        assert_eq!(
+            supervisor
+                .inner
+                .slots
+                .lock()
+                .get("codex")
+                .unwrap()
+                .bracketed_paste
+                .mode_for(binding),
+            BracketedPasteMode::Enabled
         );
 
         supervisor.handle_pty_event(
             "codex",
-            0,
-            PtyEvent::Output("codex: command not found".into()),
+            generation + 1,
+            run_id,
+            PtyEvent::Output("\x1b[?2004l".into()),
+        );
+        assert_eq!(
+            supervisor
+                .inner
+                .slots
+                .lock()
+                .get("codex")
+                .unwrap()
+                .bracketed_paste
+                .mode_for(binding),
+            BracketedPasteMode::Enabled,
+            "stale PTY output changed the exact active run tracker"
+        );
+    }
+
+    #[test]
+    fn raw_mode_scanner_runs_even_when_output_event_sequence_is_exhausted() {
+        let supervisor = test_supervisor();
+        let (pty, _inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_process_id_and_mode(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            None,
+            pty,
+            BracketedPasteMode::Unknown,
+        );
+        let (generation, run_id, binding) = {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_mut("codex").unwrap();
+            slot.run_event_sequence = u64::MAX - 2;
+            let run_id = slot.run_id.unwrap();
+            (
+                slot.generation,
+                run_id,
+                RunBinding {
+                    session_id: slot.session_id,
+                    run_id,
+                    generation: slot.generation,
+                },
+            )
+        };
+
+        supervisor.handle_pty_event(
+            "codex",
+            generation,
+            run_id,
+            PtyEvent::Output("\x1b[?2004h".into()),
         );
 
-        let snapshot = supervisor.snapshot();
-        let codex = snapshot
-            .sessions
-            .into_iter()
-            .find(|session| session.name == "codex")
+        let slots = supervisor.inner.slots.lock();
+        let slot = slots.get("codex").unwrap();
+        assert_eq!(
+            slot.bracketed_paste.mode_for(binding),
+            BracketedPasteMode::Enabled
+        );
+        assert_eq!(slot.run_event_sequence, u64::MAX - 2);
+    }
+
+    #[test]
+    fn production_start_binds_a_fresh_unknown_bracketed_paste_state_before_spawn() {
+        let supervisor = test_supervisor();
+        let (pty, _inputs) = recording_pty_session(std::process::id());
+        supervisor.set_pty_spawner_for_tests(Arc::new(QueuePtySpawner::new(vec![pty])));
+
+        let started = start_test_session(&supervisor, "codex").unwrap();
+
+        let slots = supervisor.inner.slots.lock();
+        let slot = slots.get("codex").unwrap();
+        let binding = RunBinding {
+            session_id: slot.session_id,
+            run_id: slot.run_id.unwrap(),
+            generation: slot.generation,
+        };
+        assert_eq!(started.run_id, Some(binding.run_id));
+        assert_eq!(slot.bracketed_paste.binding, Some(binding));
+        assert_eq!(
+            slot.bracketed_paste.mode_for(binding),
+            BracketedPasteMode::Unknown
+        );
+    }
+
+    #[test]
+    fn direct_operator_route_rejects_unknown_and_disabled_before_message_side_effects() {
+        for mode in [BracketedPasteMode::Unknown, BracketedPasteMode::Disabled] {
+            let supervisor = test_supervisor();
+            let (pty, inputs) = recording_pty_session(std::process::id());
+            install_mock_running_session_with_process_id_and_mode(
+                &supervisor,
+                "codex",
+                DriverKind::Codex,
+                None,
+                pty,
+                mode,
+            );
+            let before = slots_mutation_probe(&supervisor);
+            let audit_before = fs::read(supervisor.audit_log_path()).unwrap_or_default();
+            let events = capture_runtime_events(&supervisor);
+            let session_id = test_session_id(&supervisor, "codex");
+
+            let error = supervisor
+                .route_operator_message(OperatorRouteMessageRequest {
+                    recipient_id: session_id,
+                    content: "must remain atomic".into(),
+                })
+                .unwrap_err();
+
+            assert!(
+                error.to_string().contains(match mode {
+                    BracketedPasteMode::Unknown => "bracketed-paste mode is unknown",
+                    BracketedPasteMode::Disabled => "bracketed-paste mode is disabled",
+                    BracketedPasteMode::Enabled => unreachable!(),
+                }),
+                "{error:#}"
+            );
+            assert_eq!(slots_mutation_probe(&supervisor), before);
+            assert!(inputs.lock().is_empty());
+            assert!(events.lock().is_empty());
+            assert_eq!(
+                fs::read(supervisor.audit_log_path()).unwrap_or_default(),
+                audit_before
+            );
+        }
+    }
+
+    #[test]
+    fn mode_rejection_preserves_unrelated_liveness_reconciliation_without_message_side_effects() {
+        let supervisor = test_supervisor();
+        let claude_alias = test_session_alias(&supervisor, "claude");
+        let codex_id = test_session_id(&supervisor, "codex");
+        let (stale_pty, stale_inputs) = recording_pty_session(u32::MAX);
+        install_mock_running_session_with_process_id_and_mode(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            Some(u32::MAX),
+            stale_pty,
+            BracketedPasteMode::Unknown,
+        );
+        let (target_pty, target_inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_process_id_and_mode(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            None,
+            target_pty,
+            BracketedPasteMode::Unknown,
+        );
+        let target_before = slot_mutation_probe(&supervisor, "codex");
+        let events = capture_runtime_events(&supervisor);
+
+        let error = supervisor
+            .route_operator_message(OperatorRouteMessageRequest {
+                recipient_id: codex_id,
+                content: "must fail before routing".into(),
+            })
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("bracketed-paste mode is unknown"),
+            "{error:#}"
+        );
+        assert_eq!(slot_mutation_probe(&supervisor, "codex"), target_before);
+        assert!(stale_inputs.lock().is_empty());
+        assert!(target_inputs.lock().is_empty());
+        let events = events.lock();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SessionExit { session, .. } if session == &claude_alias
+        )));
+        assert!(!events.iter().any(|event| match event {
+            RuntimeEvent::DispatchAttempt { action, .. } => action == "route_message",
+            RuntimeEvent::RoutedMessage { .. } | RuntimeEvent::RouteDelivery { .. } => true,
+            _ => false,
+        }));
+        drop(events);
+        let audit = fs::read_to_string(supervisor.audit_log_path()).unwrap();
+        let audited_events = audit
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            audited_events
+                .iter()
+                .any(|event| event["event"] == "session_exit")
+        );
+        assert!(!audited_events.iter().any(|event| matches!(
+            event["event"].as_str(),
+            Some("dispatch_attempt" | "routed_message" | "route_delivery")
+        )));
+    }
+
+    #[test]
+    fn addressed_stale_run_reconciles_before_rejecting_without_message_side_effects() {
+        let supervisor = test_supervisor();
+        let codex_id = test_session_id(&supervisor, "codex");
+        let codex_alias = test_session_alias(&supervisor, "codex");
+        let (stale_pty, stale_inputs) = recording_pty_session(u32::MAX);
+        install_mock_running_session_with_process_id_and_mode(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            Some(u32::MAX),
+            stale_pty,
+            BracketedPasteMode::Unknown,
+        );
+        let bracketed_before = supervisor
+            .inner
+            .slots
+            .lock()
+            .get("codex")
+            .unwrap()
+            .bracketed_paste;
+        let events = capture_runtime_events(&supervisor);
+
+        let error = supervisor
+            .route_operator_message(OperatorRouteMessageRequest {
+                recipient_id: codex_id,
+                content: "stale target".into(),
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("is not running"), "{error:#}");
+        assert!(stale_inputs.lock().is_empty());
+        let slot = supervisor.inner.slots.lock();
+        let target = slot.get("codex").unwrap();
+        assert!(target.running.is_none());
+        assert_eq!(target.bracketed_paste, bracketed_before);
+        drop(slot);
+        let events = events.lock();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SessionExit { session, .. } if session == &codex_alias
+        )));
+        assert!(!events.iter().any(|event| match event {
+            RuntimeEvent::DispatchAttempt { action, .. } => action == "route_message",
+            RuntimeEvent::RoutedMessage { .. } | RuntimeEvent::RouteDelivery { .. } => true,
+            _ => false,
+        }));
+        drop(events);
+        let audit = fs::read_to_string(supervisor.audit_log_path()).unwrap();
+        let audited_events = audit
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            audited_events
+                .iter()
+                .any(|event| event["event"] == "session_exit")
+        );
+        assert!(!audited_events.iter().any(|event| matches!(
+            event["event"].as_str(),
+            Some("dispatch_attempt" | "routed_message" | "route_delivery")
+        )));
+    }
+
+    #[test]
+    fn operator_route_mode_flip_after_preflight_is_revalidated_before_zero_write() {
+        let supervisor = test_supervisor();
+        let (pty, inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            pty,
+        );
+        let hook_supervisor = supervisor.clone();
+        let hook_ran = Arc::new(AtomicBool::new(false));
+        let hook_ran_in_callback = hook_ran.clone();
+        supervisor.set_run_input_before_commit_for_tests(move || {
+            hook_ran_in_callback.store(true, Ordering::SeqCst);
+            let mut slots = hook_supervisor.inner.slots.lock();
+            let slot = slots.get_mut("codex").unwrap();
+            let binding = RunBinding {
+                session_id: slot.session_id,
+                run_id: slot.run_id.unwrap(),
+                generation: slot.generation,
+            };
+            slot.bracketed_paste.observe_output(binding, "\x1b[?2004l");
+        });
+        let session_id = test_session_id(&supervisor, "codex");
+
+        let error = supervisor
+            .route_operator_message(OperatorRouteMessageRequest {
+                recipient_id: session_id,
+                content: "mode flips after route preflight".into(),
+            })
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("bracketed-paste mode is disabled")
+        );
+        assert!(hook_ran.load(Ordering::SeqCst));
+        assert!(inputs.lock().is_empty());
+    }
+
+    #[test]
+    fn raw_operator_input_remains_available_when_bracketed_paste_is_unknown_or_disabled() {
+        for mode in [BracketedPasteMode::Unknown, BracketedPasteMode::Disabled] {
+            let supervisor = test_supervisor();
+            let (pty, inputs) = recording_pty_session(std::process::id());
+            install_mock_running_session_with_process_id_and_mode(
+                &supervisor,
+                "codex",
+                DriverKind::Codex,
+                None,
+                pty,
+                mode,
+            );
+
+            supervisor
+                .send_input(SendInputRequest {
+                    session_id: test_session_id(&supervisor, "codex"),
+                    input: "raw operator typing".into(),
+                })
+                .unwrap();
+
+            assert_eq!(inputs.lock().as_slice(), &["raw operator typing"]);
+        }
+    }
+
+    #[test]
+    fn raw_sideband_input_remains_available_when_bracketed_paste_is_disabled() {
+        let supervisor = test_supervisor();
+        let (pty, inputs) = recording_pty_session(101);
+        install_mock_running_session_with_process_id_and_mode(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            Some(101),
+            pty,
+            BracketedPasteMode::Disabled,
+        );
+        let caller = supervisor
+            .resolve_pane_caller(TestPaneProcess::new(7017, [101]))
             .unwrap();
-        assert!(!codex.running);
-        assert_eq!(codex.lifecycle_state, LifecycleState::Failed);
+
+        let response = supervisor.apply_sideband_request(
+            &caller,
+            SidebandRequest::SendInput {
+                name: caller.session.clone(),
+                input: "raw sideband typing".into(),
+            },
+        );
+
+        assert!(response.ok, "{}", response.message);
+        assert_eq!(inputs.lock().as_slice(), &["raw sideband typing"]);
+    }
+
+    #[test]
+    fn observed_unsafe_work_state_rejects_synthetic_delivery_before_message_side_effects() {
+        for (work_state, detail) in [
+            (WorkState::Blocked, "workspace_trust"),
+            (WorkState::ErrorLoop, "rate_limit"),
+        ] {
+            let supervisor = test_supervisor();
+            let (pty, inputs) = recording_pty_session(std::process::id());
+            install_mock_running_session_with_bracketed_paste_enabled(
+                &supervisor,
+                "codex",
+                DriverKind::Codex,
+                pty,
+            );
+            set_session_dispatch_state(
+                &supervisor,
+                "codex",
+                LifecycleState::Ready,
+                Some(work_state),
+            );
+            supervisor
+                .inner
+                .slots
+                .lock()
+                .get_mut("codex")
+                .unwrap()
+                .work_detail = Some(detail.into());
+            let before = slots_mutation_probe(&supervisor);
+            let audit_before = fs::read(supervisor.audit_log_path()).unwrap_or_default();
+            let events = capture_runtime_events(&supervisor);
+            let session_id = test_session_id(&supervisor, "codex");
+
+            let error = supervisor
+                .route_operator_message(OperatorRouteMessageRequest {
+                    recipient_id: session_id,
+                    content: "must not enter a modal prompt".into(),
+                })
+                .unwrap_err();
+
+            assert!(
+                error.to_string().contains(&format!(
+                    "work state is {} ({detail})",
+                    work_state_alert_label(Some(work_state))
+                )),
+                "{error:#}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("use raw terminal input to resolve the prompt"),
+                "{error:#}"
+            );
+            assert_eq!(slots_mutation_probe(&supervisor), before);
+            assert!(inputs.lock().is_empty());
+            assert!(events.lock().is_empty());
+            assert_eq!(
+                fs::read(supervisor.audit_log_path()).unwrap_or_default(),
+                audit_before
+            );
+        }
+    }
+
+    #[test]
+    fn codex_workspace_trust_output_blocks_the_next_route_before_any_write() {
+        let supervisor = test_supervisor();
+        let codex_alias = test_session_alias(&supervisor, "codex");
+        let (pty, inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            pty,
+        );
+        let events = capture_runtime_events(&supervisor);
+
+        handle_current_pty_event(
+            &supervisor,
+            "codex",
+            0,
+            PtyEvent::Output(
+                "Do you trust the contents of this directory?\n› 1. Yes, continue\n  2. No, exit\nPress enter to continue"
+                    .into(),
+            ),
+        );
+
         assert!(work_state_events(&events).iter().any(|event| matches!(
             event,
             RuntimeEvent::SessionWorkState {
                 session,
-                state: WorkState::Exited,
+                state: WorkState::Blocked,
                 detail: Some(detail),
                 ..
-            } if session == "codex" && detail == "command_not_found"
+            } if session == &codex_alias && detail == "workspace_trust"
         )));
-        assert!(session_exit_events(&events).iter().any(|event| matches!(
-            event,
-            RuntimeEvent::SessionExit {
-                session,
-                reason: SessionExitReason::CrashExit,
-                ..
-            } if session == "codex"
-        )));
-    }
+        events.lock().clear();
+        let before = slots_mutation_probe(&supervisor);
+        let audit_before = fs::read(supervisor.audit_log_path()).unwrap_or_default();
 
-    #[test]
-    fn snapshot_prunes_exited_running_session() {
-        let supervisor = test_supervisor();
-        install_stale_running_session(&supervisor, "codex");
-
-        let snapshot = supervisor.snapshot();
-        let codex = snapshot
-            .sessions
-            .into_iter()
-            .find(|session| session.name == "codex")
-            .unwrap();
-
-        assert!(!codex.running);
-        assert_eq!(codex.lifecycle_state, LifecycleState::Closed);
-        assert_eq!(codex.process_id, None);
-    }
-
-    #[test]
-    fn send_input_rejects_exited_session_after_liveness_refresh() {
-        let supervisor = test_supervisor();
-        install_stale_running_session(&supervisor, "codex");
-
+        let session_id = test_session_id(&supervisor, "codex");
         let error = supervisor
-            .send_input(SendInputRequest {
-                name: "codex".into(),
-                input: "hello".into(),
+            .route_operator_message(OperatorRouteMessageRequest {
+                recipient_id: session_id,
+                content: "do not type into trust UI".into(),
             })
             .unwrap_err();
 
-        assert!(error.to_string().contains("session 'codex' is not running"));
+        assert!(
+            error
+                .to_string()
+                .contains("work state is blocked (workspace_trust)"),
+            "{error:#}"
+        );
+        assert_eq!(slots_mutation_probe(&supervisor), before);
+        assert!(inputs.lock().is_empty());
+        assert!(events.lock().is_empty());
+        assert_eq!(
+            fs::read(supervisor.audit_log_path()).unwrap_or_default(),
+            audit_before
+        );
+    }
+
+    #[test]
+    fn missing_catalog_persists_zero_sessions_and_explicit_empty_reopens_empty() {
+        let root = tempfile::tempdir().expect("create zero-session catalog root");
+        let supervisor = empty_test_supervisor_with_root(root.path().to_path_buf());
+        assert!(supervisor.snapshot().sessions.is_empty());
+
+        let catalog_path = session_catalog_path(supervisor.runtime_dir());
+        let first_bytes = fs::read(&catalog_path).expect("read initial empty catalog");
+        let first_catalog: serde_json::Value =
+            serde_json::from_slice(&first_bytes).expect("parse initial empty catalog");
+        assert_eq!(first_catalog["schema_version"], 1);
+        assert_eq!(first_catalog["sessions"], serde_json::json!([]));
+        drop(supervisor);
+
+        let reopened = SupervisorHandle::new(test_supervisor_config(root.path()))
+            .expect("reopen explicit empty catalog");
+        assert!(reopened.snapshot().sessions.is_empty());
+        assert_eq!(
+            fs::read(&catalog_path).expect("read reopened empty catalog"),
+            first_bytes,
+            "an explicit empty catalog must not be reseeded or rewritten"
+        );
+    }
+
+    #[test]
+    fn catalog_crud_preserves_ids_order_duplicate_labels_and_closed_only_fields() {
+        let root = tempfile::tempdir().expect("create catalog CRUD root");
+        let supervisor = empty_test_supervisor_with_root(root.path().to_path_buf());
+        let workspace = root.path().join("chosen workspace");
+        let alternate = root.path().join("alternate workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&alternate).unwrap();
+        let persisted_workspace = supervisor
+            .set_workspace_preference(&workspace)
+            .expect("persist workspace preference");
+        let (spawner, specs) = CapturingPtySpawner::new(Vec::new());
+        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+
+        let claude = create_test_session(
+            &supervisor,
+            "Twin",
+            DriverKind::Claude,
+            shared_types::PermissionProfile::Normal,
+        );
+        let codex = create_test_session(
+            &supervisor,
+            "Twin",
+            DriverKind::Codex,
+            shared_types::PermissionProfile::Normal,
+        );
+        assert_ne!(claude.session_id, codex.session_id);
+        assert_ne!(claude.alias, codex.alias);
+        assert_eq!(
+            claude.label, codex.label,
+            "duplicate labels are presentation-only"
+        );
+
+        let (live_pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session_by_id_with_mode(
+            &supervisor,
+            codex.session_id,
+            DriverKind::Codex,
+            None,
+            live_pty,
+            BracketedPasteMode::Unknown,
+        );
+        let renamed = supervisor
+            .rename_session(codex.session_id, "Renamed while live")
+            .expect("rename a live session");
+        assert!(renamed.running);
+        assert_eq!(renamed.label, "Renamed while live");
+        supervisor
+            .stop_session_by_id(codex.session_id)
+            .expect("close live session before changing launch fields");
+
+        let updated = supervisor
+            .set_permission_profile(codex.session_id, shared_types::PermissionProfile::Unsafe)
+            .expect("set explicit unsafe profile while closed");
+        assert_eq!(
+            updated.permission_profile,
+            shared_types::PermissionProfile::Unsafe
+        );
+        let updated = supervisor
+            .set_session_working_directory(codex.session_id, &alternate)
+            .expect("set qualified session working directory while closed");
+        assert_eq!(
+            updated.working_dir,
+            child_process_path(&fs::canonicalize(&alternate).unwrap())
+                .to_string_lossy()
+                .into_owned()
+        );
+        supervisor
+            .move_session(codex.session_id, 0)
+            .expect("move session to first tab");
+        supervisor
+            .delete_session(claude.session_id)
+            .expect("delete the other closed session");
+
+        let before_reopen = supervisor.snapshot();
+        assert_eq!(before_reopen.workspace_preference, persisted_workspace);
+        assert_eq!(before_reopen.sessions.len(), 1);
+        assert_eq!(before_reopen.sessions[0].session_id, codex.session_id);
+        assert!(
+            specs.lock().is_empty(),
+            "catalog CRUD must never spawn a PTY"
+        );
+        let catalog_path = session_catalog_path(supervisor.runtime_dir());
+        let catalog_value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
+        let persisted = catalog_value["sessions"][0].as_object().unwrap();
+        assert_eq!(
+            persisted.keys().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "driver".to_string(),
+                "label".to_string(),
+                "permission_profile".to_string(),
+                "session_id".to_string(),
+                "working_directory".to_string(),
+            ])
+        );
+        assert!(!catalog_value.to_string().contains("run_id"));
+        assert!(!catalog_value.to_string().contains("process_id"));
+        assert!(!catalog_value.to_string().contains("argv"));
+        assert!(!catalog_value.to_string().contains("env"));
+        drop(supervisor);
+
+        let reopened = SupervisorHandle::new(test_supervisor_config(root.path()))
+            .expect("reopen persisted CRUD catalog");
+        let after_reopen = reopened.snapshot();
+        assert_eq!(after_reopen.workspace_preference, persisted_workspace);
+        assert_eq!(after_reopen.sessions.len(), 1);
+        let restored = &after_reopen.sessions[0];
+        assert_eq!(restored.session_id, codex.session_id);
+        assert_eq!(restored.alias, codex.alias);
+        assert_eq!(restored.label, "Renamed while live");
+        assert_eq!(restored.driver, DriverKind::Codex);
+        assert_eq!(
+            restored.permission_profile,
+            shared_types::PermissionProfile::Unsafe
+        );
+        assert_eq!(restored.lifecycle_state, LifecycleState::Closed);
+        assert!(!restored.running);
+        assert_eq!(restored.run_id, None);
+    }
+
+    #[test]
+    fn corrupt_or_unknown_catalog_fails_visibly_without_rewrite() {
+        for (name, replacement, expected_error) in [
+            ("corrupt", b"{ definitely not JSON".to_vec(), "failed to parse session catalog"),
+            (
+                "unknown-version",
+                br#"{"schema_version":99,"workspace_preference":{"canonical_path":"C:\\placeholder","identity":"placeholder"},"sessions":[]}"#.to_vec(),
+                "unsupported session catalog schema version 99",
+            ),
+        ] {
+            let root = tempfile::tempdir().expect("create invalid-catalog root");
+            let supervisor = empty_test_supervisor_with_root(root.path().to_path_buf());
+            let catalog_path = session_catalog_path(supervisor.runtime_dir());
+            drop(supervisor);
+            fs::write(&catalog_path, &replacement).expect("install invalid catalog fixture");
+
+            let error = SupervisorHandle::new(test_supervisor_config(root.path()))
+                .err()
+                .expect("invalid catalog must fail startup");
+            assert!(
+                format!("{error:#}").contains(expected_error),
+                "{name}: {error:#}"
+            );
+            assert_eq!(
+                fs::read(&catalog_path).unwrap(),
+                replacement,
+                "{name}: startup failure must not rewrite the catalog"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_rejects_relative_workspace_and_blank_qualified_identity_without_rewrite() {
+        let root = tempfile::tempdir().expect("create structural-catalog root");
+        let supervisor = empty_test_supervisor_with_root(root.path().to_path_buf());
+        let session = create_test_session(
+            &supervisor,
+            "Structural validation",
+            DriverKind::Claude,
+            shared_types::PermissionProfile::Normal,
+        );
+        let catalog_path = session_catalog_path(supervisor.runtime_dir());
+        let valid: serde_json::Value =
+            serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
+        drop(supervisor);
+
+        let mut relative_workspace = valid.clone();
+        relative_workspace["workspace_preference"]["canonical_path"] =
+            serde_json::json!("relative/workspace");
+        let relative_bytes = serde_json::to_vec_pretty(&relative_workspace).unwrap();
+        fs::write(&catalog_path, &relative_bytes).unwrap();
+        let error = SupervisorHandle::new(test_supervisor_config(root.path()))
+            .err()
+            .expect("relative workspace preference must fail startup");
+        assert!(format!("{error:#}").contains("workspace preference has an invalid absolute"));
+        assert_eq!(fs::read(&catalog_path).unwrap(), relative_bytes);
+
+        let mut blank_identity = valid;
+        let persisted = blank_identity["sessions"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|candidate| candidate["session_id"] == session.session_id.to_string())
+            .unwrap();
+        persisted["working_directory"]["identity"] = serde_json::json!("   ");
+        let blank_bytes = serde_json::to_vec_pretty(&blank_identity).unwrap();
+        fs::write(&catalog_path, &blank_bytes).unwrap();
+        let error = SupervisorHandle::new(test_supervisor_config(root.path()))
+            .err()
+            .expect("blank session directory identity must fail startup");
+        assert!(format!("{error:#}").contains("blank persisted identity"));
+        assert_eq!(fs::read(&catalog_path).unwrap(), blank_bytes);
+    }
+
+    #[test]
+    fn replaced_workspace_preference_rejects_create_without_catalog_event_or_session_mutation() {
+        let root = tempfile::tempdir().expect("create workspace-identity root");
+        let selected = root.path().join("selected workspace");
+        fs::create_dir_all(&selected).unwrap();
+        let supervisor = empty_test_supervisor_with_root(root.path().to_path_buf());
+        supervisor.set_workspace_preference(&selected).unwrap();
+        fs::rename(&selected, root.path().join("original selected workspace")).unwrap();
+        fs::create_dir_all(&selected).unwrap();
+        let slots_before = slots_mutation_probe(&supervisor);
+        let catalog_path = session_catalog_path(supervisor.runtime_dir());
+        let catalog_before = fs::read(&catalog_path).unwrap();
+        let events = capture_runtime_events(&supervisor);
+
+        let error = supervisor
+            .create_session(shared_types::CreateSessionRequest {
+                label: Some("Must reselect".into()),
+                driver: DriverKind::Claude,
+                permission_profile: shared_types::PermissionProfile::Normal,
+            })
+            .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("workspace preference changed since it was selected")
+        );
+        assert_eq!(slots_mutation_probe(&supervisor), slots_before);
+        assert_eq!(fs::read(&catalog_path).unwrap(), catalog_before);
+        assert!(events.lock().is_empty());
+    }
+
+    #[test]
+    fn catalog_persistence_failure_is_zero_memory_file_event_and_spawn_mutation() {
+        let supervisor = empty_test_supervisor();
+        let session = create_test_session(
+            &supervisor,
+            "Before",
+            DriverKind::Claude,
+            shared_types::PermissionProfile::Normal,
+        );
+        let catalog_path = session_catalog_path(supervisor.runtime_dir());
+        let catalog_before = fs::read(&catalog_path).unwrap();
+        let slots_before = slots_mutation_probe(&supervisor);
+        let events = capture_runtime_events(&supervisor);
+        let (spawner, specs) = CapturingPtySpawner::new(Vec::new());
+        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+        supervisor.fail_next_catalog_write_for_tests();
+
+        let error = supervisor
+            .rename_session(session.session_id, "After")
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected session catalog persistence failure")
+        );
+        assert_eq!(slots_mutation_probe(&supervisor), slots_before);
+        assert_eq!(fs::read(&catalog_path).unwrap(), catalog_before);
+        assert!(events.lock().is_empty());
+        assert!(specs.lock().is_empty());
+    }
+
+    #[test]
+    fn missing_and_replaced_persisted_working_directories_load_unavailable_without_spawn_or_rewrite()
+     {
+        let root = tempfile::tempdir().expect("create unavailable-cwd root");
+        let missing = root.path().join("missing selected cwd");
+        let replaced = root.path().join("replaced selected cwd");
+        fs::create_dir_all(&missing).unwrap();
+        fs::create_dir_all(&replaced).unwrap();
+        let supervisor = empty_test_supervisor_with_root(root.path().to_path_buf());
+        let missing_session = create_test_session(
+            &supervisor,
+            "Missing cwd",
+            DriverKind::Claude,
+            shared_types::PermissionProfile::Normal,
+        );
+        let replaced_session = create_test_session(
+            &supervisor,
+            "Replaced cwd",
+            DriverKind::Codex,
+            shared_types::PermissionProfile::Normal,
+        );
+        supervisor
+            .set_session_working_directory(missing_session.session_id, &missing)
+            .unwrap();
+        supervisor
+            .set_session_working_directory(replaced_session.session_id, &replaced)
+            .unwrap();
+        let catalog_path = session_catalog_path(supervisor.runtime_dir());
+        let catalog_before = fs::read(&catalog_path).unwrap();
+        drop(supervisor);
+
+        fs::rename(&missing, root.path().join("missing cwd moved away")).unwrap();
+        fs::rename(&replaced, root.path().join("original replaced cwd")).unwrap();
+        fs::create_dir_all(&replaced).unwrap();
+
+        let reopened = SupervisorHandle::new(test_supervisor_config(root.path()))
+            .expect("load catalog with unavailable session directories");
+        reopened.set_executable_resolver_for_tests(Arc::new(TestExecutableResolver));
+        let (spawner, specs) = CapturingPtySpawner::new(Vec::new());
+        reopened.set_pty_spawner_for_tests(Arc::new(spawner));
+        for session_id in [missing_session.session_id, replaced_session.session_id] {
+            let snapshot = reopened
+                .snapshot()
+                .sessions
+                .into_iter()
+                .find(|session| session.session_id == session_id)
+                .unwrap();
+            assert_eq!(snapshot.lifecycle_state, LifecycleState::Closed);
+            assert!(!snapshot.running);
+            assert!(
+                snapshot
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("working directory unavailable")),
+                "missing visible unavailable state: {snapshot:?}"
+            );
+            let before = slots_mutation_probe(&reopened);
+            let error = reopened.start_session_by_id(session_id).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("working directory"),
+                "{error:#}"
+            );
+            assert_eq!(slots_mutation_probe(&reopened), before);
+        }
+        assert!(specs.lock().is_empty());
+        assert_eq!(
+            fs::read(&catalog_path).unwrap(),
+            catalog_before,
+            "availability probing must not rewrite the user's catalog"
+        );
+    }
+
+    #[test]
+    fn workspace_and_session_directory_selection_reject_bidirectional_runtime_overlap() {
+        let root = tempfile::tempdir().expect("create runtime-overlap root");
+        let supervisor = empty_test_supervisor_with_root(root.path().to_path_buf());
+        let session = create_test_session(
+            &supervisor,
+            "Runtime overlap",
+            DriverKind::Claude,
+            shared_types::PermissionProfile::Normal,
+        );
+        let runtime = supervisor.runtime_dir().to_path_buf();
+        let catalog_path = session_catalog_path(&runtime);
+        let catalog_before = fs::read(&catalog_path).unwrap();
+        let slots_before = slots_mutation_probe(&supervisor);
+        let events = capture_runtime_events(&supervisor);
+
+        for overlapping in [&runtime, root.path()] {
+            let workspace_error = supervisor
+                .set_workspace_preference(overlapping)
+                .unwrap_err();
+            assert!(
+                workspace_error.to_string().contains("must be disjoint"),
+                "{workspace_error:#}"
+            );
+            let session_error = supervisor
+                .set_session_working_directory(session.session_id, overlapping)
+                .unwrap_err();
+            assert!(
+                session_error.to_string().contains("must be disjoint"),
+                "{session_error:#}"
+            );
+        }
+
+        assert_eq!(slots_mutation_probe(&supervisor), slots_before);
+        assert_eq!(fs::read(&catalog_path).unwrap(), catalog_before);
+        assert!(events.lock().is_empty());
+    }
+
+    #[test]
+    fn durable_catalog_events_redact_personal_working_directory_paths() {
+        let root = tempfile::tempdir().expect("create audit-redaction root");
+        let selected = root.path().join("private customer workspace");
+        fs::create_dir_all(&selected).unwrap();
+        let supervisor = empty_test_supervisor_with_root(root.path().to_path_buf());
+        let session = create_test_session(
+            &supervisor,
+            "Private workspace",
+            DriverKind::Claude,
+            shared_types::PermissionProfile::Normal,
+        );
+        supervisor
+            .set_session_working_directory(session.session_id, &selected)
+            .unwrap();
+
+        let events = fs::read_to_string(supervisor.audit_log_path())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let created = events
+            .iter()
+            .find(|event| event["event"] == "session_created")
+            .expect("durable SessionCreated metadata");
+        assert_eq!(created["session"]["working_dir"], "[path omitted]");
+        let changed = events
+            .iter()
+            .find(|event| event["event"] == "session_working_directory_changed")
+            .expect("durable working-directory change metadata");
+        assert_eq!(changed["old_working_dir"], "[path omitted]");
+        assert_eq!(changed["new_working_dir"], "[path omitted]");
+    }
+
+    #[test]
+    fn delete_retains_definition_until_event_publisher_is_quiescent_and_gap_free() {
+        let supervisor = empty_test_supervisor();
+        let session = create_test_session(
+            &supervisor,
+            "Delete only after drain",
+            DriverKind::Claude,
+            shared_types::PermissionProfile::Normal,
+        );
+        let catalog_path = session_catalog_path(supervisor.runtime_dir());
+        let catalog_before = fs::read(&catalog_path).unwrap();
+        let events = capture_runtime_events(&supervisor);
+
+        {
+            let mut streams = supervisor.inner.run_event_publish.lock();
+            streams.get_mut(&session.session_id).unwrap().draining = true;
+        }
+        assert!(
+            supervisor
+                .delete_session(session.session_id)
+                .unwrap_err()
+                .to_string()
+                .contains("still draining")
+        );
+        supervisor
+            .inner
+            .run_event_publish
+            .lock()
+            .get_mut(&session.session_id)
+            .unwrap()
+            .draining = false;
+
+        {
+            let mut streams = supervisor.inner.run_event_publish.lock();
+            let stream = streams.get_mut(&session.session_id).unwrap();
+            stream.pending.insert(
+                1,
+                RuntimeEvent::SystemLog {
+                    level: LogLevel::Info,
+                    message: "pending fixture".into(),
+                    timestamp: now_rfc3339(),
+                },
+            );
+        }
+        assert!(
+            supervisor
+                .delete_session(session.session_id)
+                .unwrap_err()
+                .to_string()
+                .contains("still draining")
+        );
+        supervisor
+            .inner
+            .run_event_publish
+            .lock()
+            .get_mut(&session.session_id)
+            .unwrap()
+            .pending
+            .clear();
+
+        supervisor
+            .inner
+            .run_event_publish
+            .lock()
+            .get_mut(&session.session_id)
+            .unwrap()
+            .next_sequence = None;
+        assert!(
+            supervisor
+                .delete_session(session.session_id)
+                .unwrap_err()
+                .to_string()
+                .contains("still draining")
+        );
+        assert_eq!(fs::read(&catalog_path).unwrap(), catalog_before);
+        assert!(
+            supervisor
+                .snapshot()
+                .sessions
+                .iter()
+                .any(|candidate| candidate.session_id == session.session_id)
+        );
+        assert!(
+            !events
+                .lock()
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::SessionDeleted { .. }))
+        );
+
+        supervisor
+            .inner
+            .run_event_publish
+            .lock()
+            .get_mut(&session.session_id)
+            .unwrap()
+            .next_sequence = Some(1);
+        supervisor
+            .delete_session(session.session_id)
+            .expect("delete after publisher becomes quiescent");
+        assert!(
+            !supervisor
+                .snapshot()
+                .sessions
+                .iter()
+                .any(|candidate| candidate.session_id == session.session_id)
+        );
+        assert!(events.lock().iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SessionDeleted { session_id, .. }
+                if *session_id == session.session_id
+        )));
+    }
+
+    #[test]
+    fn unresolved_driver_binary_is_zero_spawn_slot_catalog_and_event_mutation() {
+        let supervisor = empty_test_supervisor();
+        let session = create_test_session(
+            &supervisor,
+            "Unresolved driver",
+            DriverKind::Claude,
+            shared_types::PermissionProfile::Normal,
+        );
+        supervisor.set_executable_resolver_for_tests(Arc::new(FailingExecutableResolver));
+        let (spawner, specs) = CapturingPtySpawner::new(Vec::new());
+        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+        let slots_before = slots_mutation_probe(&supervisor);
+        let catalog_path = session_catalog_path(supervisor.runtime_dir());
+        let catalog_before = fs::read(&catalog_path).unwrap();
+        let events = capture_runtime_events(&supervisor);
+
+        let error = supervisor
+            .start_session_by_id(session.session_id)
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected unresolved Claude executable")
+        );
+        assert_eq!(slots_mutation_probe(&supervisor), slots_before);
+        assert_eq!(fs::read(&catalog_path).unwrap(), catalog_before);
+        assert!(specs.lock().is_empty());
+        assert!(events.lock().is_empty());
+    }
+
+    #[test]
+    fn labels_and_metacharacter_working_directories_never_enter_shell_syntax() {
+        let root = tempfile::tempdir().expect("create metacharacter launch root");
+        let metachar_cwd = root.path().join("workspace & harmless");
+        fs::create_dir_all(&metachar_cwd).unwrap();
+        let sentinel = metachar_cwd.join("prim1-shell-injection-sentinel.txt");
+        let supervisor = empty_test_supervisor_with_root(root.path().to_path_buf());
+        let session = create_test_session(
+            &supervisor,
+            "Claude & echo owned>prim1-shell-injection-sentinel.txt",
+            DriverKind::Claude,
+            shared_types::PermissionProfile::Normal,
+        );
+        supervisor
+            .set_session_working_directory(session.session_id, &metachar_cwd)
+            .unwrap();
+        let (pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        let (spawner, specs) = CapturingPtySpawner::new(vec![pty]);
+        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+
+        supervisor
+            .start_session_by_id(session.session_id)
+            .expect("prepare direct executable launch");
+
+        let specs = specs.lock();
+        assert_eq!(specs.len(), 1);
+        let spec = &specs[0];
+        assert!(Path::new(&spec.program).is_absolute());
+        assert!(!matches!(
+            Path::new(&spec.program)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("cmd" | "bat" | "ps1")
+        ));
+        assert_eq!(
+            spec.working_dir,
+            child_process_path(&fs::canonicalize(&metachar_cwd).unwrap()).to_string_lossy()
+        );
+        assert!(
+            !spec
+                .args
+                .iter()
+                .any(|argument| argument.contains("echo owned"))
+        );
+        assert!(!sentinel.exists());
+    }
+
+    #[test]
+    fn failed_or_timed_out_process_scope_termination_is_never_closed_deletable_or_restartable() {
+        for (name, kill_behavior, exit_status, timeout) in [
+            (
+                "kill-error-with-root-exit",
+                MockKillBehavior::Error("injected Job termination failure"),
+                Some(pty_exit_status(0, None, true)),
+                SESSION_STOP_KILL_TIMEOUT,
+            ),
+            (
+                "timeout-with-dead-root-pid",
+                MockKillBehavior::Sleep(Duration::from_millis(100)),
+                None,
+                Duration::from_millis(10),
+            ),
+        ] {
+            let supervisor = empty_test_supervisor();
+            let session = create_test_session(
+                &supervisor,
+                name,
+                DriverKind::Claude,
+                shared_types::PermissionProfile::Normal,
+            );
+            let (pty, _, _) =
+                mock_pty_session_with_exit_status(Some(u32::MAX), exit_status, kill_behavior);
+            install_mock_running_session_by_id_with_mode(
+                &supervisor,
+                session.session_id,
+                DriverKind::Claude,
+                Some(u32::MAX),
+                pty,
+                BracketedPasteMode::Unknown,
+            );
+            supervisor.set_stop_kill_timeout_for_tests(timeout);
+            let events = capture_runtime_events(&supervisor);
+            let stopped = supervisor
+                .stop_session_by_id(session.session_id)
+                .expect("uncertain stop still returns its truthful Failed snapshot");
+            assert_eq!(stopped.lifecycle_state, LifecycleState::Failed, "{name}");
+            assert!(
+                stopped.running,
+                "{name}: uncertain termination must retain the exact process-scope owner"
+            );
+            assert!(
+                stopped
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("termination could not be proved")),
+                "{name}: {stopped:?}"
+            );
+            assert!(
+                supervisor
+                    .inner
+                    .slots
+                    .lock()
+                    .get_by_id(session.session_id)
+                    .unwrap()
+                    .termination_uncertain,
+                "{name}"
+            );
+            assert!(
+                !events
+                    .lock()
+                    .iter()
+                    .any(|event| matches!(event, RuntimeEvent::SessionExit { .. })),
+                "{name}"
+            );
+            assert!(
+                !events.lock().iter().any(|event| matches!(
+                    event,
+                    RuntimeEvent::SessionState {
+                        state: LifecycleState::Closed,
+                        ..
+                    }
+                )),
+                "{name}"
+            );
+
+            let (spawner, specs) = CapturingPtySpawner::new(Vec::new());
+            supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+            let protected_state = slots_mutation_probe(&supervisor);
+            assert!(
+                supervisor.start_session_by_id(session.session_id).is_err(),
+                "{name}"
+            );
+            assert!(
+                supervisor
+                    .restart_session_by_id(session.session_id)
+                    .is_err(),
+                "{name}"
+            );
+            assert!(
+                supervisor.delete_session(session.session_id).is_err(),
+                "{name}"
+            );
+            assert_eq!(slots_mutation_probe(&supervisor), protected_state, "{name}");
+            assert!(specs.lock().is_empty(), "{name}");
+            assert!(
+                supervisor
+                    .snapshot()
+                    .sessions
+                    .iter()
+                    .any(|candidate| candidate.session_id == session.session_id)
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_retirement_retains_owner_until_reserved_reproof_succeeds() {
+        let supervisor = test_supervisor();
+        let session_id = test_session_id(&supervisor, "codex");
+        let kill_count = Arc::new(AtomicUsize::new(0));
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            Some(std::process::id()),
+            Box::new(FirstKillFailsPtySession {
+                process_id: std::process::id(),
+                kill_count: kill_count.clone(),
+            }),
+        );
+        let generation = supervisor.current_generation_for_tests(session_id).unwrap();
+        let run_id = current_run_id(&supervisor, "codex");
+        let events = capture_runtime_events(&supervisor);
+
+        supervisor.handle_pty_event_by_id(session_id, generation, run_id, PtyEvent::Closed);
+
+        let failed = supervisor
+            .snapshot()
+            .sessions
+            .into_iter()
+            .find(|session| session.session_id == session_id)
+            .unwrap();
+        assert_eq!(failed.lifecycle_state, LifecycleState::Failed);
+        assert!(failed.running);
+        assert_eq!(failed.process_id, Some(std::process::id()));
+        assert!(
+            supervisor
+                .inner
+                .slots
+                .lock()
+                .get_by_id(session_id)
+                .unwrap()
+                .termination_uncertain
+        );
+        assert!(!events.lock().iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SessionExit { .. }
+                | RuntimeEvent::SessionState {
+                    state: LifecycleState::Closed,
+                    ..
+                }
+        )));
+
+        let before_late_eof = slot_mutation_probe(&supervisor, "codex");
+        supervisor.handle_pty_event_by_id(session_id, generation, run_id, PtyEvent::Closed);
+        assert_eq!(slot_mutation_probe(&supervisor, "codex"), before_late_eof);
+
+        let stopped = supervisor
+            .stop_session_by_id(session_id)
+            .expect("explicit reserved re-proof should retry the retained owner");
+        assert_eq!(stopped.lifecycle_state, LifecycleState::Closed);
+        assert!(!stopped.running);
+        assert_eq!(kill_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn timed_out_stop_late_completion_and_eof_require_a_new_reserved_reproof() {
+        let supervisor = test_supervisor();
+        let session_id = test_session_id(&supervisor, "codex");
+        let (kill_entered_tx, kill_entered_rx) = mpsc::sync_channel(1);
+        let (kill_release_tx, kill_release_rx) = mpsc::sync_channel(2);
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            Some(std::process::id()),
+            Box::new(GatedKillPtySession {
+                process_id: std::process::id(),
+                kill_entered: Mutex::new(Some(kill_entered_tx)),
+                kill_release: Mutex::new(kill_release_rx),
+            }),
+        );
+        let generation = supervisor.current_generation_for_tests(session_id).unwrap();
+        let run_id = current_run_id(&supervisor, "codex");
+        let events = capture_runtime_events(&supervisor);
+        supervisor.set_stop_kill_timeout_for_tests(Duration::from_millis(20));
+
+        let timed_out = supervisor.stop_session_by_id(session_id).unwrap();
+        assert_eq!(timed_out.lifecycle_state, LifecycleState::Failed);
+        assert!(timed_out.running);
+        kill_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("termination attempt did not enter the gated kill");
+        assert!(
+            supervisor
+                .inner
+                .slots
+                .lock()
+                .get_by_id(session_id)
+                .unwrap()
+                .lifecycle_operation
+                .is_some(),
+            "a still-running timed-out termination attempt must retain its reservation"
+        );
+
+        supervisor.handle_pty_event_by_id(session_id, generation, run_id, PtyEvent::Closed);
+        assert_eq!(
+            supervisor
+                .snapshot()
+                .sessions
+                .into_iter()
+                .find(|session| session.session_id == session_id)
+                .unwrap()
+                .lifecycle_state,
+            LifecycleState::Failed
+        );
+
+        kill_release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let operation_cleared = supervisor
+                .inner
+                .slots
+                .lock()
+                .get_by_id(session_id)
+                .unwrap()
+                .lifecycle_operation
+                .is_none();
+            if operation_cleared {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "late termination did not reconcile"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let after_late_completion = supervisor
+            .snapshot()
+            .sessions
+            .into_iter()
+            .find(|session| session.session_id == session_id)
+            .unwrap();
+        assert_eq!(
+            after_late_completion.lifecycle_state,
+            LifecycleState::Failed
+        );
+        assert!(after_late_completion.running);
+        assert!(!events.lock().iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SessionExit { .. }
+                | RuntimeEvent::SessionState {
+                    state: LifecycleState::Closed,
+                    ..
+                }
+        )));
+
+        supervisor.set_stop_kill_timeout_for_tests(Duration::from_secs(1));
+        kill_release_tx.send(()).unwrap();
+        let reproved = supervisor.stop_session_by_id(session_id).unwrap();
+        assert_eq!(reproved.lifecycle_state, LifecycleState::Closed);
+        assert!(!reproved.running);
+    }
+
+    #[test]
+    fn rejected_spawn_cleanup_timeout_retains_owner_until_reserved_reproof() {
+        let supervisor = test_supervisor();
+        let session_id = test_session_id(&supervisor, "claude");
+        let (kill_entered_tx, kill_entered_rx) = mpsc::sync_channel(1);
+        let (kill_release_tx, kill_release_rx) = mpsc::sync_channel(2);
+        let (spawner, spawn_entered, spawn_release) =
+            gated_pty_spawner(Box::new(GatedKillPtySession {
+                process_id: std::process::id(),
+                kill_entered: Mutex::new(Some(kill_entered_tx)),
+                kill_release: Mutex::new(kill_release_rx),
+            }));
+        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+        supervisor.set_stop_kill_timeout_for_tests(Duration::from_millis(20));
+
+        let start_supervisor = supervisor.clone();
+        let start = thread::spawn(move || start_supervisor.start_session_by_id(session_id));
+        spawn_entered
+            .recv_timeout(Duration::from_secs(1))
+            .expect("spawn did not reach its gate");
+        let (spawn_generation, spawn_run_id) = {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id(session_id).unwrap();
+            (slot.generation, slot.run_id.unwrap())
+        };
+
+        let stopped = supervisor.stop_session_by_id(session_id).unwrap();
+        assert_eq!(stopped.lifecycle_state, LifecycleState::Failed);
+        spawn_release.send(()).unwrap();
+        kill_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("rejected spawn cleanup did not enter kill");
+        let start_error = start.join().unwrap().unwrap_err();
+        assert!(
+            start_error
+                .to_string()
+                .contains("failed to prove rejected spawned PTY termination"),
+            "unexpected rejected-spawn error: {start_error:#}"
+        );
+        let retained = supervisor
+            .snapshot()
+            .sessions
+            .into_iter()
+            .find(|session| session.session_id == session_id)
+            .unwrap();
+        assert_eq!(retained.lifecycle_state, LifecycleState::Failed);
+        assert!(retained.running);
+        assert_eq!(retained.process_id, Some(std::process::id()));
+        let overlapping_reproof = supervisor.stop_session_by_id(session_id).unwrap_err();
+        assert!(
+            overlapping_reproof
+                .to_string()
+                .contains("rejected-spawn cleanup is still in progress"),
+            "unexpected overlapping cleanup error: {overlapping_reproof:#}"
+        );
+
+        supervisor.handle_pty_event_by_id(
+            session_id,
+            spawn_generation,
+            spawn_run_id,
+            PtyEvent::Closed,
+        );
+        assert_eq!(
+            supervisor
+                .snapshot()
+                .sessions
+                .into_iter()
+                .find(|session| session.session_id == session_id)
+                .unwrap()
+                .lifecycle_state,
+            LifecycleState::Failed
+        );
+
+        kill_release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let spawn_reconciled = supervisor
+                .inner
+                .slots
+                .lock()
+                .get_by_id(session_id)
+                .unwrap()
+                .spawn_in_flight
+                .is_none();
+            if spawn_reconciled {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "late spawn cleanup did not reconcile"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        supervisor.set_stop_kill_timeout_for_tests(Duration::from_secs(1));
+        kill_release_tx.send(()).unwrap();
+        let reproved = supervisor.stop_session_by_id(session_id).unwrap();
+        assert_eq!(reproved.lifecycle_state, LifecycleState::Closed);
+        assert!(!reproved.running);
+    }
+
+    #[test]
+    fn shutdown_error_retains_failed_process_scope_and_never_reports_closed() {
+        let supervisor = test_supervisor();
+        let (pty, _, kill_count) = mock_pty_session(
+            Some(std::process::id()),
+            MockKillBehavior::Error("injected shutdown Job termination failure"),
+        );
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            Some(std::process::id()),
+            pty,
+        );
+
+        let error = supervisor.shutdown().unwrap_err();
+        assert!(
+            error.to_string().contains("termination failed"),
+            "{error:#}"
+        );
+        let retained = supervisor
+            .snapshot()
+            .sessions
+            .into_iter()
+            .find(|session| session.label == "claude")
+            .unwrap();
+        assert_eq!(retained.lifecycle_state, LifecycleState::Failed);
+        assert!(retained.running);
+        assert_eq!(retained.process_id, Some(std::process::id()));
+        assert_eq!(kill_count.load(Ordering::SeqCst), 1);
+
+        let retry_error = supervisor.shutdown().unwrap_err();
+        assert!(retry_error.to_string().contains("termination failed"));
+        assert_eq!(kill_count.load(Ordering::SeqCst), 2);
+        let retained = supervisor
+            .snapshot()
+            .sessions
+            .into_iter()
+            .find(|session| session.label == "claude")
+            .unwrap();
+        assert_eq!(retained.lifecycle_state, LifecycleState::Failed);
+        assert!(retained.running);
+    }
+
+    #[test]
+    fn normal_profile_approval_modals_block_real_routes_without_route_side_effects() {
+        for (label, driver, prompt, detail) in [
+            (
+                "claude",
+                DriverKind::Claude,
+                "Do you want to proceed?\n❯ 1. Yes\n  2. Yes, and don't ask again\n  3. No\nEsc to cancel · Tab to amend",
+                "approval_prompt",
+            ),
+            (
+                "codex",
+                DriverKind::Codex,
+                "Would you like to run the following command?\n› 1. Yes, proceed (y)\n  2. Yes, and don't ask again\n  3. No, and tell Codex what to do differently (esc)",
+                "approval_prompt",
+            ),
+        ] {
+            let supervisor = test_supervisor();
+            let (pty, inputs) = recording_pty_session(std::process::id());
+            install_mock_running_session_with_bracketed_paste_enabled(
+                &supervisor,
+                label,
+                driver,
+                pty,
+            );
+            let events = capture_runtime_events(&supervisor);
+            handle_current_pty_event(&supervisor, label, 0, PtyEvent::Output(prompt.into()));
+            assert!(work_state_events(&events).iter().any(|event| matches!(
+                event,
+                RuntimeEvent::SessionWorkState {
+                    state: WorkState::Blocked,
+                    detail: Some(observed),
+                    ..
+                } if observed == detail
+            )));
+            events.lock().clear();
+            let before = slots_mutation_probe(&supervisor);
+            let audit_before = fs::read(supervisor.audit_log_path()).unwrap_or_default();
+
+            let error = supervisor
+                .route_operator_message(OperatorRouteMessageRequest {
+                    recipient_id: test_session_id(&supervisor, label),
+                    content: "must not enter an approval modal".into(),
+                })
+                .unwrap_err();
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("work state is blocked (approval_prompt)"),
+                "{label}: {error:#}"
+            );
+            assert_eq!(slots_mutation_probe(&supervisor), before, "{label}");
+            assert!(inputs.lock().is_empty(), "{label}");
+            assert!(events.lock().is_empty(), "{label}");
+            assert_eq!(
+                fs::read(supervisor.audit_log_path()).unwrap_or_default(),
+                audit_before,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_operator_input_remains_available_for_blocked_work_state() {
+        let supervisor = test_supervisor();
+        let (pty, inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            pty,
+        );
+        set_session_dispatch_state(
+            &supervisor,
+            "codex",
+            LifecycleState::Ready,
+            Some(WorkState::Blocked),
+        );
+
+        supervisor
+            .send_input(SendInputRequest {
+                session_id: test_session_id(&supervisor, "codex"),
+                input: "1".into(),
+            })
+            .unwrap();
+
+        assert_eq!(inputs.lock().as_slice(), &["1"]);
     }
 }

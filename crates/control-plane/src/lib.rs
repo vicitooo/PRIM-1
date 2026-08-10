@@ -30,116 +30,66 @@ fn strip_utf8_bom(raw: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shared_types::{ControlKey, RuntimeSnapshot};
+    use shared_types::{ControlKey, SidebandResponsePayload};
 
     #[test]
-    fn round_trips_request_json() {
-        let json = encode_request(&SidebandRequest::ListSessions {
-            token: "abc".into(),
-        })
-        .unwrap();
-        let decoded = decode_request(&json).unwrap();
-
-        match decoded {
-            SidebandRequest::ListSessions { token } => assert_eq!(token, "abc"),
-            _ => panic!("unexpected request variant"),
-        }
-    }
-
-    #[test]
-    fn round_trips_send_key_request_json() {
-        let json = encode_request(&SidebandRequest::SendKey {
-            token: "abc".into(),
-            name: "claude".into(),
-            key: ControlKey::CtrlC,
-            require_idle: false,
-        })
-        .unwrap();
-        let decoded = decode_request(&json).unwrap();
-
-        match decoded {
+    fn round_trips_admitted_request_json() {
+        let requests = [
+            SidebandRequest::Ping {},
+            SidebandRequest::WaitQuiet {
+                name: "claude".into(),
+                quiet_seconds: 3,
+                timeout_seconds: 30,
+            },
+            SidebandRequest::SendInput {
+                name: "codex".into(),
+                input: "status".into(),
+            },
             SidebandRequest::SendKey {
-                token,
-                name,
-                key,
-                require_idle,
-            } => {
-                assert_eq!(token, "abc");
-                assert_eq!(name, "claude");
-                assert_eq!(key, ControlKey::CtrlC);
-                assert!(!require_idle);
-            }
-            _ => panic!("unexpected request variant"),
-        }
-    }
+                name: "claude".into(),
+                key: ControlKey::CtrlC,
+            },
+        ];
 
-    #[test]
-    fn round_trips_create_pair_request_json() {
-        let json = encode_request(&SidebandRequest::CreatePair {
-            token: "abc".into(),
-            name: "frontend-qa".into(),
-        })
-        .unwrap();
-        let decoded = decode_request(&json).unwrap();
-
-        match decoded {
-            SidebandRequest::CreatePair { token, name } => {
-                assert_eq!(token, "abc");
-                assert_eq!(name, "frontend-qa");
-            }
-            _ => panic!("unexpected request variant"),
-        }
-    }
-
-    #[test]
-    fn round_trips_start_session_extra_args_request_json() {
-        let json = encode_request(&SidebandRequest::StartSession {
-            token: "abc".into(),
-            name: "claude".into(),
-            extra_args: vec!["--resume".into(), "abc-123".into()],
-        })
-        .unwrap();
-        let decoded = decode_request(&json).unwrap();
-
-        match decoded {
-            SidebandRequest::StartSession {
-                token,
-                name,
-                extra_args,
-            } => {
-                assert_eq!(token, "abc");
-                assert_eq!(name, "claude");
-                assert_eq!(
-                    extra_args,
-                    vec!["--resume".to_string(), "abc-123".to_string()]
-                );
-            }
-            _ => panic!("unexpected request variant"),
+        for request in requests {
+            let json = encode_request(&request).unwrap();
+            assert!(!json.contains("token"));
+            assert_eq!(decode_request(&json).unwrap(), request);
         }
     }
 
     #[test]
     fn round_trips_response_json() {
-        let json = encode_response(&SidebandResponse {
+        let response = SidebandResponse {
             ok: true,
-            message: "pong".into(),
-            snapshot: Some(RuntimeSnapshot {
-                sessions: vec![],
-                control_plane: None,
-                runtime_dir: "runtime".into(),
-                audit_log_path: "audit".into(),
-                generated_at: "2026-04-15T00:00:00Z".into(),
-            }),
+            message: "quiet".into(),
             timed_out: false,
-            payload: None,
-            request_id: None,
-        })
-        .unwrap();
-        let decoded = decode_response(&json).unwrap();
+            payload: Some(SidebandResponsePayload::WaitQuiet {
+                quiet_duration_ms: 3_000,
+            }),
+            request_id: Some("req-1".into()),
+        };
+        let json = encode_response(&response).unwrap();
 
-        assert!(decoded.ok);
-        assert_eq!(decoded.message, "pong");
-        assert!(decoded.snapshot.is_some());
+        assert!(!json.contains("snapshot"));
+        assert_eq!(decode_response(&json).unwrap(), response);
+    }
+
+    #[test]
+    fn decode_request_rejects_legacy_authority_and_removed_variants() {
+        assert!(decode_request(r#"{"kind":"ping","token":"abc"}"#).is_err());
+        assert!(decode_request(r#"{"kind":"list_sessions","token":"abc"}"#).is_err());
+        assert!(
+            decode_request(
+                r#"{"kind":"send_input","name":"codex","input":"status","require_idle":true}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn decode_response_rejects_legacy_snapshot_projection() {
+        assert!(decode_response(r#"{"ok":true,"message":"pong","snapshot":null}"#).is_err());
     }
 
     #[test]
@@ -151,16 +101,10 @@ mod tests {
     fn decode_request_accepts_utf8_bom_prefixed_json() {
         let json = format!(
             "\u{feff}{}",
-            encode_request(&SidebandRequest::Ping {
-                token: "abc".into(),
-            })
-            .unwrap()
+            encode_request(&SidebandRequest::Ping {}).unwrap()
         );
 
         let decoded = decode_request(&json).unwrap();
-        match decoded {
-            SidebandRequest::Ping { token } => assert_eq!(token, "abc"),
-            _ => panic!("unexpected request variant"),
-        }
+        assert_eq!(decoded, SidebandRequest::Ping {});
     }
 }

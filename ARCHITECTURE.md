@@ -17,7 +17,7 @@ Build a generic local runtime for terminal-first AI tools where:
 
 The system consists of five main parts:
 
-1. **Supervisor daemon**
+1. **Supervisor runtime**
 2. **PTY host**
 3. **Driver layer**
 4. **Sideband control plane**
@@ -31,22 +31,33 @@ This distinction must stay explicit.
 
 Current product surface:
 
-- two hardcoded panes: Claude and Codex
+- an atomically persisted, backend-ordered set of Claude Code, Codex, and
+  Generic Terminal session definitions
+- stable opaque `SessionId` authority across desktop lifecycle, input, resize,
+  direct routing, renderer state, and run-event lineage; mutable labels are
+  display-only
+- a flat tab UI showing one retained xterm buffer at a time
+- native working-directory selection and visible `Normal`/`Unsafe` permission
+  profiles
 - Windows-first validation
-- collaboration through supervisor-mediated routing
+- a one-recipient in-process routing core with no current visible composer
+- a tokenless, pane-local Windows sideband limited to self `ping`, `wait_quiet`, `send_input`, and `send_key`
 
 Target architecture:
 
 - generic terminal-first runtime
-- dynamic session set
 - dynamic pane/layout model
+- explicit `RoomId` membership and feed
+- user-extensible driver catalog
 - portable to Linux/macOS
 
-The current implementation is a **Claude/Codex proof built on a generic-shaped runtime**, not a finished generic terminal product.
+The current implementation is a **generic persistent-session proof with a
+bounded built-in driver catalog**, not a finished room or arbitrary-layout
+product.
 
-## 3. Supervisor daemon
+## 3. Supervisor runtime
 
-The supervisor is the authority.
+The supervisor is the authority and currently lives inside the desktop process; it is not a separate daemon.
 
 Responsibilities:
 
@@ -165,39 +176,46 @@ That means:
 
 ## 6. Sideband control plane
 
-The sideband plane is the reliable control channel.
+The sideband plane is a narrow, pane-local control channel. It is not the
+operator API, room transport, lifecycle API, or inventory API.
 
-Examples:
+The current Windows surface is deliberately limited to:
 
-- `send --to claude --content "..."`
-- `send --to room --content "..."`
+- `ping`
+- `wait_quiet` for the calling pane
+- `send_input` to the calling pane
+- `send_key` to the calling pane
 
-Primary use cases:
+A named-pipe connection provides transport, not authority. On Windows the
+supervisor obtains and pins the kernel-reported client process, requires it to
+belong to exactly one live PTY job, binds the derived pane identity to that run
+generation, and revalidates both affiliation and generation at mutation time.
+There is no bearer token, credential file, caller-supplied identity, peer target,
+or disk-mailbox fallback. Operator lifecycle and routing remain direct
+in-process Tauri commands.
 
-- direct messages
-- room broadcasts
-- restart requests
-- spawn requests
-- close requests
-- ping/health probes
-- command execution requests
+Future room reads or posts may use the native sideband only after stable
+SessionId/RunId/RoomId membership exists and the supervisor derives the sender
+from the same kernel-bound caller. They must not restore name-based or bearer
+authority.
 
 ### 6.1 Transport choice
 
-The default control plane transport should be:
+The control-plane transport model is:
 
-- **Windows:** named pipe
-- **POSIX:** Unix domain socket
+- **Windows (implemented and under production verification):** current-user-local named pipe
+- **POSIX (planned, not a product claim):** Unix domain socket
 
 Not localhost TCP by default.
 
 Reason:
 
-- lower attack surface
-- local file-permission model
-- avoids accidental browser or unrelated local-process access
+- machine-local transport surface
+- kernel-reported peer-process attribution on Windows
+- rejection of unaffiliated clients before their request frame is accepted
 
-Local HTTP can exist later as a compatibility or remote-control layer, but it should not be the default local control path.
+Local HTTP is not a fallback. Any future remote-control layer needs its own
+explicit trust boundary and product contract.
 
 ### Why explicit sideband is required
 
@@ -218,7 +236,7 @@ stdout parsing may still be used for:
 - telemetry
 - fallback stalled-session heuristics
 
-But not for authoritative routing.
+But not for authority, routing, or lifecycle control.
 
 ## 7. Messaging model
 
@@ -236,50 +254,64 @@ But not for authoritative routing.
 - `private`
   Reserved for future local-only notes or hidden operator metadata
 
-### 7.2 Message types
+### 7.2 Current message types
 
-- `chat_message`
-- `command_request`
-- `command_result`
-- `heartbeat`
-- `health`
-- `spawn_request`
-- `restart_request`
-- `close_request`
+- one-recipient operator-authored direct messages at the backend boundary
+- supervisor-generated lifecycle, delivery, heartbeat, and alert events
+
+Command execution, spawn, restart, and close are not chat message types. They
+remain typed in-process operator actions; the pane-local sideband cannot invoke
+them.
 
 ### 7.3 Routing behavior
 
-On every sideband message, the supervisor should:
+On every operator route, the supervisor must:
 
-1. validate sender permissions
-2. log the event
-3. route it to the target scope
-4. visibly stamp the injection in the target PTY or room
-5. emit any resulting system log entries
+1. derive operator provenance at the Tauri boundary
+2. validate the source request and whole message body
+3. resolve the explicit recipient `SessionId` to one exact run
+4. preflight its framing before any write, including exact-run evidence that DEC private mode 2004 is enabled and that the driver has not observed a blocked/error-loop state for bracketed-paste drivers
+5. record pending metadata without retaining message content
+6. hold the recipient run-input permit, revalidate identity/generation/PTY/gate/mode/work-state, write the complete paste frame, wait the one-second compatibility interval measured against Claude Code 2.1.226 and Codex 0.147.0, then revalidate identity/generation/PTY/gate/work-state and write one Enter; paste mode may legitimately disable after the completed frame, while raw single-line drivers remain one PTY input
+7. emit a written or failed receipt without claiming final-child or model receipt
+
+The desktop command runs this blocking supervisor operation on Tauri's blocking
+pool, so the driver settle interval does not stall the UI or serialize unrelated
+desktop IPC behind the route.
+
+The mode-2004 scanner consumes the exact run's raw PTY output before desktop
+coalescing or output shedding and resets on every `RunId`. Unknown or disabled
+state, or a driver-observed blocked/error-loop state, blocks addressed Claude/Codex
+delivery without blocking raw operator or pane-local input. The paste and Enter
+boundary is FIFO-serialized and rechecked twice. Output is not used as an
+acknowledgement because multiline input may stay
+invisible until Enter; each measured interval is version-sensitive compatibility
+behavior measured against Claude Code 2.1.226 and Codex 0.147.0, with no automatic
+retry after an uncertain outcome. The packaged real-harness byte oracle remains
+responsible for final-child fidelity and receiver receipt.
 
 ### 7.4 Addressing model
 
-The supervisor must not assume one Claude and one Codex forever.
+The current operator boundary identifies each logical session by opaque
+`SessionId`; restart preserves that ID while creating a new `RunId`, and rename
+changes only its display label. The production routing boundary accepts one
+recipient ID. Unknown or stale IDs fail closed, including delete/recreate with
+the same label. There is no name, label, multi-recipient, or all-session
+fallback.
 
-Addressing should support:
-
-- `claude`
-- `codex`
-- `claude:work`
-- `claude:research`
-- `codex:test`
-- `room`
-
-The routing model should treat agent instances as named sessions, not hardcoded singular roles.
+The registry is keyed by `SessionId` with a separate persisted order and a
+deterministic immutable alias table used only by the narrow self-pane sideband.
+The private version-1 catalog stores the workspace preference and ordered
+session intent. It never persists `RunId`, process state, launch arguments,
+environment variables, terminal output, or message content.
 
 ## 8. UI model
 
-The first useful UI is a four-surface room:
+The current useful UI has three surfaces:
 
-- Claude pane
-- Codex pane
-- System log pane
-- the operator input/router
+- backend-ordered session tabs
+- one active terminal with inactive terminal buffers retained
+- the system log
 
 There should also be a small retractable control surface for:
 
@@ -288,21 +320,23 @@ There should also be a small retractable control surface for:
 - reconnect
 - close
 - health
-- room actions
+- refresh and later room actions
 
 The control surface should stay minimal and subordinate to the core room UX.
 
-### 8.2 Future pane model
+### 8.2 Current tab model
 
-The current fixed two-pane layout is acceptable for the first proof, but it is not the final UI model.
+The current UI creates, renames, reorders, configures, and deletes persistent
+session tabs. Every tab, snapshot, pending-output buffer, and terminal reference
+is keyed by `SessionId`. Duplicate labels are disambiguated by driver, cwd, and
+short ID. A tab switch hides rather than disposes the inactive xterm; only exact
+`SessionDeleted` lineage retirement discards it.
 
-Future UI requirements:
+Future layout requirements:
 
-- add/remove panes
-- dynamic pane count
-- agent instance labels and IDs
 - layout presets for one, two, or many sessions
 - workspace-specific session groupings
+- explicit room/feed surfaces
 
 ### 8.3 Workspace / home model
 
@@ -317,17 +351,15 @@ That layer should support:
 
 The room remains the core interaction surface, but it should no longer be the only surface.
 
-### 8.1 Reconnect behavior
+### 8.1 Desktop and renderer lifetime
 
-The UI is not the source of truth. The supervisor is.
-
-If the UI crashes or is closed:
-
-- supervised agents may continue running
-- the supervisor continues logging and routing
-- reopening the UI should reattach to live sessions and recover the current runtime snapshot
-
-This prevents the room from depending on one fragile window process.
+The native supervisor is the source of runtime truth while the desktop process is
+alive. A renderer reload may reconcile from its current snapshot without replacing
+the supervised runs. Closing or crashing the desktop process is different: the
+current product deliberately ends every owned process job. A later launch restores
+the ordered persisted session definitions as closed tabs and starts no harness
+until the operator explicitly starts one. Reattaching live runs across desktop
+processes would require a separately hosted supervisor service and is not claimed.
 
 ## 9. Lifecycle model
 
@@ -343,6 +375,10 @@ This prevents the room from depending on one fragile window process.
 - `closed`
 
 ### 9.2 Definitions
+
+Process exit is derived only from PTY/OS process evidence. Terminal text, including
+normal CLI version banners or strings that resemble shell/exit output, cannot close
+or fail a run.
 
 **Idle**
 
@@ -373,6 +409,14 @@ An agent should only be closed or restarted because of:
 
 This separates normal completion from process teardown.
 
+`closed` is a termination-proof claim, not a display convenience. Every explicit
+stop and every natural PTY EOF/error or liveness retirement serializes through the
+same per-session lifecycle reservation and must prove that the exact run's owned
+process job is empty. A failed or bounded-out proof retains the exact run ownership
+and reports `failed` with termination uncertainty; start, restart, and delete remain
+blocked until a later reserved termination attempt proves the scope empty. Dropping
+a PTY/job handle or observing terminal EOF is never accepted as that proof.
+
 ### 9.4 Heartbeat strategy for v1
 
 V1 heartbeat strategy is:
@@ -393,7 +437,7 @@ Generic wrapper does not imply generic trust.
 
 Per-agent policy should include:
 
-- working directory restrictions
+- qualified working-directory selection
 - network policy
 - sandbox mode
 - allowed sideband commands
@@ -403,35 +447,39 @@ Per-agent policy should include:
 
 These are not deferred hardening tasks. They are mandatory from the first working supervisor:
 
-1. **working-directory whitelist**
-   The supervisor refuses to spawn an agent without an explicit allowed root.
+1. **native working-directory qualification**
+   The renderer cannot submit a raw path. A native chooser selects an existing
+   directory; the supervisor resolves its final path and stable identity,
+   rejects runtime overlap, persists that qualified selection, and revalidates
+   it immediately before spawn. The workspace preference is a default, not an
+   allow-root or OS sandbox.
 
 2. **sideband capability whitelist**
-   By default, an agent can act on itself and send messages. Cross-agent lifecycle requests require explicit policy.
+   After kernel-bound affiliation succeeds, the pane-local schema permits only ping, wait, input, or a supported key for that caller's live run. Peer, lifecycle, inventory, room, and routing actions are absent. This is a protocol boundary, not hostile same-user OS isolation.
 
 3. **named-pipe / socket access control**
-   Only authorized local clients should be able to issue control-plane requests.
+   A successful transport connection grants no authority. On Windows, requests proceed only after the kernel-reported peer process is pinned and verified against exactly one live pane job and generation. A future POSIX transport must establish an equivalent peer-identity boundary before becoming a product claim.
 
 ### Important CLI reality
 
-- Codex exposes native sandbox modes directly.
-- Claude appears to expose permission modes and resume, but not Codex-style OS-enforced read-only sandbox.
+- Claude `Normal` launches directly with `--permission-mode manual`; `Unsafe`
+  adds only `--dangerously-skip-permissions`.
+- Codex `Normal` launches directly with
+  `--ask-for-approval on-request --sandbox workspace-write`; `Unsafe` adds only
+  `--dangerously-bypass-approvals-and-sandbox`.
+- Generic Terminal accepts `Normal` only.
 
-Implication:
+These are visible harness permission profiles, not hostile same-user OS
+isolation. Stronger containment would require a separately measured restricted
+user, ACL, container, VM, or equivalent boundary.
 
-- Codex secure modes can start as a driver setting.
-- Claude secure continuous modes will need external sandboxing later:
-  restricted worktree, lower-privilege user, ACLs, container, or equivalent.
+## 11. 24/7 target model
 
-This later work does not remove the need for the early mandatory protections above.
-
-## 11. 24/7 model
-
-The 24/7 property belongs to the supervisor service, not to one immortal child process.
+The current supervisor lifetime is the desktop-process lifetime. A future 24/7 property would belong to a separately hosted supervisor service, not to one immortal child process.
 
 What remains continuous:
 
-- supervisor daemon
+- supervisor runtime
 - session identity and state
 - metadata audit history
 - routing and health model
@@ -464,7 +512,7 @@ Format:
 
 Every record carries an event type and timestamp. Event-specific metadata may add session/actor/target identity, request or route IDs, lifecycle state, action/phase/result, and delivery counts.
 
-Terminal output and routed-message content remain available only through the live runtime and desktop event path. `session_output` is not written to audit; routed-message content is replaced with `[content omitted]`. Any future room-history surface needs an explicit bounded in-memory retention contract and gap indication rather than silently turning the audit into a content store.
+Terminal output and routed-message content remain available only through the live runtime and desktop event path. `session_output` is not written to audit; routed-message content is replaced with `[content omitted]`. The PTY host carries split UTF-8 code points across reads, then the exact-run mode-2004 scanner consumes that same incrementally decoded stream before renderer sanitization, coalescing, or shedding. The desktop bridge holds at most 512 queued events. Lifecycle and control events use lossless bounded backpressure; only already-sanitized `session_output` display events may be shed under saturation. Every such loss produces a visible, run-scoped gap notice before the next surviving event (or at drain), and renderer terminal-control parsing remains synchronized. Live terminal history can therefore be incomplete under sustained renderer pressure; full output fidelity under saturation is not claimed. Any future room-history surface needs an explicit bounded in-memory retention contract and gap indication rather than silently turning the audit into a content store.
 
 ## 12.1 Multi-instance identity
 
@@ -485,7 +533,7 @@ The room itself needs first-class failure behavior.
 At minimum the architecture must support:
 
 - output throttling when an agent floods the pane
-- parse-and-drop behavior for malformed sideband messages
+- fail-closed behavior for malformed or unaffiliated sideband requests
 - reconnecting the UI without dropping supervised sessions
 - serializing room delivery and lifecycle metadata in the audit log even when multiple agents emit concurrently
 
@@ -534,7 +582,7 @@ What portability means here:
 
 - same supervisor model
 - same PTY ownership model
-- same sideband control-plane model
+- the same narrow, identity-derived sideband policy after each OS boundary is empirically verified
 - different OS-specific validation and packaging work
 
 So the correct claim is:

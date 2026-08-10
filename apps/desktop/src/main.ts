@@ -9,36 +9,53 @@ import {
   type CopySurface,
 } from "./copy-selection";
 import {
+  completeInitialRunEventReconciliation,
+  createRunEventGateState,
+  flushRunEventGateWarnings,
+  forgetRunEventSession,
   handleRuntimeEvent,
+  reconcileSessionSnapshot,
+  registerRuntimeEventsBeforeBootstrap,
+  retireRendererSession,
   type PendingBuffer,
   type RuntimeEventContext,
 } from "./runtime-events";
+import {
+  canUseUnsafePermission,
+  driverLabel,
+  lifecycleLabel,
+  movedSessionOrder,
+  newSessionFormDefaults,
+  permissionProfileForDriver,
+  reconcileSessionTabs,
+  relativeSessionId,
+  resolveFocusedTabAction,
+  resolveGlobalSessionShortcut,
+  sessionTabDescription,
+  shouldShowZeroSession,
+  shortSessionId,
+  unsafePermissionWarning,
+  type SessionTabsState,
+} from "./session-tabs";
 import "./styles.css";
 import type {
-  CreatePairRequest,
-  DeletePairRequest,
-  RenamePairRequest,
-  RouteMessageRequest,
+  ChooseSessionWorkingDirectoryRequest,
+  CreateSessionRequest,
+  DeleteSessionRequest,
+  DriverKind,
+  MoveSessionRequest,
+  PermissionProfile,
+  RenameSessionRequest,
   RuntimeEvent,
   RuntimeSnapshot,
   SendInputRequest,
+  SetSessionPermissionRequest,
   SessionSnapshot,
 } from "./types";
 
-interface PaneGroup {
-  name: string;
-  paneNames: string[];
-}
-
-type PairFocusTarget = "create" | "delete" | `rename:${string}` | null;
-
-const RESERVED_PAIR_NAMES = new Set(["main", "claude", "codex", "room", "operator"]);
-const PAIR_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
-const PAIR_NAME_MAX_LEN = 48;
-
-function paneDisplayTitle(_name: string, original: string): string {
-  return original;
-}
+type SessionFormMode =
+  | { kind: "create" }
+  | { kind: "edit"; sessionId: string };
 
 const app = document.querySelector("#app");
 if (!(app instanceof HTMLDivElement)) {
@@ -49,29 +66,17 @@ app.innerHTML = `
   <div class="app-shell">
     <div class="prim1-ticker" aria-hidden="true">
       <div class="prim1-ticker-track">
-        <span class="prim1-ticker-cell">INTEGRITY <span class="prim1-ticker-glyph">&#9635;</span> 98.6%</span>
+        <span class="prim1-ticker-cell">PRIM-1 <span class="prim1-ticker-glyph">&#8756;</span> LOCAL MULTI-HARNESS RUNTIME</span>
         <span class="prim1-ticker-sep">&#9670;</span>
-        <span class="prim1-ticker-cell">PRIM-1 <span class="prim1-ticker-glyph">&#8756;</span> STABLE</span>
+        <span class="prim1-ticker-cell">SUPERVISOR-OWNED PTYS</span>
         <span class="prim1-ticker-sep">&#9670;</span>
-        <span class="prim1-ticker-cell">CHANNELS: CLAUDE // CODEX</span>
+        <span class="prim1-ticker-cell">VISIBLE TERMINAL SESSIONS</span>
         <span class="prim1-ticker-sep">&#9670;</span>
-        <span class="prim1-ticker-cell">LATENCY: 12.4ms</span>
+        <span class="prim1-ticker-cell">SESSIONID-KEYED TABS</span>
         <span class="prim1-ticker-sep">&#9670;</span>
-        <span class="prim1-ticker-cell">BREACH ATTEMPTS: 0</span>
+        <span class="prim1-ticker-cell">METADATA-ONLY AUDIT</span>
         <span class="prim1-ticker-sep">&#9670;</span>
-        <span class="prim1-ticker-cell">UNHANDLED EVENTS: 0</span>
-        <span class="prim1-ticker-sep">&#9670;</span>
-        <span class="prim1-ticker-cell">FW VERSION: 2.4.0</span>
-        <span class="prim1-ticker-sep">&#9670;</span>
-        <span class="prim1-ticker-cell">NET STATUS: GREEN</span>
-        <span class="prim1-ticker-sep">&#9670;</span>
-        <span class="prim1-ticker-cell">ACCESS CHECKS: PASS</span>
-        <span class="prim1-ticker-sep">&#9670;</span>
-        <span class="prim1-ticker-cell">RECOVERY: STANDBY</span>
-        <span class="prim1-ticker-sep">&#9670;</span>
-        <span class="prim1-ticker-cell">PRIM-1 <span class="prim1-ticker-glyph">&#8756;</span> STABLE</span>
-        <span class="prim1-ticker-sep">&#9670;</span>
-        <span class="prim1-ticker-cell">UPLINK: ENCRYPTED</span>
+        <span class="prim1-ticker-cell">PRIM-1 <span class="prim1-ticker-glyph">&#8756;</span> LOCAL MULTI-HARNESS RUNTIME</span>
         <span class="prim1-ticker-sep">&#9670;</span>
       </div>
     </div>
@@ -106,8 +111,8 @@ app.innerHTML = `
             <path d="M 60 22 L 60 38" style="stroke: var(--copper-hot)" stroke-width="1.5" fill="none" opacity="0.7" />
           </svg>
         </div>
-        <h1>PRIM-1 0.4</h1>
-        <span class="topbar-active-tag">Active pair</span>
+        <h1>PRIM-1</h1>
+        <span class="topbar-active-tag">Sessions</span>
       </div>
       <div class="topbar-status">
         <span class="state-pill" data-session-state="global" hidden>ready</span>
@@ -119,41 +124,62 @@ app.innerHTML = `
     </header>
 
     <section class="workspace-shell">
-      <aside class="group-picker panel">
-        <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
-        <span class="sidebar-accent-stripe" aria-hidden="true"></span>
-        <svg class="sidebar-inner-frame" viewBox="0 0 200 600" preserveAspectRatio="none" aria-hidden="true">
-          <path d="M 14 0 L 14 24 L 4 34 L 4 540 L 14 550 L 14 564 L 28 564 L 38 554 L 162 554 L 172 564 L 186 564 L 186 550 L 196 540 L 196 34 L 186 24 L 186 0"
-                style="stroke: var(--copper-hot)" stroke-width="2.2" fill="none" vector-effect="non-scaling-stroke" stroke-linejoin="miter" stroke-linecap="square"/>
-          <path d="M 4 540 L 14 550 L 14 564 L 28 564 L 38 554 L 162 554 L 172 564 L 186 564 L 186 550 L 196 540"
-                style="stroke: var(--bronze)" stroke-width="2" fill="none" vector-effect="non-scaling-stroke" stroke-linejoin="miter" stroke-linecap="square"/>
-          <rect x="2" y="544" width="14" height="10" style="fill: var(--copper-hot); fill-opacity: 0.22" stroke="none" />
-          <rect x="184" y="544" width="14" height="10" style="fill: var(--copper-hot); fill-opacity: 0.22" stroke="none" />
-        </svg>
-        <div class="card-head">
-          <div class="card-title-block">
-            <div class="kicker-row">
-              <p class="card-kicker">Link</p>
-              <span class="online-pill"><span class="online-dot"></span>Online</span>
-            </div>
-            <h2>Active pair</h2>
-          </div>
-          <div class="group-picker-tools">
-            <span class="mono" id="group-count" hidden>0 groups</span>
-            <div id="pair-create-slot"></div>
-          </div>
-        </div>
-        <ul class="group-list" id="group-list"></ul>
-        <div class="sidebar-grid" aria-hidden="true"></div>
-        <div class="sidebar-footer" aria-hidden="true">
-          <span class="sidebar-version">iSYS v.2.0</span>
-          <div class="sidebar-progress"><span></span></div>
-        </div>
-        <div id="pair-dialog-slot"></div>
-        <span class="active-group-label" id="active-group-label" hidden>main</span>
-      </aside>
+      <nav class="session-tabs-shell" aria-label="Terminal sessions">
+        <div class="session-tabs" id="session-tabs" role="tablist" aria-label="Sessions"></div>
+        <button type="button" class="new-session-button" id="new-session-button">+ New session</button>
+      </nav>
 
-      <section class="workspace-grid" id="workspace-grid"></section>
+      <section class="session-editor panel" id="session-editor" hidden aria-labelledby="session-editor-title">
+        <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
+        <form id="session-form" class="session-form">
+          <div class="session-editor-heading">
+            <div>
+              <p class="card-kicker">Session definition</p>
+              <h2 id="session-editor-title">New session</h2>
+            </div>
+            <button type="button" class="ghost" id="cancel-session-form">Cancel</button>
+          </div>
+          <label>
+            <span>Label <small>optional for new sessions</small></span>
+            <input id="session-label" type="text" maxlength="80" autocomplete="off" />
+          </label>
+          <label>
+            <span>Harness</span>
+            <select id="session-driver">
+              <option value="claude">Claude Code</option>
+              <option value="codex">Codex</option>
+              <option value="generic_terminal">Generic terminal</option>
+            </select>
+          </label>
+          <label>
+            <span>Permission profile</span>
+            <select id="session-permission">
+              <option value="normal">Normal</option>
+              <option value="unsafe">Unsafe — bypass approval prompts</option>
+            </select>
+          </label>
+          <div class="session-path-field">
+            <span>Working directory</span>
+            <output id="session-working-directory" class="session-path">No workspace selected</output>
+            <button type="button" id="browse-session-directory">Browse…</button>
+          </div>
+          <p class="permission-warning" id="permission-warning" role="alert" hidden></p>
+          <p class="session-form-note" id="session-form-note"></p>
+          <p class="session-form-error" id="session-form-error" role="alert" hidden></p>
+          <div class="session-form-actions">
+            <button type="submit" class="primary" id="save-session">Create session</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="zero-session panel" id="zero-session" hidden>
+        <p class="card-kicker">Workspace ready</p>
+        <h2>No terminal sessions</h2>
+        <p>Create a harness session in <span id="zero-workspace">the selected workspace</span>.</p>
+        <button type="button" class="primary" id="zero-new-session">New session</button>
+      </section>
+
+      <section class="workspace-grid" id="workspace-grid" aria-live="polite"></section>
     </section>
 
     <section class="bottom-grid">
@@ -175,7 +201,6 @@ app.innerHTML = `
             <rect x="715" y="3" width="10" height="6" style="fill: var(--bronze)" opacity="0.55" />
           </svg>
           <div class="card-head-meta">
-            <span class="live-pill" hidden><span class="live-dot"></span>Live</span>
             <span class="mono" id="runtime-path" hidden>runtime pending</span>
             <span class="log-toggle" aria-hidden="true">&lt; Log &gt;</span>
           </div>
@@ -184,199 +209,21 @@ app.innerHTML = `
         <span class="card-ctrl-chip" aria-hidden="true">CTRL</span>
       </article>
 
-      <article class="router-card panel">
-        <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
-        <span class="hud-antenna" aria-hidden="true"></span>
-        <div class="card-head">
-          <div class="card-title">
-            <span class="card-icon icon-send" aria-hidden="true"></span>
-            <h2>Route a message</h2>
-          </div>
-          <svg class="card-head-hud" viewBox="0 0 800 12" preserveAspectRatio="none" aria-hidden="true">
-            <path d="M 0 6 L 220 6 M 260 6 L 460 6 M 500 6 L 800 6"
-                  style="stroke: var(--bronze)" stroke-width="1.2" fill="none" stroke-linecap="square" />
-            <path d="M 240 0 L 240 12 M 480 0 L 480 12"
-                  style="stroke: var(--bronze)" stroke-width="1" fill="none" stroke-linecap="square" />
-            <rect x="235" y="3" width="10" height="6" style="fill: var(--copper-hot)" opacity="0.75" />
-            <rect x="475" y="3" width="10" height="6" style="fill: var(--bronze)" opacity="0.55" />
-          </svg>
-          <span class="mono" hidden>Visible + logged</span>
-        </div>
-        <form id="router-form" class="router-form">
-          <label>
-            <span>From</span>
-            <div class="combobox-mount" data-combobox="route-from"></div>
-          </label>
-          <label>
-            <span>To</span>
-            <div class="combobox-mount" data-combobox="route-to"></div>
-          </label>
-          <label class="message-field">
-            <span>Content</span>
-            <textarea id="route-content" rows="6" placeholder="Tell Claude to review the Codex output, or send a room-wide coordination note."></textarea>
-          </label>
-          <div class="router-actions">
-            <button type="submit" class="primary">Send routed message</button>
-            <button type="button" id="clear-router">Clear</button>
-          </div>
-        </form>
-        <span class="card-ctrl-chip" aria-hidden="true">CTRL</span>
-      </article>
     </section>
 
     <div class="control-flyout">
       <button class="control-toggle" aria-label="Open controls">CTRL</button>
       <div class="control-menu">
         <button data-control="refresh">Refresh snapshot</button>
-        <button data-control="mark-main-menu">Main menu</button>
-        <button data-control="show-control-file">Show control file</button>
       </div>
     </div>
   </div>
 `;
 
-interface ComboboxOption { value: string; label: string; }
-
-class Combobox {
-  readonly el: HTMLDivElement;
-  private readonly trigger: HTMLButtonElement;
-  private readonly triggerLabel: HTMLSpanElement;
-  private readonly listbox: HTMLDivElement;
-  private options: ComboboxOption[] = [];
-  private _value = "";
-  private isOpen = false;
-
-  constructor(mount: HTMLElement, public readonly id: string) {
-    this.el = document.createElement("div");
-    this.el.className = "combobox";
-    this.el.dataset.comboboxId = id;
-
-    this.trigger = document.createElement("button");
-    this.trigger.type = "button";
-    this.trigger.className = "combobox-trigger";
-    this.trigger.setAttribute("aria-haspopup", "listbox");
-    this.trigger.setAttribute("aria-expanded", "false");
-
-    this.triggerLabel = document.createElement("span");
-    this.triggerLabel.className = "combobox-label";
-    this.trigger.appendChild(this.triggerLabel);
-
-    const chevron = document.createElement("span");
-    chevron.className = "combobox-chevron";
-    chevron.setAttribute("aria-hidden", "true");
-    this.trigger.appendChild(chevron);
-
-    this.listbox = document.createElement("div");
-    this.listbox.className = "combobox-listbox";
-    this.listbox.setAttribute("role", "listbox");
-    this.listbox.hidden = true;
-
-    this.el.append(this.trigger, this.listbox);
-    mount.replaceChildren(this.el);
-
-    this.trigger.addEventListener("click", () => this.toggle());
-    this.trigger.addEventListener("keydown", (event) => this.handleKeydown(event));
-    this.listbox.addEventListener("keydown", (event) => this.handleKeydown(event));
-    document.addEventListener("click", (event) => {
-      if (!this.isOpen) return;
-      if (event.target instanceof Node && !this.el.contains(event.target)) {
-        this.close();
-      }
-    });
-  }
-
-  get value(): string { return this._value; }
-  set value(v: string) {
-    if (this.options.some((opt) => opt.value === v)) {
-      this._value = v;
-      this.updateLabel();
-      this.renderListbox();
-    }
-  }
-
-  setOptions(options: ComboboxOption[]): void {
-    this.options = options.slice();
-    if (!this.options.find((opt) => opt.value === this._value)) {
-      this._value = this.options[0]?.value ?? "";
-    }
-    this.updateLabel();
-    this.renderListbox();
-  }
-
-  private updateLabel(): void {
-    const opt = this.options.find((o) => o.value === this._value);
-    this.triggerLabel.textContent = opt?.label ?? "";
-  }
-
-  private renderListbox(): void {
-    this.listbox.replaceChildren();
-    for (const opt of this.options) {
-      const item = document.createElement("button");
-      item.type = "button";
-      item.className = "combobox-option";
-      item.setAttribute("role", "option");
-      item.dataset.value = opt.value;
-      item.textContent = opt.label;
-      if (opt.value === this._value) {
-        item.dataset.selected = "true";
-        item.setAttribute("aria-selected", "true");
-      }
-      item.addEventListener("click", () => {
-        this.value = opt.value;
-        this.el.dispatchEvent(new Event("change", { bubbles: true }));
-        this.close();
-        this.trigger.focus();
-      });
-      this.listbox.appendChild(item);
-    }
-  }
-
-  toggle(): void { this.isOpen ? this.close() : this.open(); }
-
-  open(): void {
-    if (this.isOpen) return;
-    this.isOpen = true;
-    this.listbox.hidden = false;
-    this.trigger.setAttribute("aria-expanded", "true");
-    const selected = this.listbox.querySelector<HTMLButtonElement>('[data-selected="true"]');
-    (selected ?? this.listbox.querySelector<HTMLButtonElement>(".combobox-option"))?.focus();
-  }
-
-  close(): void {
-    if (!this.isOpen) return;
-    this.isOpen = false;
-    this.listbox.hidden = true;
-    this.trigger.setAttribute("aria-expanded", "false");
-  }
-
-  private handleKeydown(event: KeyboardEvent): void {
-    if (event.key === "Escape" && this.isOpen) {
-      event.preventDefault();
-      this.close();
-      this.trigger.focus();
-      return;
-    }
-    if ((event.key === "ArrowDown" || event.key === "Enter" || event.key === " ") && !this.isOpen && event.target === this.trigger) {
-      event.preventDefault();
-      this.open();
-      return;
-    }
-    if (this.isOpen && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
-      event.preventDefault();
-      const items = Array.from(this.listbox.querySelectorAll<HTMLButtonElement>(".combobox-option"));
-      const current = document.activeElement;
-      const idx = current instanceof HTMLButtonElement ? items.indexOf(current) : -1;
-      const next = event.key === "ArrowDown"
-        ? items[(idx + 1) % items.length]
-        : items[(idx - 1 + items.length) % items.length];
-      next?.focus();
-    }
-  }
-}
-
 class SessionTerminal {
-  readonly name: string;
-  title: string;
+  readonly sessionId: string;
+  alias: string;
+  label: string;
   readonly terminal: Terminal;
   readonly fitAddon: FitAddon;
   readonly host: HTMLDivElement;
@@ -385,12 +232,13 @@ class SessionTerminal {
   private hooked = false;
   private snapshot: SessionSnapshot | null = null;
 
-  constructor(name: string, title: string) {
-    this.name = name;
-    this.title = paneDisplayTitle(name, title);
-    this.host = must<HTMLDivElement>(`[data-terminal="${name}"]`);
-    this.stateEl = must<HTMLSpanElement>(`[data-session-state="${name}"]`);
-    this.activityEl = must<HTMLSpanElement>(`[data-session-activity="${name}"]`);
+  constructor(sessionId: string, alias: string, label: string) {
+    this.sessionId = sessionId;
+    this.alias = alias;
+    this.label = label;
+    this.host = must<HTMLDivElement>(`[data-terminal="${sessionId}"]`);
+    this.stateEl = must<HTMLSpanElement>(`[data-session-state="${sessionId}"]`);
+    this.activityEl = must<HTMLSpanElement>(`[data-session-activity="${sessionId}"]`);
     this.terminal = new Terminal({
       convertEol: true,
       cursorBlink: true,
@@ -425,20 +273,19 @@ class SessionTerminal {
     this.terminal.open(this.host);
     this.fitAddon.fit();
     this.host.addEventListener("focusin", () => {
-      activeTerminalName = this.name;
-      activeCopySurface = this.name;
+      tabState.activeId = this.sessionId;
+      activeCopySurface = this.sessionId;
     });
     this.host.addEventListener("mousedown", () => {
-      activeTerminalName = this.name;
-      activeCopySurface = this.name;
+      tabState.activeId = this.sessionId;
+      activeCopySurface = this.sessionId;
     });
-    this.banner();
+    this.writeInitialBanner();
   }
 
-  banner(): void {
-    this.terminal.reset();
-    this.terminal.writeln(`\x1b[38;2;${brandBannerAnsi()}m${this.title} pane ready.\x1b[0m`);
-    this.terminal.writeln("Launch the session from the header or send routed messages below.");
+  writeInitialBanner(): void {
+    this.terminal.writeln(`\x1b[38;2;${brandBannerAnsi()}m${this.label} pane ready.\x1b[0m`);
+    this.terminal.writeln("Launch the session from the header to begin.");
     this.terminal.writeln("");
   }
 
@@ -455,15 +302,16 @@ class SessionTerminal {
 
       void command<SessionSnapshot>("send_input", {
         request: {
-          name: this.name,
+          session_id: this.sessionId,
           input,
         } satisfies SendInputRequest,
-      }).catch((error) => writeSystem("error", `${this.title} input failed: ${error}`));
+      }).catch((error) => writeSystem("error", `${this.label} input failed: ${error}`));
     });
   }
 
   applySnapshot(snapshot: SessionSnapshot): void {
-    this.title = paneDisplayTitle(snapshot.name, snapshot.title);
+    this.alias = snapshot.alias;
+    this.label = snapshot.label;
     this.snapshot = snapshot;
     this.stateEl.textContent = snapshot.lifecycle_state;
     this.stateEl.dataset.state = snapshot.lifecycle_state;
@@ -474,13 +322,9 @@ class SessionTerminal {
         : "idle";
     this.activityEl.dataset.running = String(snapshot.running);
 
-    if (!snapshot.running && snapshot.lifecycle_state === "closed") {
-      this.banner();
-    }
-
-    if (isPaneVisible(this.name)) {
+    if (isPaneVisible(this.sessionId)) {
       this.fitAddon.fit();
-      void resizeSession(this.name, this.terminal.cols, this.terminal.rows);
+      void resizeSession(this.sessionId, this.terminal.cols, this.terminal.rows);
     }
     this.hookInput();
   }
@@ -490,11 +334,11 @@ class SessionTerminal {
   }
 
   fit(): void {
-    if (!isPaneVisible(this.name)) {
+    if (!isPaneVisible(this.sessionId)) {
       return;
     }
     this.fitAddon.fit();
-    void resizeSession(this.name, this.terminal.cols, this.terminal.rows);
+    void resizeSession(this.sessionId, this.terminal.cols, this.terminal.rows);
   }
 
   dispose(): void {
@@ -544,53 +388,37 @@ systemTerminalHost.addEventListener("mousedown", () => {
 });
 
 const workspaceGrid = must<HTMLDivElement>("#workspace-grid");
-const groupList = must<HTMLUListElement>("#group-list");
-const groupCount = must<HTMLElement>("#group-count");
-const pairCreateSlot = must<HTMLDivElement>("#pair-create-slot");
-const pairDialogSlot = must<HTMLDivElement>("#pair-dialog-slot");
-const snapshotByName = new Map<string, SessionSnapshot>();
+const sessionTabs = must<HTMLDivElement>("#session-tabs");
+const newSessionButton = must<HTMLButtonElement>("#new-session-button");
+const sessionEditor = must<HTMLElement>("#session-editor");
+const sessionEditorTitle = must<HTMLHeadingElement>("#session-editor-title");
+const sessionForm = must<HTMLFormElement>("#session-form");
+const sessionLabelInput = must<HTMLInputElement>("#session-label");
+const sessionDriverSelect = must<HTMLSelectElement>("#session-driver");
+const sessionPermissionSelect = must<HTMLSelectElement>("#session-permission");
+const sessionWorkingDirectory = must<HTMLOutputElement>("#session-working-directory");
+const browseSessionDirectory = must<HTMLButtonElement>("#browse-session-directory");
+const permissionWarning = must<HTMLElement>("#permission-warning");
+const sessionFormNote = must<HTMLElement>("#session-form-note");
+const sessionFormError = must<HTMLElement>("#session-form-error");
+const saveSessionButton = must<HTMLButtonElement>("#save-session");
+const zeroSession = must<HTMLElement>("#zero-session");
+const zeroWorkspace = must<HTMLElement>("#zero-workspace");
+const zeroNewSession = must<HTMLButtonElement>("#zero-new-session");
+const snapshotById = new Map<string, SessionSnapshot>();
+let latestSnapshotRequest = 0;
 
 const paneMap = new Map<string, SessionTerminal>();
 const pendingOutput = new Map<string, PendingBuffer>();
 const controlEndpoint = must<HTMLElement>("#control-endpoint");
 const auditPath = must<HTMLElement>("#audit-path");
 const runtimePath = must<HTMLElement>("#runtime-path");
-const activeGroupLabel = must<HTMLElement>("#active-group-label");
-
-const routeFromCombobox = new Combobox(
-  must<HTMLDivElement>('[data-combobox="route-from"]'),
-  "route-from",
-);
-const routeToCombobox = new Combobox(
-  must<HTMLDivElement>('[data-combobox="route-to"]'),
-  "route-to",
-);
-routeFromCombobox.setOptions([
-  { value: "operator", label: "Operator" },
-  { value: "claude", label: paneDisplayTitle("claude", "Claude") },
-  { value: "codex", label: paneDisplayTitle("codex", "Codex") },
-]);
-routeToCombobox.setOptions([
-  { value: "claude", label: paneDisplayTitle("claude", "Claude") },
-  { value: "codex", label: paneDisplayTitle("codex", "Codex") },
-  { value: "room", label: "Room" },
-]);
-let renderedSessionSignature: string | null = null;
-let activeTerminalName: string | null = null;
+let tabState: SessionTabsState = { order: [], activeId: null };
 let activeCopySurface: CopySurface = null;
-let currentGroups: PaneGroup[] = [];
-let createPairMode = false;
-let createPairDraft = "";
-let createPairError: string | null = null;
-let renamePairTarget: string | null = null;
-let renamePairDraft = "";
-let renamePairError: string | null = null;
-let openPairMenu: string | null = null;
-let deletePairTarget: string | null = null;
-let pairCrudPending = false;
-let pendingPairFocus: PairFocusTarget = null;
-let pairPickerDismissWired = false;
-let pairPickerActionsWired = false;
+let workspacePreference = "";
+let sessionFormMode: SessionFormMode | null = null;
+let sessionFormPending = false;
+let zeroStateWasVisible = false;
 let paneButtonsWired = false;
 
 /* ── Theme system ──
@@ -781,7 +609,7 @@ function loadSavedTheme(): ThemeName {
 
 applyTheme(loadSavedTheme());
 
-wireRouter();
+wireSessionUi();
 wireControls();
 wireResize();
 wireTerminalShortcuts();
@@ -790,306 +618,230 @@ wireThemeToggle();
 const runtimeEventContext: RuntimeEventContext = {
   writeSystem,
   refreshSnapshotFromEvent,
-  snapshotByName,
+  snapshotById,
   pendingOutput,
-  writeToPane(session, chunk) {
-    const pane = paneMap.get(session);
+  runEventGate: createRunEventGateState(),
+  writeToPane(sessionId, chunk) {
+    const pane = paneMap.get(sessionId);
     if (pane) {
       pane.write(chunk);
       return true;
     }
     return false;
   },
-  applyPaneSnapshot(name, snapshot) {
-    paneMap.get(name)?.applySnapshot(snapshot);
+  applyPaneSnapshot(sessionId, snapshot) {
+    if (snapshot.session_id === sessionId) {
+      applySessionSnapshotToUi(snapshot);
+    }
   },
   setControlEndpoint(endpoint) {
     controlEndpoint.textContent = endpoint;
   },
 };
 
-void listen<RuntimeEvent>("runtime://event", ({ payload }) => {
-  handleRuntimeEvent(payload, runtimeEventContext);
+void registerRuntimeEventsBeforeBootstrap(
+  () =>
+    listen<RuntimeEvent>("runtime://event", ({ payload }) => {
+      handleRuntimeEvent(payload, runtimeEventContext);
+    }),
+  bootstrap,
+).catch((error) => {
+  writeSystem("error", `UI initialization failed: ${String(error)}`);
 });
-
-void bootstrap();
 
 async function bootstrap(): Promise<void> {
   await refreshSnapshot();
   writeSystem("info", "UI attached to supervisor.");
 }
 
-async function refreshSnapshot(preferredActiveGroup?: string): Promise<RuntimeSnapshot> {
+async function refreshSnapshot(preferredSessionId?: string): Promise<RuntimeSnapshot> {
+  const request = ++latestSnapshotRequest;
   const snapshot = await command<RuntimeSnapshot>("bootstrap");
-  applySnapshot(snapshot, preferredActiveGroup);
+  if (request === latestSnapshotRequest) {
+    applySnapshot(snapshot, preferredSessionId);
+  }
   return snapshot;
 }
 
-function applySnapshot(snapshot: RuntimeSnapshot, preferredActiveGroup?: string): void {
-  syncPaneInventory(snapshot.sessions, preferredActiveGroup);
-  populateRouterOptions(snapshot.sessions);
+function applySnapshot(snapshot: RuntimeSnapshot, preferredSessionId?: string): void {
+  const acceptedSessions = new Set<string>();
+  for (const session of snapshot.sessions) {
+    const reconciliation = reconcileSessionSnapshot(
+      session,
+      snapshotById,
+      runtimeEventContext.runEventGate,
+    );
+    if (reconciliation.accepted) {
+      acceptedSessions.add(session.session_id);
+    }
+  }
+  flushRunEventGateWarnings(runtimeEventContext);
+
+  workspacePreference = snapshot.workspace_preference;
+  syncPaneInventory(snapshot.sessions, preferredSessionId);
+  syncSessionForm();
   controlEndpoint.textContent = snapshot.control_plane?.endpoint ?? "starting...";
   auditPath.textContent = snapshot.audit_log_path;
   runtimePath.textContent = snapshot.runtime_dir;
 
   for (const session of snapshot.sessions) {
-    snapshotByName.set(session.name, session);
-    paneMap.get(session.name)?.applySnapshot(session);
-  }
-}
-
-function currentActiveGroupName(): string {
-  return activeGroupLabel.textContent?.trim() || resolveInitialGroup(currentGroups);
-}
-
-function resolveActiveGroupPreference(
-  groups: PaneGroup[],
-  preferredGroup?: string,
-): string {
-  if (preferredGroup && groups.some((group) => group.name === preferredGroup)) {
-    return preferredGroup;
-  }
-
-  const current = activeGroupLabel.textContent?.trim();
-  if (current && groups.some((group) => group.name === current)) {
-    return current;
-  }
-
-  return resolveInitialGroup(groups);
-}
-
-function canManagePairGroup(name: string): boolean {
-  return name !== "main" && name !== "other";
-}
-
-function isPairRunning(name: string): boolean {
-  const group = currentGroups.find((candidate) => candidate.name === name);
-  return group?.paneNames.some((paneName) => snapshotByName.get(paneName)?.running) ?? false;
-}
-
-function validatePairName(name: string, ignoreName?: string): string | null {
-  const trimmed = name.trim();
-  if (!trimmed) {
-    return "Pair name cannot be empty.";
-  }
-  if (trimmed.length > PAIR_NAME_MAX_LEN) {
-    return `Pair name cannot exceed ${PAIR_NAME_MAX_LEN} characters.`;
-  }
-  if (RESERVED_PAIR_NAMES.has(trimmed)) {
-    return `Pair name "${trimmed}" is reserved.`;
-  }
-  if (!PAIR_NAME_PATTERN.test(trimmed)) {
-    return "Use only letters, numbers, hyphens, and underscores.";
-  }
-  if (currentGroups.some((group) => group.name === trimmed && group.name !== ignoreName)) {
-    return `Pair "${trimmed}" already exists.`;
-  }
-  return null;
-}
-
-function syncPairCrudStateToGroups(): void {
-  const groupNames = new Set(currentGroups.map((group) => group.name));
-  if (renamePairTarget && !groupNames.has(renamePairTarget)) {
-    renamePairTarget = null;
-    renamePairDraft = "";
-    renamePairError = null;
-  }
-  if (openPairMenu && !groupNames.has(openPairMenu)) {
-    openPairMenu = null;
-  }
-  if (deletePairTarget && !groupNames.has(deletePairTarget)) {
-    deletePairTarget = null;
-  }
-}
-
-function focusPendingPairControl(): void {
-  const target = pendingPairFocus;
-  if (!target) {
-    return;
-  }
-
-  pendingPairFocus = null;
-  requestAnimationFrame(() => {
-    if (target === "create") {
-      document.querySelector<HTMLInputElement>("[data-pair-create-input]")?.focus();
-      return;
+    if (acceptedSessions.has(session.session_id)) {
+      paneMap.get(session.session_id)?.applySnapshot(session);
     }
-    if (target === "delete") {
-      document.querySelector<HTMLButtonElement>("[data-pair-delete-confirm]")?.focus();
-      return;
-    }
-    if (target.startsWith("rename:")) {
-      const name = target.slice("rename:".length);
-      document
-        .querySelector<HTMLInputElement>(`[data-pair-rename-input="${name}"]`)
-        ?.focus();
-    }
-  });
+  }
+  completeInitialRunEventReconciliation(runtimeEventContext);
 }
 
-function refreshPairPicker(activeGroup = currentActiveGroupName()): void {
-  renderGroupPicker(currentGroups);
-  wirePicker();
-  setActiveGroup(activeGroup);
-  focusPendingPairControl();
-}
-
-function startCreatePair(): void {
-  openPairMenu = null;
-  deletePairTarget = null;
-  renamePairTarget = null;
-  renamePairDraft = "";
-  renamePairError = null;
-  createPairMode = true;
-  createPairDraft = "";
-  createPairError = null;
-  pendingPairFocus = "create";
-  refreshPairPicker();
-}
-
-function cancelCreatePair(): void {
-  if (pairCrudPending || !createPairMode) {
+function applyCommandSessionSnapshot(snapshot: SessionSnapshot): void {
+  const reconciliation = reconcileSessionSnapshot(
+    snapshot,
+    snapshotById,
+    runtimeEventContext.runEventGate,
+  );
+  flushRunEventGateWarnings(runtimeEventContext);
+  if (!reconciliation.accepted) {
     return;
   }
-  createPairMode = false;
-  createPairDraft = "";
-  createPairError = null;
-  refreshPairPicker();
+  applySessionSnapshotToUi(snapshot);
 }
 
-function startRenamePair(name: string): void {
-  openPairMenu = null;
-  createPairMode = false;
-  createPairDraft = "";
-  createPairError = null;
-  deletePairTarget = null;
-  renamePairTarget = name;
-  renamePairDraft = name;
-  renamePairError = null;
-  pendingPairFocus = `rename:${name}`;
-  refreshPairPicker();
-}
-
-function cancelRenamePair(): void {
-  if (pairCrudPending || !renamePairTarget) {
-    return;
+function applySessionSnapshotToUi(snapshot: SessionSnapshot): void {
+  paneMap.get(snapshot.session_id)?.applySnapshot(snapshot);
+  const card = document.querySelector<HTMLElement>(
+    '[data-session-card="' + snapshot.session_id + '"]',
+  );
+  if (card) {
+    updateSessionCard(card, snapshot);
   }
-  renamePairTarget = null;
-  renamePairDraft = "";
-  renamePairError = null;
-  refreshPairPicker();
+  updateSessionTab(snapshot);
+  setActiveSession(tabState.activeId, false);
+  syncSessionForm();
 }
 
-function openDeletePairDialog(name: string): void {
-  openPairMenu = null;
-  deletePairTarget = name;
-  pendingPairFocus = "delete";
-  refreshPairPicker();
-}
-
-function closeDeletePairDialog(): void {
-  if (pairCrudPending) {
-    return;
-  }
-  deletePairTarget = null;
-  refreshPairPicker();
-}
-
-function refreshSnapshotFromEvent(preferredGroup?: string): void {
-  void refreshSnapshot(preferredGroup).catch((error) => {
+function refreshSnapshotFromEvent(preferredSessionId?: string): void {
+  void refreshSnapshot(preferredSessionId).catch((error) => {
     writeSystem(
       "error",
-      `snapshot refresh failed after runtime event: ${String(error)}`,
+      "snapshot refresh failed after runtime event: " + String(error),
     );
   });
 }
 
 function syncPaneInventory(
   sessions: SessionSnapshot[],
-  preferredActiveGroup?: string,
+  preferredSessionId?: string,
 ): void {
-  const nextNames = new Set(sessions.map((session) => session.name));
+  const orderedIds = sessions.map((session) => session.session_id);
+  const transition = reconcileSessionTabs(
+    tabState,
+    orderedIds,
+    preferredSessionId,
+  );
+  const nextIds = new Set(orderedIds);
+
   for (const buffered of Array.from(pendingOutput.keys())) {
-    if (!nextNames.has(buffered)) {
-      const entry = pendingOutput.get(buffered);
-      pendingOutput.delete(buffered);
-      if (entry && (entry.chunks.length > 0 || entry.dropped > 0)) {
-        writeSystem(
-          "info",
-          `pendingOutput dropped: ${buffered} (${entry.chunks.length} queued + ${entry.dropped} previously shed, session no longer in snapshot)`,
-        );
-      }
+    if (nextIds.has(buffered)) {
+      continue;
+    }
+    const entry = pendingOutput.get(buffered);
+    pendingOutput.delete(buffered);
+    if (entry && (entry.chunks.length > 0 || entry.dropped > 0)) {
+      writeSystem(
+        "info",
+        "pendingOutput dropped for removed session "
+          + shortSessionId(buffered)
+          + " ("
+          + entry.chunks.length
+          + " queued + "
+          + entry.dropped
+          + " previously shed)",
+      );
     }
   }
 
-  const signature = sessions
-    .map((session) => `${session.name}:${session.title}`)
-    .join("|");
-  if (signature === renderedSessionSignature) {
-    return;
+  for (const [sessionId, removedSnapshot] of Array.from(snapshotById.entries())) {
+    if (nextIds.has(sessionId)) {
+      continue;
+    }
+    retireRendererSession({
+      clearPending: () => pendingOutput.delete(sessionId),
+      disposePane: () => {
+        paneMap.get(sessionId)?.dispose();
+        paneMap.delete(sessionId);
+      },
+      removeCard: () => {
+        document
+          .querySelector<HTMLElement>(
+            '[data-session-card="' + sessionId + '"]',
+          )
+          ?.remove();
+      },
+      forgetRunEventState: () =>
+        forgetRunEventSession(
+          removedSnapshot.session_id,
+          runtimeEventContext.runEventGate,
+        ),
+      removeSnapshot: () => snapshotById.delete(sessionId),
+      clearFocus: () => {
+        if (activeCopySurface === sessionId) {
+          activeCopySurface = null;
+        }
+      },
+    });
   }
 
-  renderedSessionSignature = signature;
+  const effectiveSessions = sessions.map(
+    (session) => snapshotById.get(session.session_id) ?? session,
+  );
   const fragment = document.createDocumentFragment();
-
-  for (const session of sessions) {
+  for (const session of effectiveSessions) {
     const existingCard = document.querySelector<HTMLElement>(
-      `[data-session-card="${session.name}"]`,
+      '[data-session-card="' + session.session_id + '"]',
     );
     const card = existingCard ?? buildSessionCard(session);
-    card.dataset.group = groupNameForSession(session.name);
-    const title = card.querySelector("h2");
-    if (title instanceof HTMLHeadingElement) {
-      title.textContent = paneDisplayTitle(session.name, session.title);
-    }
+    updateSessionCard(card, session);
     fragment.appendChild(card);
   }
-
   workspaceGrid.replaceChildren(fragment);
 
-  for (const [name, pane] of Array.from(paneMap.entries())) {
-    if (!nextNames.has(name)) {
-      pane.dispose();
-      paneMap.delete(name);
-      snapshotByName.delete(name);
+  for (const session of effectiveSessions) {
+    if (paneMap.has(session.session_id)) {
+      continue;
+    }
+    const pane = new SessionTerminal(
+      session.session_id,
+      session.alias,
+      session.label,
+    );
+    paneMap.set(session.session_id, pane);
+    const pending = pendingOutput.get(session.session_id);
+    if (!pending) {
+      continue;
+    }
+    for (const chunk of pending.chunks) {
+      pane.write(chunk);
+    }
+    pendingOutput.delete(session.session_id);
+    if (pending.chunks.length > 0 || pending.dropped > 0) {
+      const suffix =
+        pending.dropped > 0
+          ? " (" + pending.dropped + " older chunks dropped due to cap)"
+          : "";
+      writeSystem(
+        "info",
+        "session_output flushed: "
+          + pending.chunks.length
+          + " chunks into "
+          + session.label
+          + suffix,
+      );
     }
   }
 
-  for (const session of sessions) {
-    if (!paneMap.has(session.name)) {
-      const pane = new SessionTerminal(session.name, session.title);
-      paneMap.set(session.name, pane);
-      const pending = pendingOutput.get(session.name);
-      if (pending) {
-        for (const chunk of pending.chunks) {
-          pane.write(chunk);
-        }
-        pendingOutput.delete(session.name);
-        if (pending.chunks.length > 0 || pending.dropped > 0) {
-          const suffix =
-            pending.dropped > 0
-              ? ` (${pending.dropped} older chunks dropped due to cap)`
-              : "";
-          writeSystem(
-            "info",
-            `session_output flushed: ${pending.chunks.length} chunks into ${session.name}${suffix}`,
-          );
-        }
-      }
-    }
-  }
-
-  currentGroups = groupSessions(sessions);
-  syncPairCrudStateToGroups();
-  refreshPairPicker(resolveActiveGroupPreference(currentGroups, preferredActiveGroup));
-
-  if (activeTerminalName && !paneMap.has(activeTerminalName)) {
-    activeTerminalName = null;
-  }
-  if (activeCopySurface && activeCopySurface !== "system" && !paneMap.has(activeCopySurface)) {
-    activeCopySurface = null;
-  }
-
+  tabState = transition.state;
+  renderSessionTabs(effectiveSessions);
+  updateZeroSessionState();
+  setActiveSession(tabState.activeId, false);
   applyTheme(currentThemeName());
   wireButtons();
 }
@@ -1097,604 +849,725 @@ function syncPaneInventory(
 function buildSessionCard(session: SessionSnapshot): HTMLElement {
   const article = document.createElement("article");
   article.className = "terminal-card panel";
-  article.dataset.sessionCard = session.name;
-  article.dataset.group = groupNameForSession(session.name);
-  article.dataset.groupActive = "true";
-
-  const isClaude = session.name === "claude" || session.name.endsWith("-claude");
-  const trailingButton = isClaude
-    ? `<button type="button" class="ghost" data-decor="clear">Clear</button>`
-    : `<button type="button" class="ghost" data-decor="close">Close</button>`;
-
-  article.innerHTML = `
-    <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
-    <span class="hud-antenna" aria-hidden="true"></span>
-    <span class="hud-side-stripe" aria-hidden="true"></span>
-    <div class="card-head terminal-head">
-      <h2></h2>
-      <div class="terminal-actions">
-        <button type="button" data-action="start" data-session="${session.name}">Launch</button>
-        <button type="button" data-action="restart" data-session="${session.name}">Restart</button>
-        <button type="button" data-action="stop" data-session="${session.name}">Stop</button>
-      </div>
-      <div class="terminal-actions terminal-actions-right">
-        ${trailingButton}
-        <button type="button" class="ghost" data-decor="tile">Tile</button>
-      </div>
-      <div class="session-meta" hidden>
-        <span class="state-pill" data-session-state="${session.name}">closed</span>
-        <span class="activity-pill" data-session-activity="${session.name}">idle</span>
-      </div>
-    </div>
-    <div class="terminal-host" data-terminal="${session.name}"></div>
-  `;
-
-  const title = article.querySelector("h2");
-  if (!(title instanceof HTMLHeadingElement)) {
-    throw new Error(`Missing title heading for ${session.name}`);
-  }
-  title.textContent = paneDisplayTitle(session.name, session.title);
-
+  article.dataset.sessionCard = session.session_id;
+  article.id = "session-panel-" + session.session_id;
+  article.setAttribute("role", "tabpanel");
+  article.setAttribute("aria-labelledby", "session-tab-" + session.session_id);
+  article.innerHTML = [
+    '<i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>',
+    '<span class="hud-antenna" aria-hidden="true"></span>',
+    '<span class="hud-side-stripe" aria-hidden="true"></span>',
+    '<div class="card-head terminal-head">',
+    '<div class="terminal-identity">',
+    "<h2></h2>",
+    '<div class="terminal-facts">',
+    '<span data-session-driver></span>',
+    '<span data-session-permission></span>',
+    '<span data-session-cwd></span>',
+    "</div>",
+    "</div>",
+    '<div class="terminal-actions">',
+    '<button type="button" data-action="start" data-session="' + session.session_id + '">Launch</button>',
+    '<button type="button" data-action="restart" data-session="' + session.session_id + '">Restart</button>',
+    '<button type="button" data-action="stop" data-session="' + session.session_id + '">Stop</button>',
+    '<button type="button" class="ghost" data-edit-session="' + session.session_id + '">Edit</button>',
+    "</div>",
+    '<div class="session-meta">',
+    '<span class="state-pill" data-session-state="' + session.session_id + '">closed</span>',
+    '<span class="activity-pill" data-session-activity="' + session.session_id + '">idle</span>',
+    "</div>",
+    "</div>",
+    '<div class="terminal-host" data-terminal="' + session.session_id + '"></div>',
+  ].join("");
   return article;
 }
 
-function groupSessions(sessions: SessionSnapshot[]): PaneGroup[] {
-  const groups = new Map<string, string[]>();
-  for (const session of sessions) {
-    const groupName = groupNameForSession(session.name);
-    const paneNames = groups.get(groupName) ?? [];
-    paneNames.push(session.name);
-    groups.set(groupName, paneNames);
+function updateSessionCard(
+  card: HTMLElement,
+  session: SessionSnapshot,
+): void {
+  const heading = card.querySelector("h2");
+  if (heading) {
+    heading.textContent = session.label;
   }
+  const driver = card.querySelector<HTMLElement>("[data-session-driver]");
+  const permission = card.querySelector<HTMLElement>("[data-session-permission]");
+  const cwd = card.querySelector<HTMLElement>("[data-session-cwd]");
+  if (driver) {
+    driver.textContent = driverLabel(session.driver);
+  }
+  if (permission) {
+    permission.textContent =
+      session.permission_profile === "unsafe" ? "Unsafe" : "Normal";
+    permission.dataset.permission = session.permission_profile;
+  }
+  if (cwd) {
+    cwd.textContent = session.working_dir;
+    cwd.title = session.working_dir;
+  }
+  card.title = sessionTabDescription(session);
 
-  return Array.from(groups.entries())
-    .sort(([left], [right]) => compareGroupNames(left, right))
-    .map(([name, paneNames]) => ({
-      name,
-      paneNames: paneNames.sort(comparePaneNamesWithinGroup),
-    }));
+  const launch = card.querySelector<HTMLButtonElement>('[data-action="start"]');
+  const restart = card.querySelector<HTMLButtonElement>('[data-action="restart"]');
+  const stop = card.querySelector<HTMLButtonElement>('[data-action="stop"]');
+  if (launch) {
+    launch.disabled = session.running;
+  }
+  if (restart) {
+    restart.disabled = false;
+  }
+  if (stop) {
+    stop.disabled = !session.running;
+  }
 }
 
-function groupNameForSession(name: string): string {
-  if (name === "claude" || name === "codex") {
-    return "main";
-  }
-
-  const match = name.match(/^(.+)-(claude|codex)$/);
-  return match ? match[1] : "other";
-}
-
-function compareGroupNames(left: string, right: string): number {
-  if (left === right) {
-    return 0;
-  }
-  if (left === "main") {
-    return -1;
-  }
-  if (right === "main") {
-    return 1;
-  }
-  if (left === "other") {
-    return 1;
-  }
-  if (right === "other") {
-    return -1;
-  }
-  return left.localeCompare(right);
-}
-
-function comparePaneNamesWithinGroup(left: string, right: string): number {
-  const leftRank = paneRoleRank(left);
-  const rightRank = paneRoleRank(right);
-  if (leftRank !== rightRank) {
-    return leftRank - rightRank;
-  }
-  return left.localeCompare(right);
-}
-
-function paneRoleRank(name: string): number {
-  if (name === "claude" || name.endsWith("-claude")) {
-    return 0;
-  }
-  if (name === "codex" || name.endsWith("-codex")) {
-    return 1;
-  }
-  return 2;
-}
-
-function renderGroupPicker(groups: PaneGroup[]): void {
-  groupCount.textContent = `${groups.length} ${groups.length === 1 ? "group" : "groups"}`;
-  renderPairCreateControl();
-
-  const fragment = document.createDocumentFragment();
-  const activeGroup = currentActiveGroupName();
-  for (const group of groups) {
-    const item = document.createElement("li");
-    const shell = document.createElement("div");
-    shell.className = "group-chip-shell";
-    shell.dataset.groupRoot = group.name;
-    shell.dataset.active = String(group.name === activeGroup);
-
-    if (renamePairTarget === group.name) {
-      const input = document.createElement("input");
-      input.type = "text";
-      input.className = "new-pair-input";
-      input.value = renamePairDraft;
-      input.placeholder = "pair name";
-      input.dataset.pairRenameInput = group.name;
-      input.disabled = pairCrudPending;
-      shell.appendChild(input);
-
-      if (renamePairError) {
-        const error = document.createElement("span");
-        error.className = "pair-error";
-        error.textContent = renamePairError;
-        shell.appendChild(error);
-      }
-    } else {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "group-chip";
-      button.dataset.group = group.name;
-      button.dataset.active = String(group.name === activeGroup);
-      button.textContent = group.name;
-      shell.appendChild(button);
-    }
-
-    if (canManagePairGroup(group.name) && renamePairTarget !== group.name) {
-      const menuRoot = document.createElement("div");
-      menuRoot.className = "chip-menu-root";
-      menuRoot.dataset.chipMenuRoot = group.name;
-
-      const menuButton = document.createElement("button");
-      menuButton.type = "button";
-      menuButton.className = "chip-menu-button";
-      menuButton.dataset.groupMenuToggle = group.name;
-      menuButton.setAttribute("aria-label", `Manage ${group.name}`);
-      menuButton.textContent = "⋯";
-      menuRoot.appendChild(menuButton);
-
-      if (openPairMenu === group.name) {
-        const menu = document.createElement("div");
-        menu.className = "chip-menu";
-        const pairRunning = isPairRunning(group.name);
-        const actions: Array<["rename" | "delete", string]> = [
-          ["rename", "Rename"],
-          ["delete", "Delete"],
-        ];
-
-        for (const [action, label] of actions) {
-          const actionButton = document.createElement("button");
-          actionButton.type = "button";
-          actionButton.className = "chip-menu-action";
-          actionButton.textContent = label;
-          actionButton.dataset.pairMenuAction = action;
-          actionButton.dataset.group = group.name;
-          actionButton.disabled = pairRunning || pairCrudPending;
-          actionButton.title = pairRunning
-            ? `Stop both panes to ${action}`
-            : "";
-          menu.appendChild(actionButton);
-        }
-
-        menuRoot.appendChild(menu);
-      }
-
-      shell.appendChild(menuRoot);
-    }
-
-    item.appendChild(shell);
-    fragment.appendChild(item);
-  }
-  groupList.replaceChildren(fragment);
-  renderDeletePairDialog();
-}
-
-function renderPairCreateControl(): void {
-  pairCreateSlot.replaceChildren();
-
-  if (!createPairMode) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "new-pair-button";
-    button.id = "new-pair-button";
-    button.textContent = "+ New pair";
-    button.disabled = pairCrudPending;
-    pairCreateSlot.appendChild(button);
-    return;
-  }
-
-  const wrapper = document.createElement("div");
-  wrapper.className = "pair-inline-editor";
-  const input = document.createElement("input");
-  input.type = "text";
-  input.className = "new-pair-input";
-  input.value = createPairDraft;
-  input.placeholder = "pair name";
-  input.dataset.pairCreateInput = "true";
-  input.disabled = pairCrudPending;
-  wrapper.appendChild(input);
-
-  if (createPairError) {
-    const error = document.createElement("span");
-    error.className = "pair-error";
-    error.textContent = createPairError;
-    wrapper.appendChild(error);
-  }
-
-  pairCreateSlot.appendChild(wrapper);
-}
-
-function renderDeletePairDialog(): void {
-  pairDialogSlot.replaceChildren();
-  // Remove any existing dialog from anywhere it might be living
-  document.querySelector(".pair-dialog-overlay")?.remove();
-  document.querySelectorAll(".pair-dialog").forEach((el) => el.remove());
-  if (!deletePairTarget) {
-    return;
-  }
-
-  // Render inline below the targeted chip-shell so the dialog feels anchored
-  // to the pair it's about to delete.
-  const targetShell = document.querySelector<HTMLElement>(
-    `[data-group-root="${deletePairTarget}"]`,
+function renderSessionTabs(sessions: SessionSnapshot[]): void {
+  const byId = new Map(
+    sessions.map((session) => [session.session_id, session] as const),
   );
-  if (!targetShell) {
-    return;
+  const fragment = document.createDocumentFragment();
+  for (const [index, sessionId] of tabState.order.entries()) {
+    const session = byId.get(sessionId);
+    if (!session) {
+      continue;
+    }
+    const shell = document.createElement("div");
+    shell.className = "session-tab-shell";
+    shell.dataset.sessionTabShell = sessionId;
+
+    const tab = document.createElement("button");
+    tab.type = "button";
+    tab.className = "session-tab";
+    tab.id = "session-tab-" + sessionId;
+    tab.dataset.sessionTab = sessionId;
+    tab.setAttribute("role", "tab");
+    tab.setAttribute(
+      "aria-selected",
+      String(tabState.activeId === sessionId),
+    );
+    tab.setAttribute("aria-controls", "session-panel-" + sessionId);
+    tab.tabIndex = tabState.activeId === sessionId ? 0 : -1;
+    tab.title = sessionTabDescription(session);
+
+    const label = document.createElement("span");
+    label.className = "session-tab-label";
+    label.dataset.sessionTabLabel = sessionId;
+    label.textContent = session.label;
+    const detail = document.createElement("span");
+    detail.className = "session-tab-detail";
+    detail.dataset.sessionTabDetail = sessionId;
+    detail.textContent =
+      driverLabel(session.driver)
+      + " · "
+      + session.working_dir
+      + " · "
+      + shortSessionId(sessionId);
+    const badges = document.createElement("span");
+    badges.className = "session-tab-badges";
+    badges.dataset.sessionTabBadges = sessionId;
+    badges.append(
+      tabBadge(
+        session.permission_profile === "unsafe" ? "Unsafe" : "Normal",
+        "permission",
+        session.permission_profile,
+      ),
+      tabBadge(
+        lifecycleLabel(session.lifecycle_state),
+        "lifecycle",
+        session.lifecycle_state,
+      ),
+    );
+    tab.append(label, detail, badges);
+    tab.addEventListener("click", () => setActiveSession(sessionId, false));
+    tab.addEventListener("keydown", (event) =>
+      handleFocusedTabKeydown(event, sessionId),
+    );
+
+    shell.append(
+      tab,
+      tabActionButton("←", "Move " + session.label + " left", "move", sessionId, -1, index === 0),
+      tabActionButton("→", "Move " + session.label + " right", "move", sessionId, 1, index === tabState.order.length - 1),
+      tabActionButton("Edit", "Edit " + session.label, "edit", sessionId),
+      tabActionButton(
+        "Close",
+        session.running
+          ? "Stop " + session.label + " before closing"
+          : "Close " + session.label,
+        "close",
+        sessionId,
+        undefined,
+        session.running,
+      ),
+    );
+    fragment.appendChild(shell);
   }
-
-  const dialog = document.createElement("div");
-  dialog.className = "pair-dialog";
-  dialog.innerHTML = `
-    <p class="card-kicker">Delete pair</p>
-    <h3>Delete "${deletePairTarget}"?</h3>
-    <p>Both panes stop and are removed. Audit log preserved.</p>
-  `;
-
-  const actions = document.createElement("div");
-  actions.className = "pair-dialog-actions";
-
-  const cancelButton = document.createElement("button");
-  cancelButton.type = "button";
-  cancelButton.textContent = "Cancel";
-  cancelButton.dataset.pairDeleteCancel = deletePairTarget;
-  cancelButton.disabled = pairCrudPending;
-
-  const deleteButton = document.createElement("button");
-  deleteButton.type = "button";
-  deleteButton.className = "danger";
-  deleteButton.textContent = "Delete";
-  deleteButton.disabled = pairCrudPending;
-  deleteButton.setAttribute("data-pair-delete-confirm", deletePairTarget);
-
-  actions.append(cancelButton, deleteButton);
-  dialog.appendChild(actions);
-  targetShell.appendChild(dialog);
+  sessionTabs.replaceChildren(fragment);
 }
 
-async function submitCreatePair(): Promise<void> {
-  if (pairCrudPending) {
+function updateSessionTab(session: SessionSnapshot): void {
+  const shell = sessionTabs.querySelector<HTMLElement>(
+    '[data-session-tab-shell="' + session.session_id + '"]',
+  );
+  if (!shell) {
     return;
   }
-
-  const name = createPairDraft.trim();
-  const validationError = validatePairName(name);
-  if (validationError) {
-    createPairError = validationError;
-    pendingPairFocus = "create";
-    refreshPairPicker();
-    return;
+  const tab = shell.querySelector<HTMLButtonElement>("[data-session-tab]");
+  const label = shell.querySelector<HTMLElement>("[data-session-tab-label]");
+  const detail = shell.querySelector<HTMLElement>("[data-session-tab-detail]");
+  const badges = shell.querySelector<HTMLElement>("[data-session-tab-badges]");
+  if (tab) {
+    tab.title = sessionTabDescription(session);
   }
+  if (label) {
+    label.textContent = session.label;
+  }
+  if (detail) {
+    detail.textContent =
+      driverLabel(session.driver)
+      + " · "
+      + session.working_dir
+      + " · "
+      + shortSessionId(session.session_id);
+  }
+  if (badges) {
+    badges.replaceChildren(
+      tabBadge(
+        session.permission_profile === "unsafe" ? "Unsafe" : "Normal",
+        "permission",
+        session.permission_profile,
+      ),
+      tabBadge(
+        lifecycleLabel(session.lifecycle_state),
+        "lifecycle",
+        session.lifecycle_state,
+      ),
+    );
+  }
+  const close = shell.querySelector<HTMLButtonElement>(
+    '[data-tab-action="close"]',
+  );
+  if (close) {
+    close.disabled = session.running;
+    const closeLabel = session.running
+      ? "Stop " + session.label + " before closing"
+      : "Close " + session.label;
+    close.title = closeLabel;
+    close.setAttribute("aria-label", closeLabel);
+  }
+}
 
-  pairCrudPending = true;
-  createPairError = null;
-  try {
-    await command<SessionSnapshot[]>("create_pair", {
-      request: { name } satisfies CreatePairRequest,
+function tabBadge(
+  text: string,
+  kind: string,
+  value: string,
+): HTMLSpanElement {
+  const badge = document.createElement("span");
+  badge.className = "session-tab-badge";
+  badge.dataset.badgeKind = kind;
+  badge.dataset.badgeValue = value;
+  badge.textContent = text;
+  return badge;
+}
+
+function tabActionButton(
+  text: string,
+  label: string,
+  action: "move" | "edit" | "close",
+  sessionId: string,
+  delta?: -1 | 1,
+  disabled = false,
+): HTMLButtonElement {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "session-tab-action";
+  button.textContent = text;
+  button.setAttribute("aria-label", label);
+  button.title = label;
+  button.dataset.tabAction = action;
+  button.dataset.session = sessionId;
+  if (delta) {
+    button.dataset.delta = String(delta);
+  }
+  button.disabled = disabled;
+  return button;
+}
+
+function setActiveSession(
+  requestedId: string | null,
+  focusTerminal: boolean,
+): void {
+  const activeId =
+    requestedId && tabState.order.includes(requestedId)
+      ? requestedId
+      : tabState.order[0] ?? null;
+  tabState = { ...tabState, activeId };
+
+  for (const tab of sessionTabs.querySelectorAll<HTMLButtonElement>(
+    "[data-session-tab]",
+  )) {
+    const selected = tab.dataset.sessionTab === activeId;
+    tab.setAttribute("aria-selected", String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+  }
+  for (const card of workspaceGrid.querySelectorAll<HTMLElement>(
+    "[data-session-card]",
+  )) {
+    const selected = card.dataset.sessionCard === activeId;
+    card.hidden = !selected;
+    card.inert = !selected;
+    card.setAttribute("aria-hidden", String(!selected));
+  }
+  if (activeId) {
+    requestAnimationFrame(() => {
+      const pane = paneMap.get(activeId);
+      pane?.fit();
+      if (focusTerminal) {
+        pane?.terminal.focus();
+      }
     });
-    createPairMode = false;
-    createPairDraft = "";
-    pairCrudPending = false;
-    await refreshSnapshot(name);
-  } catch (error) {
-    pairCrudPending = false;
-    createPairError = String(error);
-    pendingPairFocus = "create";
-    refreshPairPicker();
   }
 }
 
-async function submitRenamePair(): Promise<void> {
-  if (pairCrudPending || !renamePairTarget) {
+function handleFocusedTabKeydown(
+  event: KeyboardEvent,
+  sessionId: string,
+): void {
+  const currentIndex = tabState.order.indexOf(sessionId);
+  const action = resolveFocusedTabAction(
+    shortcutInput(event),
+    currentIndex,
+    tabState.order.length,
+  );
+  if (!action) {
     return;
   }
-
-  const oldName = renamePairTarget;
-  const newName = renamePairDraft.trim();
-  const validationError = validatePairName(newName, oldName);
-  if (validationError) {
-    renamePairError = validationError;
-    pendingPairFocus = `rename:${oldName}`;
-    refreshPairPicker();
+  event.preventDefault();
+  if (action.kind === "move") {
+    void moveSession(sessionId, action.delta);
     return;
   }
+  const targetId = tabState.order[action.index];
+  if (!targetId) {
+    return;
+  }
+  setActiveSession(targetId, false);
+  sessionTabs
+    .querySelector<HTMLButtonElement>(
+      '[data-session-tab="' + targetId + '"]',
+    )
+    ?.focus();
+}
 
-  const wasActive = currentActiveGroupName() === oldName;
-  pairCrudPending = true;
-  renamePairError = null;
-  try {
-    await command<SessionSnapshot[]>("rename_pair", {
-      request: { oldName, newName } satisfies RenamePairRequest,
-    });
-    renamePairTarget = null;
-    renamePairDraft = "";
-    pairCrudPending = false;
-    await refreshSnapshot(wasActive ? newName : undefined);
-  } catch (error) {
-    pairCrudPending = false;
-    renamePairError = String(error);
-    pendingPairFocus = `rename:${oldName}`;
-    refreshPairPicker();
+function updateZeroSessionState(): void {
+  const visible = shouldShowZeroSession(
+    tabState.order,
+    sessionFormMode !== null,
+  );
+  zeroSession.hidden = !visible;
+  workspaceGrid.hidden = tabState.order.length === 0;
+  zeroWorkspace.textContent = workspacePreference || "the selected workspace";
+  if (visible && !zeroStateWasVisible) {
+    requestAnimationFrame(() => zeroNewSession.focus());
+  }
+  zeroStateWasVisible = visible;
+}
+
+function openCreateSessionForm(): void {
+  const defaults = newSessionFormDefaults(workspacePreference);
+  sessionFormMode = { kind: "create" };
+  sessionFormPending = false;
+  sessionLabelInput.value = "";
+  sessionDriverSelect.value = defaults.driver;
+  sessionPermissionSelect.value = defaults.permissionProfile;
+  setSessionFormError(null);
+  syncSessionForm();
+  requestAnimationFrame(() => sessionLabelInput.focus());
+}
+
+function openEditSessionForm(sessionId: string): void {
+  const session = snapshotById.get(sessionId);
+  if (!session) {
+    return;
+  }
+  sessionFormMode = { kind: "edit", sessionId };
+  sessionFormPending = false;
+  sessionLabelInput.value = session.label;
+  sessionDriverSelect.value = session.driver;
+  sessionPermissionSelect.value = session.permission_profile;
+  setSessionFormError(null);
+  syncSessionForm();
+  requestAnimationFrame(() => sessionLabelInput.focus());
+}
+
+function closeSessionForm(): void {
+  sessionFormMode = null;
+  sessionFormPending = false;
+  sessionEditor.hidden = true;
+  setSessionFormError(null);
+  updateZeroSessionState();
+  if (tabState.activeId) {
+    sessionTabs
+      .querySelector<HTMLButtonElement>(
+        '[data-session-tab="' + tabState.activeId + '"]',
+      )
+      ?.focus();
   }
 }
 
-async function confirmDeletePair(): Promise<void> {
-  if (pairCrudPending || !deletePairTarget) {
+function syncSessionForm(): void {
+  zeroWorkspace.textContent = workspacePreference || "the selected workspace";
+  if (!sessionFormMode) {
+    sessionEditor.hidden = true;
+    updateZeroSessionState();
     return;
   }
 
-  const name = deletePairTarget;
-  const wasActive = currentActiveGroupName() === name;
-  pairCrudPending = true;
-  try {
-    await command<void>("delete_pair", {
-      request: { name } satisfies DeletePairRequest,
-    });
-    deletePairTarget = null;
-    pairCrudPending = false;
-    await refreshSnapshot(wasActive ? "main" : undefined);
-  } catch (error) {
-    pairCrudPending = false;
-    writeSystem("error", `delete ${name} failed: ${String(error)}`);
-    refreshPairPicker();
-  }
-}
-
-function wirePairPickerDismiss(): void {
-  if (pairPickerDismissWired) {
-    return;
-  }
-
-  const closePairMenu = (): void => {
-    if (!openPairMenu) {
+  sessionEditor.hidden = false;
+  updateZeroSessionState();
+  if (sessionFormMode.kind === "create") {
+    sessionEditorTitle.textContent = "New session";
+    sessionDriverSelect.disabled = sessionFormPending;
+    sessionWorkingDirectory.value =
+      workspacePreference || "No workspace selected";
+    sessionWorkingDirectory.title = sessionWorkingDirectory.value;
+    browseSessionDirectory.textContent = "Browse…";
+    browseSessionDirectory.disabled = sessionFormPending;
+    sessionPermissionSelect.disabled = sessionFormPending;
+    sessionLabelInput.disabled = sessionFormPending;
+    saveSessionButton.textContent = "Create session";
+    sessionFormNote.textContent = workspacePreference
+      ? "Browse changes the workspace default for this and future new sessions. The session is created stopped."
+      : "Choose a workspace before creating the session. Browse saves it as the default for future new sessions.";
+  } else {
+    const session = snapshotById.get(sessionFormMode.sessionId);
+    if (!session) {
+      closeSessionForm();
       return;
     }
-    openPairMenu = null;
-    refreshPairPicker();
-  };
+    const stopped = !session.running;
+    sessionEditorTitle.textContent = "Edit " + session.label;
+    sessionDriverSelect.value = session.driver;
+    sessionDriverSelect.disabled = true;
+    sessionWorkingDirectory.value = session.working_dir;
+    sessionWorkingDirectory.title = session.working_dir;
+    browseSessionDirectory.textContent = "Change…";
+    browseSessionDirectory.disabled = sessionFormPending || !stopped;
+    sessionPermissionSelect.disabled = sessionFormPending || !stopped;
+    sessionLabelInput.disabled = sessionFormPending;
+    saveSessionButton.textContent = "Save changes";
+    sessionFormNote.textContent = stopped
+      ? "Driver identity is fixed. Browse applies the working-directory change immediately; permission changes apply when saved."
+      : "Stop this run before changing its working directory or permission profile.";
+  }
+  saveSessionButton.disabled =
+    sessionFormPending
+    || (sessionFormMode.kind === "create" && !workspacePreference);
+  syncPermissionControls();
+}
 
-  pairPickerDismissWired = true;
+function syncPermissionControls(): void {
+  const driver = sessionDriverSelect.value as DriverKind;
+  const requested = sessionPermissionSelect.value as PermissionProfile;
+  const normalized = permissionProfileForDriver(driver, requested);
+  if (normalized !== requested) {
+    sessionPermissionSelect.value = normalized;
+  }
+  const unsafeOption = sessionPermissionSelect.querySelector<HTMLOptionElement>(
+    'option[value="unsafe"]',
+  );
+  if (unsafeOption) {
+    unsafeOption.disabled = !canUseUnsafePermission(driver);
+  }
+  const warning = unsafePermissionWarning(driver, normalized);
+  permissionWarning.hidden = warning === null;
+  permissionWarning.textContent = warning ?? "";
+}
+
+function setSessionFormError(message: string | null): void {
+  sessionFormError.hidden = message === null;
+  sessionFormError.textContent = message ?? "";
+}
+
+async function submitSessionForm(): Promise<void> {
+  if (!sessionFormMode || sessionFormPending) {
+    return;
+  }
+  const mode = sessionFormMode;
+  const driver = sessionDriverSelect.value as DriverKind;
+  const permissionProfile = permissionProfileForDriver(
+    driver,
+    sessionPermissionSelect.value as PermissionProfile,
+  );
+  const label = sessionLabelInput.value.trim();
+  if (mode.kind === "edit" && !label) {
+    setSessionFormError("A saved session label cannot be empty.");
+    return;
+  }
+  sessionFormPending = true;
+  setSessionFormError(null);
+  syncSessionForm();
+
+  if (mode.kind === "create") {
+    let created: SessionSnapshot;
+    try {
+      created = await command<SessionSnapshot>("create_session", {
+        request: {
+          label: label || null,
+          driver,
+          permission_profile: permissionProfile,
+        } satisfies CreateSessionRequest,
+      });
+    } catch (error) {
+      sessionFormPending = false;
+      setSessionFormError("Create session failed: " + String(error));
+      syncSessionForm();
+      return;
+    }
+    try {
+      await refreshSnapshot(created.session_id);
+      closeSessionForm();
+    } catch (error) {
+      sessionFormPending = false;
+      setSessionFormError(
+        "Session "
+          + shortSessionId(created.session_id)
+          + " was created, but inventory refresh failed. Do not create a duplicate; use Refresh snapshot. "
+          + String(error),
+      );
+      syncSessionForm();
+    }
+    return;
+  }
+
+  try {
+    const current = snapshotById.get(mode.sessionId);
+    if (!current) {
+      throw new Error("session no longer exists");
+    }
+    if (label !== current.label) {
+      await command<void>("rename_session", {
+        request: {
+          session_id: current.session_id,
+          label,
+        } satisfies RenameSessionRequest,
+      });
+    }
+    if (
+      !current.running
+      && permissionProfile !== current.permission_profile
+    ) {
+      await command<void>("set_session_permission_profile", {
+        request: {
+          session_id: current.session_id,
+          permission_profile: permissionProfile,
+        } satisfies SetSessionPermissionRequest,
+      });
+    }
+    await refreshSnapshot(current.session_id);
+    closeSessionForm();
+  } catch (error) {
+    sessionFormPending = false;
+    let refreshed = true;
+    try {
+      await refreshSnapshot(mode.sessionId);
+    } catch {
+      refreshed = false;
+    }
+    setSessionFormError(
+      (refreshed
+        ? "Session change failed; current runtime state was refreshed. "
+        : "Session change may have partially applied and inventory refresh also failed. ")
+        + String(error),
+    );
+    syncSessionForm();
+  }
+}
+
+async function chooseWorkingDirectory(): Promise<void> {
+  if (!sessionFormMode || sessionFormPending) {
+    return;
+  }
+  const mode = sessionFormMode;
+  sessionFormPending = true;
+  setSessionFormError(null);
+  syncSessionForm();
+
+  if (mode.kind === "create") {
+    try {
+      const snapshot = await command<RuntimeSnapshot | null>(
+        "choose_workspace_directory",
+      );
+      if (snapshot) {
+        applySnapshot(snapshot, tabState.activeId ?? undefined);
+      }
+    } catch (error) {
+      setSessionFormError("Workspace selection failed: " + String(error));
+    } finally {
+      sessionFormPending = false;
+      syncSessionForm();
+    }
+    return;
+  }
+
+  const sessionId = mode.sessionId;
+  let snapshot: SessionSnapshot | null;
+  try {
+    snapshot = await command<SessionSnapshot | null>(
+      "choose_session_working_directory",
+      {
+        request: {
+          session_id: sessionId,
+        } satisfies ChooseSessionWorkingDirectoryRequest,
+      },
+    );
+  } catch (error) {
+    setSessionFormError("Directory selection failed: " + String(error));
+    sessionFormPending = false;
+    syncSessionForm();
+    return;
+  }
+  if (!snapshot) {
+    sessionFormPending = false;
+    syncSessionForm();
+    return;
+  }
+  applyCommandSessionSnapshot(snapshot);
+  try {
+      await refreshSnapshot(sessionId);
+  } catch (error) {
+    setSessionFormError(
+      "Working directory changed, but inventory refresh failed: "
+        + String(error),
+    );
+  } finally {
+    sessionFormPending = false;
+    syncSessionForm();
+  }
+}
+
+async function moveSession(
+  sessionId: string,
+  delta: -1 | 1,
+): Promise<void> {
+  const nextOrder = movedSessionOrder(tabState.order, sessionId, delta);
+  const newIndex = nextOrder.indexOf(sessionId);
+  if (newIndex === tabState.order.indexOf(sessionId)) {
+    return;
+  }
+  try {
+    const snapshot = await command<RuntimeSnapshot>("move_session", {
+      request: {
+        session_id: sessionId,
+        new_index: newIndex,
+      } satisfies MoveSessionRequest,
+    });
+    applySnapshot(snapshot, sessionId);
+    sessionTabs
+      .querySelector<HTMLButtonElement>(
+        '[data-session-tab="' + sessionId + '"]',
+      )
+      ?.focus();
+  } catch (error) {
+    writeSystem(
+      "error",
+      "move " + paneLabel(sessionId) + " failed: " + String(error),
+    );
+  }
+}
+
+async function deleteSession(sessionId: string): Promise<void> {
+  const session = snapshotById.get(sessionId);
+  if (!session) {
+    return;
+  }
+  if (session.running) {
+    writeSystem("warn", "Stop " + session.label + " before closing it.");
+    return;
+  }
+  const confirmed = window.confirm(
+    'Close "' + session.label + '" (' + shortSessionId(sessionId) + ")? Its terminal scrollback will be discarded.",
+  );
+  if (!confirmed) {
+    return;
+  }
+  try {
+    await command<void>("delete_session", {
+      request: { session_id: sessionId } satisfies DeleteSessionRequest,
+    });
+    if (
+      sessionFormMode?.kind === "edit"
+      && sessionFormMode.sessionId === sessionId
+    ) {
+      closeSessionForm();
+    }
+  } catch (error) {
+    writeSystem(
+      "error",
+      "close " + session.label + " failed: " + String(error),
+    );
+    return;
+  }
+  try {
+    await refreshSnapshot();
+  } catch (error) {
+    writeSystem(
+      "error",
+      "session closed, but the inventory refresh failed: " + String(error),
+    );
+  }
+}
+
+function wireSessionUi(): void {
+  newSessionButton.addEventListener("click", openCreateSessionForm);
+  zeroNewSession.addEventListener("click", openCreateSessionForm);
+  must<HTMLButtonElement>("#cancel-session-form").addEventListener(
+    "click",
+    closeSessionForm,
+  );
+  sessionForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void submitSessionForm();
+  });
+  browseSessionDirectory.addEventListener("click", () => {
+    void chooseWorkingDirectory();
+  });
+  sessionDriverSelect.addEventListener("change", syncPermissionControls);
+  sessionPermissionSelect.addEventListener("change", syncPermissionControls);
+  sessionTabs.addEventListener("click", (event) => {
+    if (!(event.target instanceof Element)) {
+      return;
+    }
+    const action = event.target.closest<HTMLButtonElement>("[data-tab-action]");
+    if (!action) {
+      return;
+    }
+    const sessionId = action.dataset.session;
+    if (!sessionId) {
+      return;
+    }
+    switch (action.dataset.tabAction) {
+      case "move": {
+        const delta = action.dataset.delta === "-1" ? -1 : 1;
+        void moveSession(sessionId, delta);
+        break;
+      }
+      case "edit":
+        openEditSessionForm(sessionId);
+        break;
+      case "close":
+        void deleteSession(sessionId);
+        break;
+    }
+  });
   document.addEventListener("click", (event) => {
     if (!(event.target instanceof Element)) {
       return;
     }
-    if (openPairMenu && !event.target.closest("[data-chip-menu-root]")) {
-      closePairMenu();
+    const edit = event.target.closest<HTMLButtonElement>("[data-edit-session]");
+    if (edit?.dataset.editSession) {
+      openEditSessionForm(edit.dataset.editSession);
     }
   });
-  document.addEventListener("keydown", (event) => {
-    if (event.key !== "Escape") {
-      return;
-    }
-    if (deletePairTarget) {
-      event.preventDefault();
-      closeDeletePairDialog();
-      return;
-    }
-    if (renamePairTarget) {
-      event.preventDefault();
-      cancelRenamePair();
-      return;
-    }
-    if (createPairMode) {
-      event.preventDefault();
-      cancelCreatePair();
-      return;
-    }
-    if (openPairMenu) {
-      event.preventDefault();
-      closePairMenu();
-    }
-  });
-}
-
-function wirePairPickerActions(): void {
-  if (pairPickerActionsWired) {
-    return;
-  }
-  pairPickerActionsWired = true;
-
-  document.addEventListener("click", (event) => {
-    if (!(event.target instanceof Element)) {
-      return;
-    }
-
-    const actionButton = event.target.closest<HTMLButtonElement>("[data-pair-menu-action]");
-    if (actionButton) {
-      if (actionButton.disabled) {
-        return;
-      }
-      const name = actionButton.dataset.group;
-      const pairAction = actionButton.dataset.pairMenuAction;
-      if (!name || !pairAction) {
-        return;
-      }
-      if (pairAction === "rename") {
-        startRenamePair(name);
-      } else if (pairAction === "delete") {
-        openDeletePairDialog(name);
-      }
-      return;
-    }
-
-    const toggle = event.target.closest<HTMLButtonElement>("[data-group-menu-toggle]");
-    if (toggle) {
-      const name = toggle.dataset.groupMenuToggle;
-      if (!name) {
-        return;
-      }
-      openPairMenu = openPairMenu === name ? null : name;
-      refreshPairPicker();
-      return;
-    }
-
-    const chip = event.target.closest<HTMLButtonElement>(".group-chip");
-    if (chip) {
-      const name = chip.dataset.group;
-      if (!name) {
-        return;
-      }
-      openPairMenu = null;
-      refreshPairPicker(name);
-      return;
-    }
-
-    const newPair = event.target.closest<HTMLButtonElement>("#new-pair-button");
-    if (newPair) {
-      startCreatePair();
-      return;
-    }
-  });
-}
-
-function wirePicker(): void {
-  wirePairPickerActions();
-  wirePairPickerDismiss();
-
-  document
-    .querySelector<HTMLInputElement>("[data-pair-create-input]")
-    ?.addEventListener("input", (event) => {
-      createPairDraft = (event.currentTarget as HTMLInputElement).value;
-      createPairError = null;
-    });
-  document
-    .querySelector<HTMLInputElement>("[data-pair-create-input]")
-    ?.addEventListener("keydown", (event) => {
-      if (event.key === "Enter") {
-        event.preventDefault();
-        void submitCreatePair();
-      }
-      if (event.key === "Escape") {
-        event.preventDefault();
-        cancelCreatePair();
-      }
-    });
-  document
-    .querySelector<HTMLInputElement>("[data-pair-create-input]")
-    ?.addEventListener("blur", () => {
-      cancelCreatePair();
-    });
-
-  for (const input of document.querySelectorAll<HTMLInputElement>("[data-pair-rename-input]")) {
-    input.addEventListener("input", (event) => {
-      renamePairDraft = (event.currentTarget as HTMLInputElement).value;
-      renamePairError = null;
-    });
-    input.addEventListener("keydown", (event) => {
-      if (event.key === "Enter") {
-        event.preventDefault();
-        void submitRenamePair();
-      }
-      if (event.key === "Escape") {
-        event.preventDefault();
-        cancelRenamePair();
-      }
-    });
-    input.addEventListener("blur", () => {
-      cancelRenamePair();
-    });
-  }
-
-  document
-    .querySelector<HTMLButtonElement>("[data-pair-delete-cancel]")
-    ?.addEventListener("click", () => {
-      closeDeletePairDialog();
-    });
-  document
-    .querySelector<HTMLButtonElement>("[data-pair-delete-confirm]")
-    ?.addEventListener("click", () => {
-      void confirmDeletePair();
-    });
-}
-
-function resolveInitialGroup(groups: PaneGroup[]): string {
-  const saved = localStorage.getItem("prim1-active-group");
-  if (saved && groups.some((group) => group.name === saved)) {
-    return saved;
-  }
-  if (groups.some((group) => group.name === "main")) {
-    return "main";
-  }
-  return groups[0]?.name ?? "main";
-}
-
-function setActiveGroup(name: string): void {
-  const resolved =
-    currentGroups.find((group) => group.name === name)?.name
-    ?? resolveInitialGroup(currentGroups);
-
-  localStorage.setItem("prim1-active-group", resolved);
-  activeGroupLabel.textContent = resolved;
-
-  for (const group of currentGroups) {
-    const isActive = group.name === resolved;
-    for (const paneName of group.paneNames) {
-      const card = document.querySelector<HTMLElement>(`[data-session-card="${paneName}"]`);
-      if (!card) {
-        continue;
-      }
-      card.dataset.groupActive = String(isActive);
-    }
-  }
-
-  for (const chip of document.querySelectorAll<HTMLButtonElement>(".group-chip")) {
-    chip.dataset.active = String(chip.dataset.group === resolved);
-  }
-
-  requestAnimationFrame(() => {
-    for (const paneName of currentGroups.find((group) => group.name === resolved)?.paneNames ?? []) {
-      paneMap.get(paneName)?.fit();
-    }
-  });
-}
-
-function isPaneVisible(name: string): boolean {
-  const card = document.querySelector<HTMLElement>(`[data-session-card="${name}"]`);
-  return !card || card.dataset.groupActive !== "false";
-}
-
-function populateRouterOptions(sessions: SessionSnapshot[]): void {
-  const previousFrom = routeFromCombobox.value;
-  const previousTo = routeToCombobox.value;
-  const sessionNames = sessions.map((session) => session.name);
-
-  const fromOptions: ComboboxOption[] = [
-    { value: "operator", label: "Operator" },
-    ...sessions.map((s) => ({ value: s.name, label: paneDisplayTitle(s.name, s.title) })),
-  ];
-  routeFromCombobox.setOptions(fromOptions);
-  routeFromCombobox.value = previousFrom === "operator" || sessionNames.includes(previousFrom)
-    ? previousFrom
-    : "operator";
-
-  const toOptions: ComboboxOption[] = [
-    ...sessions.map((s) => ({ value: s.name, label: paneDisplayTitle(s.name, s.title) })),
-    { value: "room", label: "Room" },
-  ];
-  routeToCombobox.setOptions(toOptions);
-  routeToCombobox.value = previousTo === "room" || sessionNames.includes(previousTo)
-    ? previousTo
-    : "room";
 }
 
 function wireButtons(): void {
@@ -1712,75 +1585,38 @@ function wireButtons(): void {
       return;
     }
     const action = button.dataset.action;
-    const session = button.dataset.session;
-    if (!action || !session) {
+    const sessionId = button.dataset.session;
+    if (!action || !sessionId) {
       return;
     }
 
-    if (action === "start" && snapshotByName.get(session)?.running) {
-      writeSystem("info", `${paneLabel(session)} is already running`);
+    if (action === "start" && snapshotById.get(sessionId)?.running) {
+      writeSystem("info", `${paneLabel(sessionId)} is already running`);
       return;
     }
 
     try {
       if (action === "start") {
         const snapshot = await command<SessionSnapshot>("start_session", {
-          request: { name: session },
+          request: { session_id: sessionId },
         });
-        snapshotByName.set(snapshot.name, snapshot);
-        paneMap.get(snapshot.name)?.applySnapshot(snapshot);
+        applyCommandSessionSnapshot(snapshot);
       } else if (action === "restart") {
         const snapshot = await command<SessionSnapshot>("restart_session", {
-          request: { name: session },
+          request: { session_id: sessionId },
         });
-        snapshotByName.set(snapshot.name, snapshot);
-        paneMap.get(snapshot.name)?.applySnapshot(snapshot);
+        applyCommandSessionSnapshot(snapshot);
       } else if (action === "stop") {
         const snapshot = await command<SessionSnapshot>("stop_session", {
-          request: { name: session },
+          request: { session_id: sessionId },
         });
-        snapshotByName.set(snapshot.name, snapshot);
-        paneMap.get(snapshot.name)?.applySnapshot(snapshot);
+        applyCommandSessionSnapshot(snapshot);
       }
     } catch (error) {
-      writeSystem("error", `${action} ${session} failed: ${String(error)}`);
+      writeSystem("error", `${action} ${paneLabel(sessionId)} failed: ${String(error)}`);
     }
   });
 }
-
-function wireRouter(): void {
-  const form = must<HTMLFormElement>("#router-form");
-  const content = must<HTMLTextAreaElement>("#route-content");
-  const clearButton = must<HTMLButtonElement>("#clear-router");
-
-  form.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const trimmed = content.value.trim();
-    if (!trimmed) {
-      return;
-    }
-
-    const request: RouteMessageRequest = {
-      from: routeFromCombobox.value,
-      to: routeToCombobox.value,
-      scope: routeToCombobox.value === "room" ? "room" : "direct",
-      content: trimmed,
-    };
-
-    try {
-      const snapshot = await command<RuntimeSnapshot>("route_message", { request });
-      applySnapshot(snapshot);
-      content.value = "";
-    } catch (error) {
-      writeSystem("error", `route failed: ${String(error)}`);
-    }
-  });
-
-  clearButton.addEventListener("click", () => {
-    content.value = "";
-  });
-}
-
 function wireControls(): void {
   for (const button of document.querySelectorAll<HTMLButtonElement>("[data-control]")) {
     button.addEventListener("click", async () => {
@@ -1790,13 +1626,6 @@ function wireControls(): void {
           writeSystem("info", "snapshot refreshed");
           break;
         }
-        case "mark-main-menu":
-          setActiveGroup("main");
-          writeSystem("info", "active pair switched to main");
-          break;
-        case "show-control-file":
-          writeSystem("info", `control plane info: ${controlEndpoint.textContent}`);
-          break;
       }
     });
   }
@@ -1817,10 +1646,14 @@ function wireResize(): void {
 
 function fitVisiblePanes(): void {
   for (const pane of paneMap.values()) {
-    if (isPaneVisible(pane.name)) {
+    if (isPaneVisible(pane.sessionId)) {
       pane.fit();
     }
   }
+}
+
+function isPaneVisible(sessionId: string): boolean {
+  return tabState.activeId === sessionId;
 }
 
 function wireTerminalShortcuts(): void {
@@ -1835,6 +1668,36 @@ function wireTerminalShortcuts(): void {
       void command<void>("toggle_fullscreen").catch((error) =>
         writeSystem("error", `fullscreen toggle failed: ${String(error)}`),
       );
+    },
+    { capture: true },
+  );
+
+  window.addEventListener(
+    "keydown",
+    (event) => {
+      const action = resolveGlobalSessionShortcut(shortcutInput(event));
+      if (!action) {
+        return;
+      }
+      event.preventDefault();
+      if (action.kind === "new-session") {
+        openCreateSessionForm();
+        return;
+      }
+      if (action.kind === "close-session") {
+        if (tabState.activeId) {
+          void deleteSession(tabState.activeId);
+        }
+        return;
+      }
+      const targetId = relativeSessionId(
+        tabState.order,
+        tabState.activeId,
+        action.delta,
+      );
+      if (targetId) {
+        setActiveSession(targetId, true);
+      }
     },
     { capture: true },
   );
@@ -1854,8 +1717,8 @@ function wireTerminalShortcuts(): void {
         domSelection: activeNonTerminalDomSelectionText(),
         activeSurface: activeCopySurface,
         terminalSelections: Object.fromEntries(
-          Array.from(paneMap.entries()).map(([name, pane]) => [
-            name,
+          Array.from(paneMap.entries()).map(([sessionId, pane]) => [
+            sessionId,
             pane.terminal.getSelection(),
           ]),
         ),
@@ -1906,9 +1769,32 @@ function wireTerminalShortcuts(): void {
   });
 }
 
+function shortcutInput(event: KeyboardEvent) {
+  return {
+    key: event.key,
+    ctrlKey: event.ctrlKey,
+    shiftKey: event.shiftKey,
+    altKey: event.altKey,
+    metaKey: event.metaKey,
+    editable: isEditableShortcutTarget(event.target),
+  };
+}
+
+function isEditableShortcutTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof Element)) {
+    return false;
+  }
+  if (target.closest("[data-terminal]")) {
+    return false;
+  }
+  return Boolean(
+    target.closest('input, select, textarea, [contenteditable="true"]'),
+  );
+}
+
 async function pasteClipboardIntoTerminal(pane: SessionTerminal): Promise<void> {
-  if (!snapshotByName.get(pane.name)?.running) {
-    writeSystem("warn", `${pane.title} is not running; paste skipped`);
+  if (!snapshotById.get(pane.sessionId)?.running) {
+    writeSystem("warn", `${pane.label} is not running; paste skipped`);
     return;
   }
 
@@ -1920,22 +1806,22 @@ async function pasteClipboardIntoTerminal(pane: SessionTerminal): Promise<void> 
 
     await command<SessionSnapshot>("send_input", {
       request: {
-        name: pane.name,
+        session_id: pane.sessionId,
         input: clipboard,
       } satisfies SendInputRequest,
     });
-    writeSystem("info", `${pane.title} pasted ${clipboard.length} chars`);
+    writeSystem("info", `${pane.label} pasted ${clipboard.length} chars`);
   } catch (error) {
-    writeSystem("error", `paste failed for ${pane.title}: ${String(error)}`);
+    writeSystem("error", `paste failed for ${pane.label}: ${String(error)}`);
   }
 }
 
 function activeTerminal(): SessionTerminal | null {
-  return activeTerminalName ? paneMap.get(activeTerminalName) ?? null : null;
+  return tabState.activeId ? paneMap.get(tabState.activeId) ?? null : null;
 }
 
-function paneLabel(name: string): string {
-  return paneMap.get(name)?.title ?? snapshotByName.get(name)?.title ?? name;
+function paneLabel(sessionId: string): string {
+  return paneMap.get(sessionId)?.label ?? snapshotById.get(sessionId)?.label ?? sessionId;
 }
 
 function activeNonTerminalDomSelectionText(): string | null {
@@ -2009,13 +1895,13 @@ function writeSystem(level: "info" | "warn" | "error", message: string): void {
   );
 }
 
-async function resizeSession(name: string, cols: number, rows: number): Promise<void> {
-  if (!snapshotByName.get(name)?.running) {
+async function resizeSession(sessionId: string, cols: number, rows: number): Promise<void> {
+  if (!snapshotById.get(sessionId)?.running) {
     return;
   }
 
   try {
-    await command<void>("resize_session", { name, cols, rows });
+    await command<void>("resize_session", { sessionId, cols, rows });
   } catch {
     // Resize is best-effort for the MVP.
   }

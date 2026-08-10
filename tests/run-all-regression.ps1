@@ -52,10 +52,9 @@ try {
     "tests\agent-events-summary.test.py",
     "tests\control-plane-content-file.ps1",
     "tests\control-plane-request-id.ps1",
-    "tests\control-plane-deliver-wait.ps1",
-    "tests\control-plane-timeouts.ps1",
-    "tests\routing-stress-sequential.ps1",
-    "scripts\health-check.ps1"
+    "tests\control-plane-server-identity.ps1",
+    "tests\control-plane-wait.ps1",
+    "tests\control-plane-timeouts.ps1"
   )) {
     $path = Join-Path $testRoot $relativePath
     [System.IO.File]::WriteAllText($path, "", $utf8NoBom)
@@ -77,12 +76,11 @@ try {
   $singleFailure = Invoke-RunnerProcess -PowerShellExe $powerShellExe -Arguments @(
     "-NoProfile",
     "-ExecutionPolicy", "Bypass",
-    "-File", $runnerPath,
-    "-SkipLive"
+    "-File", $runnerPath
   ) -PathValue $stubPath
 
   Assert-True ($singleFailure.ExitCode -eq 1) "A single failing suite must make the runner exit 1."
-  Assert-True ($singleFailure.Output.Contains("PRIM-1 test runner: 5 pass, 1 fail, 2 skip")) "The single failing suite must be counted as an integer 1."
+  Assert-True ($singleFailure.Output.Contains("PRIM-1 test runner: 6 pass, 1 fail")) "The single failing suite must be counted as an integer 1."
   Assert-True ($singleFailure.Output.Contains("control-plane timeouts (exit 1)")) "The failing suite must be identified."
   Assert-True ($singleFailure.Output.Contains("OVERALL: FAIL")) "The runner must render the failing boundary."
   Assert-True (-not $singleFailure.Output.Contains("OVERALL: PASS")) "A failing suite must never render an overall pass."
@@ -92,7 +90,7 @@ try {
 function global:python { 'synthetic python output' }
 function global:powershell { 'synthetic powershell output' }
 `$global:LASTEXITCODE = 0
-& '$escapedRunnerPath' -SkipLive
+& '$escapedRunnerPath'
 "@
   $noNativeExit = Invoke-RunnerProcess -PowerShellExe $powerShellExe -Arguments @(
     "-NoProfile",
@@ -101,7 +99,7 @@ function global:powershell { 'synthetic powershell output' }
   ) -PathValue $env:PATH
 
   Assert-True ($noNativeExit.ExitCode -eq 1) "A suite without a fresh native exit code must fail closed."
-  Assert-True ($noNativeExit.Output.Contains("PRIM-1 test runner: 0 pass, 6 fail, 2 skip")) "Every no-exit suite must be classified as failed."
+  Assert-True ($noNativeExit.Output.Contains("PRIM-1 test runner: 0 pass, 7 fail")) "Every no-exit suite must be classified as failed."
   Assert-True ($noNativeExit.Output.Contains("suite completed without an external process exit code")) "The fail-closed reason must be visible."
   Assert-True ($noNativeExit.Output.Contains("OVERALL: FAIL")) "The no-exit case must render the failing boundary."
   Assert-True (-not $noNativeExit.Output.Contains("OVERALL: PASS")) "The no-exit case must never render an overall pass."
@@ -110,3 +108,4 @@ function global:powershell { 'synthetic powershell output' }
 }
 
 Write-Host "run-all regression tests passed"
+exit 0

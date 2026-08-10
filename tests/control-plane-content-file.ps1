@@ -48,40 +48,38 @@ $controlPlaneScript = Join-Path $repoRoot "scripts\control-plane.ps1"
 
 $failedRuntime = New-ControlPlaneTestRuntime -Prefix "prim1-no-mailbox-fallback-test"
 try {
-  $originalRuntimeDir = $env:PRIM1_RUNTIME_DIR
-  $originalPaneCredentials = $env:PRIM1_PANE_CREDENTIALS
+  $originalEndpoint = $env:PRIM1_CONTROL_PLANE_ENDPOINT
   try {
-    $env:PRIM1_RUNTIME_DIR = $failedRuntime.RuntimeDir
-    $env:PRIM1_PANE_CREDENTIALS = Join-Path $failedRuntime.RuntimeDir "missing-pane-credentials.json"
-    $missingPaneResult = Invoke-ControlPlane -Arguments @(
+    $env:PRIM1_CONTROL_PLANE_ENDPOINT = $null
+    $missingEndpointResult = Invoke-ControlPlane -Arguments @(
       "-File", $controlPlaneScript,
       "-Action", "ping",
       "-Quiet"
     )
-    Assert-True ($missingPaneResult.ExitCode -ne 0) "Missing pane credentials must fail closed."
-    Assert-True ($missingPaneResult.Output -like "*missing-pane-credentials.json*") "Expected the missing pane credential path in the failure."
-    Assert-True (-not (Test-Path -LiteralPath (Join-Path $failedRuntime.RuntimeDir "sideband"))) "Missing pane credentials must not fall back to a disk mailbox."
+    Assert-True ($missingEndpointResult.ExitCode -ne 0) "Missing endpoint must fail closed."
+    Assert-True ($missingEndpointResult.Output -like "*PRIM1_CONTROL_PLANE_ENDPOINT is not set. External operator control is unavailable; use the PRIM-1 desktop UI.*") "Expected the stable missing-endpoint direction."
   } finally {
-    $env:PRIM1_RUNTIME_DIR = $originalRuntimeDir
-    $env:PRIM1_PANE_CREDENTIALS = $originalPaneCredentials
+    $env:PRIM1_CONTROL_PLANE_ENDPOINT = $originalEndpoint
   }
 
   $failedResult = Invoke-ControlPlane -Arguments @(
     "-File", $controlPlaneScript,
     "-Action", "ping",
-    "-InfoFile", $failedRuntime.InfoPath,
+    "-Endpoint", $failedRuntime.Endpoint,
     "-Quiet"
   )
   Assert-True ($failedResult.ExitCode -ne 0) "A missing named-pipe server must fail."
   Assert-True ($failedResult.Output -like "*Control plane named-pipe request failed*") "Expected an explicit named-pipe failure."
-  Assert-True (-not (Test-Path -LiteralPath (Join-Path $failedRuntime.RuntimeDir "sideband"))) "A failed pipe connection must not create a disk mailbox."
 } finally {
   Remove-Item -LiteralPath $failedRuntime.Root -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 $testRuntime = New-ControlPlaneTestRuntime -Prefix "prim1-content-file-test"
 $payloadPath = Join-Path $testRuntime.RuntimeDir "payload.txt"
-$expected = '/compact keep ''these'' quotes, "those" quotes, $var, !bang, @at, #hash, (parens), and D:\path with spaces\file.txt'
+$lambda = [char]0x03BB
+$emoji = [char]::ConvertFromUtf32(0x1F680)
+$cjk = "{0}{1}" -f [char]0x6F22, [char]0x5B57
+$expected = "/compact keep 'these' quotes, `"those`" quotes, `$var, !bang, @at, #hash, (parens), and D:\path with spaces\file.txt; $lambda $emoji $cjk`r`nsecond line`r`n"
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 [System.IO.File]::WriteAllText($payloadPath, $expected, $utf8NoBom)
 
@@ -91,7 +89,7 @@ $bothResult = Invoke-ControlPlane -Arguments @(
   "-Session", "claude",
   "-Content", "/fast",
   "-ContentFile", $payloadPath,
-  "-InfoFile", $testRuntime.InfoPath,
+  "-Endpoint", $testRuntime.Endpoint,
   "-Quiet"
 )
 Assert-True ($bothResult.ExitCode -ne 0) "Providing both -Content and -ContentFile should fail."
@@ -103,7 +101,7 @@ $missingResult = Invoke-ControlPlane -Arguments @(
   "-Action", "input",
   "-Session", "claude",
   "-ContentFile", $missingPath,
-  "-InfoFile", $testRuntime.InfoPath,
+  "-Endpoint", $testRuntime.Endpoint,
   "-Quiet"
 )
 Assert-True ($missingResult.ExitCode -ne 0) "Missing -ContentFile should fail."
@@ -111,11 +109,11 @@ Assert-True ($missingResult.Output -like "*failed to resolve -ContentFile*") "Ex
 
 $wrongActionResult = Invoke-ControlPlane -Arguments @(
   "-File", $controlPlaneScript,
-  "-Action", "route",
-  "-From", "operator",
-  "-To", "claude",
+  "-Action", "key",
+  "-Session", "claude",
+  "-Key", "enter",
   "-ContentFile", $payloadPath,
-  "-InfoFile", $testRuntime.InfoPath,
+  "-Endpoint", $testRuntime.Endpoint,
   "-Quiet"
 )
 Assert-True ($wrongActionResult.ExitCode -ne 0) "Using -ContentFile with non-input actions should fail."
@@ -129,7 +127,7 @@ try {
     "-Action", "input",
     "-Session", "claude",
     "-ContentFile", $payloadPath,
-    "-InfoFile", $testRuntime.InfoPath,
+    "-Endpoint", $testRuntime.Endpoint,
     "-Quiet"
   )
   Assert-Equal $integrationResult.ExitCode 0 "Content-file delivery should succeed."
@@ -137,10 +135,13 @@ try {
 
   Wait-ControlPlanePipeResponder -Responder $responder
 
-  $captured = Get-Content -LiteralPath $testRuntime.CapturePath -Raw | ConvertFrom-Json
+  $strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+  $captured = [System.IO.File]::ReadAllText($testRuntime.CapturePath, $strictUtf8) | ConvertFrom-Json
   Assert-Equal $captured.kind "send_input" "Expected a send_input sideband request."
   Assert-Equal $captured.name "claude" "Expected the target session to remain intact."
   Assert-Equal $captured.input $expected "Expected the payload file to round-trip byte-for-byte through the script."
+  Assert-True (-not ($captured.PSObject.Properties.Name -contains "token")) "Token fields must never be emitted."
+  Assert-True (-not ($captured.PSObject.Properties.Name -contains "require_idle")) "Legacy require_idle must never be emitted."
 } finally {
   Remove-ControlPlanePipeResponder -Responder $responder
   Remove-Item -LiteralPath $testRuntime.Root -Recurse -Force -ErrorAction SilentlyContinue

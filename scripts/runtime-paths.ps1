@@ -64,21 +64,19 @@ function Resolve-Prim1RuntimeDirectory {
   return ConvertTo-Prim1AbsolutePath -Path (Join-Path $dataRoot "io.prim1.runtime/runtime")
 }
 
-function Resolve-Prim1ControlPlaneInfoFile {
+function Resolve-Prim1ControlPlaneEndpoint {
   [CmdletBinding()]
   param(
-    [string]$InfoFile,
-    [string]$RuntimeDir
+    [string]$Endpoint
   )
 
-  if (-not [string]::IsNullOrWhiteSpace($InfoFile)) {
-    return ConvertTo-Prim1AbsolutePath -Path $InfoFile
+  if (-not [string]::IsNullOrWhiteSpace($Endpoint)) {
+    return $Endpoint.Trim()
   }
 
-  if (-not [string]::IsNullOrWhiteSpace($env:PRIM1_PANE_CREDENTIALS)) {
-    return ConvertTo-Prim1AbsolutePath -Path $env:PRIM1_PANE_CREDENTIALS
+  if (-not [string]::IsNullOrWhiteSpace($env:PRIM1_CONTROL_PLANE_ENDPOINT)) {
+    return $env:PRIM1_CONTROL_PLANE_ENDPOINT.Trim()
   }
 
-  $resolvedRuntimeDir = Resolve-Prim1RuntimeDirectory -RuntimeDir $RuntimeDir
-  return Join-Path $resolvedRuntimeDir "control-plane.json"
+  throw "PRIM1_CONTROL_PLANE_ENDPOINT is not set. External operator control is unavailable; use the PRIM-1 desktop UI."
 }
