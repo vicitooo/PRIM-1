@@ -1,4 +1,5 @@
 import type {
+  CreateSessionRequest,
   DriverKind,
   LifecycleState,
   PermissionProfile,
@@ -178,11 +179,31 @@ export function permissionProfileForDriver(
   driver: DriverKind,
   requested: PermissionProfile,
 ): PermissionProfile {
-  return driver === "generic_terminal" ? "normal" : requested;
+  return driver === "generic_terminal" || driver === "prime" ? "normal" : requested;
 }
 
 export function canUseUnsafePermission(driver: DriverKind): boolean {
-  return driver !== "generic_terminal";
+  return driver !== "generic_terminal" && driver !== "prime";
+}
+
+export function createSessionRequestFromForm(
+  label: string,
+  driver: DriverKind,
+  requestedPermissionProfile: PermissionProfile,
+  linuxWorkingDirectory: string,
+): CreateSessionRequest {
+  const request: CreateSessionRequest = {
+    label: label.trim() || null,
+    driver,
+    permission_profile: permissionProfileForDriver(
+      driver,
+      requestedPermissionProfile,
+    ),
+  };
+  if (driver === "prime") {
+    request.linux_working_directory = linuxWorkingDirectory || null;
+  }
+  return request;
 }
 
 export function unsafePermissionWarning(
@@ -193,7 +214,9 @@ export function unsafePermissionWarning(
     return null;
   }
   if (!canUseUnsafePermission(driver)) {
-    return "Generic terminals support Normal permission only.";
+    return driver === "prime"
+      ? "Prime Agent in Ubuntu supports Normal permission only."
+      : "Generic terminals support Normal permission only.";
   }
   return "Unsafe starts this harness with its permission-bypass mode. It may act without normal approval prompts.";
 }
@@ -239,6 +262,8 @@ export function driverLabel(driver: DriverKind): string {
       return "Codex";
     case "grok":
       return "Grok Build";
+    case "prime":
+      return "Prime Agent (Ubuntu)";
     case "generic_terminal":
       return "Terminal";
   }

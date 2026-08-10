@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   canUseUnsafePermission,
+  createSessionRequestFromForm,
   driverLabel,
   movedSessionOrder,
   newSessionFormDefaults,
@@ -169,6 +170,40 @@ describe("permission profiles", () => {
     });
     expect(permissionProfileForDriver("generic_terminal", "unsafe")).toBe("normal");
     expect(canUseUnsafePermission("generic_terminal")).toBe(false);
+    expect(permissionProfileForDriver("prime", "unsafe")).toBe("normal");
+    expect(canUseUnsafePermission("prime")).toBe(false);
+    expect(unsafePermissionWarning("prime", "unsafe")).toContain("Prime Agent");
+  });
+
+  it("builds a typed Prime request without leaking Linux paths into native sessions", () => {
+    expect(
+      createSessionRequestFromForm(
+        "  Ubuntu review  ",
+        "prime",
+        "unsafe",
+        "/home/alice/work & (qa)",
+      ),
+    ).toEqual({
+      label: "Ubuntu review",
+      driver: "prime",
+      permission_profile: "normal",
+      linux_working_directory: "/home/alice/work & (qa)",
+    });
+    expect(
+      createSessionRequestFromForm("", "prime", "normal", ""),
+    ).toEqual({
+      label: null,
+      driver: "prime",
+      permission_profile: "normal",
+      linux_working_directory: null,
+    });
+    expect(
+      createSessionRequestFromForm("Native", "claude", "normal", "/not/native"),
+    ).toEqual({
+      label: "Native",
+      driver: "claude",
+      permission_profile: "normal",
+    });
   });
 
   it("makes Unsafe explicit", () => {
@@ -176,6 +211,7 @@ describe("permission profiles", () => {
     expect(canUseUnsafePermission("grok")).toBe(true);
     expect(permissionProfileForDriver("grok", "unsafe")).toBe("unsafe");
     expect(driverLabel("grok")).toBe("Grok Build");
+    expect(driverLabel("prime")).toBe("Prime Agent (Ubuntu)");
     expect(unsafePermissionWarning("codex", "normal")).toBeNull();
   });
 });

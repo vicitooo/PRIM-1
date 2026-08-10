@@ -12,8 +12,8 @@ A local multi-agent runtime for terminal-first AI tools. PRIM-1 hosts CLI agents
 - **Supervisor-owned PTYs** — the Rust supervisor owns each managed agent's stdin / stdout / lifecycle. The pane-local sideband exposes no peer lifecycle action; this protocol boundary is not hostile same-user OS isolation.
 - **Persistent generic sessions** — a versioned atomic catalog stores the ordered `SessionId`, label, driver, selected working directory, and visible permission profile for each session. A fresh install starts with zero sessions and zero harness processes.
 - **Flat terminal tabs** — the desktop renders one active xterm.js terminal at a time while retaining inactive terminal buffers. Tabs are backend-ordered and keyed only by stable `SessionId`; duplicate labels are allowed and visibly disambiguated.
-- **Native working-directory selection** — the renderer never supplies an authority-bearing path string. Native folder pickers qualify the workspace default and per-session directory before persistence and revalidate it before spawn.
-- **Explicit permission posture** — Claude Code, Codex, and Grok default to their normal approval/sandbox modes. Their measured bypass modes are available only through a visibly selected `Unsafe` profile; Generic Terminal supports `Normal` only.
+- **Qualified working directories** — Windows sessions use native folder pickers whose selections are qualified before persistence and revalidated before spawn. Prime uses an explicit Ubuntu path; the backend qualifies its canonical path and device/inode identity, and the create form prefills the qualified Ubuntu home.
+- **Explicit permission posture** — Claude Code, Codex, and Grok default to their normal approval/sandbox modes. Their measured bypass modes are available only through a visibly selected `Unsafe` profile; Generic Terminal and Prime support `Normal` only.
 - **Direct launch** — drivers launch qualified executables without `cmd.exe`, `.cmd` shims, renderer arguments, or source-checkout access. Labels and metacharacters are never interpreted as shell syntax.
 - **Structured routing core** — the in-process supervisor retains one-recipient `SessionId` routing with exact-run framing checks, but the Gate-4 tab UI intentionally exposes no message composer or pseudo-room. Visible room messaging waits for explicit `RoomId` membership. PTY-write receipts do not prove final-child byte fidelity, model receipt, or task completion.
 - **Pane-local sideband** — an authorized supervised pane gets a narrow named-pipe surface for `ping`, `wait_quiet`, raw `input`, and PTY `key` actions. Operator lifecycle, routing, rooms, and inventory remain in the desktop UI.
@@ -27,6 +27,7 @@ A local multi-agent runtime for terminal-first AI tools. PRIM-1 hosts CLI agents
 - **Claude Code CLI** (`claude`) — for the Claude pane driver
 - **Codex CLI** (`codex`) — for the Codex pane driver
 - **Grok Build CLI** (`grok`) — for the Grok pane driver
+- **Prime Agent** (`prime-agent`) in the Ubuntu WSL distribution — for the Prime pane driver; WSL must have a working user `systemd` manager
 - **Windows 10/11** — currently Windows-first. Linux/macOS work is planned but not yet validated (see [ROADMAP.md](ROADMAP.md)).
 
 ## Build
@@ -88,6 +89,7 @@ crates/control-plane/     Named-pipe / Unix-socket transport
 crates/driver-claude/     Claude Code launch + parse behavior
 crates/driver-codex/      Codex CLI launch + parse behavior
 crates/driver-grok/       Grok Build launch + parse behavior
+crates/driver-prime/      Prime Agent launch behavior for Ubuntu WSL
 crates/driver-generic-terminal/  Fallback driver for any terminal program
 crates/shared-types/      Cross-crate Rust types
 scripts/                  PowerShell + Python operator helpers
@@ -150,9 +152,10 @@ to use the runtime-directory resolver, including roots containing spaces.
 PRIM-1 runs locally. The pane sideband carries no bearer token and no master or
 per-pane credential file is an operator backdoor. Native pane authority must be
 derived by the supervisor from the named-pipe caller and bound to the live PTY
-process job and generation at mutation time. Prime/WSL sideband access is not
-claimed until that boundary has its own empirical transport test; use the desktop
-UI for operator control.
+process job and generation at mutation time. Prime/WSL sessions deliberately do
+not receive the native sideband or routed-message surface because no verified
+Windows-job-to-Linux-task caller identity bridge exists. Use raw input through
+the desktop UI for Prime.
 
 Treat the app-local runtime directory as private machine-local state. The repo-local `.runtime/` directory remains gitignored for test environments and developer scratch files; it is no longer the product runtime default.
 

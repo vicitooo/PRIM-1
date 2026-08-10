@@ -18,7 +18,8 @@ use shared_types::{
     ChooseSessionWorkingDirectoryRequest, CreateSessionRequest, DeleteSessionRequest,
     MoveSessionRequest, OperatorRouteMessageRequest, RenameSessionRequest, RestartSessionRequest,
     RunEventIdentity, RuntimeSnapshot, SendInputRequest, SessionId, SessionSnapshot,
-    SetSessionPermissionRequest, StartSessionRequest, StopSessionRequest,
+    SetSessionLinuxWorkingDirectoryRequest, SetSessionPermissionRequest, StartSessionRequest,
+    StopSessionRequest,
 };
 use supervisor::{
     RendererEventProjector, SupervisorConfig, SupervisorHandle, validate_runtime_storage_paths,
@@ -686,6 +687,25 @@ fn create_session(
 }
 
 #[tauri::command]
+fn prime_default_working_directory(state: State<'_, DesktopState>) -> Result<String, String> {
+    state
+        .diagnostics
+        .log("info", "prime_default_working_directory", "requested");
+    state
+        .supervisor
+        .prime_default_working_directory()
+        .map_err(|error| {
+            let detail = format!("{error:#}");
+            state.diagnostics.log(
+                "error",
+                "prime_default_working_directory_failed",
+                detail.clone(),
+            );
+            detail
+        })
+}
+
+#[tauri::command]
 fn rename_session(
     state: State<'_, DesktopState>,
     request: RenameSessionRequest,
@@ -826,6 +846,29 @@ fn choose_session_working_directory(
             state.diagnostics.log(
                 "error",
                 "choose_session_working_directory_failed",
+                format!("{}: {}", request.session_id, error),
+            );
+            error.to_string()
+        })
+}
+
+#[tauri::command]
+fn set_session_linux_working_directory(
+    state: State<'_, DesktopState>,
+    request: SetSessionLinuxWorkingDirectoryRequest,
+) -> Result<SessionSnapshot, String> {
+    state.diagnostics.log(
+        "info",
+        "set_session_linux_working_directory",
+        format!("requested {}", request.session_id),
+    );
+    state
+        .supervisor
+        .set_session_linux_working_directory(request.session_id, &request.linux_working_directory)
+        .map_err(|error| {
+            state.diagnostics.log(
+                "error",
+                "set_session_linux_working_directory_failed",
                 format!("{}: {}", request.session_id, error),
             );
             error.to_string()
@@ -1435,8 +1478,10 @@ pub fn run(startup: StartupConfig) {
             restart_session,
             choose_workspace_directory,
             create_session,
+            prime_default_working_directory,
             rename_session,
             choose_session_working_directory,
+            set_session_linux_working_directory,
             set_session_permission_profile,
             move_session,
             delete_session,

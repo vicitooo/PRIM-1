@@ -9,8 +9,8 @@ Today the project is:
 
 - a Windows-first supervisor-owned PTY runtime
 - a Tauri desktop app with an ordered, persistent set of `SessionId`-keyed tabs
-- built-in Claude Code, Codex, Grok, and Generic Terminal session drivers
-- native workspace/per-session directory selection and visible permission profiles
+- built-in Claude Code, Codex, Grok, Prime Agent (`wsl:Ubuntu`), and Generic Terminal session drivers
+- native Windows workspace/per-session directory selection, typed Ubuntu paths for Prime, and visible permission profiles
 - in-process operator session controls, plus a pane-local Windows sideband limited to self ping/wait/input/key
 
 Today the project is **not yet**:
@@ -43,8 +43,9 @@ The point is to prove the safe tabbed runtime before adding rooms or custom driv
 
 ### 3.1 User-extensible driver catalog
 
-The current registry can hold repeated Claude, Codex, Grok, and Generic Terminal
-sessions. A later product slice may support additional terminal-first CLIs.
+The current registry can hold repeated Claude, Codex, Grok, Prime, and Generic
+Terminal sessions. A later product slice may support additional terminal-first
+CLIs.
 
 That implies:
 
@@ -112,7 +113,9 @@ The architecture already points in this direction:
 
 But product truth today:
 
-- only Windows has been exercised seriously
+- the desktop and native drivers are Windows-only
+- Prime crosses from that Windows host into the measured Ubuntu WSL distribution
+  through an explicit dual-scope lifecycle; this is not a general Linux port
 - Linux/macOS are planned ports, not current product claims
 
 Cross-platform completion requires:
@@ -198,12 +201,12 @@ Codex keeps persistent Agent Bus conversations with CC and Grok for architecture
 
 Codex is the sole integrator. CC owns architecture, correctness, Windows runtime, and security pressure-testing; Grok owns simplicity, performance, and UX pressure-testing. A review finding changes code only after it is reproduced locally as a failing test or append-only RED receipt. Agent Bus text is advisory: it carries no operator authority and can never prove PRIM-1 transport, PTY delivery, receiver behavior, or gate completion.
 
-### 6.2 Inside PRIM-1 later: admitted native sessions
+### 6.2 Inside PRIM-1: admitted first-class sessions
 
 CC and Grok may collaborate as PRIM-1 sessions only through the same first-class session/driver path as every other harness. There is no bearer, special bypass, Agent Bus fallback, or hidden compatibility transport. Each harness must first pass, on an exact production hash:
 
-1. native launch, intended cwd, readiness, raw input/output, stop, restart, and zero-orphan shutdown
-2. kernel job/process identity and stale-run/replacement rejection
+1. driver-native launch, intended cwd, readiness, raw input/output, stop, restart, and zero-orphan shutdown; Prime additionally proves both its Ubuntu service and outer Windows job
+2. applicable kernel ownership and stale-run/replacement rejection without inventing a cross-kernel caller identity
 3. driver-specific framing, measured payload ceiling and submit gesture, positive turn-start observation, and independent receiver oracle
 4. fail-closed handling of trust/authentication/limit/modal states while raw recovery input remains usable
 5. direct and explicit `SessionId`/`RoomId` delivery, then multi-member room delivery, with Agent Bus stopped
@@ -213,4 +216,4 @@ Until the independent receiver oracle exists, a response token proves only that 
 
 ### 6.3 Simplicity and deletion rule
 
-Keep one implementation path behind small driver-specific behavior. Once a replacement passes the full relevant matrix, delete the superseded path and its compatibility surface. Do not add an Agent Bus transport inside the supervisor, a task engine, cloud coordination, a second control transport, multi-tenancy, or parallel speculative abstractions. Prove the existing generic-terminal path, use that seam to admit Grok, then Prime/WSL, and widen the UI only as those native receipts require.
+Keep one implementation path behind small driver-specific behavior. Once a replacement passes the full relevant matrix, delete the superseded path and its compatibility surface. Do not add an Agent Bus transport inside the supervisor, a task engine, cloud coordination, a second control transport, multi-tenancy, or parallel speculative abstractions. Prove the existing generic-terminal path, use that seam to admit Grok and the typed Prime/WSL boundary, and widen the UI only as those receipts require.

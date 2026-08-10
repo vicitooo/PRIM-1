@@ -705,6 +705,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "driver-prime"
+version = "0.1.0"
+dependencies = [
+ "shared-types",
+]
+
+[[package]]
 name = "dtoa"
 version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3080,6 +3087,7 @@ dependencies = [
  "driver-codex",
  "driver-generic-terminal",
  "driver-grok",
+ "driver-prime",
  "flate2",
  "libc",
  "parking_lot",

@@ -38,6 +38,11 @@ arguments, environment variables, terminal output, or message content. A fresh
 catalog contains zero sessions. Corrupt or unknown versions fail visibly without
 default replacement.
 
+Qualified cwd identity is namespaced. Native sessions persist a Windows final
+path identity selected through the native chooser. Prime persists a canonical
+path plus device/inode identity in the typed `wsl:Ubuntu` namespace. A catalog
+whose driver and cwd namespace disagree fails startup without rewrite.
+
 ## 3. Addressing
 
 The production operator routing boundary accepts exactly one `recipient_id` and
@@ -80,7 +85,8 @@ Example:
 
 - In-process operator actions own `SessionId`-addressed create, rename, reorder,
   closed-only delete, lifecycle, input, inventory, resize, native cwd selection,
-  typed permission changes, and singular direct routing.
+  typed Prime Linux cwd selection, typed permission changes, and singular direct
+  routing for admitted native drivers.
 - The pane-local sideband owns only self `ping`, `wait_quiet`, `send_input`, and
   `send_key`.
 - Runtime telemetry owns structured lifecycle, delivery, heartbeat, alert, and
@@ -115,6 +121,9 @@ V1 rule:
 - logical message bodies up to and including 1 MiB pass size validation, subject to the recipient driver's framing and exact-run mode preflight; larger bodies fail before PTY-writer admission
 - C0, C1, and DEL control characters other than tab and source line endings fail before PTY-writer admission because they cannot be injected as ordinary terminal text safely
 - generic-terminal delivery is raw and single-line only until a concrete driver proves a faithful multiline strategy
+- Prime routed delivery is not admitted in this release. Prime accepts raw
+  operator terminal input only; the rejection occurs before route-family events,
+  audit records, or PTY writes.
 - pane-sideband `send_input` and `send_key` have a 20-second server-side write budget. On expiry the supervisor first cancels only that PTY input operation for up to 5 seconds while a per-run barrier prevents a late cancellation from touching its successor. The live conversation is preserved when the writer stops. If isolated cancellation fails or does not stop the writer, the supervisor invalidates and terminates only that exact run (up to 5 seconds), then waits up to 5 more seconds for the writer. Every over-budget response sets `timed_out: true`; `ok: true` is possible only when the full write completed after the deadline and warns the caller not to retry. The PowerShell client allows 45 seconds so it can receive this truthful terminal response.
 - pane-sideband `wait_quiet` accepts a quiet window of 1–60 seconds and a total timeout of 1–300 seconds, with the quiet window no greater than the timeout. The server validates these bounds before dispatch metadata or connection-long waiting.
 
@@ -164,6 +173,28 @@ Work-state events:
   be proved terminated; process-exit job cleanup is a backstop, not an in-process
   termination receipt
 
+Prime lifecycle adds a second ownership proof:
+
+- Prime is supported only through the Ubuntu WSL distribution and `Normal`
+  permission profile; launch uses direct `wsl.exe` plus absolute Linux
+  `systemd-run`, Python, and `prime-agent` paths without a shell
+- the create form obtains the qualified Ubuntu home from the backend by default;
+  an explicit Linux path is canonicalized and bound to device/inode identity,
+  then revalidated before launch and once more by the immutable guard immediately
+  before it spawns Prime
+- startup enumerates and terminates every exact-prefix stale Prime transient
+  service before Prime create/start is admitted; a reconciliation failure blocks
+  Prime while leaving native sessions available
+- provisional PTY output remains visible while launch is being checked but cannot
+  mark the run `ready` or update semantic work state; `ready` requires the exact
+  transient service to be active with both guard and payload tasks
+- `closed` for Prime requires proof that the Linux service has no tasks and that
+  the outer Windows ConPTY job is empty; any failed proof retains exact ownership
+  in `failed`/termination-uncertain state
+- Prime receives neither native pane-sideband authority nor synthetic routed
+  delivery because no verified Windows-job-to-Linux-task caller bridge or Prime
+  submit protocol exists
+
 Supervisor default events:
 
 - `supervisor_heartbeat` is emitted automatically every `PRIM1_HEARTBEAT_INTERVAL_SECS` seconds; default is `1800`
@@ -207,6 +238,8 @@ Current pane authority is deliberately narrower than the future room model:
 - the supervisor derives the caller from live process-job membership and run generation
 - the pane-local sideband action set is fixed to self `ping`, `wait_quiet`, `send_input`, and `send_key`
 - pane callers have no room, peer, inventory, or lifecycle action
+- Prime/WSL callers have no pane-sideband surface; the native Job-derived caller
+  proof cannot identify Linux tasks and no bearer fallback exists
 - operator lifecycle, input, resize, and routing authority remains inside the desktop process and targets stable `SessionId` values
 
 ## 10. Metadata audit contract

@@ -22,6 +22,7 @@ import {
 } from "./runtime-events";
 import {
   canUseUnsafePermission,
+  createSessionRequestFromForm,
   driverLabel,
   lifecycleLabel,
   movedSessionOrder,
@@ -40,7 +41,6 @@ import {
 import "./styles.css";
 import type {
   ChooseSessionWorkingDirectoryRequest,
-  CreateSessionRequest,
   DeleteSessionRequest,
   DriverKind,
   MoveSessionRequest,
@@ -49,6 +49,7 @@ import type {
   RuntimeEvent,
   RuntimeSnapshot,
   SendInputRequest,
+  SetSessionLinuxWorkingDirectoryRequest,
   SetSessionPermissionRequest,
   SessionSnapshot,
 } from "./types";
@@ -149,6 +150,7 @@ app.innerHTML = `
               <option value="claude">Claude Code</option>
               <option value="codex">Codex</option>
               <option value="grok">Grok Build</option>
+              <option value="prime">Prime Agent (Ubuntu)</option>
               <option value="generic_terminal">Generic terminal</option>
             </select>
           </label>
@@ -159,11 +161,15 @@ app.innerHTML = `
               <option value="unsafe">Unsafe — bypass approval prompts</option>
             </select>
           </label>
-          <div class="session-path-field">
+          <div class="session-path-field" id="session-windows-directory-field">
             <span>Working directory</span>
             <output id="session-working-directory" class="session-path">No workspace selected</output>
             <button type="button" id="browse-session-directory">Browse…</button>
           </div>
+          <label class="session-linux-directory" id="session-linux-directory-field" hidden>
+            <span>Linux working directory <small>Ubuntu namespace</small></span>
+            <input id="session-linux-working-directory" type="text" autocomplete="off" spellcheck="false" placeholder="Ubuntu home when blank" />
+          </label>
           <p class="permission-warning" id="permission-warning" role="alert" hidden></p>
           <p class="session-form-note" id="session-form-note"></p>
           <p class="session-form-error" id="session-form-error" role="alert" hidden></p>
@@ -398,6 +404,9 @@ const sessionLabelInput = must<HTMLInputElement>("#session-label");
 const sessionDriverSelect = must<HTMLSelectElement>("#session-driver");
 const sessionPermissionSelect = must<HTMLSelectElement>("#session-permission");
 const sessionWorkingDirectory = must<HTMLOutputElement>("#session-working-directory");
+const sessionWindowsDirectoryField = must<HTMLElement>("#session-windows-directory-field");
+const sessionLinuxDirectoryField = must<HTMLElement>("#session-linux-directory-field");
+const sessionLinuxWorkingDirectory = must<HTMLInputElement>("#session-linux-working-directory");
 const browseSessionDirectory = must<HTMLButtonElement>("#browse-session-directory");
 const permissionWarning = must<HTMLElement>("#permission-warning");
 const sessionFormNote = must<HTMLElement>("#session-form-note");
@@ -419,6 +428,7 @@ let activeCopySurface: CopySurface = null;
 let workspacePreference = "";
 let sessionFormMode: SessionFormMode | null = null;
 let sessionFormPending = false;
+let primeDefaultRequest = 0;
 let zeroStateWasVisible = false;
 let paneButtonsWired = false;
 
@@ -1174,12 +1184,14 @@ function updateZeroSessionState(): void {
 }
 
 function openCreateSessionForm(): void {
+  primeDefaultRequest += 1;
   const defaults = newSessionFormDefaults(workspacePreference);
   sessionFormMode = { kind: "create" };
   sessionFormPending = false;
   sessionLabelInput.value = "";
   sessionDriverSelect.value = defaults.driver;
   sessionPermissionSelect.value = defaults.permissionProfile;
+  sessionLinuxWorkingDirectory.value = "";
   setSessionFormError(null);
   syncSessionForm();
   requestAnimationFrame(() => sessionLabelInput.focus());
@@ -1190,17 +1202,21 @@ function openEditSessionForm(sessionId: string): void {
   if (!session) {
     return;
   }
+  primeDefaultRequest += 1;
   sessionFormMode = { kind: "edit", sessionId };
   sessionFormPending = false;
   sessionLabelInput.value = session.label;
   sessionDriverSelect.value = session.driver;
   sessionPermissionSelect.value = session.permission_profile;
+  sessionLinuxWorkingDirectory.value =
+    session.driver === "prime" ? session.working_dir : "";
   setSessionFormError(null);
   syncSessionForm();
   requestAnimationFrame(() => sessionLabelInput.focus());
 }
 
 function closeSessionForm(): void {
+  primeDefaultRequest += 1;
   sessionFormMode = null;
   sessionFormPending = false;
   sessionEditor.hidden = true;
@@ -1215,6 +1231,45 @@ function closeSessionForm(): void {
   }
 }
 
+async function selectSessionDriver(): Promise<void> {
+  syncSessionForm();
+  if (
+    sessionFormMode?.kind !== "create"
+    || sessionDriverSelect.value !== "prime"
+    || sessionLinuxWorkingDirectory.value
+  ) {
+    return;
+  }
+
+  const request = ++primeDefaultRequest;
+  sessionFormPending = true;
+  setSessionFormError(null);
+  syncSessionForm();
+  try {
+    const qualified = await command<string>("prime_default_working_directory");
+    if (
+      request === primeDefaultRequest
+      && sessionFormMode?.kind === "create"
+      && sessionDriverSelect.value === "prime"
+    ) {
+      sessionLinuxWorkingDirectory.value = qualified;
+      sessionLinuxWorkingDirectory.title = qualified;
+    }
+  } catch (error) {
+    if (request === primeDefaultRequest && sessionFormMode?.kind === "create") {
+      setSessionFormError(
+        "Prime working-directory discovery failed; enter a qualified absolute Ubuntu path or retry. "
+          + String(error),
+      );
+    }
+  } finally {
+    if (request === primeDefaultRequest && sessionFormMode?.kind === "create") {
+      sessionFormPending = false;
+      syncSessionForm();
+    }
+  }
+}
+
 function syncSessionForm(): void {
   zeroWorkspace.textContent = workspacePreference || "the selected workspace";
   if (!sessionFormMode) {
@@ -1225,6 +1280,9 @@ function syncSessionForm(): void {
 
   sessionEditor.hidden = false;
   updateZeroSessionState();
+  const prime = sessionDriverSelect.value === "prime";
+  sessionWindowsDirectoryField.hidden = prime;
+  sessionLinuxDirectoryField.hidden = !prime;
   if (sessionFormMode.kind === "create") {
     sessionEditorTitle.textContent = "New session";
     sessionDriverSelect.disabled = sessionFormPending;
@@ -1232,13 +1290,16 @@ function syncSessionForm(): void {
       workspacePreference || "No workspace selected";
     sessionWorkingDirectory.title = sessionWorkingDirectory.value;
     browseSessionDirectory.textContent = "Browse…";
-    browseSessionDirectory.disabled = sessionFormPending;
+    browseSessionDirectory.disabled = sessionFormPending || prime;
+    sessionLinuxWorkingDirectory.disabled = sessionFormPending || !prime;
     sessionPermissionSelect.disabled = sessionFormPending;
     sessionLabelInput.disabled = sessionFormPending;
     saveSessionButton.textContent = "Create session";
-    sessionFormNote.textContent = workspacePreference
-      ? "Browse changes the workspace default for this and future new sessions. The session is created stopped."
-      : "Choose a workspace before creating the session. Browse saves it as the default for future new sessions.";
+    sessionFormNote.textContent = prime
+      ? "Prime runs directly in Ubuntu WSL. Enter an absolute Linux path, or leave blank to use the qualified Ubuntu home. The session is created stopped."
+      : workspacePreference
+        ? "Browse changes the workspace default for this and future new sessions. The session is created stopped."
+        : "Choose a workspace before creating the session. Browse saves it as the default for future new sessions.";
   } else {
     const session = snapshotById.get(sessionFormMode.sessionId);
     if (!session) {
@@ -1252,17 +1313,20 @@ function syncSessionForm(): void {
     sessionWorkingDirectory.value = session.working_dir;
     sessionWorkingDirectory.title = session.working_dir;
     browseSessionDirectory.textContent = "Change…";
-    browseSessionDirectory.disabled = sessionFormPending || !stopped;
+    browseSessionDirectory.disabled = sessionFormPending || !stopped || prime;
+    sessionLinuxWorkingDirectory.disabled = sessionFormPending || !stopped || !prime;
     sessionPermissionSelect.disabled = sessionFormPending || !stopped;
     sessionLabelInput.disabled = sessionFormPending;
     saveSessionButton.textContent = "Save changes";
     sessionFormNote.textContent = stopped
-      ? "Driver identity is fixed. Browse applies the working-directory change immediately; permission changes apply when saved."
+      ? prime
+        ? "Driver identity is fixed. Saving requalifies the exact Ubuntu path and applies any label change."
+        : "Driver identity is fixed. Browse applies the working-directory change immediately; permission changes apply when saved."
       : "Stop this run before changing its working directory or permission profile.";
   }
   saveSessionButton.disabled =
     sessionFormPending
-    || (sessionFormMode.kind === "create" && !workspacePreference);
+    || (sessionFormMode.kind === "create" && !prime && !workspacePreference);
   syncPermissionControls();
 }
 
@@ -1300,8 +1364,13 @@ async function submitSessionForm(): Promise<void> {
     sessionPermissionSelect.value as PermissionProfile,
   );
   const label = sessionLabelInput.value.trim();
+  const linuxWorkingDirectory = sessionLinuxWorkingDirectory.value;
   if (mode.kind === "edit" && !label) {
     setSessionFormError("A saved session label cannot be empty.");
+    return;
+  }
+  if (mode.kind === "edit" && driver === "prime" && !linuxWorkingDirectory.trim()) {
+    setSessionFormError("Prime requires an absolute Ubuntu working directory.");
     return;
   }
   sessionFormPending = true;
@@ -1312,11 +1381,12 @@ async function submitSessionForm(): Promise<void> {
     let created: SessionSnapshot;
     try {
       created = await command<SessionSnapshot>("create_session", {
-        request: {
-          label: label || null,
+        request: createSessionRequestFromForm(
+          label,
           driver,
-          permission_profile: permissionProfile,
-        } satisfies CreateSessionRequest,
+          permissionProfile,
+          linuxWorkingDirectory,
+        ),
       });
     } catch (error) {
       sessionFormPending = false;
@@ -1364,6 +1434,18 @@ async function submitSessionForm(): Promise<void> {
         } satisfies SetSessionPermissionRequest,
       });
     }
+    if (
+      !current.running
+      && current.driver === "prime"
+      && linuxWorkingDirectory !== current.working_dir
+    ) {
+      await command<SessionSnapshot>("set_session_linux_working_directory", {
+        request: {
+          session_id: current.session_id,
+          linux_working_directory: linuxWorkingDirectory,
+        } satisfies SetSessionLinuxWorkingDirectoryRequest,
+      });
+    }
     await refreshSnapshot(current.session_id);
     closeSessionForm();
   } catch (error) {
@@ -1389,6 +1471,10 @@ async function chooseWorkingDirectory(): Promise<void> {
     return;
   }
   const mode = sessionFormMode;
+  if (sessionDriverSelect.value === "prime") {
+    setSessionFormError("Prime uses an absolute path inside Ubuntu; enter it in the Linux field.");
+    return;
+  }
   sessionFormPending = true;
   setSessionFormError(null);
   syncSessionForm();
@@ -1532,7 +1618,9 @@ function wireSessionUi(): void {
   browseSessionDirectory.addEventListener("click", () => {
     void chooseWorkingDirectory();
   });
-  sessionDriverSelect.addEventListener("change", syncPermissionControls);
+  sessionDriverSelect.addEventListener("change", () => {
+    void selectSessionDriver();
+  });
   sessionPermissionSelect.addEventListener("change", syncPermissionControls);
   sessionTabs.addEventListener("click", (event) => {
     if (!(event.target instanceof Element)) {

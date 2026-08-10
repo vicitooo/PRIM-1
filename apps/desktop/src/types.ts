@@ -1,4 +1,4 @@
-export type DriverKind = "claude" | "codex" | "grok" | "generic_terminal";
+export type DriverKind = "claude" | "codex" | "grok" | "prime" | "generic_terminal";
 export type PermissionProfile = "normal" | "unsafe";
 export type LifecycleState =
   | "starting"
@@ -93,6 +93,7 @@ export interface CreateSessionRequest {
   label?: string | null;
   driver: DriverKind;
   permission_profile: PermissionProfile;
+  linux_working_directory?: string | null;
 }
 
 export interface RenameSessionRequest {
@@ -102,6 +103,11 @@ export interface RenameSessionRequest {
 
 export interface ChooseSessionWorkingDirectoryRequest {
   session_id: string;
+}
+
+export interface SetSessionLinuxWorkingDirectoryRequest {
+  session_id: string;
+  linux_working_directory: string;
 }
 
 export interface SetSessionPermissionRequest {

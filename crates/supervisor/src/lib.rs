@@ -543,7 +543,31 @@ impl DispatchAttemptDecision {
 }
 
 trait PtySpawner: Send + Sync {
-    fn spawn(&self, spec: &LaunchSpec, handler: PtyEventHandler) -> Result<Box<dyn PtySession>>;
+    fn spawn(&self, plan: &PreparedLaunch, handler: PtyEventHandler)
+    -> Result<Box<dyn PtySession>>;
+}
+
+#[derive(Debug, Clone)]
+struct PreparedLaunch {
+    spec: LaunchSpec,
+    wsl_scope: Option<WslRunScope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WslRunScope {
+    distro: String,
+    unit: String,
+}
+
+trait WslControl: Send + Sync {
+    fn reconcile_stale_scopes(&self) -> Result<()>;
+    fn default_working_directory(&self) -> Result<String>;
+    fn qualify_working_directory(&self, candidate: &str) -> Result<QualifiedWorkingDirectory>;
+    fn revalidate_working_directory(&self, expected: &QualifiedWorkingDirectory) -> Result<()>;
+    fn resolve_prime_executable(&self) -> Result<String>;
+    fn wsl_executable(&self) -> Result<String>;
+    fn confirm_scope_started(&self, scope: &WslRunScope) -> Result<()>;
+    fn terminate_scope(&self, scope: &WslRunScope) -> Result<()>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -564,11 +588,697 @@ impl DriverExecutableResolver for HostDriverExecutableResolver {
     }
 }
 
-struct ConcretePtySpawner;
+struct ConcretePtySpawner {
+    wsl: Arc<dyn WslControl>,
+}
 
 impl PtySpawner for ConcretePtySpawner {
-    fn spawn(&self, spec: &LaunchSpec, handler: PtyEventHandler) -> Result<Box<dyn PtySession>> {
-        Ok(Box::new(ConcretePtySession::spawn(spec, handler)?))
+    fn spawn(
+        &self,
+        plan: &PreparedLaunch,
+        handler: PtyEventHandler,
+    ) -> Result<Box<dyn PtySession>> {
+        let session = ConcretePtySession::spawn(&plan.spec, handler)?;
+        let Some(scope) = plan.wsl_scope.clone() else {
+            return Ok(Box::new(session));
+        };
+
+        // ConPTY requests a cursor-position report before the WSL payload runs.
+        // The renderer cannot answer until the session is installed, so the
+        // supervisor releases this one measured startup handshake itself.
+        if let Err(error) = session.send_input("\u{1b}[1;1R") {
+            let _ = self.wsl.terminate_scope(&scope);
+            let _ = session.kill();
+            return Err(anyhow!(error).context("failed to release Prime ConPTY startup handshake"));
+        }
+        if let Err(start_error) = self.wsl.confirm_scope_started(&scope) {
+            let scope_cleanup = self.wsl.terminate_scope(&scope);
+            let job_cleanup = session.kill();
+            let mut error = format!("Prime WSL scope failed start-time binding: {start_error:#}");
+            if let Err(cleanup_error) = scope_cleanup {
+                error.push_str(&format!("; scope cleanup failed: {cleanup_error:#}"));
+            }
+            if let Err(cleanup_error) = job_cleanup {
+                error.push_str(&format!("; Windows job cleanup failed: {cleanup_error:#}"));
+            }
+            return Err(anyhow!(error));
+        }
+
+        Ok(Box::new(WslScopedPtySession {
+            inner: Box::new(session),
+            control: Arc::clone(&self.wsl),
+            scope,
+        }))
+    }
+}
+
+struct WslScopedPtySession {
+    inner: Box<dyn PtySession>,
+    control: Arc<dyn WslControl>,
+    scope: WslRunScope,
+}
+
+impl PtySession for WslScopedPtySession {
+    fn send_input(&self, input: &str) -> pty_host::PtyWriteResult {
+        self.inner.send_input(input)
+    }
+
+    fn cancel_input_write(&self) -> Result<()> {
+        self.inner.cancel_input_write()
+    }
+
+    fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        self.inner.resize(cols, rows)
+    }
+
+    fn kill(&self) -> Result<()> {
+        let scope_result = self.control.terminate_scope(&self.scope);
+        let job_result = self.inner.kill();
+        match (scope_result, job_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(scope), Ok(())) => Err(scope.context("failed to prove Prime WSL scope empty")),
+            (Ok(()), Err(job)) => Err(job.context("failed to prove Prime Windows job empty")),
+            (Err(scope), Err(job)) => Err(anyhow!(
+                "failed to prove Prime WSL scope empty: {scope:#}; failed to prove Prime Windows job empty: {job:#}"
+            )),
+        }
+    }
+
+    fn try_wait(&self) -> Result<Option<PtyExitStatus>> {
+        self.inner.try_wait()
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        self.inner.process_id()
+    }
+
+    fn contains_process_id(&self, _process_id: u32) -> Result<bool> {
+        // Prime/WSL has no verified Windows Job -> Linux task identity bridge.
+        // It is deliberately ineligible for the native pane sideband.
+        Ok(false)
+    }
+
+    #[cfg(windows)]
+    fn contains_process(&self, _process: &PinnedProcess) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn note_real_output(&self, _driver: DriverKind) {
+        self.inner.note_real_output(DriverKind::GenericTerminal);
+    }
+
+    fn agent_alive(&self, _driver: DriverKind) -> Result<AgentLiveness> {
+        self.inner.agent_alive(DriverKind::GenericTerminal)
+    }
+}
+
+impl Drop for WslScopedPtySession {
+    fn drop(&mut self) {
+        let _ = self.control.terminate_scope(&self.scope);
+        let _ = self.inner.kill();
+    }
+}
+
+const WSL_CONTROL_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const WSL_SCOPE_START_TIMEOUT: Duration = Duration::from_secs(8);
+const WSL_SCOPE_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct ConcreteWslControl {
+    wsl_executable: String,
+    runtime_dir: PathBuf,
+}
+
+struct WslCommandResult {
+    success: bool,
+    exit_code: u32,
+    output: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LinuxDirectoryProbe {
+    path: String,
+    device: u64,
+    inode: u64,
+    directory: bool,
+}
+
+#[derive(Debug)]
+struct WslScopeStatus {
+    active_state: String,
+    tasks_current: u64,
+}
+
+impl ConcreteWslControl {
+    fn new(runtime_dir: PathBuf) -> Self {
+        let system_root = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        let candidate = system_root.join("System32").join("wsl.exe");
+        let wsl_executable = fs::canonicalize(&candidate)
+            .map(|path| child_process_path(&path))
+            .unwrap_or(candidate)
+            .to_string_lossy()
+            .into_owned();
+        Self {
+            wsl_executable,
+            runtime_dir,
+        }
+    }
+
+    fn run_command(&self, linux_args: &[String], timeout: Duration) -> Result<WslCommandResult> {
+        #[cfg(not(windows))]
+        {
+            let _ = (linux_args, timeout);
+            return Err(anyhow!("Prime/WSL is supported only on Windows"));
+        }
+
+        #[cfg(windows)]
+        {
+            if !Path::new(&self.wsl_executable).is_file() {
+                return Err(anyhow!(
+                    "WSL executable is unavailable at {}",
+                    self.wsl_executable
+                ));
+            }
+            let mut args = vec![
+                "-d".to_owned(),
+                driver_prime::WSL_DISTRO.to_owned(),
+                "--exec".to_owned(),
+            ];
+            args.extend(linux_args.iter().cloned());
+            let working_dir = Path::new(&self.wsl_executable)
+                .parent()
+                .unwrap_or_else(|| Path::new(r"C:\Windows\System32"))
+                .to_string_lossy()
+                .into_owned();
+            let spec = LaunchSpec {
+                program: self.wsl_executable.clone(),
+                args,
+                working_dir,
+                env: vec![EnvVar {
+                    key: "WSLENV".into(),
+                    value: String::new(),
+                }],
+                display_name: "PRIM-1 WSL control".into(),
+            };
+            let output = Arc::new(Mutex::new(String::new()));
+            let captured = Arc::clone(&output);
+            let reader_closed = Arc::new(AtomicBool::new(false));
+            let closed = Arc::clone(&reader_closed);
+            let handler: PtyEventHandler = Arc::new(move |event| match event {
+                PtyEvent::Output(chunk) => captured.lock().push_str(&chunk),
+                PtyEvent::Closed => closed.store(true, Ordering::Release),
+                PtyEvent::Error(error) => {
+                    let mut captured = captured.lock();
+                    captured.push_str("\n[PTY error: ");
+                    captured.push_str(&error);
+                    captured.push_str("]\n");
+                    closed.store(true, Ordering::Release);
+                }
+            });
+            let session = ConcretePtySession::spawn(&spec, handler)
+                .context("failed to start bounded WSL control command")?;
+            session
+                .send_input("\u{1b}[1;1R")
+                .map_err(anyhow::Error::from)
+                .context("failed to release WSL control ConPTY startup handshake")?;
+
+            let deadline = Instant::now() + timeout;
+            let status = loop {
+                if let Some(status) = session.try_wait()? {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    let cleanup = session.kill();
+                    return match cleanup {
+                        Ok(()) => Err(anyhow!("WSL control command timed out after {timeout:?}")),
+                        Err(error) => Err(anyhow!(
+                            "WSL control command timed out after {timeout:?}; Windows job cleanup failed: {error:#}"
+                        )),
+                    };
+                }
+                thread::sleep(Duration::from_millis(20));
+            };
+
+            session
+                .kill()
+                .context("failed to prove WSL control command Windows job empty")?;
+            let drain_deadline = Instant::now() + Duration::from_secs(1);
+            while !reader_closed.load(Ordering::Acquire) && Instant::now() < drain_deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            let output = strip_terminal_control_sequences(&output.lock())
+                .trim()
+                .to_owned();
+            Ok(WslCommandResult {
+                success: status.success,
+                exit_code: status.exit_code,
+                output,
+            })
+        }
+    }
+
+    fn run_checked(&self, linux_args: &[String], context: &str) -> Result<String> {
+        let result = self.run_command(linux_args, WSL_CONTROL_COMMAND_TIMEOUT)?;
+        if !result.success {
+            return Err(anyhow!(
+                "{context} failed with exit code {}{}",
+                result.exit_code,
+                bounded_command_output(&result.output)
+            ));
+        }
+        Ok(result.output)
+    }
+
+    fn query_directory(&self, candidate: &str) -> Result<LinuxDirectoryProbe> {
+        validate_linux_candidate(candidate)?;
+        const SCRIPT: &str = "import json,os,stat,sys; p=os.path.realpath(sys.argv[1]); s=os.stat(p); print(json.dumps({'path':p,'device':s.st_dev,'inode':s.st_ino,'directory':stat.S_ISDIR(s.st_mode)},separators=(',',':')))";
+        let output = self.run_checked(
+            &[
+                driver_prime::PYTHON.into(),
+                "-c".into(),
+                SCRIPT.into(),
+                candidate.into(),
+            ],
+            "Linux working-directory qualification",
+        )?;
+        let line = output
+            .lines()
+            .rev()
+            .find(|line| line.trim_start().starts_with('{'))
+            .ok_or_else(|| anyhow!("Linux directory probe returned no identity record"))?;
+        let probe: LinuxDirectoryProbe = serde_json::from_str(line)
+            .context("failed to decode Linux directory identity record")?;
+        validate_linux_candidate(&probe.path)?;
+        if !probe.directory {
+            return Err(anyhow!(
+                "selected Linux working directory is not a directory: {}",
+                probe.path
+            ));
+        }
+        Ok(probe)
+    }
+
+    fn runtime_path_in_wsl(&self) -> Result<String> {
+        let output = self.run_checked(
+            &[
+                "/usr/bin/wslpath".into(),
+                "-a".into(),
+                "-u".into(),
+                self.runtime_dir.to_string_lossy().into_owned(),
+            ],
+            "runtime-path translation into Ubuntu",
+        )?;
+        let translated = output
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| line.starts_with('/'))
+            .ok_or_else(|| anyhow!("wslpath returned no absolute Linux path"))?;
+        Ok(translated.to_owned())
+    }
+
+    fn scope_status(&self, scope: &WslRunScope) -> Result<Option<WslScopeStatus>> {
+        validate_wsl_scope(scope)?;
+        let result = self.run_command(
+            &[
+                driver_prime::SYSTEMCTL.into(),
+                "--user".into(),
+                "show".into(),
+                format!("{}.service", scope.unit),
+                "--property=LoadState".into(),
+                "--property=ActiveState".into(),
+                "--property=TasksCurrent".into(),
+                "--no-pager".into(),
+            ],
+            WSL_CONTROL_COMMAND_TIMEOUT,
+        )?;
+        if !result.success {
+            let lower = result.output.to_ascii_lowercase();
+            if lower.contains("not found")
+                || lower.contains("could not be found")
+                || lower.contains("not loaded")
+            {
+                return Ok(None);
+            }
+            return Err(anyhow!(
+                "failed to inspect Prime scope '{}' (exit {}){}",
+                scope.unit,
+                result.exit_code,
+                bounded_command_output(&result.output)
+            ));
+        }
+        parse_wsl_scope_status(&result.output)
+    }
+}
+
+fn parse_wsl_scope_status(output: &str) -> Result<Option<WslScopeStatus>> {
+    let mut load_state = None;
+    let mut active_state = None;
+    let mut tasks_current = None;
+    for line in output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key {
+            "LoadState" => load_state = Some(value),
+            "ActiveState" => active_state = Some(value),
+            "TasksCurrent" => tasks_current = Some(value),
+            _ => {}
+        }
+    }
+    let load_state = load_state.ok_or_else(|| anyhow!("Prime scope status omitted LoadState"))?;
+    if load_state == "not-found" {
+        return Ok(None);
+    }
+    let active_state = active_state
+        .ok_or_else(|| anyhow!("Prime scope status omitted ActiveState"))?
+        .to_owned();
+    let tasks_current = match tasks_current {
+        None | Some("") | Some("[not set]") => 0,
+        Some(value) => value
+            .parse::<u64>()
+            .with_context(|| format!("invalid Prime scope TasksCurrent value '{value}'"))?,
+    };
+    Ok(Some(WslScopeStatus {
+        active_state,
+        tasks_current,
+    }))
+}
+
+impl WslControl for ConcreteWslControl {
+    fn reconcile_stale_scopes(&self) -> Result<()> {
+        #[cfg(not(windows))]
+        return Ok(());
+
+        #[cfg(windows)]
+        {
+            if !Path::new(&self.wsl_executable).is_file() {
+                return Ok(());
+            }
+            let result = self.run_command(
+                &[
+                    driver_prime::SYSTEMCTL.into(),
+                    "--user".into(),
+                    "list-units".into(),
+                    "--all".into(),
+                    "--plain".into(),
+                    "--full".into(),
+                    "--no-legend".into(),
+                    "--no-pager".into(),
+                    format!("{}*.service", driver_prime::SCOPE_UNIT_PREFIX),
+                ],
+                WSL_CONTROL_COMMAND_TIMEOUT,
+            )?;
+            if !result.success {
+                let lower = result.output.to_ascii_lowercase();
+                if lower.contains("no distribution") || lower.contains("distribution was not found")
+                {
+                    return Ok(());
+                }
+                return Err(anyhow!(
+                    "failed to enumerate stale Prime scopes (exit {}){}",
+                    result.exit_code,
+                    bounded_command_output(&result.output)
+                ));
+            }
+            for service in result
+                .output
+                .lines()
+                .filter_map(|line| line.split_whitespace().next())
+            {
+                let Some(unit) = service.strip_suffix(".service") else {
+                    continue;
+                };
+                if !valid_wsl_unit(unit) {
+                    continue;
+                }
+                self.terminate_scope(&WslRunScope {
+                    distro: driver_prime::WSL_DISTRO.into(),
+                    unit: unit.into(),
+                })?;
+            }
+            Ok(())
+        }
+    }
+
+    fn default_working_directory(&self) -> Result<String> {
+        const SCRIPT: &str = "import json,os,pwd; print(json.dumps(os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir)))";
+        let output = self.run_checked(
+            &[driver_prime::PYTHON.into(), "-c".into(), SCRIPT.into()],
+            "Prime home-directory discovery",
+        )?;
+        let value = output
+            .lines()
+            .rev()
+            .find(|line| line.trim_start().starts_with('"'))
+            .ok_or_else(|| anyhow!("Prime home-directory probe returned no path"))?;
+        let path: String =
+            serde_json::from_str(value).context("failed to decode Prime home-directory path")?;
+        validate_linux_candidate(&path)?;
+        Ok(path)
+    }
+
+    fn qualify_working_directory(&self, candidate: &str) -> Result<QualifiedWorkingDirectory> {
+        let selected = self.query_directory(candidate)?;
+        let runtime = self.query_directory(&self.runtime_path_in_wsl()?)?;
+        if linux_paths_overlap(&selected.path, &runtime.path) {
+            return Err(anyhow!(
+                "Linux working directory and runtime storage must be disjoint"
+            ));
+        }
+        Ok(QualifiedWorkingDirectory {
+            namespace: WorkingDirectoryNamespace::WslUbuntu,
+            canonical_path: selected.path,
+            identity: format!("wsl_ubuntu:{}:{}", selected.device, selected.inode),
+        })
+    }
+
+    fn revalidate_working_directory(&self, expected: &QualifiedWorkingDirectory) -> Result<()> {
+        if expected.namespace != WorkingDirectoryNamespace::WslUbuntu {
+            return Err(anyhow!("Prime session has a non-WSL working directory"));
+        }
+        let actual = self.qualify_working_directory(&expected.canonical_path)?;
+        if actual != *expected {
+            return Err(anyhow!(
+                "Prime Linux working directory changed since it was selected; choose it again (expected identity {}, actual identity {})",
+                expected.identity,
+                actual.identity
+            ));
+        }
+        Ok(())
+    }
+
+    fn resolve_prime_executable(&self) -> Result<String> {
+        const SCRIPT: &str = "import json,os,pwd,shutil; h=pwd.getpwuid(os.getuid()).pw_dir; p=shutil.which('prime-agent') or os.path.join(h,'.npm-global','bin','prime-agent'); print(json.dumps(os.path.realpath(p) if os.path.isfile(p) and os.access(p,os.X_OK) else None))";
+        let output = self.run_checked(
+            &[driver_prime::PYTHON.into(), "-c".into(), SCRIPT.into()],
+            "Prime executable discovery",
+        )?;
+        let value = output
+            .lines()
+            .rev()
+            .find(|line| matches!(line.trim_start().chars().next(), Some('"' | 'n')))
+            .ok_or_else(|| anyhow!("Prime executable probe returned no result"))?;
+        let path: Option<String> =
+            serde_json::from_str(value).context("failed to decode Prime executable path")?;
+        let path = path.ok_or_else(|| anyhow!("prime-agent is not installed in Ubuntu"))?;
+        validate_linux_candidate(&path)?;
+        Ok(path)
+    }
+
+    fn wsl_executable(&self) -> Result<String> {
+        if !Path::new(&self.wsl_executable).is_file() {
+            return Err(anyhow!(
+                "WSL executable is unavailable at {}",
+                self.wsl_executable
+            ));
+        }
+        Ok(self.wsl_executable.clone())
+    }
+
+    fn confirm_scope_started(&self, scope: &WslRunScope) -> Result<()> {
+        validate_wsl_scope(scope)?;
+        let deadline = Instant::now() + WSL_SCOPE_START_TIMEOUT;
+        let mut last = None;
+        while Instant::now() < deadline {
+            match self.scope_status(scope) {
+                Ok(Some(status))
+                    if status.active_state == "active" && status.tasks_current >= 2 =>
+                {
+                    return Ok(());
+                }
+                Ok(status) => last = status.map(|value| format!("{value:?}")),
+                Err(error) => last = Some(format!("{error:#}")),
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        Err(anyhow!(
+            "Prime scope '{}' did not become active with at least two tasks{}",
+            scope.unit,
+            last.map(|value| format!(": {value}")).unwrap_or_default()
+        ))
+    }
+
+    fn terminate_scope(&self, scope: &WslRunScope) -> Result<()> {
+        validate_wsl_scope(scope)?;
+        let service = format!("{}.service", scope.unit);
+        let _ = self.run_command(
+            &[
+                driver_prime::SYSTEMCTL.into(),
+                "--user".into(),
+                "stop".into(),
+                service.clone(),
+                "--no-block".into(),
+            ],
+            WSL_CONTROL_COMMAND_TIMEOUT,
+        );
+        let deadline = Instant::now() + WSL_SCOPE_STOP_TIMEOUT;
+        let mut kill_sent = false;
+        loop {
+            match self.scope_status(scope) {
+                Ok(None) => return Ok(()),
+                Ok(Some(status))
+                    if status.tasks_current == 0
+                        && !matches!(status.active_state.as_str(), "active" | "activating") =>
+                {
+                    return Ok(());
+                }
+                Ok(Some(_)) | Err(_) if Instant::now() < deadline => {
+                    if !kill_sent && Instant::now() + Duration::from_secs(2) >= deadline {
+                        let _ = self.run_command(
+                            &[
+                                driver_prime::SYSTEMCTL.into(),
+                                "--user".into(),
+                                "kill".into(),
+                                "--signal=KILL".into(),
+                                "--kill-whom=all".into(),
+                                service.clone(),
+                            ],
+                            WSL_CONTROL_COMMAND_TIMEOUT,
+                        );
+                        kill_sent = true;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+                Ok(Some(status)) => {
+                    return Err(anyhow!(
+                        "Prime scope '{}' still owns {} task(s) in state '{}'",
+                        scope.unit,
+                        status.tasks_current,
+                        status.active_state
+                    ));
+                }
+                Err(error) => {
+                    return Err(error.context(format!(
+                        "failed to prove Prime scope '{}' empty",
+                        scope.unit
+                    )));
+                }
+            }
+        }
+    }
+}
+
+fn bounded_command_output(output: &str) -> String {
+    if output.is_empty() {
+        String::new()
+    } else {
+        let truncated = output.chars().take(512).collect::<String>();
+        format!(": {truncated}")
+    }
+}
+
+fn validate_linux_candidate(candidate: &str) -> Result<()> {
+    if candidate.trim() != candidate
+        || !candidate.starts_with('/')
+        || candidate.chars().any(char::is_control)
+    {
+        return Err(anyhow!(
+            "Prime Linux working directory must be a control-free absolute Ubuntu path"
+        ));
+    }
+    Ok(())
+}
+
+fn linux_paths_overlap(left: &str, right: &str) -> bool {
+    let left = left.trim_end_matches('/');
+    let right = right.trim_end_matches('/');
+    left == right
+        || left
+            .strip_prefix(right)
+            .is_some_and(|rest| rest.starts_with('/'))
+        || right
+            .strip_prefix(left)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn valid_wsl_unit(unit: &str) -> bool {
+    unit.strip_prefix(driver_prime::SCOPE_UNIT_PREFIX)
+        .is_some_and(|suffix| {
+            suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+}
+
+fn validate_wsl_scope(scope: &WslRunScope) -> Result<()> {
+    if scope.distro != driver_prime::WSL_DISTRO || !valid_wsl_unit(&scope.unit) {
+        return Err(anyhow!("invalid supervisor-owned Prime WSL scope"));
+    }
+    Ok(())
+}
+
+fn parse_wsl_identity(identity: &str) -> Result<(u64, u64)> {
+    let mut parts = identity.split(':');
+    if parts.next() != Some("wsl_ubuntu") {
+        return Err(anyhow!("invalid Prime Linux directory identity"));
+    }
+    let device = parts
+        .next()
+        .and_then(|part| part.parse::<u64>().ok())
+        .ok_or_else(|| anyhow!("invalid Prime Linux directory device identity"))?;
+    let inode = parts
+        .next()
+        .and_then(|part| part.parse::<u64>().ok())
+        .ok_or_else(|| anyhow!("invalid Prime Linux directory inode identity"))?;
+    if parts.next().is_some() {
+        return Err(anyhow!("invalid Prime Linux directory identity"));
+    }
+    Ok((device, inode))
+}
+
+#[cfg(test)]
+struct TestWslUnavailable;
+
+#[cfg(test)]
+impl WslControl for TestWslUnavailable {
+    fn reconcile_stale_scopes(&self) -> Result<()> {
+        Ok(())
+    }
+    fn default_working_directory(&self) -> Result<String> {
+        Err(anyhow!("Prime/WSL test control is not configured"))
+    }
+    fn qualify_working_directory(&self, _candidate: &str) -> Result<QualifiedWorkingDirectory> {
+        Err(anyhow!("Prime/WSL test control is not configured"))
+    }
+    fn revalidate_working_directory(&self, _expected: &QualifiedWorkingDirectory) -> Result<()> {
+        Err(anyhow!("Prime/WSL test control is not configured"))
+    }
+    fn resolve_prime_executable(&self) -> Result<String> {
+        Err(anyhow!("Prime/WSL test control is not configured"))
+    }
+    fn wsl_executable(&self) -> Result<String> {
+        Err(anyhow!("Prime/WSL test control is not configured"))
+    }
+    fn confirm_scope_started(&self, _scope: &WslRunScope) -> Result<()> {
+        Err(anyhow!("Prime/WSL test control is not configured"))
+    }
+    fn terminate_scope(&self, _scope: &WslRunScope) -> Result<()> {
+        Err(anyhow!("Prime/WSL test control is not configured"))
     }
 }
 
@@ -1165,8 +1875,18 @@ impl SessionSlot {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct QualifiedWorkingDirectory {
+    #[serde(default)]
+    namespace: WorkingDirectoryNamespace,
     canonical_path: String,
     identity: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum WorkingDirectoryNamespace {
+    #[default]
+    Windows,
+    WslUbuntu,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1215,14 +1935,18 @@ impl SessionRegistry {
                 ));
             }
             validate_session_label(&persisted.label)?;
-            if persisted.driver == DriverKind::GenericTerminal
-                && persisted.permission_profile == shared_types::PermissionProfile::Unsafe
+            if matches!(
+                persisted.driver,
+                DriverKind::GenericTerminal | DriverKind::Prime
+            ) && persisted.permission_profile == shared_types::PermissionProfile::Unsafe
             {
                 return Err(anyhow!(
-                    "generic terminal session '{}' cannot use the unsafe permission profile",
-                    persisted.session_id
+                    "{:?} session '{}' cannot use the unsafe permission profile",
+                    persisted.driver,
+                    persisted.session_id,
                 ));
             }
+            validate_driver_working_directory_pair(persisted.driver, &persisted.working_directory)?;
             let definition = SessionDefinition {
                 session_id: persisted.session_id,
                 alias: session_alias(persisted.session_id),
@@ -1720,6 +2444,8 @@ struct SupervisorInner {
     control_plane_listener: Mutex<Option<ControlPlaneListener>>,
     pty_spawner: RwLock<Arc<dyn PtySpawner>>,
     executable_resolver: RwLock<Arc<dyn DriverExecutableResolver>>,
+    wsl_control: RwLock<Arc<dyn WslControl>>,
+    wsl_reconciliation_error: Mutex<Option<String>>,
     background_runtime: BackgroundRuntime,
     events_seq: AtomicU64,
     events_watch: tokio::sync::watch::Sender<u64>,
@@ -2006,6 +2732,11 @@ struct DirectoryLease {
     identity: String,
 }
 
+enum SessionDirectoryLease {
+    Windows { _lease: DirectoryLease },
+    WslUbuntu,
+}
+
 #[cfg(windows)]
 fn open_directory_lease(path: &Path) -> Result<DirectoryLease> {
     use std::mem::zeroed;
@@ -2106,6 +2837,7 @@ fn qualify_working_directory(
 
     Ok((
         QualifiedWorkingDirectory {
+            namespace: WorkingDirectoryNamespace::Windows,
             canonical_path: child_process_path(&canonical)
                 .to_string_lossy()
                 .into_owned(),
@@ -2120,6 +2852,11 @@ fn revalidate_qualified_working_directory(
     expected: &QualifiedWorkingDirectory,
     runtime_dir: &Path,
 ) -> Result<DirectoryLease> {
+    if expected.namespace != WorkingDirectoryNamespace::Windows {
+        return Err(anyhow!(
+            "session '{session_id}' working directory is not a Windows directory"
+        ));
+    }
     revalidate_qualified_directory(
         &format!("session '{session_id}' working directory"),
         expected,
@@ -2161,6 +2898,11 @@ fn read_session_catalog(path: &Path) -> Result<SessionCatalogV1> {
         ));
     }
     validate_persisted_qualified_directory("workspace preference", &catalog.workspace_preference)?;
+    if catalog.workspace_preference.namespace != WorkingDirectoryNamespace::Windows {
+        return Err(anyhow!(
+            "workspace preference must use the Windows working-directory namespace"
+        ));
+    }
     let mut seen = HashSet::new();
     for session in &catalog.sessions {
         if !seen.insert(session.session_id) {
@@ -2174,6 +2916,7 @@ fn read_session_catalog(path: &Path) -> Result<SessionCatalogV1> {
             &format!("session '{}' working directory", session.session_id),
             &session.working_directory,
         )?;
+        validate_driver_working_directory_pair(session.driver, &session.working_directory)?;
     }
     Ok(catalog)
 }
@@ -2182,16 +2925,46 @@ fn validate_persisted_qualified_directory(
     subject: &str,
     directory: &QualifiedWorkingDirectory,
 ) -> Result<()> {
+    let valid_absolute_path = match directory.namespace {
+        WorkingDirectoryNamespace::Windows => Path::new(&directory.canonical_path).is_absolute(),
+        WorkingDirectoryNamespace::WslUbuntu => directory.canonical_path.starts_with('/'),
+    };
     if directory.canonical_path.trim() != directory.canonical_path
         || directory.canonical_path.contains('\0')
-        || !Path::new(&directory.canonical_path).is_absolute()
+        || !valid_absolute_path
     {
         return Err(anyhow!("{subject} has an invalid absolute canonical path"));
     }
     if directory.identity.trim().is_empty() {
         return Err(anyhow!("{subject} has a blank persisted identity"));
     }
+    if directory.namespace == WorkingDirectoryNamespace::WslUbuntu {
+        validate_linux_candidate(&directory.canonical_path)
+            .with_context(|| format!("{subject} has an invalid Ubuntu path"))?;
+        parse_wsl_identity(&directory.identity)
+            .with_context(|| format!("{subject} has an invalid Ubuntu identity"))?;
+    }
     Ok(())
+}
+
+fn validate_driver_working_directory_pair(
+    driver: DriverKind,
+    directory: &QualifiedWorkingDirectory,
+) -> Result<()> {
+    let valid = match driver {
+        DriverKind::Prime => directory.namespace == WorkingDirectoryNamespace::WslUbuntu,
+        DriverKind::Claude | DriverKind::Codex | DriverKind::Grok | DriverKind::GenericTerminal => {
+            directory.namespace == WorkingDirectoryNamespace::Windows
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "driver {driver:?} cannot use the persisted {:?} working-directory namespace",
+            directory.namespace
+        ))
+    }
 }
 
 fn persist_session_catalog(runtime_dir: &Path, catalog: &SessionCatalogV1) -> Result<()> {
@@ -2572,19 +3345,32 @@ impl SupervisorHandle {
             persist_session_catalog(&config.runtime_dir, &catalog)?;
             catalog
         };
+        #[cfg(test)]
+        let wsl_control: Arc<dyn WslControl> = Arc::new(TestWslUnavailable);
+        #[cfg(not(test))]
+        let wsl_control: Arc<dyn WslControl> =
+            Arc::new(ConcreteWslControl::new(config.runtime_dir.clone()));
+        let wsl_reconciliation_error = wsl_control
+            .reconcile_stale_scopes()
+            .err()
+            .map(|error| format!("{error:#}"));
+
         let mut slots = SessionRegistry::from_catalog(&catalog)?;
         for slot in slots.by_id.values_mut() {
             let availability = slot
                 .qualified_working_directory
                 .as_ref()
                 .ok_or_else(|| anyhow!("qualified working-directory metadata is missing"))
-                .and_then(|qualified| {
-                    revalidate_qualified_working_directory(
+                .and_then(|qualified| match qualified.namespace {
+                    WorkingDirectoryNamespace::Windows => revalidate_qualified_working_directory(
                         slot.session_id,
                         qualified,
                         &config.runtime_dir,
                     )
-                    .map(|_lease| ())
+                    .map(|_lease| ()),
+                    WorkingDirectoryNamespace::WslUbuntu => {
+                        wsl_control.revalidate_working_directory(qualified)
+                    }
                 });
             if let Err(error) = availability {
                 slot.last_error = Some(format!("working directory unavailable: {error:#}"));
@@ -2634,8 +3420,12 @@ impl SupervisorHandle {
                 shutdown_started: AtomicBool::new(false),
                 #[cfg(windows)]
                 control_plane_listener: Mutex::new(None),
-                pty_spawner: RwLock::new(Arc::new(ConcretePtySpawner)),
+                pty_spawner: RwLock::new(Arc::new(ConcretePtySpawner {
+                    wsl: Arc::clone(&wsl_control),
+                })),
                 executable_resolver: RwLock::new(Arc::new(HostDriverExecutableResolver)),
+                wsl_control: RwLock::new(wsl_control),
+                wsl_reconciliation_error: Mutex::new(wsl_reconciliation_error),
                 background_runtime: BackgroundRuntime::new(background_runtime),
                 events_seq: AtomicU64::new(0),
                 events_watch,
@@ -3373,6 +4163,13 @@ impl SupervisorHandle {
     }
 
     #[cfg(test)]
+    fn set_wsl_control_for_tests(&self, control: Arc<dyn WslControl>) {
+        *self.inner.wsl_control.write() = Arc::clone(&control);
+        *self.inner.pty_spawner.write() = Arc::new(ConcretePtySpawner { wsl: control });
+        *self.inner.wsl_reconciliation_error.lock() = None;
+    }
+
+    #[cfg(test)]
     fn set_pty_event_before_commit_for_tests<F>(&self, hook: F)
     where
         F: FnOnce() + Send + 'static,
@@ -3459,7 +4256,7 @@ impl SupervisorHandle {
     pub fn start_session_by_id(&self, session_id: SessionId) -> Result<SessionSnapshot> {
         self.ensure_active()?;
         self.refresh_session_liveness();
-        let (initial_generation, definition, lease) = {
+        let (initial_generation, definition, qualified_directory) = {
             let slots = self.inner.slots.lock();
             self.ensure_active()?;
             let slot = slots
@@ -3483,10 +4280,25 @@ impl SupervisorHandle {
             if slot.running.is_some() {
                 return Ok(slot.snapshot());
             }
-            let lease = self.revalidate_slot_working_directory(slot)?;
-            (slot.generation, slot.definition.clone(), lease)
+            let qualified_directory = slot
+                .qualified_working_directory
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow!("session '{session_id}' has no qualified working directory")
+                })?
+                .clone();
+            (
+                slot.generation,
+                slot.definition.clone(),
+                qualified_directory,
+            )
         };
-        let spec = self.prepare_launch_spec_for_spawn(&definition)?;
+        let lease = self.revalidate_session_working_directory(
+            session_id,
+            definition.driver,
+            &qualified_directory,
+        )?;
+        let plan = self.prepare_launch_spec_for_spawn(&definition, &qualified_directory)?;
         let expected = {
             let mut slots = self.inner.slots.lock();
             self.ensure_active()?;
@@ -3511,7 +4323,10 @@ impl SupervisorHandle {
             if slot.running.is_some() {
                 return Ok(slot.snapshot());
             }
-            if slot.generation != initial_generation || slot.definition != definition {
+            if slot.generation != initial_generation
+                || slot.definition != definition
+                || slot.qualified_working_directory.as_ref() != Some(&qualified_directory)
+            {
                 return Err(anyhow!(
                     "session '{session_id}' definition changed while launch was being prepared; retry"
                 ));
@@ -3526,7 +4341,7 @@ impl SupervisorHandle {
             slot.state = LifecycleState::Starting;
             slot.generation
         };
-        self.start_session_at(session_id, expected, lease, spec)
+        self.start_session_at(session_id, expected, lease, plan)
     }
 
     pub fn stop_session_by_id(&self, session_id: SessionId) -> Result<SessionSnapshot> {
@@ -3832,14 +4647,49 @@ impl SupervisorHandle {
         persist_session_catalog(&self.inner.runtime_dir, candidate)
     }
 
-    fn revalidate_slot_working_directory(&self, slot: &SessionSlot) -> Result<DirectoryLease> {
-        let expected = slot.qualified_working_directory.as_ref().ok_or_else(|| {
-            anyhow!(
-                "session '{}' has no qualified working directory",
-                slot.session_id
+    fn ensure_wsl_reconciled(&self) -> Result<()> {
+        if self.inner.wsl_reconciliation_error.lock().is_none() {
+            return Ok(());
+        }
+        let control = self.inner.wsl_control.read().clone();
+        match control.reconcile_stale_scopes() {
+            Ok(()) => {
+                *self.inner.wsl_reconciliation_error.lock() = None;
+                Ok(())
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                *self.inner.wsl_reconciliation_error.lock() = Some(message.clone());
+                Err(anyhow!(
+                    "Prime/WSL startup reconciliation is incomplete: {message}"
+                ))
+            }
+        }
+    }
+
+    fn revalidate_session_working_directory(
+        &self,
+        session_id: SessionId,
+        driver: DriverKind,
+        expected: &QualifiedWorkingDirectory,
+    ) -> Result<SessionDirectoryLease> {
+        validate_driver_working_directory_pair(driver, expected)?;
+        match expected.namespace {
+            WorkingDirectoryNamespace::Windows => revalidate_qualified_working_directory(
+                session_id,
+                expected,
+                &self.inner.runtime_dir,
             )
-        })?;
-        revalidate_qualified_working_directory(slot.session_id, expected, &self.inner.runtime_dir)
+            .map(|lease| SessionDirectoryLease::Windows { _lease: lease }),
+            WorkingDirectoryNamespace::WslUbuntu => {
+                self.ensure_wsl_reconciled()?;
+                self.inner
+                    .wsl_control
+                    .read()
+                    .revalidate_working_directory(expected)?;
+                Ok(SessionDirectoryLease::WslUbuntu)
+            }
+        }
     }
 
     pub fn set_workspace_preference(&self, path: &Path) -> Result<String> {
@@ -3853,6 +4703,16 @@ impl SupervisorHandle {
         Ok(qualified.canonical_path)
     }
 
+    pub fn prime_default_working_directory(&self) -> Result<String> {
+        self.ensure_active()?;
+        self.ensure_wsl_reconciled()?;
+        let control = self.inner.wsl_control.read().clone();
+        let candidate = control.default_working_directory()?;
+        Ok(control
+            .qualify_working_directory(&candidate)?
+            .canonical_path)
+    }
+
     pub fn create_session(
         &self,
         request: shared_types::CreateSessionRequest,
@@ -3862,40 +4722,65 @@ impl SupervisorHandle {
             DriverKind::Claude => "Claude".into(),
             DriverKind::Codex => "Codex".into(),
             DriverKind::Grok => "Grok".into(),
+            DriverKind::Prime => "Prime".into(),
             DriverKind::GenericTerminal => "Terminal".into(),
         });
         validate_session_label(&label)?;
-        if request.driver == DriverKind::GenericTerminal
-            && request.permission_profile == shared_types::PermissionProfile::Unsafe
+        if matches!(
+            request.driver,
+            DriverKind::GenericTerminal | DriverKind::Prime
+        ) && request.permission_profile == shared_types::PermissionProfile::Unsafe
         {
             return Err(anyhow!(
-                "generic terminal sessions do not support the unsafe permission profile"
+                "{:?} sessions do not support the unsafe permission profile",
+                request.driver
             ));
         }
 
         let workspace_preference = self.inner.catalog.lock().workspace_preference.clone();
-        let _lease = revalidate_qualified_directory(
-            "workspace preference",
-            &workspace_preference,
-            &self.inner.runtime_dir,
-        )?;
+        let qualified_directory = if request.driver == DriverKind::Prime {
+            self.ensure_wsl_reconciled()?;
+            let control = self.inner.wsl_control.read().clone();
+            let candidate = match request.linux_working_directory.as_deref() {
+                Some(path) if !path.trim().is_empty() => path.to_owned(),
+                Some(_) => {
+                    return Err(anyhow!("Prime Linux working directory must not be blank"));
+                }
+                None => control.default_working_directory()?,
+            };
+            control.qualify_working_directory(&candidate)?
+        } else {
+            if request.linux_working_directory.is_some() {
+                return Err(anyhow!(
+                    "linux_working_directory is supported only for Prime sessions"
+                ));
+            }
+            let _lease = revalidate_qualified_directory(
+                "workspace preference",
+                &workspace_preference,
+                &self.inner.runtime_dir,
+            )?;
+            workspace_preference.clone()
+        };
         let session_id = Uuid::new_v4();
         let definition = SessionDefinition {
             session_id,
             alias: session_alias(session_id),
             label: label.clone(),
             driver: request.driver,
-            working_dir: workspace_preference.canonical_path.clone(),
+            working_dir: qualified_directory.canonical_path.clone(),
             permission_profile: request.permission_profile,
         };
         let mut slot = closed_session_slot(definition);
-        slot.qualified_working_directory = Some(workspace_preference.clone());
+        slot.qualified_working_directory = Some(qualified_directory.clone());
         let snapshot = slot.snapshot();
 
         {
             let mut slots = self.inner.slots.lock();
             let mut catalog = self.inner.catalog.lock();
-            if catalog.workspace_preference != workspace_preference {
+            if request.driver != DriverKind::Prime
+                && catalog.workspace_preference != workspace_preference
+            {
                 return Err(anyhow!(
                     "workspace preference changed while the session was being created; retry"
                 ));
@@ -3906,7 +4791,7 @@ impl SupervisorHandle {
                 session_id,
                 label,
                 driver: request.driver,
-                working_directory: workspace_preference,
+                working_directory: qualified_directory,
                 permission_profile: request.permission_profile,
             });
             self.persist_catalog_candidate(&candidate)?;
@@ -3978,6 +4863,11 @@ impl SupervisorHandle {
                 .get_by_id(session_id)
                 .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
             ensure_closed_for_definition_edit(slot)?;
+            if slot.definition.driver == DriverKind::Prime {
+                return Err(anyhow!(
+                    "Prime sessions require an Ubuntu Linux working directory"
+                ));
+            }
             let old_working_dir = slot.definition.working_dir.clone();
             let mut candidate = catalog.clone();
             let persisted = candidate
@@ -3990,6 +4880,70 @@ impl SupervisorHandle {
             let slot = slots
                 .get_by_id_mut(session_id)
                 .expect("validated session disappeared during cwd update");
+            slot.definition.working_dir = qualified.canonical_path.clone();
+            slot.qualified_working_directory = Some(qualified.clone());
+            let snapshot = slot.snapshot();
+            *catalog = candidate;
+            (snapshot, old_working_dir)
+        };
+        self.emit(RuntimeEvent::SessionWorkingDirectoryChanged {
+            schema_version: 1,
+            session_id,
+            old_working_dir,
+            new_working_dir: qualified.canonical_path,
+            timestamp: now_rfc3339(),
+        });
+        Ok(snapshot)
+    }
+
+    pub fn set_session_linux_working_directory(
+        &self,
+        session_id: SessionId,
+        path: &str,
+    ) -> Result<SessionSnapshot> {
+        self.ensure_active()?;
+        {
+            let slots = self.inner.slots.lock();
+            let slot = slots
+                .get_by_id(session_id)
+                .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
+            ensure_closed_for_definition_edit(slot)?;
+            if slot.definition.driver != DriverKind::Prime {
+                return Err(anyhow!(
+                    "Linux working directories are supported only for Prime sessions"
+                ));
+            }
+        }
+        self.ensure_wsl_reconciled()?;
+        let qualified = self
+            .inner
+            .wsl_control
+            .read()
+            .qualify_working_directory(path)?;
+        let (snapshot, old_working_dir) = {
+            let mut slots = self.inner.slots.lock();
+            let mut catalog = self.inner.catalog.lock();
+            let slot = slots
+                .get_by_id(session_id)
+                .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
+            ensure_closed_for_definition_edit(slot)?;
+            if slot.definition.driver != DriverKind::Prime {
+                return Err(anyhow!(
+                    "Linux working directories are supported only for Prime sessions"
+                ));
+            }
+            let old_working_dir = slot.definition.working_dir.clone();
+            let mut candidate = catalog.clone();
+            let persisted = candidate
+                .sessions
+                .iter_mut()
+                .find(|session| session.session_id == session_id)
+                .ok_or_else(|| anyhow!("session '{session_id}' is missing from the catalog"))?;
+            persisted.working_directory = qualified.clone();
+            self.persist_catalog_candidate(&candidate)?;
+            let slot = slots
+                .get_by_id_mut(session_id)
+                .expect("validated session disappeared during Linux cwd update");
             slot.definition.working_dir = qualified.canonical_path.clone();
             slot.qualified_working_directory = Some(qualified.clone());
             let snapshot = slot.snapshot();
@@ -4019,11 +4973,14 @@ impl SupervisorHandle {
                 .get_by_id(session_id)
                 .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
             ensure_closed_for_definition_edit(slot)?;
-            if slot.definition.driver == DriverKind::GenericTerminal
-                && permission_profile == shared_types::PermissionProfile::Unsafe
+            if matches!(
+                slot.definition.driver,
+                DriverKind::GenericTerminal | DriverKind::Prime
+            ) && permission_profile == shared_types::PermissionProfile::Unsafe
             {
                 return Err(anyhow!(
-                    "generic terminal sessions do not support the unsafe permission profile"
+                    "{:?} sessions do not support the unsafe permission profile",
+                    slot.definition.driver
                 ));
             }
             let old_profile = slot.definition.permission_profile;
@@ -4502,8 +5459,8 @@ impl SupervisorHandle {
         &self,
         session_id: SessionId,
         expected: SessionGeneration,
-        directory_lease: DirectoryLease,
-        spec: LaunchSpec,
+        directory_lease: SessionDirectoryLease,
+        plan: PreparedLaunch,
     ) -> Result<SessionSnapshot> {
         self.refresh_session_liveness();
         let (run_id, starting_event) = {
@@ -4569,7 +5526,7 @@ impl SupervisorHandle {
             handle.handle_pty_event_by_id(session_id, expected, run_id, event);
         });
 
-        let spawn_result = self.inner.pty_spawner.read().clone().spawn(&spec, handler);
+        let spawn_result = self.inner.pty_spawner.read().clone().spawn(&plan, handler);
         drop(directory_lease);
         match spawn_result {
             Ok(pty) => {
@@ -4856,7 +5813,7 @@ impl SupervisorHandle {
         expected_generation: SessionGeneration,
         expected_run_id: Option<Uuid>,
     ) -> Result<SessionSnapshot> {
-        let (definition, directory_lease) = {
+        let (definition, qualified_directory) = {
             let slots = self.inner.slots.lock();
             self.ensure_active()?;
             let slot = slots
@@ -4882,12 +5839,21 @@ impl SupervisorHandle {
                     "session '{session_id}' already has a spawn in progress"
                 ));
             }
-            (
-                slot.definition.clone(),
-                self.revalidate_slot_working_directory(slot)?,
-            )
+            let qualified_directory = slot
+                .qualified_working_directory
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow!("session '{session_id}' has no qualified working directory")
+                })?
+                .clone();
+            (slot.definition.clone(), qualified_directory)
         };
-        let spec = self.prepare_launch_spec_for_spawn(&definition)?;
+        let directory_lease = self.revalidate_session_working_directory(
+            session_id,
+            definition.driver,
+            &qualified_directory,
+        )?;
+        let plan = self.prepare_launch_spec_for_spawn(&definition, &qualified_directory)?;
         let (_, expected_stop) = self.declare_stop_operation(
             session_id,
             Some((expected_generation, expected_run_id)),
@@ -4955,6 +5921,7 @@ impl SupervisorHandle {
                 if slot.definition.driver != definition.driver
                     || slot.definition.working_dir != definition.working_dir
                     || slot.definition.permission_profile != definition.permission_profile
+                    || slot.qualified_working_directory.as_ref() != Some(&qualified_directory)
                 {
                     return Err(anyhow!(
                         "session '{session_id}' definition changed during restart; retry"
@@ -4993,7 +5960,7 @@ impl SupervisorHandle {
             admission
         };
         let expected_start = expected_start_result?;
-        let result = self.start_session_at(session_id, expected_start, directory_lease, spec);
+        let result = self.start_session_at(session_id, expected_start, directory_lease, plan);
         let shutdown_crossed_restart = self.inner.shutdown_started.load(Ordering::Acquire);
         let mut slots = self.inner.slots.lock();
         if let Some(slot) = slots.get_by_id_mut(session_id)
@@ -5213,6 +6180,17 @@ impl SupervisorHandle {
     ) -> Result<RuntimeSnapshot> {
         self.ensure_active()?;
         validate_message_body(&request.content)?;
+        {
+            let slots = self.inner.slots.lock();
+            let slot = slots
+                .get_by_id(request.recipient_id)
+                .ok_or_else(|| anyhow!("unknown session id '{}'", request.recipient_id))?;
+            if slot.definition.driver == DriverKind::Prime {
+                return Err(anyhow!(
+                    "Prime/WSL routed delivery is not admitted in this release; use the visible raw terminal input"
+                ));
+            }
+        }
         self.refresh_session_liveness();
         let recipient = {
             let slots = self.inner.slots.lock();
@@ -5865,15 +6843,23 @@ impl SupervisorHandle {
                             generation: event_generation,
                         };
                         slot.bracketed_paste.observe_output(binding, &chunk);
-                        if ensure_run_event_capacity(slot, 3).is_err() {
+                        let spawn_is_unconfirmed = slot.spawn_in_flight
+                            == Some(SpawnReservation {
+                                generation: event_generation,
+                                run_id: event_run_id,
+                            });
+                        let required_events = if spawn_is_unconfirmed { 1 } else { 3 };
+                        if ensure_run_event_capacity(slot, required_events).is_err() {
                             return;
                         }
-                        let transitioned = slot.state != LifecycleState::Ready;
-                        if slot.state != LifecycleState::Ready {
+                        let transitioned =
+                            !spawn_is_unconfirmed && slot.state != LifecycleState::Ready;
+                        if transitioned {
                             slot.state = LifecycleState::Ready;
                             slot.last_activity_at = Some(now_rfc3339());
                         }
-                        if has_real_content
+                        if !spawn_is_unconfirmed
+                            && has_real_content
                             && let Some(pty) = slot
                                 .running
                                 .as_ref()
@@ -5882,8 +6868,11 @@ impl SupervisorHandle {
                             pty.note_real_output(slot.definition.driver);
                         }
 
-                        let classification =
-                            classify_work_state_for_driver(slot.definition.driver, &chunk);
+                        let classification = if spawn_is_unconfirmed {
+                            None
+                        } else {
+                            classify_work_state_for_driver(slot.definition.driver, &chunk)
+                        };
                         let work_state_event = classification.and_then(|(state, detail)| {
                             transition_work_state_locked(
                                 &session_alias,
@@ -5894,16 +6883,19 @@ impl SupervisorHandle {
                             )
                         });
 
-                        let quiesce_arm = real_output_at.map(|armed_at| {
-                            slot.last_real_output_at = Some(armed_at);
-                            cancel_quiesce_timer_locked(slot);
-                            (
-                                slot.definition.driver,
-                                slot.generation,
-                                event_run_id,
-                                armed_at,
-                            )
-                        });
+                        let quiesce_arm =
+                            real_output_at
+                                .filter(|_| !spawn_is_unconfirmed)
+                                .map(|armed_at| {
+                                    slot.last_real_output_at = Some(armed_at);
+                                    cancel_quiesce_timer_locked(slot);
+                                    (
+                                        slot.definition.driver,
+                                        slot.generation,
+                                        event_run_id,
+                                        armed_at,
+                                    )
+                                });
                         let ready_identity =
                             transitioned.then(|| next_run_event_identity(slot, event_run_id));
                         let output_identity = next_run_event_identity(slot, event_run_id);
@@ -6676,15 +7668,51 @@ impl SupervisorHandle {
 }
 
 impl SupervisorHandle {
-    fn prepare_launch_spec_for_spawn(&self, definition: &SessionDefinition) -> Result<LaunchSpec> {
-        let resolved = self
-            .inner
-            .executable_resolver
-            .read()
-            .resolve(definition.driver)?;
-        let mut spec = build_launch_spec(definition, &resolved)?;
+    fn prepare_launch_spec_for_spawn(
+        &self,
+        definition: &SessionDefinition,
+        qualified_directory: &QualifiedWorkingDirectory,
+    ) -> Result<PreparedLaunch> {
+        validate_driver_working_directory_pair(definition.driver, qualified_directory)?;
+        let (mut spec, wsl_scope) = if definition.driver == DriverKind::Prime {
+            self.ensure_wsl_reconciled()?;
+            let (expected_device, expected_inode) =
+                parse_wsl_identity(&qualified_directory.identity)?;
+            let control = self.inner.wsl_control.read().clone();
+            let prime_executable = control.resolve_prime_executable()?;
+            let wsl_executable = control.wsl_executable()?;
+            let scope = WslRunScope {
+                distro: driver_prime::WSL_DISTRO.into(),
+                unit: format!(
+                    "{}{}",
+                    driver_prime::SCOPE_UNIT_PREFIX,
+                    Uuid::new_v4().simple()
+                ),
+            };
+            let spec = driver_prime::launch_spec(
+                definition,
+                &wsl_executable,
+                &prime_executable,
+                &scope.unit,
+                expected_device,
+                expected_inode,
+            )?;
+            (spec, Some(scope))
+        } else {
+            let resolved = self
+                .inner
+                .executable_resolver
+                .read()
+                .resolve(definition.driver)?;
+            (build_launch_spec(definition, &resolved)?, None)
+        };
 
-        if let Some(status) = self.inner.control_plane.read().clone() {
+        // Prime is intentionally excluded: native Windows Job membership is
+        // the pane-sideband authority, and WSL has no equivalent verified
+        // caller-identity bridge in this release.
+        if definition.driver != DriverKind::Prime
+            && let Some(status) = self.inner.control_plane.read().clone()
+        {
             spec.env.push(EnvVar {
                 key: "PRIM1_PANE_IDENTITY".into(),
                 value: definition.alias.clone(),
@@ -6712,7 +7740,7 @@ impl SupervisorHandle {
             }
         }
 
-        Ok(spec)
+        Ok(PreparedLaunch { spec, wsl_scope })
     }
 
     fn deliver_prepared_payload(
@@ -6913,6 +7941,11 @@ fn build_launch_spec(
             driver_codex::launch_spec(definition, &resolved.program, &resolved.prefix_args)
         }
         DriverKind::Grok => driver_grok::launch_spec(definition, &resolved.program),
+        DriverKind::Prime => {
+            return Err(anyhow!(
+                "Prime launch specifications require a qualified WSL scope"
+            ));
+        }
         DriverKind::GenericTerminal => {
             let mut spec = driver_generic_terminal::launch_spec(definition, &resolved.program)?;
             spec.args.extend(resolved.prefix_args.clone());
@@ -6937,6 +7970,9 @@ fn resolve_driver_executable(driver: DriverKind) -> Result<ResolvedLaunchProgram
             program: find_direct_executable(&[if cfg!(windows) { "grok.exe" } else { "grok" }])?,
             prefix_args: Vec::new(),
         }),
+        DriverKind::Prime => Err(anyhow!(
+            "Prime executable resolution is owned by the Ubuntu WSL controller"
+        )),
         DriverKind::GenericTerminal => Ok(ResolvedLaunchProgram {
             program: find_direct_executable(if cfg!(windows) {
                 &["powershell.exe", "pwsh.exe"]
@@ -7060,6 +8096,7 @@ fn classify_work_state_for_driver(
         DriverKind::Claude => driver_claude::classify_work_state(chunk),
         DriverKind::Codex => driver_codex::classify_work_state(chunk),
         DriverKind::Grok => driver_grok::classify_work_state(chunk),
+        DriverKind::Prime => None,
         DriverKind::GenericTerminal => None,
     }
 }
@@ -7146,6 +8183,7 @@ fn quiesce_threshold(driver: DriverKind) -> Option<Duration> {
         // variable cadence. Silence is therefore not an honest idle signal;
         // its measured semantic markers own work-state transitions instead.
         DriverKind::Grok => return None,
+        DriverKind::Prime => return None,
         DriverKind::GenericTerminal => Duration::from_secs(5),
     };
 
@@ -7266,11 +8304,13 @@ fn routed_message_payload(request: &RouteMessageRequest, behavior: SubmitBehavio
 
 fn routed_message_submit_behavior(driver: DriverKind) -> SubmitBehavior {
     match driver {
-        DriverKind::Claude | DriverKind::Codex | DriverKind::Grok => SubmitBehavior {
-            sequence: "\r",
-            framing: MessageFraming::BracketedPaste,
-            submit_delay: BRACKETED_PASTE_SUBMIT_DELAY,
-        },
+        DriverKind::Claude | DriverKind::Codex | DriverKind::Grok | DriverKind::Prime => {
+            SubmitBehavior {
+                sequence: "\r",
+                framing: MessageFraming::BracketedPaste,
+                submit_delay: BRACKETED_PASTE_SUBMIT_DELAY,
+            }
+        }
         DriverKind::GenericTerminal => SubmitBehavior {
             sequence: "\r",
             framing: MessageFraming::RawSingleLine,
@@ -8394,13 +9434,26 @@ mod tests {
     impl PtySpawner for QueuePtySpawner {
         fn spawn(
             &self,
-            _spec: &LaunchSpec,
+            _plan: &PreparedLaunch,
             _handler: PtyEventHandler,
         ) -> Result<Box<dyn PtySessionTrait>> {
             self.sessions
                 .lock()
                 .pop_front()
                 .ok_or_else(|| anyhow!("no queued PTY sessions"))
+        }
+    }
+
+    struct OutputThenFailPtySpawner;
+
+    impl PtySpawner for OutputThenFailPtySpawner {
+        fn spawn(
+            &self,
+            _plan: &PreparedLaunch,
+            handler: PtyEventHandler,
+        ) -> Result<Box<dyn PtySessionTrait>> {
+            handler(PtyEvent::Output("Working before admission".into()));
+            Err(anyhow!("injected post-output spawn validation failure"))
         }
     }
 
@@ -8454,10 +9507,10 @@ mod tests {
     impl PtySpawner for CapturingPtySpawner {
         fn spawn(
             &self,
-            spec: &LaunchSpec,
+            plan: &PreparedLaunch,
             _handler: PtyEventHandler,
         ) -> Result<Box<dyn PtySessionTrait>> {
-            self.specs.lock().push(spec.clone());
+            self.specs.lock().push(plan.spec.clone());
             self.sessions
                 .lock()
                 .pop_front()
@@ -8474,7 +9527,7 @@ mod tests {
     impl PtySpawner for GatedPtySpawner {
         fn spawn(
             &self,
-            _spec: &LaunchSpec,
+            _plan: &PreparedLaunch,
             _handler: PtyEventHandler,
         ) -> Result<Box<dyn PtySessionTrait>> {
             self.entered
@@ -8635,6 +9688,7 @@ mod tests {
                 label: Some("claude".into()),
                 driver: DriverKind::Claude,
                 permission_profile: shared_types::PermissionProfile::Normal,
+                linux_working_directory: None,
             })
             .expect("create Claude test session");
         supervisor
@@ -8642,6 +9696,7 @@ mod tests {
                 label: Some("codex".into()),
                 driver: DriverKind::Codex,
                 permission_profile: shared_types::PermissionProfile::Normal,
+                linux_working_directory: None,
             })
             .expect("create Codex test session");
     }
@@ -8657,6 +9712,7 @@ mod tests {
                 label: Some(label.into()),
                 driver,
                 permission_profile,
+                linux_working_directory: None,
             })
             .expect("create test session")
     }
@@ -11942,6 +12998,51 @@ mod tests {
         assert!(slot.running.is_none());
         assert!(slot.spawn_in_flight.is_none());
         assert!(!slot.termination_uncertain);
+    }
+
+    #[test]
+    fn output_before_spawn_validation_never_declares_the_run_ready_or_working() {
+        let supervisor = test_supervisor();
+        let session_id = test_session_id(&supervisor, "claude");
+        let events = capture_runtime_events(&supervisor);
+        supervisor.set_pty_spawner_for_tests(Arc::new(OutputThenFailPtySpawner));
+
+        let error = supervisor
+            .start_session_by_id(session_id)
+            .expect_err("post-output validation failure must reject the run");
+        assert!(
+            error
+                .to_string()
+                .contains("injected post-output spawn validation failure")
+        );
+        let snapshot = supervisor
+            .snapshot()
+            .sessions
+            .into_iter()
+            .find(|session| session.session_id == session_id)
+            .unwrap();
+        assert_eq!(snapshot.lifecycle_state, LifecycleState::Failed);
+        assert!(!snapshot.running);
+
+        let events = events.lock();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SessionOutput { identity, chunk, .. }
+                if identity.session_id == session_id && chunk == "Working before admission"
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SessionState {
+                identity,
+                state: LifecycleState::Ready,
+                ..
+            } if identity.session_id == session_id
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SessionWorkState { identity, .. }
+                if identity.session_id == session_id
+        )));
     }
 
     #[test]
@@ -16046,6 +17147,7 @@ mod tests {
                 label: None,
                 driver: DriverKind::Grok,
                 permission_profile: shared_types::PermissionProfile::Normal,
+                linux_working_directory: None,
             })
             .expect("create native Grok session");
         assert_eq!(session.label, "Grok");
@@ -16121,6 +17223,46 @@ mod tests {
     }
 
     #[test]
+    fn pre_prime_v1_catalog_without_directory_namespace_loads_without_rewrite() {
+        let root = tempfile::tempdir().expect("create pre-Prime catalog root");
+        let supervisor = empty_test_supervisor_with_root(root.path().to_path_buf());
+        let session = create_test_session(
+            &supervisor,
+            "Pre-Prime Claude",
+            DriverKind::Claude,
+            shared_types::PermissionProfile::Normal,
+        );
+        let catalog_path = session_catalog_path(supervisor.runtime_dir());
+        let mut catalog: serde_json::Value =
+            serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
+        catalog["workspace_preference"]
+            .as_object_mut()
+            .unwrap()
+            .remove("namespace");
+        for persisted in catalog["sessions"].as_array_mut().unwrap() {
+            persisted["working_directory"]
+                .as_object_mut()
+                .unwrap()
+                .remove("namespace");
+        }
+        let legacy = serde_json::to_vec_pretty(&catalog).unwrap();
+        drop(supervisor);
+        fs::write(&catalog_path, &legacy).unwrap();
+
+        let reopened = SupervisorHandle::new(test_supervisor_config(root.path()))
+            .expect("load pre-Prime schema-v1 catalog");
+        let restored = reopened
+            .snapshot()
+            .sessions
+            .into_iter()
+            .find(|candidate| candidate.session_id == session.session_id)
+            .expect("restore legacy session identity");
+        assert_eq!(restored.driver, DriverKind::Claude);
+        assert_eq!(restored.lifecycle_state, LifecycleState::Closed);
+        assert_eq!(fs::read(&catalog_path).unwrap(), legacy);
+    }
+
+    #[test]
     fn catalog_rejects_relative_workspace_and_blank_qualified_identity_without_rewrite() {
         let root = tempfile::tempdir().expect("create structural-catalog root");
         let supervisor = empty_test_supervisor_with_root(root.path().to_path_buf());
@@ -16161,6 +17303,83 @@ mod tests {
             .expect("blank session directory identity must fail startup");
         assert!(format!("{error:#}").contains("blank persisted identity"));
         assert_eq!(fs::read(&catalog_path).unwrap(), blank_bytes);
+
+        let mut unknown_namespace: serde_json::Value =
+            serde_json::from_slice(&blank_bytes).unwrap();
+        let persisted = unknown_namespace["sessions"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|candidate| candidate["session_id"] == session.session_id.to_string())
+            .unwrap();
+        persisted["working_directory"]["identity"] = serde_json::json!("windows:1:1");
+        persisted["working_directory"]["namespace"] = serde_json::json!("future_kernel");
+        let unknown_bytes = serde_json::to_vec_pretty(&unknown_namespace).unwrap();
+        fs::write(&catalog_path, &unknown_bytes).unwrap();
+        let error = SupervisorHandle::new(test_supervisor_config(root.path()))
+            .err()
+            .expect("unknown working-directory namespace must fail startup");
+        assert!(format!("{error:#}").contains("failed to parse session catalog"));
+        assert_eq!(fs::read(&catalog_path).unwrap(), unknown_bytes);
+    }
+
+    #[test]
+    fn catalog_rejects_invalid_prime_namespace_identity_and_permission_without_rewrite() {
+        let root = tempfile::tempdir().expect("create Prime structural-catalog root");
+        let supervisor = empty_test_supervisor_with_root(root.path().to_path_buf());
+        let session = create_test_session(
+            &supervisor,
+            "Prime structural validation",
+            DriverKind::Claude,
+            shared_types::PermissionProfile::Normal,
+        );
+        let catalog_path = session_catalog_path(supervisor.runtime_dir());
+        let valid: serde_json::Value =
+            serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
+        drop(supervisor);
+
+        for (name, mutate, expected) in [
+            (
+                "workspace-wsl-namespace",
+                0_u8,
+                "workspace preference must use the Windows",
+            ),
+            ("Prime-control-path", 1, "invalid Ubuntu path"),
+            ("Prime-bad-identity", 2, "invalid Ubuntu identity"),
+            ("Prime-unsafe", 3, "cannot use the unsafe permission"),
+        ] {
+            let mut candidate = valid.clone();
+            if mutate == 0 {
+                candidate["workspace_preference"] = serde_json::json!({
+                    "namespace": "wsl_ubuntu",
+                    "canonical_path": "/home/test",
+                    "identity": "wsl_ubuntu:7:9"
+                });
+            } else {
+                let persisted = candidate["sessions"]
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|entry| entry["session_id"] == session.session_id.to_string())
+                    .unwrap();
+                persisted["driver"] = serde_json::json!("prime");
+                persisted["working_directory"] = serde_json::json!({
+                    "namespace": "wsl_ubuntu",
+                    "canonical_path": if mutate == 1 { "/home/test\u{0007}child" } else { "/home/test" },
+                    "identity": if mutate == 2 { "wsl_ubuntu:not-a-device:9" } else { "wsl_ubuntu:7:9" }
+                });
+                if mutate == 3 {
+                    persisted["permission_profile"] = serde_json::json!("unsafe");
+                }
+            }
+            let bytes = serde_json::to_vec_pretty(&candidate).unwrap();
+            fs::write(&catalog_path, &bytes).unwrap();
+            let error = SupervisorHandle::new(test_supervisor_config(root.path()))
+                .err()
+                .expect("invalid Prime catalog must fail startup");
+            assert!(format!("{error:#}").contains(expected), "{name}: {error:#}");
+            assert_eq!(fs::read(&catalog_path).unwrap(), bytes, "{name}");
+        }
     }
 
     #[test]
@@ -16182,6 +17401,7 @@ mod tests {
                 label: Some("Must reselect".into()),
                 driver: DriverKind::Claude,
                 permission_profile: shared_types::PermissionProfile::Normal,
+                linux_working_directory: None,
             })
             .unwrap_err();
 
@@ -17060,5 +18280,773 @@ mod tests {
             .unwrap();
 
         assert_eq!(inputs.lock().as_slice(), &["1"]);
+    }
+
+    struct FakeWslControl {
+        reconciliations: AtomicUsize,
+        qualifications: AtomicUsize,
+        fail_reconciliation: AtomicBool,
+        revalidation_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+        confirmed: Mutex<Vec<String>>,
+        terminated: Mutex<Vec<String>>,
+    }
+
+    impl FakeWslControl {
+        fn new() -> Self {
+            Self {
+                reconciliations: AtomicUsize::new(0),
+                qualifications: AtomicUsize::new(0),
+                fail_reconciliation: AtomicBool::new(false),
+                revalidation_hook: Mutex::new(None),
+                confirmed: Mutex::new(Vec::new()),
+                terminated: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl WslControl for FakeWslControl {
+        fn reconcile_stale_scopes(&self) -> Result<()> {
+            self.reconciliations.fetch_add(1, Ordering::SeqCst);
+            if self.fail_reconciliation.load(Ordering::Acquire) {
+                return Err(anyhow!("injected stale Prime scope cleanup failure"));
+            }
+            Ok(())
+        }
+
+        fn default_working_directory(&self) -> Result<String> {
+            Ok("/home/test".into())
+        }
+
+        fn qualify_working_directory(&self, candidate: &str) -> Result<QualifiedWorkingDirectory> {
+            self.qualifications.fetch_add(1, Ordering::SeqCst);
+            validate_linux_candidate(candidate)?;
+            let canonical_path = if candidate == "/renderer/../proposal" {
+                "/backend-qualified".into()
+            } else {
+                candidate.into()
+            };
+            Ok(QualifiedWorkingDirectory {
+                namespace: WorkingDirectoryNamespace::WslUbuntu,
+                canonical_path,
+                identity: "wsl_ubuntu:7:9".into(),
+            })
+        }
+
+        fn revalidate_working_directory(&self, expected: &QualifiedWorkingDirectory) -> Result<()> {
+            if let Some(hook) = self.revalidation_hook.lock().clone() {
+                hook();
+            }
+            validate_driver_working_directory_pair(DriverKind::Prime, expected)
+        }
+
+        fn resolve_prime_executable(&self) -> Result<String> {
+            Ok("/home/test/.npm-global/bin/prime-agent".into())
+        }
+
+        fn wsl_executable(&self) -> Result<String> {
+            Ok(r"C:\Windows\System32\wsl.exe".into())
+        }
+
+        fn confirm_scope_started(&self, scope: &WslRunScope) -> Result<()> {
+            validate_wsl_scope(scope)?;
+            self.confirmed.lock().push(scope.unit.clone());
+            Ok(())
+        }
+
+        fn terminate_scope(&self, scope: &WslRunScope) -> Result<()> {
+            validate_wsl_scope(scope)?;
+            self.terminated.lock().push(scope.unit.clone());
+            Ok(())
+        }
+    }
+
+    struct CapturingPreparedPtySpawner {
+        session: Mutex<Option<Box<dyn PtySessionTrait>>>,
+        plans: Arc<Mutex<Vec<PreparedLaunch>>>,
+    }
+
+    impl CapturingPreparedPtySpawner {
+        fn new(session: Box<dyn PtySessionTrait>) -> (Self, Arc<Mutex<Vec<PreparedLaunch>>>) {
+            let plans = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    session: Mutex::new(Some(session)),
+                    plans: Arc::clone(&plans),
+                },
+                plans,
+            )
+        }
+    }
+
+    impl PtySpawner for CapturingPreparedPtySpawner {
+        fn spawn(
+            &self,
+            plan: &PreparedLaunch,
+            _handler: PtyEventHandler,
+        ) -> Result<Box<dyn PtySessionTrait>> {
+            self.plans.lock().push(plan.clone());
+            self.session
+                .lock()
+                .take()
+                .ok_or_else(|| anyhow!("capturing Prime PTY already consumed"))
+        }
+    }
+
+    struct MissingScopePtySpawner {
+        control: Arc<dyn WslControl>,
+    }
+
+    impl PtySpawner for MissingScopePtySpawner {
+        fn spawn(
+            &self,
+            plan: &PreparedLaunch,
+            handler: PtyEventHandler,
+        ) -> Result<Box<dyn PtySessionTrait>> {
+            let mut missing = plan.clone();
+            let systemd_run = missing
+                .spec
+                .args
+                .iter_mut()
+                .find(|argument| argument.as_str() == driver_prime::SYSTEMD_RUN)
+                .ok_or_else(|| anyhow!("Prime launch plan omitted systemd-run"))?;
+            *systemd_run = "/usr/bin/prim1-deliberately-missing-systemd-run".into();
+            ConcretePtySpawner {
+                wsl: Arc::clone(&self.control),
+            }
+            .spawn(&missing, handler)
+        }
+    }
+
+    #[test]
+    fn prime_catalog_and_launch_plan_are_typed_shell_free_and_sideband_free() {
+        let root = tempfile::tempdir().expect("create Prime catalog root");
+        let supervisor = empty_test_supervisor_with_root(root.path().to_path_buf());
+        let control = Arc::new(FakeWslControl::new());
+        supervisor.set_wsl_control_for_tests(control.clone());
+        let (pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        let (spawner, plans) = CapturingPreparedPtySpawner::new(pty);
+        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+
+        let created = supervisor
+            .create_session(shared_types::CreateSessionRequest {
+                label: Some("Prime & echo pwned".into()),
+                driver: DriverKind::Prime,
+                permission_profile: shared_types::PermissionProfile::Normal,
+                linux_working_directory: Some("/home/test/work & (qa)".into()),
+            })
+            .expect("create typed Prime session");
+        assert_eq!(created.working_dir, "/home/test/work & (qa)");
+        let started = supervisor
+            .start_session_by_id(created.session_id)
+            .expect("prepare Prime launch");
+        assert_eq!(started.lifecycle_state, LifecycleState::Ready);
+
+        let plans = plans.lock();
+        assert_eq!(plans.len(), 1);
+        let plan = &plans[0];
+        let scope = plan.wsl_scope.as_ref().expect("Prime plan owns WSL scope");
+        assert!(valid_wsl_unit(&scope.unit));
+        assert_eq!(plan.spec.program, r"C:\Windows\System32\wsl.exe");
+        assert_eq!(plan.spec.env.len(), 1);
+        assert_eq!(plan.spec.env[0].key, "WSLENV");
+        assert!(
+            !plan
+                .spec
+                .env
+                .iter()
+                .any(|entry| entry.key.starts_with("PRIM1_"))
+        );
+        assert!(plan.spec.args.windows(4).any(|window| {
+            window
+                == [
+                    "7",
+                    "9",
+                    "/home/test/work & (qa)",
+                    "/home/test/.npm-global/bin/prime-agent",
+                ]
+        }));
+        assert!(
+            !plan
+                .spec
+                .args
+                .iter()
+                .any(|argument| argument.contains("echo pwned"))
+        );
+        drop(plans);
+
+        let catalog: serde_json::Value = serde_json::from_slice(
+            &fs::read(session_catalog_path(supervisor.runtime_dir())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            catalog["sessions"][0]["working_directory"]["namespace"],
+            "wsl_ubuntu"
+        );
+        assert_eq!(
+            catalog["sessions"][0]["working_directory"]["identity"],
+            "wsl_ubuntu:7:9"
+        );
+        assert!(control.reconciliations.load(Ordering::SeqCst) <= 1);
+    }
+
+    #[test]
+    fn prime_rejects_unsafe_and_native_linux_directory_crossing_before_mutation() {
+        let supervisor = test_supervisor();
+        let control = Arc::new(FakeWslControl::new());
+        supervisor.set_wsl_control_for_tests(control.clone());
+        let before = slots_mutation_probe(&supervisor);
+        let catalog_before = fs::read(session_catalog_path(supervisor.runtime_dir())).unwrap();
+
+        assert!(
+            supervisor
+                .create_session(shared_types::CreateSessionRequest {
+                    label: None,
+                    driver: DriverKind::Prime,
+                    permission_profile: shared_types::PermissionProfile::Unsafe,
+                    linux_working_directory: Some("/home/test".into()),
+                })
+                .is_err()
+        );
+        assert!(
+            supervisor
+                .create_session(shared_types::CreateSessionRequest {
+                    label: None,
+                    driver: DriverKind::Claude,
+                    permission_profile: shared_types::PermissionProfile::Normal,
+                    linux_working_directory: Some("/home/test".into()),
+                })
+                .is_err()
+        );
+        assert_eq!(slots_mutation_probe(&supervisor), before);
+        assert_eq!(
+            fs::read(session_catalog_path(supervisor.runtime_dir())).unwrap(),
+            catalog_before
+        );
+        assert!(
+            supervisor
+                .set_session_linux_working_directory(
+                    test_session_id(&supervisor, "claude"),
+                    "/home/probe-must-not-run",
+                )
+                .is_err()
+        );
+        assert_eq!(control.qualifications.load(Ordering::SeqCst), 0);
+
+        let prime = supervisor
+            .create_session(shared_types::CreateSessionRequest {
+                label: Some("Route denied".into()),
+                driver: DriverKind::Prime,
+                permission_profile: shared_types::PermissionProfile::Normal,
+                linux_working_directory: Some("/home/test".into()),
+            })
+            .unwrap();
+        let events = capture_runtime_events(&supervisor);
+        let before = slots_mutation_probe(&supervisor);
+        let audit_before = fs::read(supervisor.audit_log_path()).unwrap_or_default();
+        let error = supervisor
+            .route_operator_message(OperatorRouteMessageRequest {
+                recipient_id: prime.session_id,
+                content: "must remain raw-only".into(),
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("not admitted"));
+        assert_eq!(slots_mutation_probe(&supervisor), before);
+        assert!(events.lock().is_empty());
+        assert_eq!(
+            fs::read(supervisor.audit_log_path()).unwrap_or_default(),
+            audit_before
+        );
+    }
+
+    #[test]
+    fn prime_uses_only_backend_qualified_linux_path_and_blocks_on_stale_scope_failure() {
+        let supervisor = empty_test_supervisor();
+        let control = Arc::new(FakeWslControl::new());
+        supervisor.set_wsl_control_for_tests(control.clone());
+        *supervisor.inner.wsl_reconciliation_error.lock() = Some("retry required".into());
+        control.fail_reconciliation.store(true, Ordering::Release);
+        let before = slots_mutation_probe(&supervisor);
+        let error = supervisor
+            .create_session(shared_types::CreateSessionRequest {
+                label: Some("Prime qualified".into()),
+                driver: DriverKind::Prime,
+                permission_profile: shared_types::PermissionProfile::Normal,
+                linux_working_directory: Some("/renderer/../proposal".into()),
+            })
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("stale Prime scope cleanup failure"));
+        assert_eq!(slots_mutation_probe(&supervisor), before);
+
+        control.fail_reconciliation.store(false, Ordering::Release);
+        let session = supervisor
+            .create_session(shared_types::CreateSessionRequest {
+                label: Some("Prime qualified".into()),
+                driver: DriverKind::Prime,
+                permission_profile: shared_types::PermissionProfile::Normal,
+                linux_working_directory: Some("/renderer/../proposal".into()),
+            })
+            .expect("create only after stale-scope reconciliation succeeds");
+        assert_eq!(session.working_dir, "/backend-qualified");
+        assert_eq!(control.qualifications.load(Ordering::SeqCst), 1);
+        let catalog: serde_json::Value = serde_json::from_slice(
+            &fs::read(session_catalog_path(supervisor.runtime_dir())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            catalog["sessions"][0]["working_directory"]["canonical_path"],
+            "/backend-qualified"
+        );
+    }
+
+    #[test]
+    fn prime_scope_status_parser_is_keyed_and_treats_not_found_as_absent() {
+        let active =
+            parse_wsl_scope_status("TasksCurrent=2\nLoadState=loaded\nActiveState=active\n")
+                .expect("parse keyed active scope")
+                .expect("active scope is present");
+        assert_eq!(active.active_state, "active");
+        assert_eq!(active.tasks_current, 2);
+
+        assert!(
+            parse_wsl_scope_status(
+                "ActiveState=inactive\nTasksCurrent=[not set]\nLoadState=not-found\n",
+            )
+            .expect("parse collected transient scope")
+            .is_none()
+        );
+        assert!(parse_wsl_scope_status("ActiveState=active\nTasksCurrent=2\n").is_err());
+        assert!(
+            parse_wsl_scope_status("LoadState=loaded\nActiveState=active\nTasksCurrent=unknown\n",)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn prime_default_working_directory_is_backend_qualified_before_display() {
+        let supervisor = empty_test_supervisor();
+        let control = Arc::new(FakeWslControl::new());
+        supervisor.set_wsl_control_for_tests(control.clone());
+        *supervisor.inner.wsl_reconciliation_error.lock() = Some("retry required".into());
+
+        assert_eq!(
+            supervisor.prime_default_working_directory().unwrap(),
+            "/home/test"
+        );
+        assert_eq!(control.reconciliations.load(Ordering::SeqCst), 1);
+        assert_eq!(control.qualifications.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn prime_start_revalidation_releases_registry_and_rejects_a_concurrent_cwd_change() {
+        let supervisor = empty_test_supervisor();
+        let control = Arc::new(FakeWslControl::new());
+        supervisor.set_wsl_control_for_tests(control.clone());
+        let session = supervisor
+            .create_session(shared_types::CreateSessionRequest {
+                label: Some("Prime concurrent start".into()),
+                driver: DriverKind::Prime,
+                permission_profile: shared_types::PermissionProfile::Normal,
+                linux_working_directory: Some("/home/test".into()),
+            })
+            .unwrap();
+        let (pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        let (spawner, plans) = CapturingPreparedPtySpawner::new(pty);
+        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        *control.revalidation_hook.lock() = Some(Arc::new(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.lock().recv().unwrap();
+        }));
+
+        let starting = supervisor.clone();
+        let thread = thread::spawn(move || starting.start_session_by_id(session.session_id));
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("Prime start never entered WSL cwd revalidation");
+        let slots = supervisor.inner.slots.try_lock();
+        assert!(
+            slots.is_some(),
+            "Prime WSL revalidation held the global session registry lock"
+        );
+        drop(slots);
+        supervisor
+            .set_session_linux_working_directory(session.session_id, "/home/changed")
+            .expect("concurrent closed-session cwd update");
+        release_tx.send(()).unwrap();
+        let error = thread
+            .join()
+            .unwrap()
+            .expect_err("stale Prime launch preparation must not spawn");
+        assert!(
+            error
+                .to_string()
+                .contains("definition changed while launch was being prepared"),
+            "{error:#}"
+        );
+        assert!(plans.lock().is_empty());
+        let current = supervisor
+            .snapshot()
+            .sessions
+            .into_iter()
+            .find(|candidate| candidate.session_id == session.session_id)
+            .unwrap();
+        assert_eq!(current.lifecycle_state, LifecycleState::Closed);
+        assert_eq!(current.working_dir, "/home/changed");
+    }
+
+    #[test]
+    fn wsl_scoped_pty_denies_native_membership_and_terminates_both_scopes() {
+        let control = Arc::new(FakeWslControl::new());
+        let (inner, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        let session = WslScopedPtySession {
+            inner,
+            control: control.clone(),
+            scope: WslRunScope {
+                distro: driver_prime::WSL_DISTRO.into(),
+                unit: "prim1-session-11111111111111111111111111111111".into(),
+            },
+        };
+        assert!(!session.contains_process_id(std::process::id()).unwrap());
+        #[cfg(windows)]
+        {
+            let process = PinnedProcess::open(std::process::id()).unwrap();
+            assert!(!session.contains_process(&process).unwrap());
+        }
+        session
+            .kill()
+            .expect("prove both Prime ownership scopes empty");
+        assert_eq!(control.terminated.lock().len(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires Ubuntu WSL with systemd and Prime Agent"]
+    fn real_wsl_controller_qualifies_identity_and_resolves_prime() {
+        let root = tempfile::tempdir().expect("create real WSL controller runtime");
+        let control = ConcreteWslControl::new(root.path().to_path_buf());
+        control
+            .reconcile_stale_scopes()
+            .expect("reconcile stale Prime scopes");
+        let home = control
+            .default_working_directory()
+            .expect("discover Ubuntu home");
+        let qualified = control
+            .qualify_working_directory(&home)
+            .expect("qualify Ubuntu home");
+        assert_eq!(qualified.namespace, WorkingDirectoryNamespace::WslUbuntu);
+        parse_wsl_identity(&qualified.identity).expect("parse real Linux identity");
+        control
+            .revalidate_working_directory(&qualified)
+            .expect("revalidate exact Linux identity");
+        let executable = control
+            .resolve_prime_executable()
+            .expect("resolve installed Prime Agent");
+        assert!(executable.starts_with('/'));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires Ubuntu WSL with systemd"]
+    fn real_startup_reconciliation_reaps_a_seeded_stale_prime_scope() {
+        let root = tempfile::tempdir().expect("create stale-scope runtime");
+        let control = ConcreteWslControl::new(root.path().to_path_buf());
+        control
+            .reconcile_stale_scopes()
+            .expect("begin from an empty Prime scope set");
+        let scope = WslRunScope {
+            distro: driver_prime::WSL_DISTRO.into(),
+            unit: format!(
+                "{}{}",
+                driver_prime::SCOPE_UNIT_PREFIX,
+                Uuid::new_v4().simple()
+            ),
+        };
+        control
+            .run_checked(
+                &[
+                    driver_prime::SYSTEMD_RUN.into(),
+                    "--user".into(),
+                    format!("--unit={}.service", scope.unit),
+                    "--property=KillMode=control-group".into(),
+                    "--property=Type=exec".into(),
+                    "--property=TimeoutStopSec=2s".into(),
+                    "--collect".into(),
+                    "--quiet".into(),
+                    driver_prime::PYTHON.into(),
+                    "-c".into(),
+                    "import signal,time; signal.signal(signal.SIGHUP,signal.SIG_IGN); time.sleep(120)".into(),
+                ],
+                "seed stale Prime scope",
+            )
+            .expect("seed stale Prime scope without a live desktop owner");
+        let seeded = control
+            .scope_status(&scope)
+            .expect("inspect seeded stale scope")
+            .expect("seeded stale scope must exist");
+        assert_eq!(seeded.active_state, "active");
+        assert!(seeded.tasks_current >= 1);
+
+        control
+            .reconcile_stale_scopes()
+            .expect("startup reconciliation must reap every exact-prefix stale scope");
+        assert!(
+            control.scope_status(&scope).unwrap().is_none(),
+            "stale Prime scope survived startup reconciliation"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires Ubuntu WSL with systemd and Prime Agent"]
+    fn real_missing_prime_scope_never_reaches_ready_or_vacuous_success() {
+        let root = tempfile::tempdir().expect("create missing-scope supervisor root");
+        let supervisor = empty_test_supervisor_with_root(root.path().to_path_buf());
+        let control: Arc<dyn WslControl> = Arc::new(ConcreteWslControl::new(
+            supervisor.runtime_dir().to_path_buf(),
+        ));
+        control
+            .reconcile_stale_scopes()
+            .expect("begin missing-scope test reconciled");
+        supervisor.set_wsl_control_for_tests(Arc::clone(&control));
+        supervisor.set_pty_spawner_for_tests(Arc::new(MissingScopePtySpawner {
+            control: Arc::clone(&control),
+        }));
+        let home = control.default_working_directory().unwrap();
+        let session = supervisor
+            .create_session(shared_types::CreateSessionRequest {
+                label: Some("Prime missing scope".into()),
+                driver: DriverKind::Prime,
+                permission_profile: shared_types::PermissionProfile::Normal,
+                linux_working_directory: Some(home),
+            })
+            .unwrap();
+        let events = capture_runtime_events(&supervisor);
+
+        let error = supervisor
+            .start_session_by_id(session.session_id)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("failed start-time binding"),
+            "{error:#}"
+        );
+        let snapshot = supervisor
+            .snapshot()
+            .sessions
+            .into_iter()
+            .find(|candidate| candidate.session_id == session.session_id)
+            .unwrap();
+        assert!(!snapshot.running);
+        assert_ne!(snapshot.lifecycle_state, LifecycleState::Ready);
+        assert!(!events.lock().iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SessionState {
+                identity,
+                state: LifecycleState::Ready,
+                ..
+            } if identity.session_id == session.session_id
+        )));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires Ubuntu WSL with systemd and Prime Agent"]
+    fn real_prime_wsl_scope_starts_resizes_outputs_and_stops_empty() {
+        let root = tempfile::tempdir().expect("create real Prime supervisor root");
+        let supervisor = empty_test_supervisor_with_root(root.path().to_path_buf());
+        let control = Arc::new(ConcreteWslControl::new(
+            supervisor.runtime_dir().to_path_buf(),
+        ));
+        control
+            .reconcile_stale_scopes()
+            .expect("reconcile stale Prime scopes before test");
+        supervisor.set_wsl_control_for_tests(control.clone());
+        let events = capture_runtime_events(&supervisor);
+
+        let session = supervisor
+            .create_session(shared_types::CreateSessionRequest {
+                label: Some("Prime integration".into()),
+                driver: DriverKind::Prime,
+                permission_profile: shared_types::PermissionProfile::Normal,
+                linux_working_directory: None,
+            })
+            .expect("create real Prime session");
+        let started = supervisor
+            .start_session_by_id(session.session_id)
+            .expect("start real Prime session in owned WSL scope");
+        assert_eq!(started.lifecycle_state, LifecycleState::Ready);
+        assert!(started.process_id.is_some());
+        supervisor
+            .resize_session_by_id(session.session_id, 100, 36)
+            .expect("resize Prime ConPTY bridge");
+
+        let output_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < output_deadline
+            && !events.lock().iter().any(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::SessionOutput { identity, .. }
+                        if identity.session_id == session.session_id
+                )
+            })
+        {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(events.lock().iter().any(|event| {
+            matches!(
+                event,
+                RuntimeEvent::SessionOutput { identity, .. }
+                    if identity.session_id == session.session_id
+            )
+        }));
+
+        let stopped = supervisor
+            .stop_session_by_id(session.session_id)
+            .expect("stop and prove both Prime scopes empty");
+        assert_eq!(stopped.lifecycle_state, LifecycleState::Closed);
+        assert!(!stopped.running);
+        let remaining = control
+            .run_checked(
+                &[
+                    driver_prime::SYSTEMCTL.into(),
+                    "--user".into(),
+                    "list-units".into(),
+                    "--all".into(),
+                    "--plain".into(),
+                    "--no-legend".into(),
+                    "--no-pager".into(),
+                    format!("{}*.service", driver_prime::SCOPE_UNIT_PREFIX),
+                ],
+                "post-stop Prime scope enumeration",
+            )
+            .expect("enumerate Prime scopes after stop");
+        assert!(
+            !remaining.contains(driver_prime::SCOPE_UNIT_PREFIX),
+            "Prime scope remained after stop: {remaining}"
+        );
+        supervisor
+            .shutdown()
+            .expect("shutdown clean test supervisor");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires Ubuntu WSL with systemd"]
+    fn real_prime_guard_propagates_resize_and_reaps_detached_linux_descendant_after_windows_death()
+    {
+        const PAYLOAD: &str = "import os,signal,subprocess,time; signal.signal(signal.SIGHUP,signal.SIG_IGN); signal.signal(signal.SIGWINCH,lambda s,f: print('SIZE %d %d'%os.get_terminal_size(),flush=True)); subprocess.Popen(['/usr/bin/python3','-c','import signal,time; signal.signal(signal.SIGHUP,signal.SIG_IGN); time.sleep(120)'],start_new_session=True); print('READY',flush=True); time.sleep(120)";
+
+        let root = tempfile::tempdir().expect("create adversarial WSL runtime");
+        let control = ConcreteWslControl::new(root.path().to_path_buf());
+        control
+            .reconcile_stale_scopes()
+            .expect("clear stale scopes before adversarial run");
+        let home = control.default_working_directory().unwrap();
+        let qualified = control.qualify_working_directory(&home).unwrap();
+        let (device, inode) = parse_wsl_identity(&qualified.identity).unwrap();
+        let scope = WslRunScope {
+            distro: driver_prime::WSL_DISTRO.into(),
+            unit: format!(
+                "{}{}",
+                driver_prime::SCOPE_UNIT_PREFIX,
+                Uuid::new_v4().simple()
+            ),
+        };
+        let definition = SessionDefinition {
+            session_id: Uuid::new_v4(),
+            alias: "prime-adversarial".into(),
+            label: "Prime adversarial lifecycle".into(),
+            driver: DriverKind::Prime,
+            working_dir: qualified.canonical_path,
+            permission_profile: shared_types::PermissionProfile::Normal,
+        };
+        let mut spec = driver_prime::launch_spec(
+            &definition,
+            &control.wsl_executable().unwrap(),
+            &control.resolve_prime_executable().unwrap(),
+            &scope.unit,
+            device,
+            inode,
+        )
+        .unwrap();
+        let guard_index = spec
+            .args
+            .iter()
+            .position(|argument| argument == driver_prime::PRIME_GUARD)
+            .expect("find immutable guard argv");
+        spec.args.truncate(guard_index + 4);
+        spec.args
+            .extend([driver_prime::PYTHON.into(), "-c".into(), PAYLOAD.into()]);
+
+        let output = Arc::new(Mutex::new(String::new()));
+        let captured = Arc::clone(&output);
+        let session = ConcretePtySession::spawn(
+            &spec,
+            Arc::new(move |event| {
+                if let PtyEvent::Output(chunk) = event {
+                    captured.lock().push_str(&chunk);
+                }
+            }),
+        )
+        .expect("spawn adversarial Prime WSL bridge");
+        session
+            .send_input("\u{1b}[1;1R")
+            .expect("release adversarial ConPTY startup handshake");
+        control
+            .confirm_scope_started(&scope)
+            .expect("bind adversarial scope before proof");
+
+        let ready_deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < ready_deadline && !output.lock().contains("READY") {
+            thread::sleep(Duration::from_millis(50));
+        }
+        let ready = output.lock().contains("READY");
+        session.resize(91, 37).expect("resize double-PTY path");
+        let resize_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < resize_deadline && !output.lock().contains("SIZE 91 37") {
+            thread::sleep(Duration::from_millis(50));
+        }
+        let resize_observed = output.lock().contains("SIZE 91 37");
+
+        // Simulate abrupt loss of the exact Windows WSL client/job without
+        // first asking systemd to stop the Linux scope.
+        session
+            .kill()
+            .expect("terminate and prove adversarial Windows job empty");
+        let reap_deadline = Instant::now() + Duration::from_secs(8);
+        let linux_empty = loop {
+            match control.scope_status(&scope) {
+                Ok(None) => break true,
+                Ok(Some(status))
+                    if status.tasks_current == 0
+                        && !matches!(status.active_state.as_str(), "active" | "activating") =>
+                {
+                    break true;
+                }
+                _ if Instant::now() < reap_deadline => {
+                    thread::sleep(Duration::from_millis(100));
+                }
+                _ => break false,
+            }
+        };
+        if !linux_empty {
+            let _ = control.terminate_scope(&scope);
+        }
+        assert!(
+            ready,
+            "adversarial Linux payload never reached READY: {}",
+            output.lock()
+        );
+        assert!(
+            resize_observed,
+            "Linux payload did not observe 91x37 through the double PTY: {}",
+            output.lock()
+        );
+        assert!(
+            linux_empty,
+            "detached Linux task survived abrupt Windows job death"
+        );
     }
 }

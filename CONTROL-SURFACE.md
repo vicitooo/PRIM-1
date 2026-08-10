@@ -10,7 +10,8 @@ The desktop owns:
 - `SessionId`-addressed create, rename, reorder, delete, launch, stop, restart,
   terminal input, and resize
 - an ordered, atomically persisted session inventory and snapshots
-- native workspace and per-session working-directory selection
+- native Windows workspace and per-session working-directory selection, plus a
+  backend-qualified absolute Ubuntu path for Prime
 - visible `Normal` / `Unsafe` permission profiles, with `Normal` as the default
 - a singular direct-routing backend command to one explicit `SessionId`; the
   current tab UI has no composer and exposes no room-shaped action
@@ -23,8 +24,11 @@ The operator schemas reject unknown fields. Lifecycle/input requests carry one
 `session_id`; a route request carries one `recipient_id` and `content` only.
 The Rust boundary derives operator provenance. Mutable labels are never
 authority. Create accepts only a driver, optional label, and typed permission
-profile; launch accepts no renderer-controlled command, arguments, environment,
-or working-directory path. Folder paths enter through the native Rust picker.
+profile. Prime create may additionally carry one typed absolute Ubuntu working
+directory; the backend canonicalizes and identity-binds it, and the UI prefills
+the qualified Ubuntu home. Launch accepts no renderer-controlled command,
+arguments, environment, or native working-directory path. Windows folder paths
+enter through the native Rust picker.
 Durable `RoomId` membership and visible message composition are not implemented
 yet.
 
@@ -135,5 +139,7 @@ powershell -Command "& '.\scripts\agent-slash.ps1' -Session claude -Slash compac
 An endpoint name is routing metadata, not authority. The supervisor must derive
 the native caller from the kernel and bind it to one live pane process job and
 generation when a mutating request is handled. Bearer files are not a fallback.
-Prime/WSL sideband access remains unsupported until an empirical boundary test
-proves a secure transport or a supervisor-owned proxy is introduced.
+Prime/WSL sideband access is deliberately disabled. The native named-pipe policy
+cannot derive a Linux task identity from Windows Job membership, and there is no
+bearer or compatibility fallback. Prime uses raw desktop terminal input; routed
+delivery is also rejected until a measured Prime submit protocol exists.

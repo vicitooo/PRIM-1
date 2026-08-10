@@ -32,13 +32,13 @@ This distinction must stay explicit.
 Current product surface:
 
 - an atomically persisted, backend-ordered set of Claude Code, Codex, Grok,
-  and Generic Terminal session definitions
+  Prime Agent (Ubuntu WSL), and Generic Terminal session definitions
 - stable opaque `SessionId` authority across desktop lifecycle, input, resize,
   direct routing, renderer state, and run-event lineage; mutable labels are
   display-only
 - a flat tab UI showing one retained xterm buffer at a time
-- native working-directory selection and visible `Normal`/`Unsafe` permission
-  profiles
+- native Windows working-directory selection, backend-qualified Ubuntu paths
+  for Prime, and visible `Normal`/`Unsafe` permission profiles
 - Windows-first validation
 - a one-recipient in-process routing core with no current visible composer
 - a tokenless, pane-local Windows sideband limited to self `ping`, `wait_quiet`, `send_input`, and `send_key`
@@ -132,6 +132,13 @@ If native Windows ConPTY proves unstable for a required CLI flow, the fallback p
 
 The fallback is architectural, not product-level. The room model should not change if the PTY backend changes.
 
+Prime is a deliberate current use of this boundary rather than an implicit
+fallback. The Windows supervisor owns the outer `wsl.exe` ConPTY process job;
+inside Ubuntu, a uniquely named transient user-systemd service owns the Prime
+guard and payload control group. A run is `Ready` only after the exact service
+is active with both guard and payload present. Stop/close succeeds only after
+both the Linux service and outer Windows job are proved empty.
+
 ## 5. Driver layer
 
 Drivers translate generic supervisor actions into CLI-specific behavior.
@@ -156,6 +163,7 @@ Each driver should define:
 - `claude_cli`
 - `codex_cli`
 - `grok_cli`
+- `prime_cli` (`wsl:Ubuntu`)
 - `generic_terminal`
 
 ### 5.3 Future drivers
@@ -173,7 +181,7 @@ renderer-controlled programs or arguments.
 That means:
 
 - the session registry and lifecycle remain driver-agnostic
-- Claude Code, Codex, Grok, and Generic Terminal are explicit typed choices
+- Claude Code, Codex, Grok, Prime Agent, and Generic Terminal are explicit typed choices
 - user-extensible drivers remain a separate product step
 
 ## 6. Sideband control plane
@@ -195,6 +203,10 @@ generation, and revalidates both affiliation and generation at mutation time.
 There is no bearer token, credential file, caller-supplied identity, peer target,
 or disk-mailbox fallback. Operator lifecycle and routing remain direct
 in-process Tauri commands.
+
+Prime sessions are intentionally excluded from this native sideband. Their
+Linux descendants cannot be authenticated through the Windows Job membership
+proof used by the named pipe, and no bearer or proxy fallback is introduced.
 
 Future room reads or posts may use the native sideband only after stable
 SessionId/RunId/RoomId membership exists and the supervisor derives the sender
@@ -457,6 +469,12 @@ These are not deferred hardening tasks. They are mandatory from the first workin
    it immediately before spawn. The workspace preference is a default, not an
    allow-root or OS sandbox.
 
+   Prime uses a separate typed `wsl:Ubuntu` namespace. The backend resolves the
+   Ubuntu path and persists its canonical path plus device/inode identity,
+   revalidates that identity before every start, and passes it to an immutable
+   launch guard that checks it again immediately before spawning Prime. Windows
+   paths and `/mnt/c/...` are never silently equated.
+
 2. **sideband capability whitelist**
    After kernel-bound affiliation succeeds, the pane-local schema permits only ping, wait, input, or a supported key for that caller's live run. Peer, lifecycle, inventory, room, and routing actions are absent. This is a protocol boundary, not hostile same-user OS isolation.
 
@@ -472,6 +490,9 @@ These are not deferred hardening tasks. They are mandatory from the first workin
   `--dangerously-bypass-approvals-and-sandbox`.
 - Grok `Normal` launches directly with `--permission-mode default`; `Unsafe`
   changes only that value to `bypassPermissions`.
+- Prime launches only with `Normal`. The Windows command is direct `wsl.exe`;
+  the Linux side uses absolute `systemd-run`, Python, and `prime-agent` paths,
+  with no shell evaluation or renderer-controlled arguments.
 - Generic Terminal accepts `Normal` only.
 
 These are visible harness permission profiles, not hostile same-user OS

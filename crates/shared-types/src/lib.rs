@@ -29,6 +29,7 @@ pub enum DriverKind {
     Claude,
     Codex,
     Grok,
+    Prime,
     GenericTerminal,
 }
 
@@ -246,6 +247,8 @@ pub struct CreateSessionRequest {
     pub driver: DriverKind,
     #[serde(default)]
     pub permission_profile: PermissionProfile,
+    #[serde(default)]
+    pub linux_working_directory: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -266,6 +269,13 @@ pub struct SetSessionPermissionRequest {
 #[serde(deny_unknown_fields)]
 pub struct ChooseSessionWorkingDirectoryRequest {
     pub session_id: SessionId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SetSessionLinuxWorkingDirectoryRequest {
+    pub session_id: SessionId,
+    pub linux_working_directory: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -827,6 +837,19 @@ mod tests {
         .unwrap();
         assert_eq!(create.label, None);
         assert_eq!(create.permission_profile, PermissionProfile::Normal);
+        assert_eq!(create.linux_working_directory, None);
+
+        let prime: CreateSessionRequest = serde_json::from_value(json!({
+            "driver": "prime",
+            "permission_profile": "normal",
+            "linux_working_directory": "/home/alice"
+        }))
+        .unwrap();
+        assert_eq!(prime.driver, DriverKind::Prime);
+        assert_eq!(
+            prime.linux_working_directory.as_deref(),
+            Some("/home/alice")
+        );
 
         assert!(
             serde_json::from_value::<CreateSessionRequest>(json!({
@@ -849,6 +872,23 @@ mod tests {
                 "session_id": session_id,
                 "permission_profile": "unsafe",
                 "unsafe": true
+            }))
+            .is_err()
+        );
+        assert_eq!(
+            serde_json::from_value::<SetSessionLinuxWorkingDirectoryRequest>(json!({
+                "session_id": session_id,
+                "linux_working_directory": "/home/alice/project"
+            }))
+            .unwrap()
+            .linux_working_directory,
+            "/home/alice/project"
+        );
+        assert!(
+            serde_json::from_value::<SetSessionLinuxWorkingDirectoryRequest>(json!({
+                "session_id": session_id,
+                "linux_working_directory": "/home/alice/project",
+                "working_directory": "renderer-authority"
             }))
             .is_err()
         );

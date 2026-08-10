@@ -805,6 +805,7 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
 
 .session-editor-heading,
 .session-path-field,
+.session-linux-directory,
 .permission-warning,
 .session-form-note,
 .session-form-error,
@@ -1571,6 +1572,7 @@ textarea:focus-visible {
 
   .session-editor-heading,
   .session-path-field,
+  .session-linux-directory,
   .permission-warning,
   .session-form-note,
   .session-form-error,

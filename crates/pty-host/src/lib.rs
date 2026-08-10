@@ -668,6 +668,7 @@ pub fn expected_agent_image_name(driver: DriverKind, image_name: &str) -> bool {
                 || (base.starts_with("claude") && (base.ends_with(".exe") || !base.contains('.')))
         }
         DriverKind::Grok => matches!(base.as_str(), "grok.exe" | "grok"),
+        DriverKind::Prime => false,
         DriverKind::GenericTerminal => false,
     }
 }

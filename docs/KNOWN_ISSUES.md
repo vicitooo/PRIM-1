@@ -4,7 +4,7 @@ A short, public-facing reference for current limitations, known bugs, and versio
 
 ## Platform support
 
-PRIM-1 is currently **Windows-first**. The wrapper uses Windows named pipes for the control plane and assumes ConPTY/PTY semantics that have been validated on Windows 10/11. Linux/macOS work is on the roadmap (Unix sockets for the control plane, portable-pty already abstracts the PTY layer) but is not yet validated. See `ROADMAP.md`.
+PRIM-1 is currently **Windows-first**. The wrapper uses Windows named pipes for the control plane and assumes ConPTY/PTY semantics that have been validated on Windows 10/11. Prime is the one explicit cross-boundary driver: it runs inside the Ubuntu WSL distribution under a user-systemd transient service while the Windows supervisor retains the outer ConPTY job. This is not a general Linux desktop port. Native Linux/macOS work remains on the roadmap. See `ROADMAP.md`.
 
 ## Pinned CLI versions known to work
 
@@ -15,6 +15,7 @@ The wrapper drives external CLI tools whose UIs evolve. Known-good versions (val
 | Claude Code | 2.1.226 |
 | Codex CLI | 0.147.0 |
 | Grok Build | 1.0.0 (`3cd0d0cbce`) |
+| Prime Agent (Ubuntu WSL) | 0.7.0 |
 
 If you upgrade any CLI and observe regressions (PTY behavior, startup timing, prompt rendering, routing behavior after injected stdin, paste-threshold behavior), record the wrapper commit and every affected CLI version together. Upstream CLI changes can break wrapper assumptions independent of wrapper code.
 
@@ -31,7 +32,19 @@ These are documented runtime behaviors that callers should know. Each is on the 
 
 The pane-local Windows sideband carries no bearer token and scripts do not discover authority from runtime files. Its production boundary therefore depends on the supervisor deriving the named-pipe caller from the kernel and binding that caller to one live PTY process job and generation at mutation time. An endpoint name alone is not authority.
 
-Release confidence remains blocked until that binding and the stable per-user desktop singleton have adversarial production-build receipts. Prime/WSL sideband access remains unclaimed until an empirical Windows/WSL boundary test proves a secure channel or a supervisor-owned proxy is added. External operators use the desktop UI.
+The native Windows boundary and stable per-user desktop singleton still require
+exact-artifact adversarial receipts for each release candidate. Prime/WSL is
+intentionally ineligible for the named-pipe sideband because Windows Job
+membership cannot identify Linux tasks. No bearer fallback exists; external
+operators use the desktop UI.
+
+### Prime is raw-input-only in the current release
+
+Prime supports `Normal` permission only, one qualified absolute path inside the
+Ubuntu distribution, and raw operator terminal input. Synthetic routed delivery
+and pane-sideband actions are rejected before write. Prime startup also requires
+an operational Ubuntu user-systemd manager and an absolute executable
+`prime-agent`; a stale-service cleanup failure blocks only Prime create/start.
 
 ### Multi-line content submission
 
