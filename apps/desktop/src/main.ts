@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
+import { InitialTerminalBanner } from "./terminal-banner";
 import "@xterm/xterm/css/xterm.css";
 
 import { exposeAutomationBridge } from "./automation-bridge";
@@ -308,6 +309,9 @@ class SessionTerminal {
   readonly stateEl: HTMLSpanElement;
   readonly activityEl: HTMLSpanElement;
   private hooked = false;
+  private readonly initialBanner: InitialTerminalBanner;
+  private readonly initialBannerLabel: HTMLElement;
+  private readonly initialBannerElement: HTMLDivElement;
   private snapshot: SessionSnapshot | null = null;
 
   constructor(sessionId: string, alias: string, label: string) {
@@ -350,6 +354,19 @@ class SessionTerminal {
     this.terminal.loadAddon(this.fitAddon);
     this.terminal.open(this.host);
     this.fitAddon.fit();
+    this.initialBannerElement = document.createElement("div");
+    this.initialBannerElement.className = "terminal-prelaunch";
+    this.initialBannerElement.setAttribute("role", "status");
+    this.initialBannerLabel = document.createElement("strong");
+    this.initialBannerLabel.textContent = `${this.label} pane ready.`;
+    const instruction = document.createElement("span");
+    instruction.textContent = "Launch the session from the header to begin.";
+    this.initialBannerElement.append(this.initialBannerLabel, instruction);
+    this.host.appendChild(this.initialBannerElement);
+    this.initialBanner = new InitialTerminalBanner(
+      () => this.initialBannerElement.remove(),
+      (chunk) => this.terminal.write(chunk),
+    );
     this.host.addEventListener("focusin", () => {
       tabState.activeId = this.sessionId;
       activeCopySurface = this.sessionId;
@@ -358,13 +375,6 @@ class SessionTerminal {
       tabState.activeId = this.sessionId;
       activeCopySurface = this.sessionId;
     });
-    this.writeInitialBanner();
-  }
-
-  writeInitialBanner(): void {
-    this.terminal.writeln(`\x1b[38;2;${brandBannerAnsi()}m${this.label} pane ready.\x1b[0m`);
-    this.terminal.writeln("Launch the session from the header to begin.");
-    this.terminal.writeln("");
   }
 
   hookInput(): void {
@@ -390,6 +400,7 @@ class SessionTerminal {
   applySnapshot(snapshot: SessionSnapshot): void {
     this.alias = snapshot.alias;
     this.label = snapshot.label;
+    this.initialBannerLabel.textContent = `${this.label} pane ready.`;
     this.snapshot = snapshot;
     this.stateEl.textContent = snapshot.lifecycle_state;
     this.stateEl.dataset.state = snapshot.lifecycle_state;
@@ -400,6 +411,8 @@ class SessionTerminal {
         : "idle";
     this.activityEl.dataset.running = String(snapshot.running);
 
+    this.initialBanner.observeRunning(snapshot.running);
+
     if (isPaneVisible(this.sessionId)) {
       this.fitAddon.fit();
       void resizeSession(this.sessionId, this.terminal.cols, this.terminal.rows);
@@ -408,7 +421,7 @@ class SessionTerminal {
   }
 
   write(chunk: string): void {
-    this.terminal.write(chunk);
+    this.initialBanner.forwardOutput(chunk);
   }
 
   fit(): void {
@@ -687,17 +700,6 @@ function wireThemeToggle(): void {
     const nextIdx = cycleIdx === -1 ? 0 : (cycleIdx + 1) % THEME_CYCLE.length;
     applyTheme(THEME_CYCLE[nextIdx]);
   });
-}
-
-/** Read the active theme's brand color from CSS and return as ANSI truecolor
-    "R;G;B" so banner text stays in sync with the current theme. */
-function brandBannerAnsi(): string {
-  const raw = getComputedStyle(document.documentElement)
-    .getPropertyValue("--prim1")
-    .trim();
-  const m = raw.match(/^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i);
-  if (!m) return "255;45;140";
-  return `${parseInt(m[1], 16)};${parseInt(m[2], 16)};${parseInt(m[3], 16)}`;
 }
 
 /** Active theme's secondary color as ANSI truecolor — used for system log info

@@ -12,6 +12,7 @@
   --bg-inset:      #02040a;
   --bg-hover:      #0d1208;
   --bg-active:     #1a2010;
+  --terminal-session-bg: #03060a;
 
   /* ── Primary (lemon yellow) — frames, brand, dominant chrome ── */
   --bronze:        #d8e02a;
@@ -984,6 +985,27 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
   z-index: 2;
 }
 
+.terminal-prelaunch {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  gap: 0.25rem;
+  padding: 0.8rem 0.9rem;
+  color: var(--copper-hot);
+  background: var(--terminal-session-bg);
+  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.35;
+  pointer-events: none;
+}
+
+.terminal-prelaunch strong {
+  color: var(--prim1);
+}
+
 .bottom-grid {
   min-height: 0;
   display: grid;
@@ -1343,6 +1365,7 @@ textarea:focus-visible {
   --bg-inset:      #050207;
   --bg-hover:      #150815;
   --bg-active:     #20102a;
+  --terminal-session-bg: #000000;
 
   /* Primary — magenta replaces yellow as the dominant frame color */
   --bronze:        #d8389a;
@@ -1614,6 +1637,7 @@ textarea:focus-visible {
   --bg-base:       #e8e4df;
   --bg-panel:      #f2efeb;
   --bg-inset:      #ddd9d4;
+  --terminal-session-bg: #e8e4df;
 
   --bronze:        #7a6048;
   --bronze-light:  #8a7058;
