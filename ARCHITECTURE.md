@@ -575,15 +575,23 @@ user, ACL, container, VM, or equivalent boundary.
 
 Grok remains lifecycle `Starting` through its launcher and startup repaint, so
 synthetic delivery fails closed while raw input remains available. A per-run,
-bounded tracker following the relevant xterm VT500 control transitions
-recognizes completed cursor-hide/show frames. It requires a frame containing
-`Starting session…`, then a later full-screen Home
-repaint containing the interactive composer plus both measured shortcut labels
-and no launcher/start marker. Partial composer repaints and the independent MCP
-spinner cannot admit; replacement runs cannot inherit progress; no timer grants
-readiness. Grok Build 1.0.0's optional telemetry banner is measured non-modal
-chrome and is ignored. After admission, ordinary Grok silence is never an idle
-signal; semantic `Thinking`, tool, and `Worked for` markers own work state.
+bounded fixed-grid projector follows only Grok Build 1.0.0's measured cursor,
+erase, scroll, terminal-string, mode, and decoded-text subset across completed
+cursor-hide/show frames; Unicode cell widths follow Unicode Standard Annex #11.
+It is not a general terminal emulator and
+requires a trusted screen containing `Starting session…`, then a trusted screen
+with that marker and the launcher gone, the interactive composer and both
+measured shortcut labels present, and bracketed paste enabled. This admits the
+measured partial CUP+ECH transition without depending on Home or another paint
+spelling. The projector retains neither styling nor scrollback, caps its grid at
+64 Ki cells, and fails closed after resize or unsupported control state until
+known output reconstructs the screen. Partial composer repaints and the
+independent MCP spinner cannot admit; replacement runs cannot inherit progress;
+no timer grants readiness, and structural readiness is not a model-turn receipt.
+Grok Build 1.0.0's optional telemetry banner is
+measured non-modal chrome and is ignored. After admission, ordinary Grok silence
+is never an idle signal; semantic `Thinking`, tool, and `Worked for` markers own
+work state.
 
 ## 11. 24/7 target model
 

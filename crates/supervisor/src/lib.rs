@@ -7155,19 +7155,24 @@ impl SupervisorHandle {
     pub fn resize_session_by_id(&self, session_id: SessionId, cols: u16, rows: u16) -> Result<()> {
         self.ensure_active()?;
         self.refresh_session_liveness();
-        let slots = self.inner.slots.lock();
+        let mut slots = self.inner.slots.lock();
         let slot = slots
-            .get_by_id(session_id)
+            .get_by_id_mut(session_id)
             .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
-        let running = slot
-            .running
-            .as_ref()
-            .ok_or_else(|| anyhow!("session '{session_id}' is not running"))?;
-        running
-            .pty
-            .as_ref()
-            .ok_or_else(|| anyhow!("session '{session_id}' transport is not available"))?
-            .resize(cols, rows)?;
+        {
+            let running = slot
+                .running
+                .as_ref()
+                .ok_or_else(|| anyhow!("session '{session_id}' is not running"))?;
+            running
+                .pty
+                .as_ref()
+                .ok_or_else(|| anyhow!("session '{session_id}' transport is not available"))?
+                .resize(cols, rows)?;
+        }
+        if slot.definition.driver == DriverKind::Grok {
+            slot.grok_startup.resize(cols, rows);
+        }
         Ok(())
     }
 
@@ -12287,7 +12292,7 @@ mod tests {
     }
 
     fn grok_starting_frame() -> &'static str {
-        "\x1b[?25lStarting session… 0.0s  Shift+Tab:mode  Ctrl+x:shortcuts\x1b[?25h"
+        "\x1b[?2004h\x1b[?25l\x1b[2J\x1b[HStarting session… 0.0s  Shift+Tab:mode  Ctrl+x:shortcuts\x1b[?25h"
     }
 
     fn grok_ready_frame(with_banner: bool) -> String {
@@ -12296,7 +12301,7 @@ mod tests {
         } else {
             ""
         };
-        format!("\x1b[?25l\x1b[H{banner}❯  Shift+Tab:mode  Ctrl+x:shortcuts\x1b[?25h")
+        format!("\x1b[?25l\x1b[2J\x1b[H{banner}❯  Shift+Tab:mode  Ctrl+x:shortcuts\x1b[?25h")
     }
 
     #[test]
@@ -12622,6 +12627,35 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn resized_grok_tracker_admits_the_exact_av_partial_repaint() {
+        let supervisor = test_supervisor();
+        let (pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Grok, pty);
+        let session_id = test_session_id(&supervisor, "codex");
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_mut("codex").unwrap();
+            slot.state = LifecycleState::Starting;
+            reset_work_state_locked(slot);
+            slot.grok_startup.begin_run();
+        }
+        supervisor
+            .resize_session_by_id(session_id, 196, 22)
+            .expect("the production resize seam must update the Grok startup viewport");
+        let stream: String = serde_json::from_str(include_str!(
+            "../../driver-grok/src/fixtures/grok-startup-av.json"
+        ))
+        .expect("AV Grok startup fixture should remain valid JSON");
+
+        handle_current_pty_event(&supervisor, "codex", 0, PtyEvent::Output(stream));
+
+        let slots = supervisor.inner.slots.lock();
+        let slot = slots.get("codex").unwrap();
+        assert_eq!(slot.state, LifecycleState::Idle);
+        assert_eq!(slot.work_state, WorkState::Idle);
     }
 
     #[test]

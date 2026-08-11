@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 shared-types = { path = "../shared-types" }
+unicode-width.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

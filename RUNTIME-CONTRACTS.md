@@ -193,15 +193,19 @@ Work-state events:
   startup repaint; those states reject synthetic delivery while raw terminal
   input remains available
 - Grok startup admission is structural, never temporal: a bounded exact-run
-  tracker following the relevant xterm VT500 control transitions requires one
-  completed cursor-hide/show frame containing
-  `Starting session…`, followed by a later completed frame that includes Home
-  plus the interactive composer and both measured shortcut labels, with no
-  launcher/start marker; partial and spinner-only repaints cannot admit
+  fixed-grid projector follows only Grok Build 1.0.0's measured cursor, erase,
+  scroll, terminal-string, mode, and decoded-text subset across completed
+  cursor-hide/show frames, with Unicode cell widths derived from Unicode
+  Standard Annex #11; it is not a general terminal emulator, and it
+  first requires a trusted current screen containing `Starting session…`, then
+  a trusted current screen with that marker and the launcher absent, the
+  interactive composer and both measured shortcut labels present, and DEC
+  private mode 2004 enabled; partial and spinner-only repaints cannot admit
 - the optional Grok Build 1.0.0 telemetry banner is measured non-modal chrome;
   it is ignored for both blocked-state classification and readiness
-- replacement runs start with a fresh tracker, malformed or over-limit frames
-  fail closed until the next cursor-hide, and no timeout grants readiness
+- replacement runs start with a fresh tracker; resize, malformed, unsupported,
+  or over-limit control state fails closed until known output reconstructs the
+  screen; no timeout grants readiness, and readiness is not a model-turn receipt
 - after that one-shot admission, Grok Build 1.0.0's variable full-screen repaint
   cadence is never treated as idle; only measured semantic markers report
   `idle`, `thinking`, or `tool_call`
