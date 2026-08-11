@@ -694,10 +694,6 @@ impl PtySession for WslScopedPtySession {
         self.inner.send_input(input)
     }
 
-    fn flush_input(&self) -> Result<()> {
-        self.inner.flush_input()
-    }
-
     fn cancel_input_write(&self) -> Result<()> {
         self.inner.cancel_input_write()
     }
@@ -6894,13 +6890,6 @@ impl SupervisorHandle {
         let _writer = self.begin_run_input_write(target, None, safety, None)?;
         let framed_content = frame_message_payload(content, MessageFraming::BracketedPaste);
         let content_bytes = Self::write_full_pty_input(target.pty.as_ref(), &framed_content)?;
-        if let Err(error) = target.pty.flush_input() {
-            return Err(PtyWriteError::new(
-                content_bytes,
-                format!("failed to drain completed bracketed-paste frame: {error:#}"),
-            )
-            .into());
-        }
         thread::sleep(bracketed_paste_submit_delay(
             submit_behavior.submit_delay,
             framed_content.len(),
@@ -9859,7 +9848,6 @@ mod tests {
         process_id: u32,
         inputs: Arc<Mutex<Vec<String>>>,
         write_times: Arc<Mutex<Vec<Instant>>>,
-        flush_times: Arc<Mutex<Vec<Instant>>>,
         first_write: Mutex<Option<mpsc::SyncSender<()>>>,
     }
 
@@ -9867,7 +9855,6 @@ mod tests {
         pty: Box<dyn PtySessionTrait>,
         inputs: Arc<Mutex<Vec<String>>>,
         write_times: Arc<Mutex<Vec<Instant>>>,
-        flush_times: Arc<Mutex<Vec<Instant>>>,
     }
 
     struct FirstWriteBlockingPtySession {
@@ -10061,10 +10048,6 @@ mod tests {
             Ok(input.len())
         }
 
-        fn flush_input(&self) -> Result<()> {
-            Ok(())
-        }
-
         fn resize(&self, _cols: u16, _rows: u16) -> Result<()> {
             Ok(())
         }
@@ -10094,11 +10077,6 @@ mod tests {
                 first_write.send(()).unwrap();
             }
             Ok(input.len())
-        }
-
-        fn flush_input(&self) -> Result<()> {
-            self.flush_times.lock().push(Instant::now());
-            Ok(())
         }
 
         fn resize(&self, _cols: u16, _rows: u16) -> Result<()> {
@@ -10141,18 +10119,15 @@ mod tests {
     ) -> FirstWriteSignalFixture {
         let inputs = Arc::new(Mutex::new(Vec::new()));
         let write_times = Arc::new(Mutex::new(Vec::new()));
-        let flush_times = Arc::new(Mutex::new(Vec::new()));
         FirstWriteSignalFixture {
             pty: Box::new(FirstWriteSignalPtySession {
                 process_id,
                 inputs: inputs.clone(),
                 write_times: write_times.clone(),
-                flush_times: flush_times.clone(),
                 first_write: Mutex::new(Some(first_write)),
             }),
             inputs,
             write_times,
-            flush_times,
         }
     }
 
@@ -10218,10 +10193,6 @@ mod tests {
                 thread::spawn(move || on_send());
             }
             Ok(input.len())
-        }
-
-        fn flush_input(&self) -> Result<()> {
-            Ok(())
         }
 
         fn resize(&self, _cols: u16, _rows: u16) -> Result<()> {
@@ -10322,11 +10293,6 @@ mod tests {
         error_message: String,
     }
 
-    struct FlushFailPtySession {
-        inputs: Arc<Mutex<Vec<String>>>,
-        error_message: String,
-    }
-
     struct ShortOkPtySession {
         bytes_written: usize,
     }
@@ -10360,33 +10326,6 @@ mod tests {
                 self.bytes_written,
                 self.error_message.clone(),
             ))
-        }
-
-        fn resize(&self, _cols: u16, _rows: u16) -> Result<()> {
-            Ok(())
-        }
-
-        fn kill(&self) -> Result<()> {
-            Ok(())
-        }
-
-        fn try_wait(&self) -> Result<Option<pty_host::PtyExitStatus>> {
-            Ok(None)
-        }
-
-        fn process_id(&self) -> Option<u32> {
-            None
-        }
-    }
-
-    impl PtySessionTrait for FlushFailPtySession {
-        fn send_input(&self, input: &str) -> pty_host::PtyWriteResult {
-            self.inputs.lock().push(input.to_owned());
-            Ok(input.len())
-        }
-
-        fn flush_input(&self) -> Result<()> {
-            Err(anyhow!(self.error_message.clone()))
         }
 
         fn resize(&self, _cols: u16, _rows: u16) -> Result<()> {
@@ -11703,7 +11642,6 @@ mod tests {
             pty,
             inputs,
             write_times,
-            flush_times,
         } = first_write_signal_pty_session(std::process::id(), first_write_tx);
         install_mock_running_session_with_process_id_and_mode(
             &supervisor,
@@ -11773,12 +11711,11 @@ mod tests {
         );
         let expected_frame_len = inputs.lock()[0].len();
         let write_times = write_times.lock();
-        let flush_times = flush_times.lock();
         let expected_delay =
             bracketed_paste_submit_delay(BRACKETED_PASTE_SUBMIT_DELAY, expected_frame_len);
         assert!(
-            write_times[1].duration_since(flush_times[0]) >= expected_delay,
-            "submit was not delayed from the drained frame boundary"
+            write_times[1].duration_since(write_times[0]) >= expected_delay,
+            "submit was not delayed from the completed frame write"
         );
     }
 
@@ -11790,7 +11727,6 @@ mod tests {
             pty,
             inputs,
             write_times,
-            flush_times,
         } = first_write_signal_pty_session(std::process::id(), first_write_tx);
         install_mock_running_session_with_process_id_and_mode(
             &supervisor,
@@ -11832,12 +11768,11 @@ mod tests {
         );
         let expected_frame_len = inputs.lock()[0].len();
         let write_times = write_times.lock();
-        let flush_times = flush_times.lock();
         let expected_delay =
             bracketed_paste_submit_delay(BRACKETED_PASTE_SUBMIT_DELAY, expected_frame_len);
         assert!(
-            write_times[1].duration_since(flush_times[0]) >= expected_delay,
-            "Codex submit ran before the drained-frame compatibility interval elapsed"
+            write_times[1].duration_since(write_times[0]) >= expected_delay,
+            "Codex submit ran before the completed-frame compatibility interval elapsed"
         );
     }
 
@@ -11850,7 +11785,6 @@ mod tests {
             pty,
             inputs,
             write_times: _write_times,
-            flush_times: _flush_times,
         } = first_write_signal_pty_session(std::process::id(), first_write_tx);
         install_mock_running_session_with_process_id_and_mode(
             &supervisor,
@@ -11910,7 +11844,6 @@ mod tests {
             pty,
             inputs: original_inputs,
             write_times: _write_times,
-            flush_times: _flush_times,
         } = first_write_signal_pty_session(std::process::id(), first_write_tx);
         install_mock_running_session_with_process_id_and_mode(
             &supervisor,
@@ -13594,66 +13527,6 @@ mod tests {
                 && *bytes_written == committed_prefix
                 && message.contains("synthetic partial PTY write failure")
         ));
-    }
-
-    #[test]
-    fn bracketed_transport_drain_failure_reports_the_complete_frame_without_submit() {
-        let supervisor = test_supervisor();
-        let codex_alias = test_session_alias(&supervisor, "codex");
-        let events = capture_runtime_events(&supervisor);
-        let inputs = Arc::new(Mutex::new(Vec::<String>::new()));
-        install_mock_running_session_with_bracketed_paste_enabled(
-            &supervisor,
-            "codex",
-            DriverKind::Codex,
-            Box::new(FlushFailPtySession {
-                inputs: Arc::clone(&inputs),
-                error_message: "synthetic transport drain failure".into(),
-            }),
-        );
-        let codex_id = test_session_id(&supervisor, "codex");
-
-        let error = supervisor
-            .route_operator_message(OperatorRouteMessageRequest {
-                recipient_id: codex_id,
-                content: "hello".into(),
-            })
-            .unwrap_err();
-
-        let inputs = inputs.lock();
-        assert_eq!(
-            inputs.len(),
-            1,
-            "submit sequence must not follow a failed drain"
-        );
-        let frame_bytes = inputs[0].len();
-        let error = error.to_string();
-        assert!(error.contains("synthetic transport drain failure"));
-        assert!(error.contains(&format!(
-            "after {frame_bytes} bytes were accepted by the PTY"
-        )));
-        assert!(error.contains("content may be partial"));
-
-        let deliveries = route_delivery_events(&events);
-        assert!(matches!(
-            deliveries.last().unwrap(),
-            RuntimeEvent::RouteDelivery {
-                phase: RouteDeliveryPhase::Failed,
-                recipient: Some(recipient),
-                bytes_written,
-                error: Some(message),
-                ..
-            } if recipient == &codex_alias
-                && *bytes_written == frame_bytes
-                && message.contains("synthetic transport drain failure")
-        ));
-        assert!(!deliveries.iter().any(|event| matches!(
-            event,
-            RuntimeEvent::RouteDelivery {
-                phase: RouteDeliveryPhase::Written,
-                ..
-            }
-        )));
     }
 
     #[test]
