@@ -18,6 +18,7 @@ A local multi-agent runtime for terminal-first AI tools. PRIM-1 hosts CLI agents
 - **Explicit rooms** — a separate atomic catalog stores ordered `RoomId` definitions, labels, membership, and membership revisions. Room content stays in a bounded 512-event / 16 MiB in-memory feed with explicit cursor gaps; it is never restored after process restart.
 - **Deliberate room traffic** — **Post** appends to the shared feed without prompting a harness. **Send** targets one member or explicitly all members through the existing exact-run framing path, with whole-recipient preflight and truthful per-recipient pending/written/failed receipts. Prime remains raw-terminal-only.
 - **Pane-local sideband** — an authorized supervised pane gets a narrow named-pipe surface for `ping`, `wait_quiet`, raw `input`, PTY `key`, and membership-derived room `read` / `post`. The pane cannot supply a `RoomId`, sender, peer target, lifecycle action, or recipient delivery.
+- **Model-facing room tools, fail-closed by driver** — Claude Code and Codex receive a PRIM-owned `prim1_pane` stdio MCP child exposing only `ping`, `room_read`, and feed-only `room_post`; caller, run, room, and sender still come from kernel Job membership. Grok Build 1.0.0 offers no privacy-safe session-scoped plugin seam for its TUI and its shell tools are not Job-affiliated, so Grok receives no model-facing sideband tool rather than a bearer or redirected-history workaround.
 - **Append-only metadata audit** at `<runtime-dir>/audit/YYYY-MM-DD.jsonl` for lifecycle, authorization, dispatch, delivery, session-definition, and room receipts. Terminal output is not persisted; routed and room-message content is stored as `[content omitted]`.
 
 ## Prerequisites
@@ -165,7 +166,9 @@ derived by the supervisor from the named-pipe caller and bound to the live PTY
 process job and generation at mutation time. Prime/WSL sessions deliberately do
 not receive the native sideband or routed-message surface because no verified
 Windows-job-to-Linux-task caller identity bridge exists. Use raw input through
-the desktop UI for Prime.
+the desktop UI for Prime. Grok's TUI likewise receives no model-facing pane
+tool until its client exposes a session-scoped plugin/config boundary that does
+not redirect Grok-owned sessions or logs; operator room sends remain available.
 
 Treat the app-local runtime directory as private machine-local state. The repo-local `.runtime/` directory remains gitignored for test environments and developer scratch files; it is no longer the product runtime default.
 

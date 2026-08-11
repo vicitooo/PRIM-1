@@ -8,6 +8,18 @@ use std::sync::OnceLock;
 static WRAPPER_JOB: OnceLock<pty_host::ProcessJob> = OnceLock::new();
 
 fn main() {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--prim1-pane-mcp")) {
+        if std::env::args_os().count() != 2 {
+            eprintln!("pane MCP mode accepts no additional arguments");
+            std::process::exit(2);
+        }
+        if let Err(error) = pane_mcp::run_stdio() {
+            eprintln!("pane MCP server failed: {error:#}");
+            std::process::exit(2);
+        }
+        return;
+    }
+
     let startup = cli_master_wrapper_desktop_lib::load_startup_config().unwrap_or_else(|error| {
         eprintln!("startup configuration: {error}");
         std::process::exit(2);

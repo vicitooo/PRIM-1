@@ -267,6 +267,13 @@ Current pane authority is deliberately narrower than operator room authority:
   `room_post`
 - pane callers cannot supply `RoomId`, sender, peer, recipient, delivery,
   inventory, membership, or lifecycle authority
+- Claude Code and Codex receive a session-scoped `prim1_pane` stdio MCP child
+  exposing only `ping`, `room_read`, and `room_post`; the MCP layer contributes
+  no authority and every call is re-authorized through the named pipe
+- Grok Build 1.0.0 receives no model-facing pane tool: its TUI lacks a
+  privacy-safe session-scoped plugin/config seam and its shell-tool children do
+  not satisfy Job membership. Operator sends/raw input remain available, with
+  no bearer, ancestry, global-config, or redirected-history fallback
 - Prime/WSL callers have no pane-sideband surface; the native Job-derived caller
   proof cannot identify Linux tasks and no bearer fallback exists
 - operator lifecycle, input, resize, and routing authority remains inside the desktop process and targets stable `SessionId` values

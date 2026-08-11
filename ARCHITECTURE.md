@@ -221,7 +221,26 @@ Room reads/posts use the same kernel-bound caller proof, derive current
 `RoomId` membership and sender `SessionId` under the supervisor locks, and are
 revoked immediately when the run or membership changes. Prime remains excluded.
 
-### 6.1 Transport choice
+### 6.1 Model-facing bridge
+
+Claude Code and Codex receive a session-scoped stdio MCP child named
+`prim1_pane`. The child is the signed/packaged PRIM-1 executable in an early
+no-UI mode, configured so the harness creates it inside the same pane Job. Its
+only tools are `ping`, membership-derived `room_read`, and feed-only
+`room_post`. The MCP
+request carries neither caller nor room authority; the helper verifies the
+desktop named-pipe server PID and creation time, and the supervisor derives the
+exact caller/run from the kernel again on every request.
+
+This bridge is deliberately driver-scoped. Grok Build 1.0.0 supports
+session-scoped plugins only through its non-interactive agent host, while its
+TUI has no equivalent flag and its shell-tool subprocesses are empirically not
+members of the pane Job. Redirecting `GROK_HOME` would redirect Grok's sessions
+and logs into PRIM runtime storage. PRIM therefore leaves Grok, Prime, and
+Generic Terminal unchanged rather than adding a bearer, ancestry check,
+global plugin, workspace mutation, or history-redirection fallback.
+
+### 6.2 Transport choice
 
 The control-plane transport model is:
 

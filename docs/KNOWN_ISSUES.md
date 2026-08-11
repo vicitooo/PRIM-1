@@ -38,6 +38,14 @@ intentionally ineligible for the named-pipe sideband because Windows Job
 membership cannot identify Linux tasks. No bearer fallback exists; external
 operators use the desktop UI.
 
+Claude Code and Codex receive a PRIM-owned session-scoped stdio MCP child for
+model-facing `ping`, `room_read`, and `room_post`. Grok Build 1.0.0 does not:
+its normal TUI has no session-scoped plugin/config flag, `GROK_HOME` also owns
+session/log storage, and a real Grok shell-tool child failed the Job-bound pipe
+check. Grok remains usable through raw terminal input and explicit operator
+room delivery, but it cannot autonomously read/post the PRIM room feed in this
+release.
+
 ### Prime is raw-input-only in the current release
 
 Prime supports `Normal` permission only, one qualified absolute path inside the

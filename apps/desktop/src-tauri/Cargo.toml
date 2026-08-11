@@ -26,6 +26,7 @@ dotenvy = { workspace = true }
 shared-types = { path = "../../../crates/shared-types" }
 supervisor = { path = "../../../crates/supervisor" }
 pty-host = { path = "../../../crates/pty-host" }
+pane-mcp = { path = "../../../crates/pane-mcp" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_UI_WindowsAndMessaging"] }

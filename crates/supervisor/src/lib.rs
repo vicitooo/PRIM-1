@@ -14,7 +14,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, NaiveDate, Utc};
-use control_plane::{DEFAULT_ENDPOINT, decode_request, encode_response};
+use control_plane::{DEFAULT_ENDPOINT, MAX_FRAME_BYTES, decode_request, encode_response};
 use parking_lot::{Condvar, Mutex, RwLock};
 #[cfg(windows)]
 use pty_host::PinnedProcess;
@@ -57,7 +57,7 @@ struct RouteMessageRequest {
     content: String,
 }
 
-const SIDEBAND_FRAME_MAX_BYTES: usize = 8 * 1024 * 1024;
+const SIDEBAND_FRAME_MAX_BYTES: usize = MAX_FRAME_BYTES;
 const SIDEBAND_FRAME_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const SIDEBAND_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const SIDEBAND_MAX_CONNECTIONS: usize = 64;
@@ -77,6 +77,30 @@ const RECENT_ROUTE_OVERLAP_WINDOW: Duration = Duration::from_secs(3);
 const SESSION_LABEL_MAX_CHARS: usize = 128;
 const SESSION_CATALOG_SCHEMA_VERSION: u32 = 1;
 const SESSION_CATALOG_FILE_NAME: &str = "session-catalog-v1.json";
+#[cfg(windows)]
+const PANE_MCP_SERVER_NAME: &str = "prim1_pane";
+#[cfg(windows)]
+const PANE_MCP_MODE_ARGUMENT: &str = "--prim1-pane-mcp";
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneMcpClient {
+    Claude,
+    Codex,
+}
+
+#[cfg(windows)]
+impl PaneMcpClient {
+    fn for_driver(driver: DriverKind) -> Option<Self> {
+        match driver {
+            DriverKind::Claude => Some(Self::Claude),
+            DriverKind::Codex => Some(Self::Codex),
+            // Grok's TUI has no session-scoped plugin seam; Prime cannot use
+            // Windows Job identity; Generic Terminal has no model tool host.
+            DriverKind::Grok | DriverKind::Prime | DriverKind::GenericTerminal => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MessageFraming {
@@ -1298,6 +1322,7 @@ impl WslControl for TestWslUnavailable {
 pub struct SupervisorConfig {
     pub working_root: PathBuf,
     pub runtime_dir: PathBuf,
+    pub pane_mcp_executable: Option<PathBuf>,
     pub heartbeat_interval: Option<Duration>,
     pub auto_restart_on_stall_sessions: Option<Vec<SessionId>>,
     pub auto_restart_stall_threshold: Option<Duration>,
@@ -2444,6 +2469,7 @@ fn ensure_run_input_safety_locked(
 
 struct SupervisorInner {
     runtime_dir: PathBuf,
+    pane_mcp_executable: Option<PathBuf>,
     catalog: Mutex<SessionCatalogV1>,
     rooms: Mutex<RoomState>,
     audit: AuditLog,
@@ -3389,6 +3415,10 @@ fn restrict_path_to_current_user(path: &Path, is_directory: bool) -> Result<()> 
 
 impl SupervisorHandle {
     pub fn new(mut config: SupervisorConfig) -> Result<Self> {
+        #[cfg(windows)]
+        if let Some(executable) = config.pane_mcp_executable.as_deref() {
+            validate_pane_mcp_executable(executable)?;
+        }
         let expected_runtime =
             validate_runtime_storage_paths(&config.runtime_dir, &config.working_root)?;
         fs::create_dir_all(&expected_runtime).context("failed to create runtime directory")?;
@@ -3498,6 +3528,7 @@ impl SupervisorHandle {
         let handle = Self {
             inner: Arc::new(SupervisorInner {
                 runtime_dir: config.runtime_dir,
+                pane_mcp_executable: config.pane_mcp_executable,
                 catalog: Mutex::new(catalog),
                 rooms: Mutex::new(rooms),
                 audit,
@@ -8590,6 +8621,12 @@ impl SupervisorHandle {
                     key: "PRIM1_CONTROL_PLANE_SERVER_STARTED_FILETIME".into(),
                     value: server.creation_time_filetime().to_string(),
                 });
+                if let (Some(executable), Some(client)) = (
+                    self.inner.pane_mcp_executable.as_deref(),
+                    PaneMcpClient::for_driver(definition.driver),
+                ) {
+                    augment_launch_spec_with_pane_mcp(&mut spec, client, executable)?;
+                }
             }
         }
 
@@ -8806,6 +8843,72 @@ fn build_launch_spec(
         }
     }
     .map_err(anyhow::Error::from)
+}
+
+#[cfg(windows)]
+fn validate_pane_mcp_executable(path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        return Err(anyhow!(
+            "pane MCP executable must be an absolute path: {}",
+            path.display()
+        ));
+    }
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect pane MCP executable {}", path.display()))?;
+    if metadata_is_link_or_reparse(&metadata) || !metadata.is_file() {
+        return Err(anyhow!(
+            "pane MCP executable must be a regular non-reparse file: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn augment_launch_spec_with_pane_mcp(
+    spec: &mut LaunchSpec,
+    client: PaneMcpClient,
+    pane_mcp_executable: &Path,
+) -> Result<()> {
+    validate_pane_mcp_executable(pane_mcp_executable)?;
+    let executable = child_process_path(pane_mcp_executable)
+        .into_os_string()
+        .into_string()
+        .map_err(|_| anyhow!("pane MCP executable path is not valid Unicode"))?;
+
+    match client {
+        PaneMcpClient::Claude => {
+            let mut servers = serde_json::Map::new();
+            servers.insert(
+                PANE_MCP_SERVER_NAME.into(),
+                serde_json::json!({
+                    "type": "stdio",
+                    "command": executable,
+                    "args": [PANE_MCP_MODE_ARGUMENT],
+                }),
+            );
+            let config = serde_json::to_string(&serde_json::json!({
+                "mcpServers": servers,
+            }))
+            .context("failed to encode Claude pane MCP configuration")?;
+            spec.args.extend(["--mcp-config".into(), config]);
+        }
+        PaneMcpClient::Codex => {
+            let command = serde_json::to_string(&executable)
+                .context("failed to encode Codex pane MCP command")?;
+            let arguments = serde_json::to_string(&[PANE_MCP_MODE_ARGUMENT])
+                .context("failed to encode Codex pane MCP arguments")?;
+            spec.args.extend([
+                "-c".into(),
+                format!("mcp_servers.{PANE_MCP_SERVER_NAME}.command={command}"),
+                "-c".into(),
+                format!("mcp_servers.{PANE_MCP_SERVER_NAME}.args={arguments}"),
+                "-c".into(),
+                format!("mcp_servers.{PANE_MCP_SERVER_NAME}.required=true"),
+            ]);
+        }
+    }
+    Ok(())
 }
 
 fn resolve_driver_executable(driver: DriverKind) -> Result<ResolvedLaunchProgram> {
@@ -10536,6 +10639,7 @@ mod tests {
         SupervisorConfig {
             working_root: root.join("work"),
             runtime_dir: root.join("runtime"),
+            pane_mcp_executable: None,
             heartbeat_interval: None,
             auto_restart_on_stall_sessions: None,
             auto_restart_stall_threshold: None,
@@ -10606,6 +10710,7 @@ mod tests {
         let supervisor = SupervisorHandle::new(SupervisorConfig {
             working_root,
             runtime_dir: root.join("runtime"),
+            pane_mcp_executable: None,
             heartbeat_interval,
             auto_restart_on_stall_sessions: None,
             auto_restart_stall_threshold: auto_restart_threshold,
@@ -15609,6 +15714,7 @@ mod tests {
         let result = SupervisorHandle::new(SupervisorConfig {
             working_root,
             runtime_dir,
+            pane_mcp_executable: None,
             heartbeat_interval: None,
             auto_restart_on_stall_sessions: None,
             auto_restart_stall_threshold: None,
@@ -15650,6 +15756,7 @@ mod tests {
         let supervisor = SupervisorHandle::new(SupervisorConfig {
             working_root,
             runtime_dir,
+            pane_mcp_executable: None,
             heartbeat_interval: None,
             auto_restart_on_stall_sessions: None,
             auto_restart_stall_threshold: None,
@@ -15681,6 +15788,7 @@ mod tests {
         let result = SupervisorHandle::new(SupervisorConfig {
             working_root,
             runtime_dir: runtime_junction.clone(),
+            pane_mcp_executable: None,
             heartbeat_interval: None,
             auto_restart_on_stall_sessions: None,
             auto_restart_stall_threshold: None,
@@ -15723,6 +15831,7 @@ mod tests {
         let supervisor = SupervisorHandle::new(SupervisorConfig {
             working_root,
             runtime_dir,
+            pane_mcp_executable: None,
             heartbeat_interval: None,
             auto_restart_on_stall_sessions: None,
             auto_restart_stall_threshold: None,
@@ -20534,6 +20643,78 @@ mod tests {
             .kill()
             .expect("prove both Prime ownership scopes empty");
         assert_eq!(control.terminated.lock().len(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pane_mcp_launch_augmentation_is_driver_scoped_and_authority_free() {
+        let root = tempfile::tempdir().expect("create pane MCP launch root");
+        let executable = root.path().join("PRIM & one's pane helper.exe");
+        fs::write(&executable, b"fixture").expect("write pane MCP executable fixture");
+        let expected_executable = child_process_path(&executable)
+            .to_str()
+            .expect("encode pane MCP executable path")
+            .to_owned();
+
+        let base_spec = |driver| LaunchSpec {
+            program: executable.display().to_string(),
+            args: vec![format!("{driver:?}-base")],
+            working_dir: root.path().display().to_string(),
+            env: Vec::new(),
+            display_name: format!("{driver:?}"),
+        };
+
+        let mut claude = base_spec(DriverKind::Claude);
+        augment_launch_spec_with_pane_mcp(&mut claude, PaneMcpClient::Claude, &executable)
+            .expect("augment Claude pane MCP launch");
+        let config_index = claude
+            .args
+            .iter()
+            .position(|argument| argument == "--mcp-config")
+            .expect("Claude launch must carry an MCP config");
+        let claude_config: serde_json::Value =
+            serde_json::from_str(&claude.args[config_index + 1]).expect("decode Claude MCP config");
+        assert_eq!(
+            claude_config["mcpServers"][PANE_MCP_SERVER_NAME]["command"],
+            expected_executable
+        );
+        assert_eq!(
+            claude_config["mcpServers"][PANE_MCP_SERVER_NAME]["args"],
+            serde_json::json!([PANE_MCP_MODE_ARGUMENT])
+        );
+
+        let mut codex = base_spec(DriverKind::Codex);
+        augment_launch_spec_with_pane_mcp(&mut codex, PaneMcpClient::Codex, &executable)
+            .expect("augment Codex pane MCP launch");
+        let codex_arguments = codex.args.join("\n");
+        assert!(codex_arguments.contains(&format!(
+            "mcp_servers.{PANE_MCP_SERVER_NAME}.command={}",
+            serde_json::to_string(&expected_executable).unwrap()
+        )));
+        assert!(codex_arguments.contains(&format!(
+            "mcp_servers.{PANE_MCP_SERVER_NAME}.args=[\"{PANE_MCP_MODE_ARGUMENT}\"]"
+        )));
+        assert!(
+            codex_arguments.contains(&format!("mcp_servers.{PANE_MCP_SERVER_NAME}.required=true"))
+        );
+
+        for payload in [claude.args.join("\n"), codex_arguments] {
+            let lower = payload.to_ascii_lowercase();
+            for forbidden in ["token", "credential", "room_id", "sender", "from="] {
+                assert!(
+                    !lower.contains(forbidden),
+                    "pane MCP launch config leaked authority field {forbidden:?}: {payload}"
+                );
+            }
+        }
+
+        for driver in [
+            DriverKind::Grok,
+            DriverKind::GenericTerminal,
+            DriverKind::Prime,
+        ] {
+            assert_eq!(PaneMcpClient::for_driver(driver), None);
+        }
     }
 
     #[cfg(windows)]

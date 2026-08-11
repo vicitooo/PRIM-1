@@ -1314,9 +1314,12 @@ fn init_supervisor(
     agent_working_root: PathBuf,
     diagnostics: &DesktopDiagnostics,
 ) -> Result<SupervisorHandle, String> {
+    let pane_mcp_executable = std::env::current_exe()
+        .map_err(|error| format!("failed to locate the PRIM-1 pane MCP executable: {error}"))?;
     let supervisor = SupervisorHandle::new(SupervisorConfig {
         working_root: agent_working_root,
         runtime_dir,
+        pane_mcp_executable: Some(pane_mcp_executable),
         heartbeat_interval: None,
         auto_restart_on_stall_sessions: None,
         auto_restart_stall_threshold: None,

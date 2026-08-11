@@ -71,7 +71,7 @@ When no endpoint is available, the stable failure is:
 PRIM1_CONTROL_PLANE_ENDPOINT is not set. External operator control is unavailable; use the PRIM-1 desktop UI.
 ```
 
-Examples from an authorized supervised pane:
+Examples from an authorized supervised OS process that remains in the pane Job:
 
 ```powershell
 .\scripts\control-plane.ps1 -Action ping -Quiet
@@ -106,6 +106,29 @@ Behavior:
 The helper does not accept list, lifecycle, recipient delivery, arbitrary route,
 signal, or session/room-management actions. It never reads `control-plane.json`,
 `PRIM1_PANE_CREDENTIALS`, or any bearer token.
+
+Model shell tools are not assumed to preserve that Job membership. Production
+receipts show Claude Code and Grok Build shell-tool PowerShell processes can be
+outside the pane Job and are therefore rejected before request decoding.
+
+## Model-facing MCP bridge
+
+Claude Code and Codex are launched with one session-scoped `prim1_pane` stdio
+MCP server. The server is the PRIM-1 executable in a dedicated no-UI mode and
+is created by the harness inside the pane Job. It exposes exactly `ping`,
+`room_read`, and `room_post`; the schemas accept no `RoomId`, sender, peer,
+recipient, lifecycle, or delivery authority. Each tool call opens the existing
+named pipe, pins and verifies the expected desktop server process, and then
+uses the same kernel-derived caller/run/membership checks as the PowerShell
+helper. MCP frames and control-plane frames are both bounded and fail closed.
+
+Grok Build 1.0.0 exposes session-scoped plugins only through its non-interactive
+agent protocol, not the TUI used by PRIM-1. `GROK_HOME` also owns Grok's
+sessions and logs, so PRIM-1 does not redirect it to inject configuration.
+Grok therefore receives no model-facing pane tool in this release. Prime and
+Generic Terminal are likewise unchanged. Operator room Post/Send and raw
+terminal input remain available; no bearer, ancestry, global-plugin, or
+workspace-config fallback exists.
 
 ## Thin pane wrappers
 

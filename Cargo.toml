@@ -8,6 +8,7 @@ members = [
   "crates/driver-generic-terminal",
   "crates/driver-grok",
   "crates/driver-prime",
+  "crates/pane-mcp",
   "crates/pty-host",
   "crates/shared-types",
   "crates/supervisor",
