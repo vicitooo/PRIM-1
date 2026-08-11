@@ -573,13 +573,17 @@ These are visible harness permission profiles, not hostile same-user OS
 isolation. Stronger containment would require a separately measured restricted
 user, ACL, container, VM, or equivalent boundary.
 
-Grok remains lifecycle `Starting` through its launcher, telemetry-consent, and
-startup repaint states, so synthetic delivery fails closed while raw input can
-resolve a prompt. Once Grok emits its measured `Starting session…` marker, every
-raw exact-run PTY chunk rearms a three-second one-shot startup timer. Expiry may
-admit only that same `SessionId`/`RunId`/generation. After admission, ordinary
-Grok silence is never an idle signal; semantic `Thinking`, tool, and `Worked
-for` markers own work state.
+Grok remains lifecycle `Starting` through its launcher and startup repaint, so
+synthetic delivery fails closed while raw input remains available. A per-run,
+bounded tracker following the relevant xterm VT500 control transitions
+recognizes completed cursor-hide/show frames. It requires a frame containing
+`Starting session…`, then a later full-screen Home
+repaint containing the interactive composer plus both measured shortcut labels
+and no launcher/start marker. Partial composer repaints and the independent MCP
+spinner cannot admit; replacement runs cannot inherit progress; no timer grants
+readiness. Grok Build 1.0.0's optional telemetry banner is measured non-modal
+chrome and is ignored. After admission, ordinary Grok silence is never an idle
+signal; semantic `Thinking`, tool, and `Worked for` markers own work state.
 
 ## 11. 24/7 target model
 

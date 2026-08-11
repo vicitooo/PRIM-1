@@ -20,13 +20,17 @@ The wrapper drives external CLI tools whose UIs evolve. Known-good versions (val
 If you upgrade any CLI and observe regressions (PTY behavior, startup timing, prompt rendering, routing behavior after injected stdin, paste-threshold behavior), record the wrapper commit and every affected CLI version together. Upstream CLI changes can break wrapper assumptions independent of wrapper code.
 
 Grok Build 1.0.0 periodically repaints its full-screen TUI even while waiting at
-the prompt, and the measured cadence varies enough that ordinary silence cannot
-identify idleness. PRIM launches each run with a fresh native `--session-id`,
-holds it in lifecycle `Starting`, and uses one measured exception: after Grok's
-own `Starting session…` marker, three seconds with no exact-run PTY chunk admits
-that run. Launcher and telemetry-consent screens remain blocked and every
-startup repaint rearms the timer. After admission, only measured semantic
-markers report `Idle`, `Thinking`, or `ToolCall`; no generic quiet timer runs.
+the prompt, and its independent MCP spinner can repaint continuously, so
+ordinary silence cannot identify readiness or idleness. PRIM launches each run
+with a fresh native `--session-id` and holds it in lifecycle `Starting` until a
+bounded exact-run tracker observes the measured ordered cursor-hide/show startup
+frames: `Starting session…`, then a later full-screen Home repaint containing
+the interactive composer and both shortcut labels. Partial and spinner-only
+frames do not admit, replacement runs cannot inherit progress, and no timeout
+grants readiness. The optional telemetry banner is non-modal in the pinned build
+and is ignored. After admission, only measured semantic markers report `Idle`,
+`Thinking`, or `ToolCall`; no generic quiet timer runs. A Grok UI/copy change can
+therefore fail closed in `Starting` until the pinned markers are re-measured.
 The fresh native session ID intentionally creates a separate Grok conversation
 record for each PRIM run. PRIM never reuses or deletes Grok-owned history, so
 long-lived installations should manage that history through Grok's own tools.

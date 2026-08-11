@@ -6,3 +6,6 @@ edition.workspace = true
 [dependencies]
 shared-types = { path = "../shared-types" }
 uuid.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

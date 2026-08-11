@@ -189,13 +189,19 @@ Work-state events:
 - output quiescence can transition Claude, Codex, and Generic Terminal sessions
   back to lifecycle/work-state `idle`
 - each Grok launch receives a fresh native `--session-id` and remains lifecycle
-  `starting` while the exact run is on the launcher, telemetry-consent screen,
-  or startup repaint; those states reject synthetic delivery while raw terminal
+  `starting` while the exact run is on the launcher or still producing its
+  startup repaint; those states reject synthetic delivery while raw terminal
   input remains available
-- Grok startup has one narrow measured quiescence exception: after its own
-  `Starting session…` marker, every exact-run PTY chunk—including ANSI-only
-  repaint activity—restarts a three-second timer; only expiry with the same
-  `SessionId`/`RunId`/generation and startup marker admits that run as `idle`
+- Grok startup admission is structural, never temporal: a bounded exact-run
+  tracker following the relevant xterm VT500 control transitions requires one
+  completed cursor-hide/show frame containing
+  `Starting session…`, followed by a later completed frame that includes Home
+  plus the interactive composer and both measured shortcut labels, with no
+  launcher/start marker; partial and spinner-only repaints cannot admit
+- the optional Grok Build 1.0.0 telemetry banner is measured non-modal chrome;
+  it is ignored for both blocked-state classification and readiness
+- replacement runs start with a fresh tracker, malformed or over-limit frames
+  fail closed until the next cursor-hide, and no timeout grants readiness
 - after that one-shot admission, Grok Build 1.0.0's variable full-screen repaint
   cadence is never treated as idle; only measured semantic markers report
   `idle`, `thinking`, or `tool_call`
