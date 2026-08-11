@@ -1,10 +1,25 @@
 use std::path::Path;
 
 use shared_types::{LaunchSpec, LaunchSpecError, PermissionProfile, SessionDefinition, WorkState};
+use uuid::Uuid;
+
+// Measured against Grok Build 1.0.0 (3cd0d0cbce). Unknown future text stays
+// fail-closed in lifecycle Starting rather than being inferred ready.
+pub const LAUNCHER_MENU_DETAIL: &str = "launcher_menu";
+pub const SESSION_STARTING_DETAIL: &str = "session_starting";
+pub const TELEMETRY_CONSENT_DETAIL: &str = "telemetry_consent";
 
 pub fn launch_spec(
     definition: &SessionDefinition,
     executable: &str,
+) -> Result<LaunchSpec, LaunchSpecError> {
+    launch_spec_with_session_id(definition, executable, Uuid::new_v4())
+}
+
+fn launch_spec_with_session_id(
+    definition: &SessionDefinition,
+    executable: &str,
+    session_id: Uuid,
 ) -> Result<LaunchSpec, LaunchSpecError> {
     validate_direct_program(executable)?;
 
@@ -17,6 +32,8 @@ pub fn launch_spec(
         permission_mode.into(),
         "--cwd".into(),
         definition.working_dir.clone(),
+        "--session-id".into(),
+        session_id.to_string(),
     ];
 
     Ok(LaunchSpec {
@@ -48,6 +65,20 @@ pub fn classify_work_state(chunk: &str) -> Option<(WorkState, Option<String>)> {
     {
         return Some((WorkState::Blocked, Some("authentication".into())));
     }
+    if lower.contains("help improve grok")
+        && (lower.contains("opt in") || lower.contains("opt out"))
+    {
+        return Some((WorkState::Blocked, Some(TELEMETRY_CONSENT_DETAIL.into())));
+    }
+    if lower.contains("grok build")
+        && lower.contains("new worktree")
+        && lower.contains("resume session")
+    {
+        return Some((WorkState::Blocked, Some(LAUNCHER_MENU_DETAIL.into())));
+    }
+    if lower.contains("starting session...") {
+        return Some((WorkState::Blocked, Some(SESSION_STARTING_DETAIL.into())));
+    }
 
     if normalized.contains("Thinking...") || normalized.contains("Responding...") {
         return Some((WorkState::Thinking, None));
@@ -55,11 +86,7 @@ pub fn classify_work_state(chunk: &str) -> Option<(WorkState, Option<String>)> {
     if normalized.contains("◆ Run ") || normalized.contains("◆ Edit ") {
         return Some((WorkState::ToolCall, None));
     }
-    if lower.contains("worked for ")
-        || (lower.contains("grok build")
-            && lower.contains("new worktree")
-            && lower.contains("resume session"))
-    {
+    if lower.contains("worked for ") {
         return Some((WorkState::Idle, None));
     }
 
@@ -158,11 +185,24 @@ mod tests {
 
     #[test]
     fn normal_launch_is_direct_and_explicitly_uses_default_permissions() {
-        let spec = launch_spec(&definition(PermissionProfile::Normal), GROK_EXECUTABLE).unwrap();
+        let session_id = Uuid::parse_str("8fe042e1-9007-43cc-80bc-ee3d53301ee2").unwrap();
+        let spec = launch_spec_with_session_id(
+            &definition(PermissionProfile::Normal),
+            GROK_EXECUTABLE,
+            session_id,
+        )
+        .unwrap();
         assert_eq!(spec.program, GROK_EXECUTABLE);
         assert_eq!(
             spec.args,
-            vec!["--permission-mode", "default", "--cwd", WORKSPACE_ROOT,]
+            vec![
+                "--permission-mode",
+                "default",
+                "--cwd",
+                WORKSPACE_ROOT,
+                "--session-id",
+                "8fe042e1-9007-43cc-80bc-ee3d53301ee2",
+            ]
         );
         assert_eq!(spec.working_dir, WORKSPACE_ROOT);
         assert!(spec.env.is_empty());
@@ -176,8 +216,34 @@ mod tests {
 
     #[test]
     fn unsafe_launch_uses_the_measured_grok_bypass_mode() {
-        let spec = launch_spec(&definition(PermissionProfile::Unsafe), GROK_EXECUTABLE).unwrap();
+        let spec = launch_spec_with_session_id(
+            &definition(PermissionProfile::Unsafe),
+            GROK_EXECUTABLE,
+            Uuid::nil(),
+        )
+        .unwrap();
         assert_eq!(spec.args[0..2], ["--permission-mode", "bypassPermissions"]);
+    }
+
+    #[test]
+    fn each_launch_gets_one_fresh_grok_session_id_without_a_bootstrap_prompt() {
+        let definition = definition(PermissionProfile::Normal);
+        let first = launch_spec(&definition, GROK_EXECUTABLE).unwrap();
+        let second = launch_spec(&definition, GROK_EXECUTABLE).unwrap();
+
+        let session_id = |spec: &LaunchSpec| {
+            let positions = spec
+                .args
+                .iter()
+                .enumerate()
+                .filter_map(|(index, value)| (value == "--session-id").then_some(index))
+                .collect::<Vec<_>>();
+            assert_eq!(positions.len(), 1);
+            assert_eq!(positions[0] + 2, spec.args.len());
+            Uuid::parse_str(&spec.args[positions[0] + 1]).unwrap()
+        };
+
+        assert_ne!(session_id(&first), session_id(&second));
     }
 
     #[test]
@@ -210,10 +276,23 @@ mod tests {
             WorkState::Idle
         );
         assert_eq!(
-            classify_work_state("Grok Build 1.0.0\nNew worktree\nResume session")
+            classify_work_state("Grok Build 1.0.0\nNew worktree\nResume session"),
+            Some((WorkState::Blocked, Some(LAUNCHER_MENU_DETAIL.into())))
+        );
+        assert_eq!(
+            classify_work_state("Starting session… 0.0s"),
+            Some((WorkState::Blocked, Some(SESSION_STARTING_DETAIL.into())))
+        );
+        assert_eq!(
+            classify_work_state("Help improve Grok [Opt out] [Opt in]"),
+            Some((WorkState::Blocked, Some(TELEMETRY_CONSENT_DETAIL.into())))
+        );
+        assert_eq!(
+            classify_work_state("Responding… 0.4s 16K / 500K")
                 .unwrap()
                 .0,
-            WorkState::Idle
+            WorkState::Thinking
         );
+        assert_eq!(classify_work_state("16K / 500K"), None);
     }
 }

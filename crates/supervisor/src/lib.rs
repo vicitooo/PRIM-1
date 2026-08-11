@@ -76,6 +76,7 @@ const SESSION_STOP_KILL_TIMEOUT: Duration = Duration::from_secs(5);
 const AUTO_RESTART_WINDOW: Duration = Duration::from_secs(30 * 60);
 const AUTO_RESTART_MAX_PER_WINDOW: usize = 3;
 const RECENT_ROUTE_OVERLAP_WINDOW: Duration = Duration::from_secs(3);
+const GROK_STARTUP_QUIESCE_THRESHOLD: Duration = Duration::from_secs(3);
 const SESSION_LABEL_MAX_CHARS: usize = 128;
 const SESSION_CATALOG_SCHEMA_VERSION: u32 = 1;
 const SESSION_CATALOG_FILE_NAME: &str = "session-catalog-v1.json";
@@ -1865,6 +1866,7 @@ impl RunRetirementCause {
 struct QuiesceTimer {
     generation: SessionGeneration,
     run_id: Uuid,
+    armed_at: Instant,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -2459,6 +2461,14 @@ fn ensure_run_input_safety_locked(
             "session '{}' work state is {}{detail}; routed/delivered framing is blocked; use raw terminal input to resolve the prompt",
             target.session,
             work_state_alert_label(Some(slot.work_state)),
+        ));
+    }
+
+    if slot.definition.driver == DriverKind::Grok && slot.state == LifecycleState::Starting {
+        return Err(anyhow!(
+            "session '{}' lifecycle state {:?} is not ready for routed/delivered framing",
+            target.session,
+            slot.state
         ));
     }
 
@@ -3908,15 +3918,11 @@ impl SupervisorHandle {
     fn arm_quiesce_timer(
         &self,
         session_id: SessionId,
-        driver: DriverKind,
         generation: SessionGeneration,
         run_id: Uuid,
         armed_at: Instant,
+        threshold: Duration,
     ) {
-        let Some(threshold) = quiesce_threshold(driver) else {
-            return;
-        };
-
         let handle = self.clone();
         let task = self.inner.background_runtime.spawn(async move {
             tokio::time::sleep(threshold).await;
@@ -3925,14 +3931,17 @@ impl SupervisorHandle {
 
         let mut slots = self.inner.slots.lock();
         if !self.inner.shutdown_started.load(Ordering::Acquire)
-            && let Some(slot) = slots
-                .get_by_id_mut(session_id)
-                .filter(|slot| slot.generation == generation && slot.run_id == Some(run_id))
+            && let Some(slot) = slots.get_by_id_mut(session_id).filter(|slot| {
+                slot.generation == generation
+                    && slot.run_id == Some(run_id)
+                    && slot.last_real_output_at == Some(armed_at)
+            })
         {
             cancel_quiesce_timer_locked(slot);
             slot.quiesce_timer = Some(QuiesceTimer {
                 generation,
                 run_id,
+                armed_at,
                 handle: task,
             });
         } else {
@@ -3961,11 +3970,16 @@ impl SupervisorHandle {
             let timer = slot.quiesce_timer.take();
             match timer {
                 Some(timer)
-                    if timer.generation == armed_generation && timer.run_id == armed_run_id =>
+                    if timer.generation == armed_generation
+                        && timer.run_id == armed_run_id
+                        && timer.armed_at == armed_at =>
                 {
+                    let grok_startup = is_grok_startup_quiescence(slot);
+                    let ordinary_ready = slot.state == LifecycleState::Ready
+                        && quiesce_threshold(slot.definition.driver).is_some();
                     if slot.generation == armed_generation
                         && slot.run_id == Some(armed_run_id)
-                        && slot.state == LifecycleState::Ready
+                        && (ordinary_ready || grok_startup)
                         && slot.last_real_output_at == Some(armed_at)
                     {
                         if ensure_run_event_capacity(slot, 2).is_err() {
@@ -3988,7 +4002,14 @@ impl SupervisorHandle {
                                 identity,
                                 session: session_alias,
                                 state: LifecycleState::Idle,
-                                reason: format!("quiesce timeout {}s", threshold.as_secs()),
+                                reason: if grok_startup {
+                                    format!(
+                                        "Grok startup quiet for {}s; interactive session admitted",
+                                        threshold.as_secs()
+                                    )
+                                } else {
+                                    format!("quiesce timeout {}s", threshold.as_secs())
+                                },
                                 timestamp: now_rfc3339(),
                             });
                             (events, false)
@@ -6342,7 +6363,11 @@ impl SupervisorHandle {
                                 slot.spawn_in_flight = None;
                                 slot.process_id = pty.process_id();
                                 slot.running = Some(RunningSession::new(Some(pty.clone())));
-                                slot.state = LifecycleState::Ready;
+                                slot.state = if slot.definition.driver == DriverKind::Grok {
+                                    LifecycleState::Starting
+                                } else {
+                                    LifecycleState::Ready
+                                };
                                 slot.last_activity_at = Some(now_rfc3339());
                                 slot.last_real_output_at = None;
                                 reset_work_state_locked(slot);
@@ -6507,7 +6532,11 @@ impl SupervisorHandle {
                     identity,
                     session: snapshot.alias.clone(),
                     state: snapshot.lifecycle_state,
-                    reason: "session ready".into(),
+                    reason: if snapshot.driver == DriverKind::Grok {
+                        "Grok process started; awaiting interactive session readiness".into()
+                    } else {
+                        "session ready".into()
+                    },
                     timestamp: now_rfc3339(),
                 });
                 Ok(snapshot)
@@ -7635,22 +7664,6 @@ impl SupervisorHandle {
                         if ensure_run_event_capacity(slot, required_events).is_err() {
                             return;
                         }
-                        let transitioned =
-                            !spawn_is_unconfirmed && slot.state != LifecycleState::Ready;
-                        if transitioned {
-                            slot.state = LifecycleState::Ready;
-                            slot.last_activity_at = Some(now_rfc3339());
-                        }
-                        if !spawn_is_unconfirmed
-                            && has_real_content
-                            && let Some(pty) = slot
-                                .running
-                                .as_ref()
-                                .and_then(|running| running.pty.as_ref().map(|pty| pty.as_ref()))
-                        {
-                            pty.note_real_output(slot.definition.driver);
-                        }
-
                         let classification = if spawn_is_unconfirmed {
                             None
                         } else {
@@ -7665,20 +7678,41 @@ impl SupervisorHandle {
                                 detail,
                             )
                         });
+                        let grok_still_starting = slot.definition.driver == DriverKind::Grok
+                            && slot.state == LifecycleState::Starting
+                            && !(slot.work_state_observed && slot.work_state == WorkState::Idle);
+                        let transitioned = !spawn_is_unconfirmed
+                            && slot.state != LifecycleState::Ready
+                            && !grok_still_starting;
+                        if transitioned {
+                            slot.state = LifecycleState::Ready;
+                            slot.last_activity_at = Some(now_rfc3339());
+                        }
+                        if !spawn_is_unconfirmed
+                            && has_real_content
+                            && let Some(pty) = slot
+                                .running
+                                .as_ref()
+                                .and_then(|running| running.pty.as_ref().map(|pty| pty.as_ref()))
+                        {
+                            pty.note_real_output(slot.definition.driver);
+                        }
 
-                        let quiesce_arm =
-                            real_output_at
-                                .filter(|_| !spawn_is_unconfirmed)
-                                .map(|armed_at| {
-                                    slot.last_real_output_at = Some(armed_at);
-                                    cancel_quiesce_timer_locked(slot);
-                                    (
-                                        slot.definition.driver,
-                                        slot.generation,
-                                        event_run_id,
-                                        armed_at,
-                                    )
-                                });
+                        let startup_output = !spawn_is_unconfirmed
+                            && slot.definition.driver == DriverKind::Grok
+                            && slot.state == LifecycleState::Starting;
+                        let quiesce_activity_at = if startup_output {
+                            Some(observed_at)
+                        } else {
+                            real_output_at.filter(|_| !spawn_is_unconfirmed)
+                        };
+                        let quiesce_arm = quiesce_activity_at.and_then(|armed_at| {
+                            slot.last_real_output_at = Some(armed_at);
+                            cancel_quiesce_timer_locked(slot);
+                            quiesce_threshold_for_slot(slot).map(|threshold| {
+                                (slot.generation, event_run_id, armed_at, threshold)
+                            })
+                        });
                         let ready_identity =
                             transitioned.then(|| next_run_event_identity(slot, event_run_id));
                         let output_identity = next_run_event_identity(slot, event_run_id);
@@ -7704,8 +7738,8 @@ impl SupervisorHandle {
                     return;
                 };
 
-                if let Some((driver, generation, run_id, armed_at)) = quiesce_arm {
-                    self.arm_quiesce_timer(session_id, driver, generation, run_id, armed_at);
+                if let Some((generation, run_id, armed_at, threshold)) = quiesce_arm {
+                    self.arm_quiesce_timer(session_id, generation, run_id, armed_at, threshold);
                 }
 
                 if let Some(event) = work_state_event {
@@ -9092,7 +9126,14 @@ fn transition_work_state_locked(
     detail: Option<String>,
 ) -> Option<RuntimeEvent> {
     if state == WorkState::Blocked {
-        if let Some(key) = detail.as_deref() {
+        if let Some(key) = detail.as_deref()
+            && !matches!(
+                key,
+                driver_grok::LAUNCHER_MENU_DETAIL
+                    | driver_grok::SESSION_STARTING_DETAIL
+                    | driver_grok::TELEMETRY_CONSENT_DETAIL
+            )
+        {
             let now = Instant::now();
             let observations = slot
                 .work_error_observations
@@ -9162,9 +9203,9 @@ fn quiesce_threshold(driver: DriverKind) -> Option<Duration> {
     let threshold = match driver {
         DriverKind::Claude => Duration::from_secs(3),
         DriverKind::Codex => Duration::from_secs(2),
-        // Grok Build 1.0.0 continuously redraws its full-screen TUI at a
-        // variable cadence. Silence is therefore not an honest idle signal;
-        // its measured semantic markers own work-state transitions instead.
+        // Grok Build 1.0.0 uses a separately guarded one-shot startup quiet
+        // window. Silence after admission is not an honest idle signal; its
+        // measured semantic markers own ordinary work-state transitions.
         DriverKind::Grok => return None,
         DriverKind::Prime => return None,
         DriverKind::GenericTerminal => Duration::from_secs(5),
@@ -9172,6 +9213,22 @@ fn quiesce_threshold(driver: DriverKind) -> Option<Duration> {
 
     (threshold >= Duration::from_secs(1) && threshold <= Duration::from_secs(30))
         .then_some(threshold)
+}
+
+fn is_grok_startup_quiescence(slot: &SessionSlot) -> bool {
+    slot.definition.driver == DriverKind::Grok
+        && slot.state == LifecycleState::Starting
+        && slot.work_state_observed
+        && slot.work_state == WorkState::Blocked
+        && slot.work_detail.as_deref() == Some(driver_grok::SESSION_STARTING_DETAIL)
+}
+
+fn quiesce_threshold_for_slot(slot: &SessionSlot) -> Option<Duration> {
+    if is_grok_startup_quiescence(slot) {
+        Some(GROK_STARTUP_QUIESCE_THRESHOLD)
+    } else {
+        quiesce_threshold(slot.definition.driver)
+    }
 }
 
 fn audit_file_name(date: NaiveDate) -> String {
@@ -11014,9 +11071,14 @@ mod tests {
             .background_runtime
             .spawn(std::future::pending::<()>());
         let mut slots = supervisor.inner.slots.lock();
+        let armed_at = slots
+            .get(name)
+            .and_then(|slot| slot.last_real_output_at)
+            .unwrap_or_else(Instant::now);
         slots.get_mut(name).unwrap().quiesce_timer = Some(QuiesceTimer {
             generation,
             run_id,
+            armed_at,
             handle,
         });
     }
@@ -12176,7 +12238,7 @@ mod tests {
 
         for chunk in [
             "◆ Thinking…",
-            "measured full-screen repaint",
+            "⠴ MCP (4/9) │ 16K / 500K",
             "Worked for 6.3s",
             "another measured full-screen repaint",
         ] {
@@ -12229,6 +12291,306 @@ mod tests {
     }
 
     #[test]
+    fn grok_startup_blocks_synthetic_routes_until_one_shot_quiet_admission() {
+        let supervisor = test_supervisor();
+        let (pty, inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "codex",
+            DriverKind::Grok,
+            pty,
+        );
+        let session_id = test_session_id(&supervisor, "codex");
+        let run_id = current_run_id(&supervisor, "codex");
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_mut("codex").unwrap();
+            slot.state = LifecycleState::Starting;
+            reset_work_state_locked(slot);
+        }
+        let events = capture_runtime_events(&supervisor);
+
+        let before = slots_mutation_probe(&supervisor);
+        let audit_before = fs::read(supervisor.audit_log_path()).unwrap_or_default();
+        let error = supervisor
+            .route_operator_message(OperatorRouteMessageRequest {
+                recipient_id: session_id,
+                content: "must wait for Grok startup".into(),
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("lifecycle state Starting is not ready"),
+            "{error:#}"
+        );
+        assert_eq!(slots_mutation_probe(&supervisor), before);
+        assert!(inputs.lock().is_empty());
+        assert!(events.lock().is_empty());
+        assert_eq!(
+            fs::read(supervisor.audit_log_path()).unwrap_or_default(),
+            audit_before
+        );
+
+        handle_current_pty_event(
+            &supervisor,
+            "codex",
+            0,
+            PtyEvent::Output("Grok Build 1.0.0\nNew worktree\nResume session".into()),
+        );
+        for _ in 0..3 {
+            handle_current_pty_event(
+                &supervisor,
+                "codex",
+                0,
+                PtyEvent::Output("Grok Build 1.0.0\nNew worktree\nResume session".into()),
+            );
+        }
+        {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get("codex").unwrap();
+            assert_eq!(slot.state, LifecycleState::Starting);
+            assert_eq!(slot.work_state, WorkState::Blocked);
+            assert_eq!(
+                slot.work_detail.as_deref(),
+                Some(driver_grok::LAUNCHER_MENU_DETAIL)
+            );
+            assert!(slot.quiesce_timer.is_none());
+            assert!(slot.work_error_observations.is_empty());
+        }
+        events.lock().clear();
+        let before = slots_mutation_probe(&supervisor);
+        let audit_before = fs::read(supervisor.audit_log_path()).unwrap_or_default();
+        let error = supervisor
+            .route_operator_message(OperatorRouteMessageRequest {
+                recipient_id: session_id,
+                content: "must not enter the launcher".into(),
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("work state is blocked (launcher_menu)"),
+            "{error:#}"
+        );
+        assert_eq!(slots_mutation_probe(&supervisor), before);
+        assert!(inputs.lock().is_empty());
+        assert!(events.lock().is_empty());
+        assert_eq!(
+            fs::read(supervisor.audit_log_path()).unwrap_or_default(),
+            audit_before
+        );
+
+        supervisor
+            .send_input(SendInputRequest {
+                session_id,
+                input: "raw input remains available".into(),
+            })
+            .expect("raw operator input must remain available during Grok startup");
+        assert_eq!(inputs.lock().as_slice(), &["raw input remains available"]);
+        inputs.lock().clear();
+
+        handle_current_pty_event(
+            &supervisor,
+            "codex",
+            0,
+            PtyEvent::Output("Starting session… 0.0s".into()),
+        );
+        let first_armed_at = {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get("codex").unwrap();
+            assert!(is_grok_startup_quiescence(slot));
+            assert!(slot.quiesce_timer.is_some());
+            slot.last_real_output_at.unwrap()
+        };
+        thread::sleep(Duration::from_millis(2));
+        handle_current_pty_event(
+            &supervisor,
+            "codex",
+            0,
+            PtyEvent::Output("\x1b[?25l\x1b[2;94H⠙\x1b[36;7H\x1b[?25h".into()),
+        );
+        let rearmed_at = {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get("codex").unwrap();
+            assert!(slot.quiesce_timer.is_some());
+            slot.last_real_output_at.unwrap()
+        };
+        assert!(rearmed_at > first_armed_at);
+
+        supervisor.fire_quiesce_timer(
+            session_id,
+            0,
+            run_id,
+            rearmed_at,
+            GROK_STARTUP_QUIESCE_THRESHOLD,
+        );
+        {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get("codex").unwrap();
+            assert_eq!(slot.state, LifecycleState::Idle);
+            assert_eq!(slot.work_state, WorkState::Idle);
+            assert!(slot.work_state_observed);
+            assert_eq!(slot.work_detail, None);
+            assert!(slot.quiesce_timer.is_none());
+        }
+
+        events.lock().clear();
+        supervisor
+            .route_operator_message(OperatorRouteMessageRequest {
+                recipient_id: session_id,
+                content: "accepted after readiness".into(),
+            })
+            .expect("Grok route should be admitted after exact-run startup quiet");
+        assert_eq!(inputs.lock().len(), 2);
+        assert!(matches!(
+            &route_delivery_events(&events)[..],
+            [
+                RuntimeEvent::RouteDelivery {
+                    phase: RouteDeliveryPhase::Resolved,
+                    ..
+                },
+                RuntimeEvent::RouteDelivery {
+                    phase: RouteDeliveryPhase::Written,
+                    ..
+                }
+            ]
+        ));
+    }
+
+    #[test]
+    fn stale_grok_startup_timer_cannot_admit_a_replacement_run() {
+        let supervisor = test_supervisor();
+        install_synthetic_running_session(&supervisor, "codex", DriverKind::Grok);
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_mut("codex").unwrap();
+            slot.state = LifecycleState::Starting;
+            reset_work_state_locked(slot);
+        }
+        handle_current_pty_event(
+            &supervisor,
+            "codex",
+            0,
+            PtyEvent::Output("Starting session… 0.0s".into()),
+        );
+        let session_id = test_session_id(&supervisor, "codex");
+        let stale_run_id = current_run_id(&supervisor, "codex");
+        let armed_at = supervisor
+            .inner
+            .slots
+            .lock()
+            .get("codex")
+            .unwrap()
+            .last_real_output_at
+            .unwrap();
+        let replacement_run_id = Uuid::new_v4();
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_mut("codex").unwrap();
+            cancel_quiesce_timer_locked(slot);
+            slot.generation = 1;
+            slot.run_id = Some(replacement_run_id);
+            slot.last_run_id = Some(replacement_run_id);
+            slot.state = LifecycleState::Starting;
+            reset_work_state_locked(slot);
+        }
+        let events = capture_runtime_events(&supervisor);
+
+        supervisor.fire_quiesce_timer(
+            session_id,
+            0,
+            stale_run_id,
+            armed_at,
+            GROK_STARTUP_QUIESCE_THRESHOLD,
+        );
+
+        let slots = supervisor.inner.slots.lock();
+        let slot = slots.get("codex").unwrap();
+        assert_eq!(slot.generation, 1);
+        assert_eq!(slot.run_id, Some(replacement_run_id));
+        assert_eq!(slot.state, LifecycleState::Starting);
+        assert!(!slot.work_state_observed);
+        assert!(!events.lock().iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SessionState {
+                state: LifecycleState::Idle,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn grok_startup_timer_is_cancelled_when_the_blocked_detail_changes() {
+        let supervisor = test_supervisor();
+        install_synthetic_running_session(&supervisor, "codex", DriverKind::Grok);
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_mut("codex").unwrap();
+            slot.state = LifecycleState::Starting;
+            reset_work_state_locked(slot);
+        }
+        handle_current_pty_event(
+            &supervisor,
+            "codex",
+            0,
+            PtyEvent::Output("Starting session… 0.0s".into()),
+        );
+        let session_id = test_session_id(&supervisor, "codex");
+        let run_id = current_run_id(&supervisor, "codex");
+        let stale_armed_at = supervisor
+            .inner
+            .slots
+            .lock()
+            .get("codex")
+            .unwrap()
+            .last_real_output_at
+            .unwrap();
+
+        handle_current_pty_event(
+            &supervisor,
+            "codex",
+            0,
+            PtyEvent::Output("Help improve Grok [Opt out] [Opt in]".into()),
+        );
+        {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get("codex").unwrap();
+            assert_eq!(slot.state, LifecycleState::Starting);
+            assert_eq!(slot.work_state, WorkState::Blocked);
+            assert_eq!(
+                slot.work_detail.as_deref(),
+                Some(driver_grok::TELEMETRY_CONSENT_DETAIL)
+            );
+            assert!(slot.quiesce_timer.is_none());
+        }
+        let events = capture_runtime_events(&supervisor);
+
+        supervisor.fire_quiesce_timer(
+            session_id,
+            0,
+            run_id,
+            stale_armed_at,
+            GROK_STARTUP_QUIESCE_THRESHOLD,
+        );
+
+        let slots = supervisor.inner.slots.lock();
+        let slot = slots.get("codex").unwrap();
+        assert_eq!(slot.state, LifecycleState::Starting);
+        assert_eq!(
+            slot.work_detail.as_deref(),
+            Some(driver_grok::TELEMETRY_CONSENT_DETAIL)
+        );
+        assert!(!events.lock().iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SessionState {
+                state: LifecycleState::Idle,
+                ..
+            }
+        )));
+    }
+
+    #[test]
     fn idle_cancelled_on_new_output() {
         let supervisor = test_supervisor();
         install_synthetic_running_session(&supervisor, "codex", DriverKind::Codex);
@@ -12275,6 +12637,63 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    #[test]
+    fn stale_quiesce_callback_cannot_consume_a_newer_timer_for_the_same_run() {
+        let supervisor = test_supervisor();
+        install_synthetic_running_session(&supervisor, "codex", DriverKind::Codex);
+        let session_id = test_session_id(&supervisor, "codex");
+        let run_id = current_run_id(&supervisor, "codex");
+        let older = Instant::now();
+        let newer = older + Duration::from_millis(1);
+        let newer_handle = supervisor
+            .inner
+            .background_runtime
+            .spawn(std::future::pending::<()>());
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_mut("codex").unwrap();
+            slot.state = LifecycleState::Ready;
+            slot.last_real_output_at = Some(newer);
+            slot.quiesce_timer = Some(QuiesceTimer {
+                generation: 0,
+                run_id,
+                armed_at: newer,
+                handle: newer_handle,
+            });
+        }
+        let events = capture_runtime_events(&supervisor);
+
+        supervisor.arm_quiesce_timer(session_id, 0, run_id, older, Duration::from_secs(2));
+        assert_eq!(
+            supervisor
+                .inner
+                .slots
+                .lock()
+                .get("codex")
+                .and_then(|slot| slot.quiesce_timer.as_ref())
+                .map(|timer| timer.armed_at),
+            Some(newer),
+            "an older arm must not replace the current observation's timer"
+        );
+        supervisor.fire_quiesce_timer(session_id, 0, run_id, older, Duration::from_secs(2));
+
+        let slots = supervisor.inner.slots.lock();
+        let slot = slots.get("codex").unwrap();
+        assert_eq!(slot.state, LifecycleState::Ready);
+        assert_eq!(slot.last_real_output_at, Some(newer));
+        assert_eq!(
+            slot.quiesce_timer.as_ref().map(|timer| timer.armed_at),
+            Some(newer)
+        );
+        assert!(!events.lock().iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SessionState {
+                state: LifecycleState::Idle,
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -18191,20 +18610,24 @@ mod tests {
             shared_types::PermissionProfile::Unsafe
         );
 
-        supervisor
+        let started = supervisor
             .start_session_by_id(session.session_id)
             .expect("start captured Grok session");
+        assert_eq!(started.lifecycle_state, LifecycleState::Starting);
         let specs = specs.lock();
         assert_eq!(specs.len(), 1);
         assert_eq!(
-            specs[0].args,
-            vec![
+            specs[0].args[0..4],
+            [
                 "--permission-mode",
                 "bypassPermissions",
                 "--cwd",
                 session.working_dir.as_str(),
             ]
         );
+        assert_eq!(specs[0].args[4], "--session-id");
+        assert_eq!(specs[0].args.len(), 6);
+        Uuid::parse_str(&specs[0].args[5]).expect("Grok launch must use a fresh UUID");
         drop(specs);
         supervisor
             .stop_session_by_id(session.session_id)

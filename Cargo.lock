@@ -703,6 +703,7 @@ name = "driver-grok"
 version = "0.1.0"
 dependencies = [
  "shared-types",
+ "uuid",
 ]
 
 [[package]]

@@ -187,9 +187,18 @@ Work-state events:
 - each event carries a nested `RunEventIdentity` (`SessionId`, `RunId`, generation, monotonic sequence), the current session label, state, optional detail, optional previous state, and timestamp
 - events are transition-based; repeated output in the same work state updates supervisor memory but does not emit another audit event
 - output quiescence can transition Claude, Codex, and Generic Terminal sessions
-  back to lifecycle/work-state `idle`; Grok Build 1.0.0 redraws its full-screen
-  TUI at a variable cadence, so its live lifecycle remains `ready` and only its
-  measured semantic markers report `idle`, `thinking`, or `tool_call`
+  back to lifecycle/work-state `idle`
+- each Grok launch receives a fresh native `--session-id` and remains lifecycle
+  `starting` while the exact run is on the launcher, telemetry-consent screen,
+  or startup repaint; those states reject synthetic delivery while raw terminal
+  input remains available
+- Grok startup has one narrow measured quiescence exception: after its own
+  `Starting session…` marker, every exact-run PTY chunk—including ANSI-only
+  repaint activity—restarts a three-second timer; only expiry with the same
+  `SessionId`/`RunId`/generation and startup marker admits that run as `idle`
+- after that one-shot admission, Grok Build 1.0.0's variable full-screen repaint
+  cadence is never treated as idle; only measured semantic markers report
+  `idle`, `thinking`, or `tool_call`
 - repeated blocked observations with the same detail can escalate to `error_loop`
 - process exit is never inferred from terminal text; PTY closure/error, OS process state, and job membership own process lifecycle truth
 - `closed` means the exact per-run owned process job was proved empty; PTY EOF,

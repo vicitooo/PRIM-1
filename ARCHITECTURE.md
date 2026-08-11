@@ -561,7 +561,9 @@ These are not deferred hardening tasks. They are mandatory from the first workin
   `--ask-for-approval on-request --sandbox workspace-write`; `Unsafe` adds only
   `--dangerously-bypass-approvals-and-sandbox`.
 - Grok `Normal` launches directly with `--permission-mode default`; `Unsafe`
-  changes only that value to `bypassPermissions`.
+  changes only that value to `bypassPermissions`. Every run also receives one
+  fresh native `--session-id` with no bootstrap prompt, bypassing the launcher
+  without reusing Grok-owned history.
 - Prime launches only with `Normal`. The Windows command is direct `wsl.exe`;
   the Linux side uses absolute `systemd-run`, Python, and `prime-agent` paths,
   with no shell evaluation or renderer-controlled arguments.
@@ -570,6 +572,14 @@ These are not deferred hardening tasks. They are mandatory from the first workin
 These are visible harness permission profiles, not hostile same-user OS
 isolation. Stronger containment would require a separately measured restricted
 user, ACL, container, VM, or equivalent boundary.
+
+Grok remains lifecycle `Starting` through its launcher, telemetry-consent, and
+startup repaint states, so synthetic delivery fails closed while raw input can
+resolve a prompt. Once Grok emits its measured `Starting session…` marker, every
+raw exact-run PTY chunk rearms a three-second one-shot startup timer. Expiry may
+admit only that same `SessionId`/`RunId`/generation. After admission, ordinary
+Grok silence is never an idle signal; semantic `Thinking`, tool, and `Worked
+for` markers own work state.
 
 ## 11. 24/7 target model
 
