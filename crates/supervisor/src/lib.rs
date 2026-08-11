@@ -81,6 +81,13 @@ const SESSION_CATALOG_FILE_NAME: &str = "session-catalog-v1.json";
 const PANE_MCP_SERVER_NAME: &str = "prim1_pane";
 #[cfg(windows)]
 const PANE_MCP_MODE_ARGUMENT: &str = "--prim1-pane-mcp";
+#[cfg(windows)]
+const PANE_MCP_ENVIRONMENT_VARIABLES: &[&str] = &[
+    "PRIM1_CONTROL_PLANE_TRANSPORT",
+    "PRIM1_CONTROL_PLANE_ENDPOINT",
+    "PRIM1_CONTROL_PLANE_SERVER_PID",
+    "PRIM1_CONTROL_PLANE_SERVER_STARTED_FILETIME",
+];
 
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8898,11 +8905,15 @@ fn augment_launch_spec_with_pane_mcp(
                 .context("failed to encode Codex pane MCP command")?;
             let arguments = serde_json::to_string(&[PANE_MCP_MODE_ARGUMENT])
                 .context("failed to encode Codex pane MCP arguments")?;
+            let environment_variables = serde_json::to_string(PANE_MCP_ENVIRONMENT_VARIABLES)
+                .context("failed to encode Codex pane MCP environment allowlist")?;
             spec.args.extend([
                 "-c".into(),
                 format!("mcp_servers.{PANE_MCP_SERVER_NAME}.command={command}"),
                 "-c".into(),
                 format!("mcp_servers.{PANE_MCP_SERVER_NAME}.args={arguments}"),
+                "-c".into(),
+                format!("mcp_servers.{PANE_MCP_SERVER_NAME}.env_vars={environment_variables}"),
                 "-c".into(),
                 format!("mcp_servers.{PANE_MCP_SERVER_NAME}.required=true"),
             ]);
@@ -20693,6 +20704,10 @@ mod tests {
         )));
         assert!(codex_arguments.contains(&format!(
             "mcp_servers.{PANE_MCP_SERVER_NAME}.args=[\"{PANE_MCP_MODE_ARGUMENT}\"]"
+        )));
+        assert!(codex_arguments.contains(&format!(
+            "mcp_servers.{PANE_MCP_SERVER_NAME}.env_vars={}",
+            serde_json::to_string(PANE_MCP_ENVIRONMENT_VARIABLES).unwrap()
         )));
         assert!(
             codex_arguments.contains(&format!("mcp_servers.{PANE_MCP_SERVER_NAME}.required=true"))

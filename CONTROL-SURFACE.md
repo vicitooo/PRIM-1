@@ -121,6 +121,9 @@ recipient, lifecycle, or delivery authority. Each tool call opens the existing
 named pipe, pins and verifies the expected desktop server process, and then
 uses the same kernel-derived caller/run/membership checks as the PowerShell
 helper. MCP frames and control-plane frames are both bounded and fail closed.
+Codex forwards only the four injected transport and desktop-server identity
+environment variables to this child; none carries caller, room, or sender
+authority.
 
 Grok Build 1.0.0 exposes session-scoped plugins only through its non-interactive
 agent protocol, not the TUI used by PRIM-1. `GROK_HOME` also owns Grok's
