@@ -26,7 +26,7 @@ fn main() {
     });
 
     if let Some(port) = startup.cdp_port() {
-        let args = format!("--remote-debugging-port={port} --remote-allow-origins=*");
+        let args = cli_master_wrapper_desktop_lib::cdp_browser_arguments(port);
         unsafe {
             std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", args);
         }

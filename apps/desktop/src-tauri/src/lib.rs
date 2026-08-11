@@ -124,6 +124,7 @@ impl DesktopDiagnostics {
 struct DesktopState {
     supervisor: SupervisorHandle,
     diagnostics: DesktopDiagnostics,
+    automation_mode: bool,
     shutdown_started: AtomicBool,
     shutdown_succeeded: AtomicBool,
     fullscreen_on_first_focus: AtomicBool,
@@ -587,6 +588,11 @@ impl TerminalOutputSanitizer {
         // renderer's sequence gate, so terminal close discards it atomically.
         String::new()
     }
+}
+
+#[tauri::command]
+fn automation_mode(state: State<'_, DesktopState>) -> bool {
+    state.automation_mode
 }
 
 #[tauri::command]
@@ -1096,6 +1102,10 @@ impl StartupConfig {
     }
 }
 
+pub fn cdp_browser_arguments(port: u16) -> String {
+    format!("--remote-debugging-port={port} --remote-debugging-address=127.0.0.1")
+}
+
 pub fn load_startup_config() -> Result<StartupConfig, String> {
     let startup_cwd = std::env::current_dir()
         .map_err(|error| format!("failed to resolve startup working directory: {error}"))?;
@@ -1587,6 +1597,7 @@ pub fn run(startup: StartupConfig) {
             app.manage(DesktopState {
                 supervisor,
                 diagnostics: setup_diagnostics.clone(),
+                automation_mode: setup_startup.cdp_port.is_some(),
                 shutdown_started: AtomicBool::new(false),
                 shutdown_succeeded: AtomicBool::new(false),
                 fullscreen_on_first_focus: AtomicBool::new(setup_startup.start_minimized),
@@ -1608,6 +1619,7 @@ pub fn run(startup: StartupConfig) {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            automation_mode,
             bootstrap,
             start_session,
             stop_session,
@@ -1701,11 +1713,11 @@ mod tests {
         DesktopInstanceLock, MAX_UI_OUTPUT_BATCH_AGE, MAX_UI_OUTPUT_BATCH_BYTES,
         PendingOutputBatcher, PendingSessionOutput, RendererTerminalStream,
         TerminalOutputSanitizer, UI_EVENT_QUEUE_CAPACITY, UiEventEnqueueResult, UiOutputGap,
-        close_main_window_gracefully, normalize_path_for_child_processes, parse_cdp_port,
-        parse_start_minimized, queue_pending_session_output, resolve_agent_working_root_from,
-        resolve_environment_source, resolve_runtime_dir_override, sanitize_terminal_output_for_ui,
-        ui_event_channel, ui_output_gap_runtime_event, validate_and_lock_desktop_runtime,
-        validate_runtime_storage_paths,
+        cdp_browser_arguments, close_main_window_gracefully, normalize_path_for_child_processes,
+        parse_cdp_port, parse_start_minimized, queue_pending_session_output,
+        resolve_agent_working_root_from, resolve_environment_source, resolve_runtime_dir_override,
+        sanitize_terminal_output_for_ui, ui_event_channel, ui_output_gap_runtime_event,
+        validate_and_lock_desktop_runtime, validate_runtime_storage_paths,
     };
     use shared_types::{
         LifecycleState, LogLevel, OperatorRouteMessageRequest, RunEventIdentity, RuntimeEvent,
@@ -2719,6 +2731,56 @@ mod tests {
             )))
             .is_err()
         );
+    }
+
+    #[test]
+    fn release_webview_security_configuration_is_fail_closed() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(config["app"]["withGlobalTauri"], false);
+
+        let csp = config["app"]["security"]["csp"]
+            .as_str()
+            .expect("release CSP must be configured");
+        for directive in [
+            "default-src 'self'",
+            "script-src 'self'",
+            "connect-src 'self' ipc: http://ipc.localhost",
+            "object-src 'none'",
+            "base-uri 'none'",
+            "form-action 'none'",
+            "frame-ancestors 'none'",
+        ] {
+            assert!(csp.contains(directive), "missing CSP directive {directive}");
+        }
+        assert!(!csp.contains("'unsafe-eval'"));
+
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+        assert_eq!(
+            capability["permissions"],
+            serde_json::json!([
+                "core:event:allow-listen",
+                "core:event:allow-unlisten",
+                "core:window:allow-is-focused",
+                "core:window:allow-is-fullscreen",
+                "core:window:allow-is-minimized"
+            ])
+        );
+
+        let manifest = include_str!("../Cargo.toml");
+        assert!(!manifest.contains("features = [\"devtools\"]"));
+    }
+
+    #[test]
+    fn cdp_browser_arguments_bind_loopback_without_wildcard_origins() {
+        let arguments = cdp_browser_arguments(9222);
+        assert_eq!(
+            arguments,
+            "--remote-debugging-port=9222 --remote-debugging-address=127.0.0.1"
+        );
+        assert!(!arguments.contains("remote-allow-origins"));
+        assert!(!arguments.contains("0.0.0.0"));
     }
 
     #[test]

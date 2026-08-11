@@ -172,6 +172,15 @@ not redirect Grok-owned sessions or logs; operator room sends remain available.
 
 Treat the app-local runtime directory as private machine-local state. The repo-local `.runtime/` directory remains gitignored for test environments and developer scratch files; it is no longer the product runtime default.
 
+The packaged renderer loads only bundled assets under an explicit Content
+Security Policy. It exposes no global Tauri API during normal use, ships without
+the in-app devtools feature, and grants the renderer only event-listener plus
+read-only window-state capabilities. Exact-artifact QA may opt into a numeric
+`PRIM1_CDP_PORT`; that mode binds WebView2 debugging to loopback, never enables
+wildcard origins, and exposes a frozen automation bridge only for the lifetime
+of that explicitly instrumented process. Production-artifact screenshots use
+the WebView's built-in `Page.captureScreenshot` path.
+
 ## Contributing
 
 This is a personal open-source project. Bug reports and well-scoped pull requests are welcome via GitHub Issues / PRs against the `main` branch.

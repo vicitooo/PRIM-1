@@ -501,6 +501,23 @@ Active heartbeats can be added later, but v1 should not block on them.
 
 Generic wrapper does not imply generic trust.
 
+The desktop renderer is bundled-only and runs under an explicit CSP: scripts
+come from the application bundle, objects/frames/forms are denied, and the one
+inline-style allowance exists for xterm and the current static HUD markup. The
+normal renderer has no `window.__TAURI__` global and the release binary omits
+the in-app devtools feature. Its capability manifest grants only runtime-event
+listen/unlisten plus read-only focused/fullscreen/minimized queries used by the
+test seam; filesystem, shell, menu, image, tray, and devtools-toggle commands
+are not granted.
+
+Production-artifact automation is an explicit local diagnostic mode rather
+than a second build. A strictly parsed `PRIM1_CDP_PORT` binds WebView2 debugging
+to `127.0.0.1` without wildcard origins. Only in that mode does trusted bundled
+frontend code install a frozen compatibility bridge containing `invoke`,
+`listen`, and `getCurrentWindow`, allowing the same exact artifact to run the
+verification matrix and built-in `Page.captureScreenshot` receipts. Without
+the opt-in port, the bridge and debugging endpoint are absent.
+
 Per-agent policy should include:
 
 - qualified working-directory selection

@@ -1,8 +1,11 @@
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
+
+import { exposeAutomationBridge } from "./automation-bridge";
 
 import {
   resolveCopySelection,
@@ -752,15 +755,25 @@ const runtimeEventContext: RuntimeEventContext = {
   },
 };
 
-void registerRuntimeEventsBeforeBootstrap(
-  () =>
-    listen<RuntimeEvent>("runtime://event", ({ payload }) => {
-      handleRuntimeEvent(payload, runtimeEventContext);
-    }),
-  bootstrap,
-).catch((error) => {
+void initializeUi().catch((error) => {
   writeSystem("error", `UI initialization failed: ${String(error)}`);
 });
+
+async function initializeUi(): Promise<void> {
+  const automationMode = await command<boolean>("automation_mode");
+  exposeAutomationBridge(window, automationMode, {
+    core: { invoke },
+    event: { listen },
+    window: { getCurrentWindow },
+  });
+  await registerRuntimeEventsBeforeBootstrap(
+    () =>
+      listen<RuntimeEvent>("runtime://event", ({ payload }) => {
+        handleRuntimeEvent(payload, runtimeEventContext);
+      }),
+    bootstrap,
+  );
+}
 
 async function bootstrap(): Promise<void> {
   await refreshSnapshot();
