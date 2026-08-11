@@ -270,6 +270,9 @@ Current pane authority is deliberately narrower than operator room authority:
 - Claude Code and Codex receive a session-scoped `prim1_pane` stdio MCP child
   exposing only `ping`, `room_read`, and `room_post`; the MCP layer contributes
   no authority and every call is re-authorized through the named pipe
+- Claude's three fully qualified pane-MCP tool names are allowed only for that
+  process; no wildcard or persistent user/workspace permission is installed,
+  and all non-pane tools retain the selected harness permission policy
 - Grok Build 1.0.0 receives no model-facing pane tool: its TUI lacks a
   privacy-safe session-scoped plugin/config seam and its shell-tool children do
   not satisfy Job membership. Operator sends/raw input remain available, with

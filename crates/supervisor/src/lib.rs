@@ -88,6 +88,12 @@ const PANE_MCP_ENVIRONMENT_VARIABLES: &[&str] = &[
     "PRIM1_CONTROL_PLANE_SERVER_PID",
     "PRIM1_CONTROL_PLANE_SERVER_STARTED_FILETIME",
 ];
+#[cfg(windows)]
+const PANE_MCP_CLAUDE_ALLOWED_TOOLS: &[&str] = &[
+    "mcp__prim1_pane__ping",
+    "mcp__prim1_pane__room_read",
+    "mcp__prim1_pane__room_post",
+];
 
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8898,7 +8904,12 @@ fn augment_launch_spec_with_pane_mcp(
                 "mcpServers": servers,
             }))
             .context("failed to encode Claude pane MCP configuration")?;
-            spec.args.extend(["--mcp-config".into(), config]);
+            spec.args.extend([
+                "--mcp-config".into(),
+                config,
+                "--allowedTools".into(),
+                PANE_MCP_CLAUDE_ALLOWED_TOOLS.join(","),
+            ]);
         }
         PaneMcpClient::Codex => {
             let command = serde_json::to_string(&executable)
@@ -20693,6 +20704,16 @@ mod tests {
             claude_config["mcpServers"][PANE_MCP_SERVER_NAME]["args"],
             serde_json::json!([PANE_MCP_MODE_ARGUMENT])
         );
+        let allowed_tools_index = claude
+            .args
+            .iter()
+            .position(|argument| argument == "--allowedTools")
+            .expect("Claude launch must pre-approve the exact pane MCP tools");
+        assert_eq!(
+            claude.args[allowed_tools_index + 1],
+            PANE_MCP_CLAUDE_ALLOWED_TOOLS.join(",")
+        );
+        assert!(!claude.args[allowed_tools_index + 1].contains('*'));
 
         let mut codex = base_spec(DriverKind::Codex);
         augment_launch_spec_with_pane_mcp(&mut codex, PaneMcpClient::Codex, &executable)

@@ -124,6 +124,11 @@ helper. MCP frames and control-plane frames are both bounded and fail closed.
 Codex forwards only the four injected transport and desktop-server identity
 environment variables to this child; none carries caller, room, or sender
 authority.
+Claude receives an ephemeral, process-local allowlist for exactly these three
+fully qualified MCP tools. That makes the safe pane tools autonomous without a
+per-call approval or persistent harness setting; every other Claude tool keeps
+the selected Normal/Unsafe permission policy, and newly added MCP tools remain
+unapproved by default.
 
 Grok Build 1.0.0 exposes session-scoped plugins only through its non-interactive
 agent protocol, not the TUI used by PRIM-1. `GROK_HOME` also owns Grok's
