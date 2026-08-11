@@ -125,7 +125,8 @@ kind requires a new explicit contract and authority model.
 ## 6. Visible injection contract
 
 When a routed message is injected into a Claude, Codex, or Grok PTY, it must be
-visibly stamped inside the bracketed-paste frame. Generic Terminal is the
+visibly stamped inside its logical bracketed submission. Claude/Codex use one
+frame; Grok minimal mode uses one fused buffer of per-line frames. Generic Terminal is the
 deliberate exception: the PTY receives only the validated printable single-line
 source command, while PRIM displays provenance in its feed and route receipts
 and retains provenance metadata in the audit. Prefixing a generic shell command
@@ -142,14 +143,16 @@ V1 rule:
 - injections must be explicit and human-readable
 - hidden control messages are not acceptable in the visible room
 - one logical message holds one run-scoped FIFO input permit until its harness submit is complete; semantic chunking is forbidden, but a driver may use multiple serialized PTY calls when its measured TUI protocol requires a boundary
-- for Claude, Codex, and Grok, the Rust supervisor requires enabled paste mode before writing one complete bracketed-paste frame, waits from that successful write boundary for a one-second base interval plus a proportional 500 milliseconds per MiB of framed input, revalidates the exact run and safe observed work state, then writes one Enter under the same permit; the exact final-child oracle observed approximately 10/19/174 milliseconds of parser lag at 1 KiB/64 KiB/1 MiB, while 500 milliseconds per MiB is the deliberately conservative stability margin, the 1 MiB body cap keeps that margin bounded to roughly half a second, and tests cover embedded CR, LF, tabs, Unicode, blank lines, and trailing spaces from the backend request body through the bytes admitted to the PTY writer
+- for Claude and Codex, the Rust supervisor requires enabled paste mode before writing one complete bracketed-paste frame; Grok always launches in measured `--minimal` mode and instead receives one complete fused buffer containing one bracketed frame per LF-separated logical line with `ESC CR` (Alt+Enter) between frames, preserving empty and trailing lines without per-line host waits
+- Grok minimal delivery rejects any source carriage return, body above 13 KiB, or more than 256 source lines during whole-route preflight; these bounds stay below the Grok Build 1.0.0 receiver-proven 261-line / 14,333-byte GREEN while a preserved 4,095-line / 114,780-byte neighbor remains RED, and a partial/error/short first write reports exact progress but sends no Enter or retry
+- after the complete first input, Claude, Codex, and Grok wait from that successful write boundary for a one-second base interval plus a proportional 500 milliseconds per MiB of framed input, revalidate the exact run and safe observed work state, then write one Enter under the same permit; the exact final-child oracle observed approximately 10/19/174 milliseconds of parser lag at 1 KiB/64 KiB/1 MiB, while 500 milliseconds per MiB is the deliberately conservative stability margin
 - PTY output is not treated as paste acknowledgement because a multiline paste may remain intentionally invisible until Enter; another operator, pane-sideband, or routed input cannot interleave during the interval, and an uncertain outcome is never followed by an automatic Enter or message retry
 - bracketed delivery is admitted only after the exact active run's incrementally decoded, unshed PTY stream has enabled DEC private mode 2004 and its last driver-observed work state is not `blocked` or `error_loop`; UTF-8 code points split across PTY reads are carried intact so the scanner and renderer receive the same character stream, the bounded scanner resets for every `RunId`, follows the shipped terminal's relevant control transitions, returns to unknown on parser overflow, and refuses unknown/disabled mode or a known unsafe work state before route metadata or PTY writes
 - the supervisor revalidates `SessionId`, `RunId`, generation, PTY, input gate, enabled paste mode, and safe observed work state together before the paste frame; before Enter it revalidates the same exact run/gate/PTY and safe work state but does not require paste mode to remain enabled because Codex legitimately emits DECRST after consuming a completed frame; this proves the state observed at those writer boundaries, not the child's interpretation during or after them, and raw operator or pane-sideband typing remains available when addressed delivery is refused
-- within that proven Rust boundary, supervisor framing does not normalize, trim, flatten, or silently truncate source-content UTF-8 bytes
+- within that proven Rust boundary, supervisor framing does not trim, flatten, or silently truncate source-content UTF-8 bytes; Grok accepts LF-only source and fails closed on CR rather than normalizing it
 - final-child byte fidelity and receiver receipt remain Gate 3 RED; `PtySession::send_input` success and `route_delivery.phase = "written"` prove only the PTY-writer outcome
 - clipboard-to-WebView textarea CRLF fidelity before the backend request boundary remains unclaimed until a packaged WebView receipt proves it
-- logical message bodies up to and including 1 MiB pass size validation, subject to the recipient driver's framing and exact-run mode preflight; larger bodies fail before PTY-writer admission
+- Claude/Codex logical message bodies up to and including 1 MiB pass size validation, subject to exact-run mode preflight; Grok uses the smaller measured bound above, and larger bodies fail before PTY-writer admission
 - C0, C1, and DEL control characters other than tab and source line endings fail before PTY-writer admission because they cannot be injected as ordinary terminal text safely
 - generic-terminal delivery is the unprefixed source command, raw and single-line only, until a concrete driver proves a safe provenance/framing strategy; route/feed/audit metadata remains provenance-authoritative
 - Prime routed delivery is not admitted in this release. Prime accepts raw
@@ -188,7 +191,7 @@ Work-state events:
 - events are transition-based; repeated output in the same work state updates supervisor memory but does not emit another audit event
 - output quiescence can transition Claude, Codex, and Generic Terminal sessions
   back to lifecycle/work-state `idle`
-- each Grok launch receives a fresh native `--session-id` and remains lifecycle
+- each Grok launch receives native `--minimal`, a fresh native `--session-id`, and remains lifecycle
   `starting` while the exact run is on the launcher or still producing its
   startup repaint; those states reject synthetic delivery while raw terminal
   input remains available
@@ -198,17 +201,16 @@ Work-state events:
   cursor-hide/show frames, with Unicode cell widths derived from Unicode
   Standard Annex #11; it is not a general terminal emulator, and it
   first requires a trusted current screen containing `Starting session…`, then
-  a trusted current screen with that marker and the launcher absent, the
-  interactive composer and both measured shortcut labels present, and DEC
-  private mode 2004 enabled; partial and spinner-only repaints cannot admit
-- the optional Grok Build 1.0.0 telemetry banner is measured non-modal chrome;
-  it is ignored for both blocked-state classification and readiness
+  a later trusted current screen with the launcher absent, the interactive
+  composer and exact `minimal · /help` chrome present, and DEC private mode
+  2004 enabled; minimal mode can leave the earlier startup row visible, so the
+  ordered exact minimal marker—not absence of that stale row—establishes readiness
 - replacement runs start with a fresh tracker; resize, malformed, unsupported,
   or over-limit control state fails closed until known output reconstructs the
   screen; no timeout grants readiness, and readiness is not a model-turn receipt
-- after that one-shot admission, Grok Build 1.0.0's variable full-screen repaint
-  cadence is never treated as idle; only measured semantic markers report
-  `idle`, `thinking`, or `tool_call`
+- after that one-shot admission, minimal mode publishes finalized response blocks
+  instead of relying on Grok's suppressible full-screen response repaint; only
+  measured semantic markers report `idle`, `thinking`, or `tool_call`
 - repeated blocked observations with the same detail can escalate to `error_loop`
 - process exit is never inferred from terminal text; PTY closure/error, OS process state, and job membership own process lifecycle truth
 - `closed` means the exact per-run owned process job was proved empty; PTY EOF,

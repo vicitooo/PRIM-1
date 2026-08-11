@@ -68,6 +68,13 @@ const BRACKETED_PASTE_START: &str = "\x1b[200~";
 const BRACKETED_PASTE_END: &str = "\x1b[201~";
 const BRACKETED_PASTE_SUBMIT_DELAY: Duration = Duration::from_secs(1);
 const BRACKETED_PASTE_SIZE_COMPENSATION_PER_MIB_MICROS: u64 = 500_000;
+// Grok Build 1.0.0 receiver evidence is GREEN at 261 lines / 14,333 source
+// bytes and RED at 4,095 lines / 114,780 source bytes. Keep production inside
+// the measured band with a small margin; later versions may raise this only
+// with a fresh exact-history and single-answer receiver receipt.
+const GROK_MINIMAL_BODY_MAX_BYTES: usize = 13 * 1024;
+const GROK_MINIMAL_BODY_MAX_LINES: usize = 256;
+const GROK_MINIMAL_LINE_BREAK: &str = "\x1b\r";
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 const TERMINAL_MODE_CONTROL_MAX_CHARS: u16 = 128;
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 1800;
@@ -120,6 +127,7 @@ impl PaneMcpClient {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MessageFraming {
     BracketedPaste,
+    GrokMinimal,
     RawSingleLine,
 }
 
@@ -140,7 +148,9 @@ enum RunInputSafety {
 impl From<SubmitBehavior> for RunInputSafety {
     fn from(behavior: SubmitBehavior) -> Self {
         match behavior.framing {
-            MessageFraming::BracketedPaste => Self::BracketedPasteEnabled,
+            MessageFraming::BracketedPaste | MessageFraming::GrokMinimal => {
+                Self::BracketedPasteEnabled
+            }
             MessageFraming::RawSingleLine => Self::Raw,
         }
     }
@@ -6911,7 +6921,7 @@ impl SupervisorHandle {
     ) -> Result<usize> {
         let safety = RunInputSafety::BracketedPasteEnabled;
         let _writer = self.begin_run_input_write(target, None, safety, None)?;
-        let framed_content = frame_message_payload(content, MessageFraming::BracketedPaste);
+        let framed_content = frame_message_payload(content, submit_behavior.framing);
         let content_bytes = Self::write_full_pty_input(target.pty.as_ref(), &framed_content)?;
         thread::sleep(bracketed_paste_submit_delay(
             submit_behavior.submit_delay,
@@ -8710,7 +8720,7 @@ impl SupervisorHandle {
         submit_behavior: SubmitBehavior,
     ) -> Result<DeliveryWriteResult> {
         let bytes_written = match submit_behavior.framing {
-            MessageFraming::BracketedPaste => {
+            MessageFraming::BracketedPaste | MessageFraming::GrokMinimal => {
                 self.write_bracketed_submission(target, payload, submit_behavior)?
             }
             MessageFraming::RawSingleLine => {
@@ -9345,13 +9355,16 @@ fn routed_message_payload(request: &RouteMessageRequest, behavior: SubmitBehavio
 
 fn routed_message_submit_behavior(driver: DriverKind) -> SubmitBehavior {
     match driver {
-        DriverKind::Claude | DriverKind::Codex | DriverKind::Grok | DriverKind::Prime => {
-            SubmitBehavior {
-                sequence: "\r",
-                framing: MessageFraming::BracketedPaste,
-                submit_delay: BRACKETED_PASTE_SUBMIT_DELAY,
-            }
-        }
+        DriverKind::Claude | DriverKind::Codex | DriverKind::Prime => SubmitBehavior {
+            sequence: "\r",
+            framing: MessageFraming::BracketedPaste,
+            submit_delay: BRACKETED_PASTE_SUBMIT_DELAY,
+        },
+        DriverKind::Grok => SubmitBehavior {
+            sequence: "\r",
+            framing: MessageFraming::GrokMinimal,
+            submit_delay: BRACKETED_PASTE_SUBMIT_DELAY,
+        },
         DriverKind::GenericTerminal => SubmitBehavior {
             sequence: "\r",
             framing: MessageFraming::RawSingleLine,
@@ -9396,25 +9409,73 @@ fn bounded_room_delivery_error(error: &str) -> String {
 }
 
 fn validate_message_framing(content: &str, behavior: SubmitBehavior) -> Result<()> {
-    if behavior.framing == MessageFraming::RawSingleLine && content.chars().any(char::is_control) {
-        return Err(anyhow!(
-            "generic terminal delivery supports only printable single-line message bodies"
-        ));
+    match behavior.framing {
+        MessageFraming::RawSingleLine if content.chars().any(char::is_control) => {
+            return Err(anyhow!(
+                "generic terminal delivery supports only printable single-line message bodies"
+            ));
+        }
+        MessageFraming::GrokMinimal => {
+            if content.contains('\r') {
+                return Err(anyhow!(
+                    "Grok minimal delivery supports LF line boundaries only; carriage returns are not admitted"
+                ));
+            }
+            if content.len() > GROK_MINIMAL_BODY_MAX_BYTES {
+                return Err(anyhow!(
+                    "Grok minimal delivery body is {} bytes; measured maximum is {GROK_MINIMAL_BODY_MAX_BYTES} bytes",
+                    content.len()
+                ));
+            }
+            let line_count = content
+                .as_bytes()
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count()
+                .saturating_add(1);
+            if line_count > GROK_MINIMAL_BODY_MAX_LINES {
+                return Err(anyhow!(
+                    "Grok minimal delivery has {line_count} source lines; measured maximum is {GROK_MINIMAL_BODY_MAX_LINES}"
+                ));
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
 
 fn frame_message_payload(content: &str, framing: MessageFraming) -> String {
-    let framing_bytes = match framing {
-        MessageFraming::BracketedPaste => BRACKETED_PASTE_START.len() + BRACKETED_PASTE_END.len(),
-        MessageFraming::RawSingleLine => 0,
-    };
-    let mut input = String::with_capacity(content.len() + framing_bytes);
-    if framing == MessageFraming::BracketedPaste {
-        input.push_str(BRACKETED_PASTE_START);
+    match framing {
+        MessageFraming::BracketedPaste => {
+            let mut input = String::with_capacity(
+                content.len() + BRACKETED_PASTE_START.len() + BRACKETED_PASTE_END.len(),
+            );
+            input.push_str(BRACKETED_PASTE_START);
+            input.push_str(content);
+            input.push_str(BRACKETED_PASTE_END);
+            input
+        }
+        MessageFraming::GrokMinimal => grok_minimal_fused_frame(content),
+        MessageFraming::RawSingleLine => content.to_string(),
     }
-    input.push_str(content);
-    if framing == MessageFraming::BracketedPaste {
+}
+
+fn grok_minimal_fused_frame(content: &str) -> String {
+    let line_count = content.split('\n').count();
+    let framing_bytes = line_count
+        .saturating_mul(BRACKETED_PASTE_START.len() + BRACKETED_PASTE_END.len())
+        .saturating_add(
+            line_count
+                .saturating_sub(1)
+                .saturating_mul(GROK_MINIMAL_LINE_BREAK.len()),
+        );
+    let mut input = String::with_capacity(content.len().saturating_add(framing_bytes));
+    for (index, line) in content.split('\n').enumerate() {
+        if index > 0 {
+            input.push_str(GROK_MINIMAL_LINE_BREAK);
+        }
+        input.push_str(BRACKETED_PASTE_START);
+        input.push_str(line);
         input.push_str(BRACKETED_PASTE_END);
     }
     input
@@ -11576,9 +11637,9 @@ mod tests {
     }
 
     #[test]
-    fn harness_message_frame_is_content_faithful_before_observed_submit() {
+    fn claude_and_codex_message_frame_is_content_faithful_before_observed_submit() {
         let content = "  alpha\r\n\tbeta 👩‍💻  ";
-        for driver in [DriverKind::Claude, DriverKind::Codex, DriverKind::Grok] {
+        for driver in [DriverKind::Claude, DriverKind::Codex] {
             let behavior = routed_message_submit_behavior(driver);
             validate_message_body(content).unwrap();
             validate_message_framing(content, behavior).unwrap();
@@ -11588,6 +11649,57 @@ mod tests {
             );
             assert_eq!(behavior.sequence, "\r");
         }
+    }
+
+    #[test]
+    fn grok_minimal_frame_preserves_lf_blank_and_trailing_lines_in_one_buffer() {
+        let content = "  alpha\n\n\tbeta 👩‍💻  \n";
+        let behavior = routed_message_submit_behavior(DriverKind::Grok);
+        validate_message_body(content).unwrap();
+        validate_message_framing(content, behavior).unwrap();
+
+        assert_eq!(
+            frame_message_payload(content, behavior.framing),
+            format!(
+                "{BRACKETED_PASTE_START}  alpha{BRACKETED_PASTE_END}{GROK_MINIMAL_LINE_BREAK}\
+                 {BRACKETED_PASTE_START}{BRACKETED_PASTE_END}{GROK_MINIMAL_LINE_BREAK}\
+                 {BRACKETED_PASTE_START}\tbeta 👩‍💻  {BRACKETED_PASTE_END}{GROK_MINIMAL_LINE_BREAK}\
+                 {BRACKETED_PASTE_START}{BRACKETED_PASTE_END}"
+            )
+        );
+        assert_eq!(behavior.sequence, "\r");
+    }
+
+    #[test]
+    fn grok_minimal_framing_rejects_cr_and_unmeasured_size_or_line_count() {
+        let behavior = routed_message_submit_behavior(DriverKind::Grok);
+        assert_eq!(
+            validate_message_framing("first\r\nsecond", behavior)
+                .unwrap_err()
+                .to_string(),
+            "Grok minimal delivery supports LF line boundaries only; carriage returns are not admitted"
+        );
+        validate_message_framing(&"x".repeat(GROK_MINIMAL_BODY_MAX_BYTES), behavior).unwrap();
+        assert_eq!(
+            validate_message_framing(&"x".repeat(GROK_MINIMAL_BODY_MAX_BYTES + 1), behavior)
+                .unwrap_err()
+                .to_string(),
+            format!(
+                "Grok minimal delivery body is {} bytes; measured maximum is {GROK_MINIMAL_BODY_MAX_BYTES} bytes",
+                GROK_MINIMAL_BODY_MAX_BYTES + 1
+            )
+        );
+        validate_message_framing(&"\n".repeat(GROK_MINIMAL_BODY_MAX_LINES - 1), behavior).unwrap();
+        let excessive = "\n".repeat(GROK_MINIMAL_BODY_MAX_LINES);
+        assert_eq!(
+            validate_message_framing(&excessive, behavior)
+                .unwrap_err()
+                .to_string(),
+            format!(
+                "Grok minimal delivery has {} source lines; measured maximum is {GROK_MINIMAL_BODY_MAX_LINES}",
+                GROK_MINIMAL_BODY_MAX_LINES + 1
+            )
+        );
     }
 
     #[test]
@@ -12033,6 +12145,38 @@ mod tests {
     }
 
     #[test]
+    fn grok_delivery_rejects_unmeasured_large_body_before_every_side_effect() {
+        let content = "x".repeat(MESSAGE_BODY_MAX_BYTES);
+        let supervisor = test_supervisor();
+        let events = capture_runtime_events(&supervisor);
+        let (pty, inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "codex",
+            DriverKind::Grok,
+            pty,
+        );
+        let before = slots_mutation_probe(&supervisor);
+        let audit_before = fs::read(supervisor.audit_log_path()).unwrap_or_default();
+
+        let error = route_operator_to_test_session(&supervisor, "codex", content).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("measured maximum is 13312 bytes"),
+            "{error:#}"
+        );
+        assert_eq!(slots_mutation_probe(&supervisor), before);
+        assert!(inputs.lock().is_empty());
+        assert!(events.lock().is_empty());
+        assert_eq!(
+            fs::read(supervisor.audit_log_path()).unwrap_or_default(),
+            audit_before
+        );
+    }
+
+    #[test]
     fn operator_route_writes_exact_provenance_paste_then_submit_at_required_sizes() {
         let prefix = "  \r\n\tUnicode 👩‍💻 e\u{301} 終  ";
         for size in [1024, 64 * 1024, MESSAGE_BODY_MAX_BYTES] {
@@ -12162,7 +12306,14 @@ mod tests {
             bracketed
         );
         assert_eq!(routed_message_submit_behavior(DriverKind::Codex), bracketed);
-        assert_eq!(routed_message_submit_behavior(DriverKind::Grok), bracketed);
+        assert_eq!(
+            routed_message_submit_behavior(DriverKind::Grok),
+            SubmitBehavior {
+                sequence: "\r",
+                framing: MessageFraming::GrokMinimal,
+                submit_delay: BRACKETED_PASTE_SUBMIT_DELAY,
+            }
+        );
         assert_eq!(
             routed_message_submit_behavior(DriverKind::GenericTerminal),
             SubmitBehavior {
@@ -12304,8 +12455,15 @@ mod tests {
         format!("\x1b[?25l\x1b[2J\x1b[H{banner}❯  Shift+Tab:mode  Ctrl+x:shortcuts\x1b[?25h")
     }
 
+    fn grok_minimal_ready_frame() -> String {
+        format!(
+            "\x1b[?25l\x1b[15;1H{}\x1b[16;1H❯\x1b[16;3H\x1b[?25h",
+            driver_grok::MINIMAL_MODE_READY_MARKER
+        )
+    }
+
     #[test]
-    fn grok_startup_blocks_routes_until_the_measured_full_repaint() {
+    fn grok_startup_blocks_routes_until_the_measured_minimal_repaint() {
         let supervisor = test_supervisor();
         let (pty, inputs) = recording_pty_session(std::process::id());
         install_mock_running_session_with_bracketed_paste_enabled(
@@ -12422,7 +12580,7 @@ mod tests {
             &supervisor,
             "codex",
             0,
-            PtyEvent::Output(grok_ready_frame(true)),
+            PtyEvent::Output(grok_minimal_ready_frame()),
         );
         {
             let slots = supervisor.inner.slots.lock();
@@ -12448,11 +12606,19 @@ mod tests {
                 recipient_id: session_id,
                 content: "accepted after readiness".into(),
             })
-            .expect("Grok route should be admitted after the measured full repaint");
+            .expect("Grok route should be admitted after the measured minimal repaint");
         assert_eq!(
-            inputs.lock().len(),
-            3,
-            "raw input plus routed payload and submit must be the only PTY writes"
+            inputs.lock().as_slice(),
+            &[
+                "raw input remains available".to_string(),
+                format!(
+                    "{BRACKETED_PASTE_START}[Direct message from operator]{BRACKETED_PASTE_END}\
+                     {GROK_MINIMAL_LINE_BREAK}\
+                     {BRACKETED_PASTE_START}accepted after readiness{BRACKETED_PASTE_END}"
+                ),
+                "\r".to_string(),
+            ],
+            "raw input plus one fused routed buffer and submit must be the only PTY writes"
         );
         assert!(matches!(
             &route_delivery_events(&events)[..],
@@ -14012,6 +14178,35 @@ mod tests {
                 && *bytes_written == committed_prefix
                 && message.contains("synthetic partial PTY write failure")
         ));
+    }
+
+    #[test]
+    fn grok_partial_fused_write_never_sends_the_final_submit() {
+        let supervisor = test_supervisor();
+        let committed_prefix = 17;
+        let (grok_pty, send_count) =
+            write_failing_pty_session(committed_prefix, "synthetic Grok fused write failure");
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "codex",
+            DriverKind::Grok,
+            grok_pty,
+        );
+
+        let error = supervisor
+            .route_operator_message(OperatorRouteMessageRequest {
+                recipient_id: test_session_id(&supervisor, "codex"),
+                content: "first\nsecond".into(),
+            })
+            .unwrap_err();
+
+        assert_eq!(send_count.load(Ordering::SeqCst), 1);
+        assert!(
+            error
+                .to_string()
+                .contains("synthetic Grok fused write failure")
+        );
+        assert!(error.to_string().contains("after 17 bytes were accepted"));
     }
 
     #[test]
@@ -18685,17 +18880,18 @@ mod tests {
         let specs = specs.lock();
         assert_eq!(specs.len(), 1);
         assert_eq!(
-            specs[0].args[0..4],
+            specs[0].args[0..5],
             [
+                "--minimal",
                 "--permission-mode",
                 "bypassPermissions",
                 "--cwd",
                 session.working_dir.as_str(),
             ]
         );
-        assert_eq!(specs[0].args[4], "--session-id");
-        assert_eq!(specs[0].args.len(), 6);
-        Uuid::parse_str(&specs[0].args[5]).expect("Grok launch must use a fresh UUID");
+        assert_eq!(specs[0].args[5], "--session-id");
+        assert_eq!(specs[0].args.len(), 7);
+        Uuid::parse_str(&specs[0].args[6]).expect("Grok launch must use a fresh UUID");
         drop(specs);
         supervisor
             .stop_session_by_id(session.session_id)
@@ -19515,6 +19711,132 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn grok_room_delivery_uses_one_fused_buffer_and_preserves_lf_content() {
+        let supervisor = test_supervisor();
+        let grok = create_test_session(
+            &supervisor,
+            "grok",
+            DriverKind::Grok,
+            shared_types::PermissionProfile::Normal,
+        );
+        let (grok_pty, grok_inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_by_id_with_mode(
+            &supervisor,
+            grok.session_id,
+            DriverKind::Grok,
+            None,
+            grok_pty,
+            BracketedPasteMode::Enabled,
+        );
+        let room = supervisor
+            .create_room(CreateRoomRequest {
+                label: Some("Grok exact".into()),
+                member_ids: vec![grok.session_id, test_session_id(&supervisor, "claude")],
+            })
+            .unwrap();
+        let content = "  λ room line one\n\nline two 🚀  \n";
+
+        let result = supervisor
+            .deliver_room_message(DeliverRoomMessageRequest {
+                room_id: room.room_id,
+                recipients: RoomRecipientSelection::One {
+                    session_id: grok.session_id,
+                },
+                content: content.into(),
+            })
+            .unwrap();
+
+        assert_eq!(result.written_count, 1);
+        assert!(result.failures.is_empty());
+        let payload = format!("[Room message from operator]\n{content}");
+        assert_eq!(
+            grok_inputs.lock().as_slice(),
+            &[
+                frame_message_payload(&payload, MessageFraming::GrokMinimal),
+                "\r".into(),
+            ]
+        );
+        let page = supervisor
+            .read_room_feed(ReadRoomFeedRequest {
+                room_id: room.room_id,
+                cursor: None,
+            })
+            .unwrap();
+        assert!(page.events.iter().any(|event| matches!(
+            &event.item,
+            RoomFeedItem::Message { content: stored, .. } if stored == content
+        )));
+    }
+
+    #[test]
+    fn mixed_room_cr_rejection_is_atomic_when_grok_is_a_recipient() {
+        let supervisor = test_supervisor();
+        let grok = create_test_session(
+            &supervisor,
+            "grok",
+            DriverKind::Grok,
+            shared_types::PermissionProfile::Normal,
+        );
+        let (claude_pty, claude_inputs) = recording_pty_session(std::process::id());
+        let (grok_pty, grok_inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            claude_pty,
+        );
+        install_mock_running_session_by_id_with_mode(
+            &supervisor,
+            grok.session_id,
+            DriverKind::Grok,
+            None,
+            grok_pty,
+            BracketedPasteMode::Enabled,
+        );
+        let room = supervisor
+            .create_room(CreateRoomRequest {
+                label: Some("Mixed CR".into()),
+                member_ids: vec![test_session_id(&supervisor, "claude"), grok.session_id],
+            })
+            .unwrap();
+        let before = supervisor
+            .read_room_feed(ReadRoomFeedRequest {
+                room_id: room.room_id,
+                cursor: None,
+            })
+            .unwrap();
+        let audit_before = fs::read(supervisor.audit_log_path()).unwrap();
+        let events = capture_runtime_events(&supervisor);
+
+        let error = supervisor
+            .deliver_room_message(DeliverRoomMessageRequest {
+                room_id: room.room_id,
+                recipients: RoomRecipientSelection::All {},
+                content: "first\r\nsecond".into(),
+            })
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("carriage returns are not admitted")
+        );
+        assert!(claude_inputs.lock().is_empty());
+        assert!(grok_inputs.lock().is_empty());
+        assert!(events.lock().is_empty());
+        assert_eq!(
+            supervisor
+                .read_room_feed(ReadRoomFeedRequest {
+                    room_id: room.room_id,
+                    cursor: None,
+                })
+                .unwrap(),
+            before
+        );
+        assert_eq!(fs::read(supervisor.audit_log_path()).unwrap(), audit_before);
     }
 
     #[test]

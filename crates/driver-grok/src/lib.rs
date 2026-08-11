@@ -9,6 +9,7 @@ use uuid::Uuid;
 pub const LAUNCHER_MENU_DETAIL: &str = "launcher_menu";
 pub const SESSION_STARTING_DETAIL: &str = "session_starting";
 pub const STARTUP_SCREEN_MAX_CELLS: usize = 64 * 1024;
+pub const MINIMAL_MODE_READY_MARKER: &str = "minimal · /help";
 
 const TERMINAL_CONTROL_MAX_CHARS: u16 = 128;
 const DEFAULT_TERMINAL_COLS: usize = 120;
@@ -740,8 +741,10 @@ impl StartupTracker {
 
         let has_starting = lower.contains("starting session...");
         let has_launcher = lower.contains("new worktree") || lower.contains("resume session");
-        let has_interactive_composer =
+        let has_fullscreen_interactive_composer =
             normalized.contains('❯') && lower.contains("shift+tab") && lower.contains("ctrl+x");
+        let has_minimal_interactive_composer =
+            normalized.contains('❯') && normalized.contains(MINIMAL_MODE_READY_MARKER);
 
         match self.phase {
             StartupPhase::AwaitingStarting if has_starting => {
@@ -750,9 +753,9 @@ impl StartupTracker {
             }
             StartupPhase::StartingObserved
                 if self.bracketed_paste_enabled
-                    && !has_starting
                     && !has_launcher
-                    && has_interactive_composer =>
+                    && (has_minimal_interactive_composer
+                        || (!has_starting && has_fullscreen_interactive_composer)) =>
             {
                 self.phase = StartupPhase::Complete;
                 StartupProgress::InteractiveReady
@@ -853,6 +856,7 @@ fn launch_spec_with_session_id(
         PermissionProfile::Unsafe => "bypassPermissions",
     };
     let args = vec![
+        "--minimal".into(),
         "--permission-mode".into(),
         permission_mode.into(),
         "--cwd".into(),
@@ -1016,6 +1020,7 @@ mod tests {
         assert_eq!(
             spec.args,
             vec![
+                "--minimal",
                 "--permission-mode",
                 "default",
                 "--cwd",
@@ -1042,7 +1047,10 @@ mod tests {
             Uuid::nil(),
         )
         .unwrap();
-        assert_eq!(spec.args[0..2], ["--permission-mode", "bypassPermissions"]);
+        assert_eq!(
+            spec.args[0..3],
+            ["--minimal", "--permission-mode", "bypassPermissions"]
+        );
     }
 
     #[test]
@@ -1134,6 +1142,16 @@ mod tests {
         repaint(&format!("{banner}❯  Shift+Tab:mode  Ctrl+x:shortcuts"))
     }
 
+    fn minimal_ready_repaint() -> String {
+        concat!(
+            "\x1b[?25l",
+            "\x1b[15;1Hminimal · /help",
+            "\x1b[16;1H❯",
+            "\x1b[16;3H\x1b[?25h",
+        )
+        .into()
+    }
+
     fn positioned_starting_repaint() -> String {
         concat!(
             "\x1b[?2004h\x1b[?25l\x1b[2J",
@@ -1192,6 +1210,39 @@ mod tests {
         assert_eq!(
             tracker.observe_output(&ready_repaint(false)),
             StartupProgress::InteractiveReady
+        );
+    }
+
+    #[test]
+    fn startup_tracker_admits_the_measured_minimal_mode_completion_frame() {
+        let mut tracker = StartupTracker::default();
+        assert_eq!(
+            tracker.observe_output(&starting_repaint()),
+            StartupProgress::StartingObserved
+        );
+        assert_eq!(
+            tracker.observe_output(&minimal_ready_repaint()),
+            StartupProgress::InteractiveReady,
+            "minimal mode retains the stale startup row, so its exact completed chrome marker must establish readiness"
+        );
+    }
+
+    #[test]
+    fn startup_tracker_rejects_minimal_chrome_before_start_or_without_its_exact_marker() {
+        let mut premature = StartupTracker::default();
+        assert_eq!(
+            premature.observe_output(&minimal_ready_repaint()),
+            StartupProgress::None
+        );
+
+        let mut incomplete = StartupTracker::default();
+        assert_eq!(
+            incomplete.observe_output(&starting_repaint()),
+            StartupProgress::StartingObserved
+        );
+        assert_eq!(
+            incomplete.observe_output("\x1b[?25l\x1b[15;1H/help\x1b[16;1H❯\x1b[?25h"),
+            StartupProgress::None
         );
     }
 
@@ -1462,6 +1513,7 @@ mod tests {
     fn startup_tracker_handles_every_chunk_boundary() {
         for stream in [
             format!("{}{}", starting_repaint(), ready_repaint(false)),
+            format!("{}{}", starting_repaint(), minimal_ready_repaint()),
             format!(
                 "{}{}",
                 positioned_starting_repaint(),

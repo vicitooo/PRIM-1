@@ -317,11 +317,12 @@ On every operator route, the supervisor must:
 3. resolve the explicit recipient `SessionId` to one exact run
 4. preflight its framing before any write, including exact-run evidence that DEC private mode 2004 is enabled and that the driver has not observed a blocked/error-loop state for bracketed-paste drivers
 5. record pending metadata without retaining message content
-6. hold the recipient run-input permit, revalidate identity/generation/PTY/gate/mode/work-state, write the complete paste frame, then from that successful write boundary wait a one-second base interval plus a conservative proportional 500 milliseconds per MiB of framed input (chosen over the roughly 10/19/174 milliseconds of parser lag observed at 1 KiB/64 KiB/1 MiB), revalidate identity/generation/PTY/gate/work-state, and write one Enter; the 1 MiB body cap keeps compensation to roughly half a second, paste mode may legitimately disable after the completed frame, and raw single-line drivers remain one PTY input containing only the validated source command because a textual provenance prefix would be executable shell input
+6. hold the recipient run-input permit, revalidate identity/generation/PTY/gate/mode/work-state, and write the complete driver input: one bracketed frame for Claude/Codex, or one Grok-minimal fused buffer containing a bracketed frame per LF line with `ESC CR` (Alt+Enter) between frames; Grok rejects CR, source bodies above 13 KiB, and more than 256 source lines during preflight because those bounds stay inside its measured receiver envelope. From that successful write boundary, wait a one-second base interval plus a conservative proportional 500 milliseconds per MiB of framed input (chosen over the roughly 10/19/174 milliseconds of parser lag observed at 1 KiB/64 KiB/1 MiB), revalidate identity/generation/PTY/gate/work-state, and write one Enter. A partial/error/short first write reports exact progress and sends no Enter or retry; raw single-line drivers remain one PTY input containing only the validated source command because a textual provenance prefix would be executable shell input
 7. emit a written or failed receipt without claiming final-child or model receipt
 
-Claude, Codex, and Grok receive the visible provenance envelope inside their
-bracketed-paste frame. Generic Terminal carries provenance in PRIM's feed,
+Claude and Codex receive the visible provenance envelope inside one
+bracketed-paste frame. Grok reconstructs the same envelope from one FIFO-held
+fused buffer of per-line bracketed frames. Generic Terminal carries provenance in PRIM's feed,
 route receipts, and audit instead; its raw command line is not prefixed with
 display text that a shell could parse as code.
 
@@ -331,7 +332,7 @@ desktop IPC behind the route.
 
 The mode-2004 scanner consumes the exact run's raw PTY output before desktop
 coalescing or output shedding and resets on every `RunId`. Unknown or disabled
-state, or a driver-observed blocked/error-loop state, blocks addressed Claude/Codex
+state, or a driver-observed blocked/error-loop state, blocks addressed Claude/Codex/Grok
 delivery without blocking raw operator or pane-local input. The paste and Enter
 boundary is FIFO-serialized and rechecked twice. Output is not used as an
 acknowledgement because multiline input may stay
@@ -560,10 +561,11 @@ These are not deferred hardening tasks. They are mandatory from the first workin
 - Codex `Normal` launches directly with
   `--ask-for-approval on-request --sandbox workspace-write`; `Unsafe` adds only
   `--dangerously-bypass-approvals-and-sandbox`.
-- Grok `Normal` launches directly with `--permission-mode default`; `Unsafe`
-  changes only that value to `bypassPermissions`. Every run also receives one
-  fresh native `--session-id` with no bootstrap prompt, bypassing the launcher
-  without reusing Grok-owned history.
+- Grok `Normal` launches directly with `--minimal --permission-mode default`;
+  `Unsafe` changes only the permission value to `bypassPermissions`. Every run
+  also receives one fresh native `--session-id`. Minimal mode replaces the
+  suppressible full-screen response repaint with finalized answer blocks while
+  preserving raw operator input and Grok-owned history.
 - Prime launches only with `Normal`. The Windows command is direct `wsl.exe`;
   the Linux side uses absolute `systemd-run`, Python, and `prime-agent` paths,
   with no shell evaluation or renderer-controlled arguments.
@@ -573,25 +575,23 @@ These are visible harness permission profiles, not hostile same-user OS
 isolation. Stronger containment would require a separately measured restricted
 user, ACL, container, VM, or equivalent boundary.
 
-Grok remains lifecycle `Starting` through its launcher and startup repaint, so
+Grok remains lifecycle `Starting` through its launcher and minimal startup repaint, so
 synthetic delivery fails closed while raw input remains available. A per-run,
 bounded fixed-grid projector follows only Grok Build 1.0.0's measured cursor,
 erase, scroll, terminal-string, mode, and decoded-text subset across completed
 cursor-hide/show frames; Unicode cell widths follow Unicode Standard Annex #11.
 It is not a general terminal emulator and
-requires a trusted screen containing `Starting session…`, then a trusted screen
-with that marker and the launcher gone, the interactive composer and both
-measured shortcut labels present, and bracketed paste enabled. This admits the
-measured partial CUP+ECH transition without depending on Home or another paint
-spelling. The projector retains neither styling nor scrollback, caps its grid at
+requires a trusted screen containing `Starting session…`, then a later trusted
+screen with the launcher gone, the interactive composer, exact `minimal · /help`
+chrome, and bracketed paste enabled. The exact minimal marker can establish the
+second phase even when the prior startup row remains visible. The projector
+retains neither styling nor scrollback, caps its grid at
 64 Ki cells, and fails closed after resize or unsupported control state until
 known output reconstructs the screen. Partial composer repaints and the
 independent MCP spinner cannot admit; replacement runs cannot inherit progress;
 no timer grants readiness, and structural readiness is not a model-turn receipt.
-Grok Build 1.0.0's optional telemetry banner is
-measured non-modal chrome and is ignored. After admission, ordinary Grok silence
-is never an idle signal; semantic `Thinking`, tool, and `Worked for` markers own
-work state.
+After admission, ordinary Grok silence is never an idle signal; semantic
+`Thinking`, tool, and `Worked for` markers own work state.
 
 ## 11. 24/7 target model
 
