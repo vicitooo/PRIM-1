@@ -317,8 +317,13 @@ On every operator route, the supervisor must:
 3. resolve the explicit recipient `SessionId` to one exact run
 4. preflight its framing before any write, including exact-run evidence that DEC private mode 2004 is enabled and that the driver has not observed a blocked/error-loop state for bracketed-paste drivers
 5. record pending metadata without retaining message content
-6. hold the recipient run-input permit, revalidate identity/generation/PTY/gate/mode/work-state, write the complete paste frame, then from that successful write boundary wait a one-second base interval plus a conservative proportional 500 milliseconds per MiB of framed input (chosen over the roughly 10/19/174 milliseconds of parser lag observed at 1 KiB/64 KiB/1 MiB), revalidate identity/generation/PTY/gate/work-state, and write one Enter; the 1 MiB body cap keeps compensation to roughly half a second, paste mode may legitimately disable after the completed frame, and raw single-line drivers remain one PTY input
+6. hold the recipient run-input permit, revalidate identity/generation/PTY/gate/mode/work-state, write the complete paste frame, then from that successful write boundary wait a one-second base interval plus a conservative proportional 500 milliseconds per MiB of framed input (chosen over the roughly 10/19/174 milliseconds of parser lag observed at 1 KiB/64 KiB/1 MiB), revalidate identity/generation/PTY/gate/work-state, and write one Enter; the 1 MiB body cap keeps compensation to roughly half a second, paste mode may legitimately disable after the completed frame, and raw single-line drivers remain one PTY input containing only the validated source command because a textual provenance prefix would be executable shell input
 7. emit a written or failed receipt without claiming final-child or model receipt
+
+Claude, Codex, and Grok receive the visible provenance envelope inside their
+bracketed-paste frame. Generic Terminal carries provenance in PRIM's feed,
+route receipts, and audit instead; its raw command line is not prefixed with
+display text that a shell could parse as code.
 
 The desktop command runs this blocking supervisor operation on Tauri's blocking
 pool, so the driver settle interval does not stall the UI or serialize unrelated

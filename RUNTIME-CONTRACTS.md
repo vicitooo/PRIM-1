@@ -124,7 +124,12 @@ kind requires a new explicit contract and authority model.
 
 ## 6. Visible injection contract
 
-When a routed message is injected into a PTY, it must be visibly stamped.
+When a routed message is injected into a Claude, Codex, or Grok PTY, it must be
+visibly stamped inside the bracketed-paste frame. Generic Terminal is the
+deliberate exception: the PTY receives only the validated printable single-line
+source command, while PRIM displays provenance in its feed and route receipts
+and retains provenance metadata in the audit. Prefixing a generic shell command
+with human display text would change or invalidate the command.
 
 The operator should be able to distinguish:
 
@@ -146,7 +151,7 @@ V1 rule:
 - clipboard-to-WebView textarea CRLF fidelity before the backend request boundary remains unclaimed until a packaged WebView receipt proves it
 - logical message bodies up to and including 1 MiB pass size validation, subject to the recipient driver's framing and exact-run mode preflight; larger bodies fail before PTY-writer admission
 - C0, C1, and DEL control characters other than tab and source line endings fail before PTY-writer admission because they cannot be injected as ordinary terminal text safely
-- generic-terminal delivery is raw and single-line only until a concrete driver proves a faithful multiline strategy
+- generic-terminal delivery is the unprefixed source command, raw and single-line only, until a concrete driver proves a safe provenance/framing strategy; route/feed/audit metadata remains provenance-authoritative
 - Prime routed delivery is not admitted in this release. Prime accepts raw
   operator terminal input only; the rejection occurs before route-family events,
   audit records, or PTY writes.

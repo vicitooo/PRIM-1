@@ -9275,11 +9275,12 @@ fn work_state_alert_label(state: Option<WorkState>) -> &'static str {
 }
 
 fn routed_message_payload(request: &RouteMessageRequest, behavior: SubmitBehavior) -> String {
+    if behavior.framing == MessageFraming::RawSingleLine {
+        return request.content.clone();
+    }
     let header = routed_message_header(request.scope, &request.from);
     if request.content.is_empty() {
         header
-    } else if behavior.framing == MessageFraming::RawSingleLine {
-        format!("{header} {}", request.content)
     } else {
         format!("{header}\n{}", request.content)
     }
@@ -11497,7 +11498,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_terminal_route_stays_single_line() {
+    fn generic_terminal_route_stays_raw_and_single_line() {
         let payload = routed_message_payload(
             &RouteMessageRequest {
                 from: "operator".into(),
@@ -11508,7 +11509,7 @@ mod tests {
             routed_message_submit_behavior(DriverKind::GenericTerminal),
         );
 
-        assert_eq!(payload, "[Direct message from operator] hello");
+        assert_eq!(payload, "hello");
     }
 
     #[test]
@@ -12020,10 +12021,7 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(
-            inputs.lock().as_slice(),
-            &["[Direct message from operator] printable only\r".to_string()]
-        );
+        assert_eq!(inputs.lock().as_slice(), &["printable only\r".to_string()]);
     }
 
     #[test]
