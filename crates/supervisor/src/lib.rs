@@ -67,6 +67,8 @@ const MESSAGE_BODY_MAX_BYTES: usize = 1024 * 1024;
 const BRACKETED_PASTE_START: &str = "\x1b[200~";
 const BRACKETED_PASTE_END: &str = "\x1b[201~";
 const BRACKETED_PASTE_SUBMIT_DELAY: Duration = Duration::from_secs(1);
+const BRACKETED_PASTE_SIZE_COMPENSATION_PER_MIB_MICROS: u64 = 500_000;
+const BYTES_PER_MIB: u64 = 1024 * 1024;
 const TERMINAL_MODE_CONTROL_MAX_CHARS: u16 = 128;
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 1800;
 const DEFAULT_AUTO_RESTART_STALL_THRESHOLD_SECS: u64 = 600;
@@ -6899,7 +6901,10 @@ impl SupervisorHandle {
             )
             .into());
         }
-        thread::sleep(submit_behavior.submit_delay);
+        thread::sleep(bracketed_paste_submit_delay(
+            submit_behavior.submit_delay,
+            framed_content.len(),
+        ));
 
         let slots = self.inner.slots.lock();
         if let Err(error) = Self::validate_run_input_target_locked(
@@ -9368,6 +9373,14 @@ fn frame_message_payload(content: &str, framing: MessageFraming) -> String {
     input
 }
 
+fn bracketed_paste_submit_delay(base: Duration, framed_bytes: usize) -> Duration {
+    let framed_bytes = u64::try_from(framed_bytes).unwrap_or(u64::MAX);
+    let compensation_micros = framed_bytes
+        .saturating_mul(BRACKETED_PASTE_SIZE_COMPENSATION_PER_MIB_MICROS)
+        .div_ceil(BYTES_PER_MIB);
+    base.saturating_add(Duration::from_micros(compensation_micros))
+}
+
 fn control_key_sequence(key: ControlKey) -> &'static str {
     match key {
         ControlKey::Enter => "\r",
@@ -11758,10 +11771,13 @@ mod tests {
                 "queued raw input".to_string(),
             ]
         );
+        let expected_frame_len = inputs.lock()[0].len();
         let write_times = write_times.lock();
         let flush_times = flush_times.lock();
+        let expected_delay =
+            bracketed_paste_submit_delay(BRACKETED_PASTE_SUBMIT_DELAY, expected_frame_len);
         assert!(
-            write_times[1].duration_since(flush_times[0]) >= BRACKETED_PASTE_SUBMIT_DELAY,
+            write_times[1].duration_since(flush_times[0]) >= expected_delay,
             "submit was not delayed from the drained frame boundary"
         );
     }
@@ -11814,10 +11830,13 @@ mod tests {
             ],
             "a terminal may legitimately disable paste mode after consuming the completed frame"
         );
+        let expected_frame_len = inputs.lock()[0].len();
         let write_times = write_times.lock();
         let flush_times = flush_times.lock();
+        let expected_delay =
+            bracketed_paste_submit_delay(BRACKETED_PASTE_SUBMIT_DELAY, expected_frame_len);
         assert!(
-            write_times[1].duration_since(flush_times[0]) >= BRACKETED_PASTE_SUBMIT_DELAY,
+            write_times[1].duration_since(flush_times[0]) >= expected_delay,
             "Codex submit ran before the drained-frame compatibility interval elapsed"
         );
     }
@@ -12157,6 +12176,26 @@ mod tests {
                 framing: MessageFraming::RawSingleLine,
                 submit_delay: Duration::ZERO,
             }
+        );
+    }
+
+    #[test]
+    fn bracketed_paste_submit_delay_scales_only_with_frame_size() {
+        assert_eq!(
+            bracketed_paste_submit_delay(BRACKETED_PASTE_SUBMIT_DELAY, 0),
+            BRACKETED_PASTE_SUBMIT_DELAY
+        );
+        assert_eq!(
+            bracketed_paste_submit_delay(BRACKETED_PASTE_SUBMIT_DELAY, 1),
+            BRACKETED_PASTE_SUBMIT_DELAY + Duration::from_micros(1)
+        );
+        assert_eq!(
+            bracketed_paste_submit_delay(BRACKETED_PASTE_SUBMIT_DELAY, 64 * 1024),
+            BRACKETED_PASTE_SUBMIT_DELAY + Duration::from_micros(31_250)
+        );
+        assert_eq!(
+            bracketed_paste_submit_delay(BRACKETED_PASTE_SUBMIT_DELAY, 1024 * 1024),
+            BRACKETED_PASTE_SUBMIT_DELAY + Duration::from_millis(500)
         );
     }
 
