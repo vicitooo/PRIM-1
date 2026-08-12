@@ -1896,6 +1896,7 @@ struct SessionSlot {
     bracketed_paste: BracketedPasteRunState,
     codex_work_state: driver_codex::WorkStateTracker,
     grok_startup: driver_grok::StartupTracker,
+    grok_initial_idle_pending: bool,
     run_event_sequence: u64,
     generation: SessionGeneration,
     spawn_in_flight: Option<SpawnReservation>,
@@ -2402,6 +2403,7 @@ fn closed_session_slot(definition: SessionDefinition) -> SessionSlot {
         bracketed_paste: BracketedPasteRunState::default(),
         codex_work_state: driver_codex::WorkStateTracker::default(),
         grok_startup: driver_grok::StartupTracker::default(),
+        grok_initial_idle_pending: false,
         run_event_sequence: 0,
         generation: 0,
         spawn_in_flight: None,
@@ -7744,11 +7746,20 @@ impl SupervisorHandle {
                         let codex_classification = (slot.definition.driver == DriverKind::Codex)
                             .then(|| slot.codex_work_state.observe_output(&chunk))
                             .flatten();
-                        if slot.definition.driver == DriverKind::Grok {
+                        let grok_startup_progress = if slot.definition.driver == DriverKind::Grok {
                             let bracketed_paste_enabled = slot.bracketed_paste.mode_for(binding)
                                 == BracketedPasteMode::Enabled;
-                            slot.grok_startup
-                                .observe_output_with_mode(&chunk, bracketed_paste_enabled);
+                            Some(
+                                slot.grok_startup
+                                    .observe_output_with_mode(&chunk, bracketed_paste_enabled),
+                            )
+                        } else {
+                            None
+                        };
+                        if grok_startup_progress
+                            == Some(driver_grok::StartupProgress::InteractiveReady)
+                        {
+                            slot.grok_initial_idle_pending = true;
                         }
                         let spawn_is_unconfirmed = slot.spawn_in_flight
                             == Some(SpawnReservation {
@@ -7761,12 +7772,23 @@ impl SupervisorHandle {
                         }
                         let grok_interactive_ready = slot.definition.driver == DriverKind::Grok
                             && slot.grok_startup.is_interactive_ready();
+                        let grok_semantic_classification = (slot.definition.driver
+                            == DriverKind::Grok)
+                            .then(|| classify_work_state_for_driver(DriverKind::Grok, &chunk))
+                            .flatten();
                         let classification = if spawn_is_unconfirmed {
                             None
-                        } else if grok_interactive_ready {
+                        } else if grok_startup_progress
+                            == Some(driver_grok::StartupProgress::InteractiveReady)
+                        {
                             Some((WorkState::Idle, None))
                         } else if slot.definition.driver == DriverKind::Codex {
                             codex_classification
+                        } else if slot.definition.driver == DriverKind::Grok {
+                            grok_semantic_classification.or_else(|| {
+                                slot.grok_initial_idle_pending
+                                    .then_some((WorkState::Idle, None))
+                            })
                         } else {
                             classify_work_state_for_driver(slot.definition.driver, &chunk)
                         };
@@ -7782,6 +7804,9 @@ impl SupervisorHandle {
                                 detail,
                             )
                         });
+                        if !spawn_is_unconfirmed && slot.grok_initial_idle_pending {
+                            slot.grok_initial_idle_pending = false;
+                        }
                         let lifecycle_target = if spawn_is_unconfirmed {
                             None
                         } else if slot.definition.driver == DriverKind::Grok
@@ -9211,6 +9236,7 @@ fn reset_work_state_locked(slot: &mut SessionSlot) {
     slot.work_state = WorkState::Idle;
     slot.work_state_observed = false;
     slot.work_detail = None;
+    slot.grok_initial_idle_pending = false;
     slot.work_error_observations.clear();
     slot.stall_state_entered_at = None;
     slot.stall_state_entered_timestamp = None;
@@ -9312,7 +9338,7 @@ fn quiesce_threshold(driver: DriverKind) -> Option<Duration> {
     let threshold = match driver {
         DriverKind::Claude => Duration::from_secs(3),
         DriverKind::Codex => Duration::from_secs(2),
-        // Grok Build 1.0.0 has no honest silence-based idle signal. Its
+        // Grok Build 1.0.0-1.0.3 has no honest silence-based idle signal. Its
         // semantic markers own ordinary work-state transitions, while its
         // startup tracker owns first interactive admission.
         DriverKind::Grok => return None,
@@ -11313,6 +11339,8 @@ mod tests {
         last_run_id: Option<Uuid>,
         bracketed_paste: BracketedPasteRunState,
         codex_work_state: driver_codex::WorkStateTracker,
+        grok_startup: driver_grok::StartupTracker,
+        grok_initial_idle_pending: bool,
         run_event_sequence: u64,
         generation: SessionGeneration,
         spawn_in_flight: Option<SpawnReservation>,
@@ -11353,6 +11381,8 @@ mod tests {
                 last_run_id: slot.last_run_id,
                 bracketed_paste: slot.bracketed_paste,
                 codex_work_state: slot.codex_work_state.clone(),
+                grok_startup: slot.grok_startup.clone(),
+                grok_initial_idle_pending: slot.grok_initial_idle_pending,
                 run_event_sequence: slot.run_event_sequence,
                 generation: slot.generation,
                 spawn_in_flight: slot.spawn_in_flight,
@@ -12542,7 +12572,7 @@ mod tests {
     }
 
     #[test]
-    fn grok_repaints_use_semantic_work_state_without_lifecycle_quiescence() {
+    fn grok_1_0_3_repaints_use_semantic_work_state_after_startup() {
         assert_eq!(quiesce_threshold(DriverKind::Grok), None);
         let supervisor = test_supervisor();
         install_synthetic_running_session(&supervisor, "codex", DriverKind::Grok);
@@ -12553,10 +12583,35 @@ mod tests {
             captured.lock().push(event);
         });
 
+        handle_current_pty_event(
+            &supervisor,
+            "codex",
+            0,
+            PtyEvent::Output(grok_starting_frame().into()),
+        );
+        handle_current_pty_event(
+            &supervisor,
+            "codex",
+            0,
+            PtyEvent::Output(grok_minimal_ready_frame()),
+        );
+        assert!(
+            supervisor
+                .inner
+                .slots
+                .lock()
+                .get("codex")
+                .unwrap()
+                .grok_startup
+                .is_interactive_ready(),
+            "the regression must exercise semantic work after interactive startup"
+        );
+        events.lock().clear();
+
         for chunk in [
-            "◆ Thinking…",
-            "⠴ MCP (4/9) │ 16K / 500K",
-            "Worked for 6.3s",
+            "┃◆ Thinking…",
+            "┃◆ Thought for 0.0s  ⠧ Responding… 0.0s",
+            "Worked for 2.4s",
             "another measured full-screen repaint",
         ] {
             handle_current_pty_event(&supervisor, "codex", 0, PtyEvent::Output(chunk.into()));
@@ -12580,8 +12635,8 @@ mod tests {
                         if session == &grok_alias && *state == LifecycleState::Ready
                 ))
                 .count(),
-            1,
-            "only the initial Busy -> Ready lifecycle transition is valid"
+            0,
+            "semantic work markers must not perturb the already-Ready lifecycle"
         );
         let work_states = events
             .lock()
@@ -12796,6 +12851,90 @@ mod tests {
         assert_eq!(slot.state, LifecycleState::Idle);
         assert!(slot.work_state_observed);
         assert_eq!(slot.work_state, WorkState::Idle);
+    }
+
+    #[test]
+    fn grok_suppressed_ready_frame_recovers_without_overwriting_newer_semantics() {
+        for (recovery_chunk, expected_state) in [
+            ("ordinary measured repaint", WorkState::Idle),
+            ("┃◆ Thinking…", WorkState::Thinking),
+        ] {
+            let supervisor = test_supervisor();
+            let (pty, _inputs) = recording_pty_session(std::process::id());
+            install_mock_running_session_with_bracketed_paste_enabled(
+                &supervisor,
+                "codex",
+                DriverKind::Grok,
+                pty,
+            );
+            let session_id = test_session_id(&supervisor, "codex");
+            let (generation, run_id) = {
+                let mut slots = supervisor.inner.slots.lock();
+                let slot = slots.get_mut("codex").unwrap();
+                slot.state = LifecycleState::Starting;
+                reset_work_state_locked(slot);
+                slot.grok_startup.begin_run();
+                (slot.generation, slot.run_id.unwrap())
+            };
+            let events = capture_runtime_events(&supervisor);
+
+            supervisor.handle_pty_event_by_id(
+                session_id,
+                generation,
+                run_id,
+                PtyEvent::Output(grok_starting_frame().into()),
+            );
+            let sequence_after_starting = {
+                let mut slots = supervisor.inner.slots.lock();
+                let slot = slots.get_by_id_mut(session_id).unwrap();
+                assert_eq!(slot.state, LifecycleState::Starting);
+                assert!(!slot.grok_startup.is_interactive_ready());
+                let sequence = slot.run_event_sequence;
+                slot.run_event_sequence = u64::MAX - 2;
+                sequence
+            };
+            events.lock().clear();
+
+            supervisor.handle_pty_event_by_id(
+                session_id,
+                generation,
+                run_id,
+                PtyEvent::Output(grok_minimal_ready_frame()),
+            );
+            {
+                let mut slots = supervisor.inner.slots.lock();
+                let slot = slots.get_by_id_mut(session_id).unwrap();
+                assert!(slot.grok_startup.is_interactive_ready());
+                assert!(slot.grok_initial_idle_pending);
+                assert_eq!(slot.state, LifecycleState::Starting);
+                assert_eq!(slot.run_event_sequence, u64::MAX - 2);
+                slot.run_event_sequence = sequence_after_starting;
+            }
+            assert!(events.lock().is_empty());
+
+            supervisor.handle_pty_event_by_id(
+                session_id,
+                generation,
+                run_id,
+                PtyEvent::Output(recovery_chunk.into()),
+            );
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id(session_id).unwrap();
+            assert!(!slot.grok_initial_idle_pending);
+            assert_eq!(slot.state, LifecycleState::Idle);
+            assert!(slot.work_state_observed);
+            assert_eq!(slot.work_state, expected_state);
+            drop(slots);
+            let work_states = events
+                .lock()
+                .iter()
+                .filter_map(|event| match event {
+                    RuntimeEvent::SessionWorkState { state, .. } => Some(*state),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(work_states, [expected_state]);
+        }
     }
 
     #[test]

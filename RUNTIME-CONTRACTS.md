@@ -223,8 +223,13 @@ Work-state events:
   incomplete, malformed, unsupported, resized-but-unreconstructed, or over-limit
   state remain Unknown, while raw input remains available for modal resolution
 - after that one-shot admission, minimal mode publishes finalized response blocks
-  instead of relying on Grok's suppressible full-screen response repaint; only
-  measured semantic markers report `idle`, `thinking`, or `tool_call`
+  instead of relying on Grok's suppressible full-screen response repaint; the
+  completing startup frame makes initial `idle` pending exactly once; event
+  admission publishes it unless a later admitted output carries a newer
+  semantic marker, which supersedes it. Every later Grok output returns to the semantic
+  classifier rather than being coerced to `idle`; measured Grok 1.0.3
+  `Thinking`/`Responding`, tool, and `Worked for` markers report subsequent
+  `idle`, `thinking`, or `tool_call`
 - repeated blocked observations with the same detail can escalate to `error_loop`
 - process exit is never inferred from terminal text; PTY closure/error, OS process state, and job membership own process lifecycle truth
 - `closed` means the exact per-run owned process job was proved empty; PTY EOF,

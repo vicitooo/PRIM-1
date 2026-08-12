@@ -604,8 +604,12 @@ retains neither styling nor scrollback, caps its grid at
 known output reconstructs the screen. Partial composer repaints and the
 independent MCP spinner cannot admit; replacement runs cannot inherit progress;
 no timer grants readiness, and structural readiness is not a model-turn receipt.
-After admission, ordinary Grok silence is never an idle signal; semantic
-`Thinking`, tool, and `Worked for` markers own work state.
+The startup-completion frame makes the run's initial semantic Idle pending
+exactly once. Event admission publishes it unless a later admitted output
+carries a newer semantic marker, which supersedes it. After admission ordinary
+Grok silence is not an idle signal, and the measured Grok 1.0.3
+`Thinking`/`Responding`, tool, and `Worked for` markers own subsequent work
+state.
 
 ## 11. 24/7 target model
 
