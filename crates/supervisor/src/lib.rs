@@ -1892,6 +1892,7 @@ struct SessionSlot {
     run_id: Option<Uuid>,
     last_run_id: Option<Uuid>,
     bracketed_paste: BracketedPasteRunState,
+    codex_work_state: driver_codex::WorkStateTracker,
     grok_startup: driver_grok::StartupTracker,
     run_event_sequence: u64,
     generation: SessionGeneration,
@@ -2397,6 +2398,7 @@ fn closed_session_slot(definition: SessionDefinition) -> SessionSlot {
         run_id: None,
         last_run_id: None,
         bracketed_paste: BracketedPasteRunState::default(),
+        codex_work_state: driver_codex::WorkStateTracker::default(),
         grok_startup: driver_grok::StartupTracker::default(),
         run_event_sequence: 0,
         generation: 0,
@@ -2455,6 +2457,26 @@ fn ensure_run_input_safety_locked(
 ) -> Result<()> {
     if safety == RunInputSafety::Raw {
         return Ok(());
+    }
+
+    if slot.definition.driver == DriverKind::Codex {
+        if slot.codex_work_state.is_blocked() {
+            let detail = slot
+                .codex_work_state
+                .blocked_detail()
+                .map(|detail| format!(" ({detail})"))
+                .unwrap_or_default();
+            return Err(anyhow!(
+                "session '{}' work state is blocked{detail}; routed/delivered framing is blocked; use raw terminal input to resolve the prompt",
+                target.session,
+            ));
+        }
+        if !slot.work_state_observed {
+            return Err(anyhow!(
+                "session '{}' work state is unknown; routed/delivered framing is blocked until Codex emits an explicit interactive state; use raw terminal input to resolve any startup prompt",
+                target.session,
+            ));
+        }
     }
 
     if slot.work_state_observed
@@ -6306,6 +6328,7 @@ impl SupervisorHandle {
                 run_id,
                 generation: slot.generation,
             });
+            slot.codex_work_state.begin_run();
             slot.grok_startup.begin_run();
             slot.run_id = Some(run_id);
             slot.last_run_id = Some(run_id);
@@ -6361,7 +6384,13 @@ impl SupervisorHandle {
                                 })
                             {
                                 Err(anyhow!("start_session_at lost its spawn reservation"))
-                            } else if let Err(error) = ensure_run_event_capacity(slot, 1) {
+                            } else if let Err(error) = ensure_run_event_capacity(
+                                slot,
+                                1 + u64::from(
+                                    slot.definition.driver == DriverKind::Codex
+                                        && slot.codex_work_state.has_pending_classification(),
+                                ),
+                            ) {
                                 Err(error)
                             } else {
                                 slot.spawn_in_flight = None;
@@ -6375,13 +6404,25 @@ impl SupervisorHandle {
                                 slot.last_activity_at = Some(now_rfc3339());
                                 slot.last_real_output_at = None;
                                 reset_work_state_locked(slot);
+                                let pending_work_state_event = slot
+                                    .codex_work_state
+                                    .take_pending_classification()
+                                    .and_then(|(state, detail)| {
+                                        transition_work_state_locked(
+                                            &slot.definition.alias.clone(),
+                                            slot,
+                                            run_id,
+                                            state,
+                                            detail,
+                                        )
+                                    });
                                 let identity = next_run_event_identity(slot, run_id);
-                                Ok((slot.snapshot(), identity))
+                                Ok((slot.snapshot(), identity, pending_work_state_event))
                             }
                         }
                     }
                 };
-                let (snapshot, identity) = match installation {
+                let (snapshot, identity, pending_work_state_event) = match installation {
                     Ok(result) => result,
                     Err(error) => {
                         let process_id = pty.process_id();
@@ -6527,6 +6568,9 @@ impl SupervisorHandle {
                         };
                     }
                 };
+                if let Some(event) = pending_work_state_event {
+                    self.emit_run_work_state(event, expected, run_id);
+                }
                 self.emit(RuntimeEvent::SystemLog {
                     level: LogLevel::Info,
                     message: format!("Started {} session", snapshot.label),
@@ -7664,6 +7708,9 @@ impl SupervisorHandle {
                             generation: event_generation,
                         };
                         slot.bracketed_paste.observe_output(binding, &chunk);
+                        let codex_classification = (slot.definition.driver == DriverKind::Codex)
+                            .then(|| slot.codex_work_state.observe_output(&chunk))
+                            .flatten();
                         let spawn_is_unconfirmed = slot.spawn_in_flight
                             == Some(SpawnReservation {
                                 generation: event_generation,
@@ -7687,9 +7734,14 @@ impl SupervisorHandle {
                             None
                         } else if grok_interactive_ready {
                             Some((WorkState::Idle, None))
+                        } else if slot.definition.driver == DriverKind::Codex {
+                            codex_classification
                         } else {
                             classify_work_state_for_driver(slot.definition.driver, &chunk)
                         };
+                        if classification.is_some() {
+                            slot.codex_work_state.acknowledge_pending();
+                        }
                         let work_state_event = classification.and_then(|(state, detail)| {
                             transition_work_state_locked(
                                 &session_alias,
@@ -10578,6 +10630,41 @@ mod tests {
         }
     }
 
+    struct OutputThenReturnPtySpawner {
+        outputs: Vec<String>,
+        session: Mutex<Option<Box<dyn PtySessionTrait>>>,
+    }
+
+    impl PtySpawner for OutputThenReturnPtySpawner {
+        fn spawn(
+            &self,
+            _plan: &PreparedLaunch,
+            handler: PtyEventHandler,
+        ) -> Result<Box<dyn PtySessionTrait>> {
+            for output in &self.outputs {
+                handler(PtyEvent::Output(output.clone()));
+            }
+            self.session
+                .lock()
+                .take()
+                .ok_or_else(|| anyhow!("pre-install output PTY session already consumed"))
+        }
+    }
+
+    fn codex_workspace_trust_prompt() -> String {
+        concat!(
+            "\u{1b}[?2004h\u{1b}[?2026h\u{1b}[?2026l> \u{1b}[1mYou are in ",
+            "C:\\workspace\u{1b}[K\r\n\u{1b}[K\r\n  ",
+            "Do you trust the contents of this directory? Working with untrusted contents ",
+            "comes with higher risk of prompt injection.\u{1b}[K\r\n",
+            "  policies to load.\u{1b}[K\r\n\u{1b}[K\u{1b}[38;5;6m\r\n",
+            "› 1. Yes, continue\u{1b}[K\u{1b}[m\r\n",
+            "  2. No, quit\u{1b}[K\r\n\u{1b}[K\r\n  ",
+            "\u{1b}[2mPress enter to continue\u{1b}[22m\u{1b}[K\r\n",
+        )
+        .into()
+    }
+
     struct TestExecutableResolver;
 
     impl DriverExecutableResolver for TestExecutableResolver {
@@ -10907,6 +10994,7 @@ mod tests {
         slot.running = Some(RunningSession::new(None));
         let run_id = Uuid::new_v4();
         set_test_bracketed_paste_mode(slot, run_id, BracketedPasteMode::Unknown);
+        slot.codex_work_state.begin_run();
         slot.run_id = Some(run_id);
         slot.last_run_id = Some(run_id);
         slot.process_id = None;
@@ -11001,11 +11089,17 @@ mod tests {
         slot.running = Some(RunningSession::new(Some(Arc::from(pty))));
         let run_id = Uuid::new_v4();
         set_test_bracketed_paste_mode(slot, run_id, bracketed_paste_mode);
+        slot.codex_work_state.begin_run();
         slot.run_id = Some(run_id);
         slot.last_run_id = Some(run_id);
         slot.process_id = process_id;
         slot.state = LifecycleState::Busy;
         slot.last_real_output_at = None;
+        if driver == DriverKind::Codex {
+            slot.work_state = WorkState::Idle;
+            slot.work_state_observed = true;
+            slot.work_detail = None;
+        }
     }
 
     fn set_test_bracketed_paste_mode(
@@ -11159,6 +11253,7 @@ mod tests {
         run_id: Option<Uuid>,
         last_run_id: Option<Uuid>,
         bracketed_paste: BracketedPasteRunState,
+        codex_work_state: driver_codex::WorkStateTracker,
         run_event_sequence: u64,
         generation: SessionGeneration,
         spawn_in_flight: Option<SpawnReservation>,
@@ -11198,6 +11293,7 @@ mod tests {
                 run_id: slot.run_id,
                 last_run_id: slot.last_run_id,
                 bracketed_paste: slot.bracketed_paste,
+                codex_work_state: slot.codex_work_state.clone(),
                 run_event_sequence: slot.run_event_sequence,
                 generation: slot.generation,
                 spawn_in_flight: slot.spawn_in_flight,
@@ -13197,8 +13293,9 @@ mod tests {
     }
 
     #[test]
-    fn run_event_sequence_exhaustion_rejects_before_pty_state_mutation() {
+    fn run_event_sequence_exhaustion_mutates_only_fail_closed_raw_trackers() {
         let supervisor = test_supervisor();
+        let session_id = test_session_id(&supervisor, "codex");
         let (pty, inputs) = recording_pty_session(101);
         install_mock_running_session_with_process_id(
             &supervisor,
@@ -13207,6 +13304,13 @@ mod tests {
             None,
             pty,
         );
+        {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id(session_id).unwrap();
+            assert!(slot.work_state_observed);
+            assert_eq!(slot.work_state, WorkState::Idle);
+            assert!(!slot.codex_work_state.is_blocked());
+        }
         supervisor
             .inner
             .slots
@@ -13224,7 +13328,21 @@ mod tests {
             PtyEvent::Output("real output".into()),
         );
 
-        assert_eq!(slots_mutation_probe(&supervisor), slots_before);
+        let tracker_after = supervisor
+            .inner
+            .slots
+            .lock()
+            .get_by_id(session_id)
+            .unwrap()
+            .codex_work_state
+            .clone();
+        let mut expected = slots_before;
+        expected
+            .iter_mut()
+            .find(|probe| probe.session_id == session_id)
+            .unwrap()
+            .codex_work_state = tracker_after;
+        assert_eq!(slots_mutation_probe(&supervisor), expected);
         assert!(events.lock().is_empty());
         assert!(inputs.lock().is_empty());
     }
@@ -14753,6 +14871,201 @@ mod tests {
             RuntimeEvent::SessionWorkState { identity, .. }
                 if identity.session_id == session_id
         )));
+    }
+
+    #[test]
+    fn complete_preinstall_codex_trust_prompt_is_published_before_ready_and_blocks_route() {
+        let supervisor = test_supervisor();
+        let session_id = test_session_id(&supervisor, "codex");
+        let (pty, inputs) = recording_pty_session(std::process::id());
+        supervisor.set_pty_spawner_for_tests(Arc::new(OutputThenReturnPtySpawner {
+            outputs: vec![codex_workspace_trust_prompt()],
+            session: Mutex::new(Some(pty)),
+        }));
+        let events = capture_runtime_events(&supervisor);
+
+        let snapshot = supervisor
+            .start_session_by_id(session_id)
+            .expect("the recording Codex run should install");
+        assert_eq!(snapshot.lifecycle_state, LifecycleState::Ready);
+        {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id(session_id).unwrap();
+            assert!(slot.work_state_observed);
+            assert_eq!(slot.work_state, WorkState::Blocked);
+            assert_eq!(slot.work_detail.as_deref(), Some("workspace_trust"));
+        }
+
+        let recorded = events.lock();
+        let blocked_index = recorded
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::SessionWorkState {
+                        identity,
+                        state: WorkState::Blocked,
+                        detail: Some(detail),
+                        ..
+                    } if identity.session_id == session_id && detail == "workspace_trust"
+                )
+            })
+            .expect("pre-install trust prompt must publish a blocked event");
+        let ready_index = recorded
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::SessionState {
+                        identity,
+                        state: LifecycleState::Ready,
+                        ..
+                    } if identity.session_id == session_id
+                )
+            })
+            .expect("installed Codex run must publish Ready");
+        assert!(
+            blocked_index < ready_index,
+            "the pending Blocked state must publish before Ready"
+        );
+        drop(recorded);
+
+        events.lock().clear();
+        let before = slots_mutation_probe(&supervisor);
+        let audit_before = fs::read(supervisor.audit_log_path()).unwrap_or_default();
+        let error = supervisor
+            .route_operator_message(OperatorRouteMessageRequest {
+                recipient_id: session_id,
+                content: "must not accept the trust prompt".into(),
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("work state is blocked (workspace_trust)"),
+            "{error:#}"
+        );
+        assert_eq!(slots_mutation_probe(&supervisor), before);
+        assert!(inputs.lock().is_empty());
+        assert!(events.lock().is_empty());
+        assert_eq!(
+            fs::read(supervisor.audit_log_path()).unwrap_or_default(),
+            audit_before
+        );
+    }
+
+    #[test]
+    fn preinstall_codex_idle_marker_establishes_observed_state_and_allows_route() {
+        let supervisor = test_supervisor();
+        let session_id = test_session_id(&supervisor, "codex");
+        let (pty, inputs) = recording_pty_session(std::process::id());
+        supervisor.set_pty_spawner_for_tests(Arc::new(OutputThenReturnPtySpawner {
+            outputs: vec!["\u{1b}[?2004h\u{258c}".into()],
+            session: Mutex::new(Some(pty)),
+        }));
+
+        let snapshot = supervisor
+            .start_session_by_id(session_id)
+            .expect("the pre-install Idle Codex run should install");
+        assert_eq!(snapshot.lifecycle_state, LifecycleState::Ready);
+        {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id(session_id).unwrap();
+            assert!(slot.work_state_observed);
+            assert_eq!(slot.work_state, WorkState::Idle);
+        }
+
+        supervisor
+            .route_operator_message(OperatorRouteMessageRequest {
+                recipient_id: session_id,
+                content: "explicit pre-install idle remains routable".into(),
+            })
+            .expect("an explicitly observed pre-install Idle state should admit routing");
+        assert_eq!(inputs.lock().len(), 2);
+    }
+
+    #[test]
+    fn codex_trust_prompt_split_across_install_stays_unknown_then_blocks_without_route_mutation() {
+        let supervisor = test_supervisor();
+        let session_id = test_session_id(&supervisor, "codex");
+        let prompt = codex_workspace_trust_prompt();
+        let split = prompt
+            .find("Press enter to continue")
+            .expect("live prompt fixture must include its submit instruction");
+        let (pty, inputs) = recording_pty_session(std::process::id());
+        supervisor.set_pty_spawner_for_tests(Arc::new(OutputThenReturnPtySpawner {
+            outputs: vec![prompt[..split].into()],
+            session: Mutex::new(Some(pty)),
+        }));
+        let events = capture_runtime_events(&supervisor);
+
+        let snapshot = supervisor
+            .start_session_by_id(session_id)
+            .expect("the split-prompt Codex run should install");
+        assert_eq!(snapshot.lifecycle_state, LifecycleState::Ready);
+        assert!(
+            !supervisor
+                .inner
+                .slots
+                .lock()
+                .get_by_id(session_id)
+                .unwrap()
+                .work_state_observed
+        );
+
+        events.lock().clear();
+        let before_unknown = slots_mutation_probe(&supervisor);
+        let audit_before_unknown = fs::read(supervisor.audit_log_path()).unwrap_or_default();
+        let unknown = supervisor
+            .route_operator_message(OperatorRouteMessageRequest {
+                recipient_id: session_id,
+                content: "must wait for an explicit Codex state".into(),
+            })
+            .unwrap_err();
+        assert!(unknown.to_string().contains("work state is unknown"));
+        assert_eq!(slots_mutation_probe(&supervisor), before_unknown);
+        assert!(events.lock().is_empty());
+        assert_eq!(
+            fs::read(supervisor.audit_log_path()).unwrap_or_default(),
+            audit_before_unknown
+        );
+
+        handle_current_pty_event(
+            &supervisor,
+            "codex",
+            snapshot.generation,
+            PtyEvent::Output(prompt[split..].into()),
+        );
+        {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id(session_id).unwrap();
+            assert!(slot.work_state_observed);
+            assert_eq!(slot.work_state, WorkState::Blocked);
+            assert_eq!(slot.work_detail.as_deref(), Some("workspace_trust"));
+        }
+
+        events.lock().clear();
+        let before_blocked = slots_mutation_probe(&supervisor);
+        let audit_before_blocked = fs::read(supervisor.audit_log_path()).unwrap_or_default();
+        let blocked = supervisor
+            .route_operator_message(OperatorRouteMessageRequest {
+                recipient_id: session_id,
+                content: "must still not accept the trust prompt".into(),
+            })
+            .unwrap_err();
+        assert!(
+            blocked
+                .to_string()
+                .contains("work state is blocked (workspace_trust)"),
+            "{blocked:#}"
+        );
+        assert_eq!(slots_mutation_probe(&supervisor), before_blocked);
+        assert!(inputs.lock().is_empty());
+        assert!(events.lock().is_empty());
+        assert_eq!(
+            fs::read(supervisor.audit_log_path()).unwrap_or_default(),
+            audit_before_blocked
+        );
     }
 
     #[test]
@@ -18286,6 +18599,81 @@ mod tests {
             BracketedPasteMode::Enabled
         );
         assert_eq!(slot.run_event_sequence, u64::MAX - 2);
+    }
+
+    #[test]
+    fn codex_modal_tracker_stays_fail_closed_when_output_event_sequence_is_exhausted() {
+        let supervisor = test_supervisor();
+        let session_id = test_session_id(&supervisor, "codex");
+        let (pty, inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            pty,
+        );
+        let prompt = codex_workspace_trust_prompt();
+        let first_split = prompt
+            .find("Yes, continue")
+            .expect("trust prompt fixture must contain the first choice");
+        let second_split = prompt
+            .find("Press enter to continue")
+            .expect("trust prompt fixture must contain the submit instruction");
+        let (generation, run_id) = {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_mut("codex").unwrap();
+            assert!(slot.work_state_observed);
+            assert_eq!(slot.work_state, WorkState::Idle);
+            (slot.generation, slot.run_id.unwrap())
+        };
+
+        supervisor.handle_pty_event(
+            "codex",
+            generation,
+            run_id,
+            PtyEvent::Output(prompt[..first_split].into()),
+        );
+        supervisor
+            .inner
+            .slots
+            .lock()
+            .get_mut("codex")
+            .unwrap()
+            .run_event_sequence = u64::MAX - 2;
+
+        supervisor.handle_pty_event(
+            "codex",
+            generation,
+            run_id,
+            PtyEvent::Output(prompt[first_split..second_split].into()),
+        );
+        supervisor.handle_pty_event(
+            "codex",
+            generation,
+            run_id,
+            PtyEvent::Output(prompt[second_split..].into()),
+        );
+
+        let events = capture_runtime_events(&supervisor);
+        let audit_before = fs::read(supervisor.audit_log_path()).unwrap_or_default();
+        let error = supervisor
+            .route_operator_message(OperatorRouteMessageRequest {
+                recipient_id: session_id,
+                content: "must not enter an unpublishable modal".into(),
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("work state is blocked (workspace_trust)"),
+            "{error:#}"
+        );
+        assert!(inputs.lock().is_empty());
+        assert!(events.lock().is_empty());
+        assert_eq!(
+            fs::read(supervisor.audit_log_path()).unwrap_or_default(),
+            audit_before
+        );
     }
 
     #[test]

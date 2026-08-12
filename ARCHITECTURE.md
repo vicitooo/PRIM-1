@@ -315,7 +315,7 @@ On every operator route, the supervisor must:
 1. derive operator provenance at the Tauri boundary
 2. validate the source request and whole message body
 3. resolve the explicit recipient `SessionId` to one exact run
-4. preflight its framing before any write, including exact-run evidence that DEC private mode 2004 is enabled and that the driver has not observed a blocked/error-loop state for bracketed-paste drivers
+4. preflight its framing before any write, including exact-run evidence that DEC private mode 2004 is enabled, that the driver has not observed a blocked/error-loop state, and—on Codex—that an explicit work state has been observed
 5. record pending metadata without retaining message content
 6. hold the recipient run-input permit, revalidate identity/generation/PTY/gate/mode/work-state, and write the complete driver input: one bracketed frame for Claude/Codex, or one Grok-minimal fused buffer containing a bracketed frame per LF line with `ESC CR` (Alt+Enter) between frames; Grok rejects CR, source bodies above 13 KiB, and more than 256 source lines during preflight because those bounds stay inside its measured receiver envelope. From that successful write boundary, wait a one-second base interval plus a conservative proportional 500 milliseconds per MiB of framed input (chosen over the roughly 10/19/174 milliseconds of parser lag observed at 1 KiB/64 KiB/1 MiB), revalidate identity/generation/PTY/gate/work-state, and write one Enter. A partial/error/short first write reports exact progress and sends no Enter or retry; raw single-line drivers remain one PTY input containing only the validated source command because a textual provenance prefix would be executable shell input
 7. emit a written or failed receipt without claiming final-child or model receipt
@@ -331,8 +331,12 @@ pool, so the driver settle interval does not stall the UI or serialize unrelated
 desktop IPC behind the route.
 
 The mode-2004 scanner consumes the exact run's raw PTY output before desktop
-coalescing or output shedding and resets on every `RunId`. Unknown or disabled
-state, or a driver-observed blocked/error-loop state, blocks addressed Claude/Codex/Grok
+coalescing or output shedding and resets on every `RunId`. Codex also owns a
+bounded per-run work-state tracker that starts before PTY installation, joins
+arbitrary output chunks only for measured classifier context, latches blocking
+prompts until explicit non-blocked output, and commits any pre-install block
+before Ready. Unknown or disabled mode, unobserved Codex state, or a
+driver-observed blocked/error-loop state blocks addressed Claude/Codex/Grok
 delivery without blocking raw operator or pane-local input. The paste and Enter
 boundary is FIFO-serialized and rechecked twice. Output is not used as an
 acknowledgement because multiline input may stay

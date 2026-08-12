@@ -2,8 +2,84 @@ use std::path::Path;
 
 use shared_types::{LaunchSpec, LaunchSpecError, PermissionProfile, SessionDefinition, WorkState};
 
+const WORK_STATE_CONTEXT_MAX_BYTES: usize = 16 * 1024;
+
+/// Tracks Codex's bounded interactive-prompt context across arbitrary PTY
+/// output chunks. A detected blocking prompt stays latched until Codex emits
+/// an explicit non-blocked state; silence, unrelated output, and context
+/// eviction never clear it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkStateTracker {
+    context: String,
+    blocked: bool,
+    blocked_detail: Option<String>,
+    pending_classification: Option<(WorkState, Option<String>)>,
+}
+
+impl WorkStateTracker {
+    pub fn begin_run(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn observe_output(&mut self, chunk: &str) -> Option<(WorkState, Option<String>)> {
+        self.context.push_str(chunk);
+        let normalized_context = strip_ansi_and_controls(&self.context);
+
+        if let Some(classification) = classify_normalized_work_state(&normalized_context) {
+            self.context.clear();
+            self.blocked = classification.0 == WorkState::Blocked;
+            self.blocked_detail = classification.1.clone().filter(|_| self.blocked);
+            self.pending_classification = Some(classification.clone());
+            return Some(classification);
+        }
+
+        if self.blocked {
+            trim_context_suffix(&mut self.context);
+            return None;
+        }
+
+        trim_context_suffix(&mut self.context);
+        None
+    }
+
+    pub fn take_pending_classification(&mut self) -> Option<(WorkState, Option<String>)> {
+        self.pending_classification.take()
+    }
+
+    pub fn acknowledge_pending(&mut self) {
+        self.pending_classification = None;
+    }
+
+    pub fn has_pending_classification(&self) -> bool {
+        self.pending_classification.is_some()
+    }
+
+    pub fn blocked_detail(&self) -> Option<&str> {
+        self.blocked_detail.as_deref()
+    }
+
+    pub fn is_blocked(&self) -> bool {
+        self.blocked
+    }
+}
+
+fn trim_context_suffix(context: &mut String) {
+    if context.len() <= WORK_STATE_CONTEXT_MAX_BYTES {
+        return;
+    }
+    let mut start = context.len() - WORK_STATE_CONTEXT_MAX_BYTES;
+    while !context.is_char_boundary(start) {
+        start += 1;
+    }
+    context.drain(..start);
+}
+
 pub fn classify_work_state(chunk: &str) -> Option<(WorkState, Option<String>)> {
     let normalized = strip_ansi_and_controls(chunk);
+    classify_normalized_work_state(&normalized)
+}
+
+fn classify_normalized_work_state(normalized: &str) -> Option<(WorkState, Option<String>)> {
     let lower = normalized.to_ascii_lowercase();
 
     if lower.contains("do you trust the contents of this directory?")
@@ -55,8 +131,8 @@ pub fn classify_work_state(chunk: &str) -> Option<(WorkState, Option<String>)> {
         return Some((WorkState::Blocked, Some("stream_disconnected".into())));
     }
 
-    if contains_working_timer(&normalized) {
-        return Some((WorkState::Thinking, extract_working_detail(&normalized)));
+    if contains_working_timer(normalized) {
+        return Some((WorkState::Thinking, extract_working_detail(normalized)));
     }
 
     if lower.contains("> run ")
@@ -215,6 +291,17 @@ fn validate_direct_program(program: &str) -> Result<(), LaunchSpecError> {
 mod tests {
     use super::*;
     use shared_types::{DriverKind, SessionId};
+
+    const LIVE_WORKSPACE_TRUST_PROMPT: &str = concat!(
+        "\u{1b}[?2026h\u{1b}[?2026l> \u{1b}[1mYou are in ",
+        "C:\\workspace\u{1b}[K\r\n\u{1b}[K\r\n  ",
+        "Do you trust the contents of this directory? Working with untrusted contents ",
+        "comes with higher risk of prompt injection.\u{1b}[K\r\n",
+        "  policies to load.\u{1b}[K\r\n\u{1b}[K\u{1b}[38;5;6m\r\n",
+        "› 1. Yes, continue\u{1b}[K\u{1b}[m\r\n",
+        "  2. No, quit\u{1b}[K\r\n\u{1b}[K\r\n  ",
+        "\u{1b}[2mPress enter to continue\u{1b}[22m\u{1b}[K\r\n",
+    );
 
     #[cfg(windows)]
     const WORKSPACE_ROOT: &str = r"D:\workspace & (qa)";
@@ -387,6 +474,108 @@ mod tests {
                 "remaining capacity is not an exhausted usage limit: {available_usage}"
             );
         }
+    }
+
+    #[test]
+    fn workspace_trust_tracker_detects_the_live_prompt_at_every_chunk_boundary() {
+        for split in 0..=LIVE_WORKSPACE_TRUST_PROMPT.len() {
+            if !LIVE_WORKSPACE_TRUST_PROMPT.is_char_boundary(split) {
+                continue;
+            }
+            let mut tracker = WorkStateTracker::default();
+            let first = tracker.observe_output(&LIVE_WORKSPACE_TRUST_PROMPT[..split]);
+            let second = tracker.observe_output(&LIVE_WORKSPACE_TRUST_PROMPT[split..]);
+            assert!(
+                matches!(first, Some((WorkState::Blocked, Some(ref detail))) if detail == "workspace_trust")
+                    || matches!(second, Some((WorkState::Blocked, Some(ref detail))) if detail == "workspace_trust"),
+                "split {split} did not detect the live trust prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_trust_tracker_detects_one_character_chunks_and_rejects_prose() {
+        let mut tracker = WorkStateTracker::default();
+        let mut observed = None;
+        for character in LIVE_WORKSPACE_TRUST_PROMPT.chars() {
+            observed = tracker.observe_output(&character.to_string()).or(observed);
+        }
+        assert_eq!(
+            observed,
+            Some((WorkState::Blocked, Some("workspace_trust".into())))
+        );
+
+        let mut prose = WorkStateTracker::default();
+        for character in
+            "The documentation asks: Do you trust the contents of this directory?".chars()
+        {
+            assert_ne!(
+                prose.observe_output(&character.to_string()),
+                Some((WorkState::Blocked, Some("workspace_trust".into())))
+            );
+        }
+        assert!(!prose.has_pending_classification());
+    }
+
+    #[test]
+    fn workspace_trust_tracker_reassembles_control_sequences_split_inside_an_anchor() {
+        let prompt = LIVE_WORKSPACE_TRUST_PROMPT.replace(
+            "contents of this directory",
+            "cont\u{1b}[31ments of this directory",
+        );
+        let mut tracker = WorkStateTracker::default();
+        let mut observed = None;
+        for character in prompt.chars() {
+            observed = tracker.observe_output(&character.to_string()).or(observed);
+        }
+        assert_eq!(
+            observed,
+            Some((WorkState::Blocked, Some("workspace_trust".into())))
+        );
+    }
+
+    #[test]
+    fn blocked_prompt_is_latched_until_explicit_non_blocked_state_and_resets_per_run() {
+        let mut tracker = WorkStateTracker::default();
+        assert_eq!(
+            tracker.observe_output(LIVE_WORKSPACE_TRUST_PROMPT),
+            Some((WorkState::Blocked, Some("workspace_trust".into())))
+        );
+        assert_eq!(
+            tracker.take_pending_classification(),
+            Some((WorkState::Blocked, Some("workspace_trust".into())))
+        );
+        assert!(!tracker.has_pending_classification());
+        assert_eq!(tracker.observe_output("unrelated cursor repaint"), None);
+        assert_eq!(
+            tracker.observe_output("Working 12s"),
+            Some((WorkState::Thinking, Some("Working 12s".into())))
+        );
+
+        tracker.observe_output(LIVE_WORKSPACE_TRUST_PROMPT);
+        tracker.acknowledge_pending();
+        assert_eq!(
+            tracker.observe_output("\u{258c}"),
+            Some((WorkState::Idle, None))
+        );
+
+        tracker.observe_output(&LIVE_WORKSPACE_TRUST_PROMPT[..64]);
+        tracker.begin_run();
+        assert!(tracker.context.is_empty());
+        assert!(!tracker.is_blocked());
+        assert!(tracker.blocked_detail.is_none());
+        assert!(!tracker.has_pending_classification());
+    }
+
+    #[test]
+    fn work_state_tracker_context_is_bounded_without_manufacturing_a_state() {
+        let mut tracker = WorkStateTracker::default();
+        assert_eq!(
+            tracker.observe_output(&"ordinary output ".repeat(2_048)),
+            None
+        );
+        assert!(tracker.context.len() <= WORK_STATE_CONTEXT_MAX_BYTES);
+        assert!(!tracker.has_pending_classification());
     }
 
     #[test]
