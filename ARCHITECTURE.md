@@ -335,7 +335,14 @@ coalescing or output shedding and resets on every `RunId`. Codex also owns a
 bounded per-run work-state tracker that starts before PTY installation, joins
 arbitrary output chunks only for measured classifier context, latches blocking
 prompts until explicit non-blocked output, and commits any pre-install block
-before Ready. Unknown or disabled mode, unobserved Codex state, or a
+before Ready. A distinct bounded raw-frame scanner recognizes only a complete
+Codex 0.147.0 DEC-2026 paint whose final input row, model/cwd footer, and cursor
+state prove the clean prompt; it does not assemble state across paints, admit
+malformed/overlong frames, or clear a latched block. This removes incidental
+startup-output timing from first-route admission without adding another
+terminal emulator. Terminal-string payload cannot supply text or cursor proof;
+the measured footer suffix and absolute column-3 cursor position remain explicit
+version pins, with unfamiliar repaint shapes left Unknown. Unknown or disabled mode, unobserved Codex state, or a
 driver-observed blocked/error-loop state blocks addressed Claude/Codex/Grok
 delivery without blocking raw operator or pane-local input. The paste and Enter
 boundary is FIFO-serialized and rechecked twice. Output is not used as an

@@ -10665,6 +10665,25 @@ mod tests {
         .into()
     }
 
+    fn codex_clean_prompt_frame() -> String {
+        concat!(
+            "\u{1b}[?2004h\u{1b}[?2026h\u{1b}[?25l\u{1b}[1;1H",
+            "\r\n╭───────────────────────────────────────────────╮\r\n",
+            "│ >_ OpenAI Codex (v0.147.0)                    │\r\n",
+            "│                                               │\r\n",
+            "│ model:     gpt-5.6-sol max   /model to change │\r\n",
+            "│ directory: ~\\mywork                           │\r\n",
+            "╰───────────────────────────────────────────────╯\r\n",
+            "\r\n\r\n\r\n",
+            "› Find and fix a bug in @filename\r\n",
+            "\r\n",
+            "  gpt-5.6-sol max · ~\\mywork\r\n",
+            "\r\n\r\n\r\n",
+            "\u{1b}[18;3H\u{1b}[?25h\u{1b}[?2026l",
+        )
+        .into()
+    }
+
     struct TestExecutableResolver;
 
     impl DriverExecutableResolver for TestExecutableResolver {
@@ -14955,32 +14974,33 @@ mod tests {
     }
 
     #[test]
-    fn preinstall_codex_idle_marker_establishes_observed_state_and_allows_route() {
+    fn preinstall_codex_clean_prompt_establishes_idle_before_ready_and_allows_first_route() {
         let supervisor = test_supervisor();
         let session_id = test_session_id(&supervisor, "codex");
         let (pty, inputs) = recording_pty_session(std::process::id());
         supervisor.set_pty_spawner_for_tests(Arc::new(OutputThenReturnPtySpawner {
-            outputs: vec!["\u{1b}[?2004h\u{258c}".into()],
+            outputs: vec![codex_clean_prompt_frame()],
             session: Mutex::new(Some(pty)),
         }));
 
         let snapshot = supervisor
             .start_session_by_id(session_id)
-            .expect("the pre-install Idle Codex run should install");
+            .expect("the pre-install clean Codex prompt should install");
         assert_eq!(snapshot.lifecycle_state, LifecycleState::Ready);
         {
             let slots = supervisor.inner.slots.lock();
             let slot = slots.get_by_id(session_id).unwrap();
             assert!(slot.work_state_observed);
             assert_eq!(slot.work_state, WorkState::Idle);
+            assert_eq!(slot.work_detail, None);
         }
 
         supervisor
             .route_operator_message(OperatorRouteMessageRequest {
                 recipient_id: session_id,
-                content: "explicit pre-install idle remains routable".into(),
+                content: "the first clean-prompt route is deterministic".into(),
             })
-            .expect("an explicitly observed pre-install Idle state should admit routing");
+            .expect("the clean prompt must admit the first route without a warm-up turn");
         assert_eq!(inputs.lock().len(), 2);
     }
 
