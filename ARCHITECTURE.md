@@ -331,18 +331,21 @@ pool, so the driver settle interval does not stall the UI or serialize unrelated
 desktop IPC behind the route.
 
 The mode-2004 scanner consumes the exact run's raw PTY output before desktop
-coalescing or output shedding and resets on every `RunId`. Codex also owns a
-bounded per-run work-state tracker that starts before PTY installation, joins
-arbitrary output chunks only for measured classifier context, latches blocking
-prompts until explicit non-blocked output, and commits any pre-install block
-before Ready. A distinct bounded raw-frame scanner recognizes only a complete
-Codex 0.147.0 DEC-2026 paint whose final input row, model/cwd footer, and cursor
-state prove the clean prompt; it does not assemble state across paints, admit
-malformed/overlong frames, or clear a latched block. This removes incidental
-startup-output timing from first-route admission without adding another
-terminal emulator. Terminal-string payload cannot supply text or cursor proof;
-the measured footer suffix and absolute column-3 cursor position remain explicit
-version pins, with unfamiliar repaint shapes left Unknown. Unknown or disabled mode, unobserved Codex state, or a
+coalescing or output shedding and resets on every `RunId`; it remains the sole
+delivery-mode authority. Codex and Grok apply separate driver policies over one
+bounded, driver-internal terminal viewport that retains no styling or scrollback.
+Codex's per-run work-state tracker starts before PTY installation, joins arbitrary
+output chunks only for measured classifier context, latches blocking prompts,
+and commits any pre-install block before Ready. Codex 0.147.0 composes its prompt
+across multiple synchronized and ordinary cursor-hide/show transactions, so a
+trusted current screen proves Idle only when it shows a visible column-3 cursor
+on an input row exactly `›` or beginning `› `, followed by an indented non-empty
+footer row whose final ` · ` separates a non-empty model from a path-like cwd.
+A later clean screen clears a
+latched blocker only when no measured blocker remains anywhere on that same
+screen. The legacy `▌` and `esc to interrupt` text are not authority. Terminal-
+string payload cannot supply text or cursor proof; malformed, unsupported,
+resized-but-unreconstructed, and over-limit projections remain Unknown. Unknown or disabled mode, unobserved Codex state, or a
 driver-observed blocked/error-loop state blocks addressed Claude/Codex/Grok
 delivery without blocking raw operator or pane-local input. The paste and Enter
 boundary is FIFO-serialized and rechecked twice. Output is not used as an

@@ -12,6 +12,7 @@ members = [
   "crates/pty-host",
   "crates/shared-types",
   "crates/supervisor",
+  "crates/terminal-viewport",
 ]
 exclude = ["vendor/portable-pty"]
 

@@ -1,261 +1,9 @@
 use std::path::Path;
 
 use shared_types::{LaunchSpec, LaunchSpecError, PermissionProfile, SessionDefinition, WorkState};
+use terminal_viewport::{TerminalViewport, TrustedScreen};
 
 const WORK_STATE_CONTEXT_MAX_BYTES: usize = 16 * 1024;
-const PROMPT_FRAME_MAX_BYTES: usize = 16 * 1024;
-const SYNC_FRAME_START: &[u8] = b"\x1b[?2026h";
-const SYNC_FRAME_END: &[u8] = b"\x1b[?2026l";
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum PromptFrameState {
-    #[default]
-    Ground,
-    Collecting,
-    Discarding,
-}
-
-/// Tracks complete DEC synchronized-output frames without assembling prompt
-/// evidence across separate paints. Unknown, malformed, nested, truncated, or
-/// overlong frames never manufacture an interactive state.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct PromptFrameTracker {
-    state: PromptFrameState,
-    buffer: Vec<u8>,
-}
-
-impl PromptFrameTracker {
-    fn reset(&mut self) {
-        *self = Self::default();
-    }
-
-    fn observe_output(&mut self, chunk: &str) -> bool {
-        self.buffer.extend_from_slice(chunk.as_bytes());
-        let mut last_completed_frame = None;
-
-        loop {
-            match self.state {
-                PromptFrameState::Ground => {
-                    let Some(start) = find_bytes(&self.buffer, SYNC_FRAME_START) else {
-                        retain_partial_marker(&mut self.buffer, SYNC_FRAME_START);
-                        break;
-                    };
-                    self.buffer.drain(..start + SYNC_FRAME_START.len());
-                    self.state = PromptFrameState::Collecting;
-                }
-                PromptFrameState::Collecting => {
-                    let end = find_bytes(&self.buffer, SYNC_FRAME_END);
-                    let nested_start = find_bytes(&self.buffer, SYNC_FRAME_START);
-                    if nested_start.is_some_and(|start| end.is_none_or(|end| start < end)) {
-                        let start = nested_start.expect("nested start was checked above");
-                        self.buffer.drain(..start + SYNC_FRAME_START.len());
-                        self.state = PromptFrameState::Discarding;
-                        last_completed_frame = Some(false);
-                        continue;
-                    }
-
-                    if let Some(end) = end {
-                        let is_clean_prompt = end <= PROMPT_FRAME_MAX_BYTES
-                            && std::str::from_utf8(&self.buffer[..end])
-                                .is_ok_and(is_clean_prompt_frame);
-                        self.buffer.drain(..end + SYNC_FRAME_END.len());
-                        self.state = PromptFrameState::Ground;
-                        last_completed_frame = Some(is_clean_prompt);
-                        continue;
-                    }
-
-                    if self.buffer.len() > PROMPT_FRAME_MAX_BYTES {
-                        retain_partial_marker(&mut self.buffer, SYNC_FRAME_END);
-                        self.state = PromptFrameState::Discarding;
-                        last_completed_frame = Some(false);
-                    }
-                    break;
-                }
-                PromptFrameState::Discarding => {
-                    let Some(end) = find_bytes(&self.buffer, SYNC_FRAME_END) else {
-                        retain_partial_marker(&mut self.buffer, SYNC_FRAME_END);
-                        break;
-                    };
-                    self.buffer.drain(..end + SYNC_FRAME_END.len());
-                    self.state = PromptFrameState::Ground;
-                    last_completed_frame = Some(false);
-                }
-            }
-        }
-
-        last_completed_frame == Some(true)
-            && self.state == PromptFrameState::Ground
-            && self.buffer.is_empty()
-    }
-}
-
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
-fn retain_partial_marker(buffer: &mut Vec<u8>, marker: &[u8]) {
-    let keep = (1..marker.len())
-        .rev()
-        .find(|length| buffer.ends_with(&marker[..*length]))
-        .unwrap_or(0);
-    if keep == 0 {
-        buffer.clear();
-    } else {
-        buffer.drain(..buffer.len() - keep);
-    }
-}
-
-fn is_clean_prompt_frame(raw_frame: &str) -> bool {
-    let Some(normalized) = normalize_prompt_frame(raw_frame) else {
-        return false;
-    };
-    if !cursor_is_visible_at_empty_input(&normalized.cursor_stream) {
-        return false;
-    }
-    let non_empty = normalized
-        .text
-        .lines()
-        .map(|line| line.trim_end_matches('\r'))
-        .filter(|line| !line.trim().is_empty())
-        .collect::<Vec<_>>();
-    let [.., input, footer] = non_empty.as_slice() else {
-        return false;
-    };
-    if !(*input == "›" || input.starts_with("› ")) || !footer.starts_with("  ") {
-        return false;
-    }
-
-    let Some((model, working_dir)) = footer.trim().rsplit_once(" · ") else {
-        return false;
-    };
-    !model.trim().is_empty() && looks_like_status_working_directory(working_dir.trim())
-}
-
-struct NormalizedPromptFrame {
-    text: String,
-    cursor_stream: String,
-}
-
-fn normalize_prompt_frame(input: &str) -> Option<NormalizedPromptFrame> {
-    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-    enum State {
-        #[default]
-        Normal,
-        Escape,
-        Csi,
-        String {
-            bell_terminated: bool,
-        },
-    }
-
-    let mut text = String::with_capacity(input.len());
-    let mut cursor_stream = String::with_capacity(input.len());
-    let mut state = State::Normal;
-
-    for ch in input.chars() {
-        state = match state {
-            State::Normal => match ch {
-                '\u{1b}' => State::Escape,
-                '\u{009b}' => {
-                    cursor_stream.push_str("\u{1b}[");
-                    State::Csi
-                }
-                '\u{009d}' => State::String {
-                    bell_terminated: true,
-                },
-                '\u{0090}' | '\u{0098}' | '\u{009e}' | '\u{009f}' => State::String {
-                    bell_terminated: false,
-                },
-                '\u{009c}' => State::Normal,
-                '\u{0007}' => State::Normal,
-                _ if ch.is_control() && ch != '\n' && ch != '\r' && ch != '\t' => {
-                    return None;
-                }
-                _ => {
-                    text.push(ch);
-                    cursor_stream.push(ch);
-                    State::Normal
-                }
-            },
-            State::Escape => match ch {
-                '[' => {
-                    cursor_stream.push_str("\u{1b}[");
-                    State::Csi
-                }
-                ']' => State::String {
-                    bell_terminated: true,
-                },
-                'P' | 'X' | '^' | '_' => State::String {
-                    bell_terminated: false,
-                },
-                '\\' => State::Normal,
-                '\u{1b}' => State::Escape,
-                _ => return None,
-            },
-            State::Csi => {
-                cursor_stream.push(ch);
-                if ('@'..='~').contains(&ch) {
-                    State::Normal
-                } else if (' '..='?').contains(&ch) {
-                    State::Csi
-                } else {
-                    return None;
-                }
-            }
-            State::String { bell_terminated } => match ch {
-                '\u{0007}' if bell_terminated => State::Normal,
-                '\u{009c}' => State::Normal,
-                '\u{1b}' => State::Escape,
-                '\u{009b}' => {
-                    cursor_stream.push_str("\u{1b}[");
-                    State::Csi
-                }
-                '\u{009d}' => State::String {
-                    bell_terminated: true,
-                },
-                '\u{0090}' | '\u{0098}' | '\u{009e}' | '\u{009f}' => State::String {
-                    bell_terminated: false,
-                },
-                _ if matches!(ch, '\u{0080}'..='\u{009a}') => return None,
-                _ => State::String { bell_terminated },
-            },
-        };
-    }
-
-    (state == State::Normal).then_some(NormalizedPromptFrame {
-        text,
-        cursor_stream,
-    })
-}
-
-fn cursor_is_visible_at_empty_input(raw_frame: &str) -> bool {
-    const CURSOR_SHOW: &str = "\x1b[?25h";
-    const CURSOR_HIDE: &str = "\x1b[?25l";
-
-    let Some(show) = raw_frame.rfind(CURSOR_SHOW) else {
-        return false;
-    };
-    if raw_frame.rfind(CURSOR_HIDE).is_some_and(|hide| hide > show) {
-        return false;
-    }
-    let before_show = &raw_frame[..show];
-    let Some(position_start) = before_show.rfind("\x1b[") else {
-        return false;
-    };
-    let position = &before_show[position_start + 2..];
-    let Some(parameters) = position
-        .strip_suffix('H')
-        .or_else(|| position.strip_suffix('f'))
-    else {
-        return false;
-    };
-    let mut fields = parameters.split(';');
-    let row = fields.next().and_then(|value| value.parse::<usize>().ok());
-    let column = fields.next().and_then(|value| value.parse::<usize>().ok());
-    row.is_some() && column == Some(3) && fields.next().is_none()
-}
 
 fn looks_like_status_working_directory(value: &str) -> bool {
     value.starts_with(['~', '/', '\\', '…'])
@@ -265,14 +13,44 @@ fn looks_like_status_working_directory(value: &str) -> bool {
             .is_some_and(|prefix| prefix[0].is_ascii_alphabetic() && prefix[1] == b':')
 }
 
+fn is_clean_prompt_screen(screen: &TrustedScreen<'_>) -> bool {
+    if !screen.cursor_visible() || screen.cursor_col() != 2 {
+        return false;
+    }
+    let Some(input) = screen.row_text(screen.cursor_row()) else {
+        return false;
+    };
+    if input != "›" && !input.starts_with("› ") {
+        return false;
+    }
+
+    let footer = (screen.cursor_row() + 1..screen.rows())
+        .filter_map(|row| screen.row_text(row))
+        .find(|row| !row.trim().is_empty());
+    let Some(footer) = footer.filter(|footer| footer.starts_with("  ")) else {
+        return false;
+    };
+    let Some((model, working_dir)) = footer.trim().rsplit_once(" · ") else {
+        return false;
+    };
+    !model.trim().is_empty() && looks_like_status_working_directory(working_dir.trim())
+}
+
+fn classify_current_screen_blocker(
+    screen: &TrustedScreen<'_>,
+) -> Option<(WorkState, Option<String>)> {
+    classify_normalized_work_state(&screen.text()).filter(|(state, _)| *state == WorkState::Blocked)
+}
+
 /// Tracks Codex's bounded interactive-prompt context across arbitrary PTY
-/// output chunks. A detected blocking prompt stays latched until Codex emits
-/// an explicit non-blocked state; silence, unrelated output, and context
-/// eviction never clear it.
+/// output chunks. A detected blocking prompt stays latched until a trusted,
+/// blocker-free clean prompt is observed; silence, activity text, unrelated
+/// output, and context eviction never clear it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WorkStateTracker {
     context: String,
-    prompt_frames: PromptFrameTracker,
+    viewport: TerminalViewport,
+    clean_commit_pending: bool,
     blocked: bool,
     blocked_detail: Option<String>,
     pending_classification: Option<(WorkState, Option<String>)>,
@@ -280,37 +58,125 @@ pub struct WorkStateTracker {
 
 impl WorkStateTracker {
     pub fn begin_run(&mut self) {
-        *self = Self::default();
+        self.context.clear();
+        self.viewport.begin_run();
+        self.clean_commit_pending = false;
+        self.blocked = false;
+        self.blocked_detail = None;
+        self.pending_classification = None;
+    }
+
+    pub fn resize(&mut self, cols: u16, rows: u16) {
+        self.viewport.resize(cols, rows);
     }
 
     pub fn observe_output(&mut self, chunk: &str) -> Option<(WorkState, Option<String>)> {
-        self.context.push_str(chunk);
-        let normalized_context = strip_ansi_and_controls(&self.context);
+        let mut observed = None;
+        let mut blocker_resolved = !self.blocked;
+        for character in chunk.chars() {
+            self.context.push(character);
+            if self.context.len() > WORK_STATE_CONTEXT_MAX_BYTES * 2 {
+                trim_context_suffix(&mut self.context);
+            }
 
-        if let Some(classification) = classify_normalized_work_state(&normalized_context) {
-            self.context.clear();
-            self.prompt_frames.reset();
-            self.blocked = classification.0 == WorkState::Blocked;
-            self.blocked_detail = classification.1.clone().filter(|_| self.blocked);
-            self.pending_classification = Some(classification.clone());
-            return Some(classification);
+            let signals = self.viewport.observe_character(character);
+            if (signals.cursor_hidden || signals.projection_invalidated)
+                && matches!(observed, Some((WorkState::Idle, _)))
+            {
+                observed = None;
+            }
+            if signals.cursor_hidden || signals.projection_invalidated {
+                self.clean_commit_pending = false;
+            }
+
+            if signals.cursor_shown {
+                if let Some(classification) = self.classify_context() {
+                    self.clean_commit_pending = false;
+                    if classification.0 == WorkState::Blocked {
+                        blocker_resolved = false;
+                        observed = Some(classification);
+                    } else if blocker_resolved {
+                        observed = Some(classification);
+                    }
+                }
+                if let Some(screen) = self.viewport.trusted_screen() {
+                    if let Some(blocker) = classify_current_screen_blocker(&screen) {
+                        self.clean_commit_pending = false;
+                        blocker_resolved = false;
+                        observed = Some(blocker);
+                    } else if is_clean_prompt_screen(&screen) {
+                        self.clean_commit_pending = true;
+                        blocker_resolved = true;
+                        observed = Some((WorkState::Idle, None));
+                    }
+                }
+                self.context.clear();
+            }
         }
 
-        let clean_prompt = self.prompt_frames.observe_output(chunk);
-        if !self.blocked && clean_prompt {
-            self.context.clear();
-            let classification = (WorkState::Idle, None);
-            self.pending_classification = Some(classification.clone());
-            return Some(classification);
+        if let Some(classification) = self.classify_context() {
+            self.clean_commit_pending = false;
+            if classification.0 == WorkState::Blocked {
+                blocker_resolved = false;
+                observed = Some(classification);
+            } else if blocker_resolved {
+                observed = Some(classification);
+            }
         }
 
-        if self.blocked {
-            trim_context_suffix(&mut self.context);
-            return None;
+        if let Some(screen) = self.viewport.trusted_screen() {
+            if let Some(blocker) = classify_current_screen_blocker(&screen) {
+                self.clean_commit_pending = false;
+                blocker_resolved = false;
+                let repeated_in_this_chunk = observed.as_ref().is_some_and(|classification| {
+                    classification.0 == WorkState::Blocked && classification.1 == blocker.1
+                });
+                observed = if repeated_in_this_chunk
+                    || !self.blocked
+                    || self.blocked_detail.as_deref() != blocker.1.as_deref()
+                {
+                    Some(blocker)
+                } else {
+                    None
+                };
+            } else if is_clean_prompt_screen(&screen) {
+                if observed.is_none() && self.clean_commit_pending {
+                    blocker_resolved = true;
+                    observed = Some((WorkState::Idle, None));
+                }
+            } else {
+                if matches!(observed, Some((WorkState::Idle, _))) {
+                    observed = None;
+                }
+                self.clean_commit_pending = false;
+            }
+        } else if matches!(observed, Some((WorkState::Idle, _))) {
+            observed = None;
         }
 
         trim_context_suffix(&mut self.context);
-        None
+        if let Some(classification) = observed.filter(|classification| {
+            classification.0 == WorkState::Blocked || !self.blocked || blocker_resolved
+        }) {
+            if classification.0 == WorkState::Idle {
+                self.clean_commit_pending = false;
+            }
+            self.blocked = classification.0 == WorkState::Blocked;
+            self.blocked_detail = classification.1.clone().filter(|_| self.blocked);
+            self.pending_classification = Some(classification.clone());
+            Some(classification)
+        } else {
+            None
+        }
+    }
+
+    fn classify_context(&mut self) -> Option<(WorkState, Option<String>)> {
+        let normalized = strip_ansi_and_controls(&self.context);
+        let classification = classify_normalized_work_state(&normalized);
+        if classification.is_some() {
+            self.context.clear();
+        }
+        classification
     }
 
     pub fn take_pending_classification(&mut self) -> Option<(WorkState, Option<String>)> {
@@ -414,10 +280,6 @@ fn classify_normalized_work_state(normalized: &str) -> Option<(WorkState, Option
         || lower.contains("apply_patch")
     {
         return Some((WorkState::ToolCall, None));
-    }
-
-    if normalized.contains('▌') || lower.contains("esc to interrupt") {
-        return Some((WorkState::Idle, None));
     }
 
     None
@@ -576,7 +438,7 @@ mod tests {
 
     fn synchronized_frame(body: &str, cursor_column: usize) -> String {
         format!(
-            "\u{1b}[?2026h\u{1b}[?25l\u{1b}[1;1H{body}\u{1b}[18;{cursor_column}H\u{1b}[?25h\u{1b}[?2026l"
+            "\u{1b}[?2026h\u{1b}[?25l\u{1b}[1;1H{body}\u{1b}[11;{cursor_column}H\u{1b}[?25h\u{1b}[?2026l"
         )
     }
 
@@ -599,6 +461,18 @@ mod tests {
                 suggestion
             ),
             3,
+        )
+    }
+
+    fn current_prompt_screen(extra: &str) -> String {
+        format!(
+            concat!(
+                "\u{1b}[?25l\u{1b}[2J\u{1b}[H{}",
+                "\u{1b}[5;1H› Summarize recent commits",
+                "\u{1b}[7;1H  gpt-5.6-sol max · ~\\mywork",
+                "\u{1b}[5;3H\u{1b}[?25h"
+            ),
+            extra
         )
     }
 
@@ -868,7 +742,105 @@ mod tests {
     }
 
     #[test]
-    fn clean_prompt_tracker_rejects_cross_frame_prose_and_malformed_frames() {
+    fn current_screen_tracker_accepts_the_exact_e16a_production_prefix() {
+        // Exact prefix through the first post-MCP clean commit from the immutable
+        // e16a raw stream (SHA-256 5B2FE2DD...E66FC). It deliberately contains
+        // multiple rendering transactions and the obsolete interrupt hint.
+        let stream: String =
+            serde_json::from_str(include_str!("fixtures/codex-clean-prompt-e16a-prefix.json"))
+                .expect("e16a production prefix should remain valid JSON");
+        assert!(stream.contains("Summarize recent commits"));
+        assert!(stream.contains("esc to interrupt"));
+
+        let mut whole = WorkStateTracker::default();
+        whole.resize(196, 22);
+        assert_eq!(
+            whole.observe_output(&stream),
+            Some((WorkState::Idle, None)),
+            "the measured multi-transaction screen must admit without a synthetic warm-up"
+        );
+
+        let mut one_character = WorkStateTracker::default();
+        one_character.resize(196, 22);
+        let mut observed = None;
+        for character in stream.chars() {
+            observed = one_character
+                .observe_output(&character.to_string())
+                .or(observed);
+        }
+        assert_eq!(observed, Some((WorkState::Idle, None)));
+    }
+
+    #[test]
+    fn current_screen_blockers_and_clean_commits_preserve_stream_order() {
+        let clean = current_prompt_screen("");
+        let blocker = "You've hit your usage limit.";
+
+        let mut persistent = WorkStateTracker::default();
+        assert_eq!(
+            persistent.observe_output(&current_prompt_screen(blocker)),
+            Some((WorkState::Blocked, Some("usage_limit".into())))
+        );
+        persistent.acknowledge_pending();
+        assert_eq!(persistent.observe_output("unrelated repaint"), None);
+        assert!(persistent.is_blocked());
+        assert_eq!(
+            persistent.observe_output("\u{1b}[999zWorking 1s"),
+            None,
+            "activity text on an untrusted projection cannot clear a blocker"
+        );
+        assert!(persistent.is_blocked());
+
+        let mut blocker_after_clean = WorkStateTracker::default();
+        assert_eq!(
+            blocker_after_clean.observe_output(&format!("{clean}{blocker}")),
+            Some((WorkState::Blocked, Some("usage_limit".into()))),
+            "a blocker observed after the clean commit must win"
+        );
+
+        let mut clean_after_blocker = WorkStateTracker::default();
+        assert_eq!(
+            clean_after_blocker.observe_output(&format!("{blocker}{clean}")),
+            Some((WorkState::Idle, None)),
+            "a later trusted repaint may clear an erased blocker"
+        );
+
+        let mut final_clean = WorkStateTracker::default();
+        assert_eq!(
+            final_clean.observe_output(&format!("{clean}{blocker}{clean}")),
+            Some((WorkState::Idle, None)),
+            "the final trusted current screen is authoritative"
+        );
+    }
+
+    #[test]
+    fn resize_fails_closed_until_reconstruction_and_run_reset_drops_old_authority() {
+        let mut tracker = WorkStateTracker::default();
+        tracker.resize(80, 20);
+        assert_eq!(
+            tracker.observe_output(concat!(
+                "\u{1b}[?25l\u{1b}[5;1H› partial",
+                "\u{1b}[7;1H  gpt-5.6-sol max · ~\\mywork",
+                "\u{1b}[5;3H\u{1b}[?25h"
+            )),
+            None
+        );
+        assert_eq!(
+            tracker.observe_output(&current_prompt_screen("")),
+            Some((WorkState::Idle, None))
+        );
+
+        tracker.observe_output(LIVE_WORKSPACE_TRUST_PROMPT);
+        assert!(tracker.is_blocked());
+        tracker.begin_run();
+        assert!(!tracker.is_blocked());
+        assert!(!tracker.has_pending_classification());
+        assert_eq!(tracker.viewport.dimensions(), Some((80, 20)));
+        assert_eq!(tracker.observe_output("\u{1b}[?25h"), None);
+    }
+
+    #[test]
+    fn current_screen_tracker_rejects_disjoint_prose_and_malformed_control_state() {
         let mut cross_frame = WorkStateTracker::default();
         assert_eq!(
             cross_frame.observe_output(&synchronized_frame("\r\n› stale input row\r\n", 3)),
@@ -880,7 +852,7 @@ mod tests {
                 3,
             )),
             None,
-            "prompt evidence must not assemble across separate paints"
+            "a footer-only later paint cannot establish a clean cursor/input screen"
         );
 
         let mut prose = WorkStateTracker::default();
@@ -906,7 +878,7 @@ mod tests {
 
         let mut wrong_cursor = WorkStateTracker::default();
         let wrong_cursor_frame =
-            live_clean_prompt_frame("future suggestion").replace("\u{1b}[18;3H", "\u{1b}[18;4H");
+            live_clean_prompt_frame("future suggestion").replace("\u{1b}[11;3H", "\u{1b}[11;4H");
         assert_eq!(wrong_cursor.observe_output(&wrong_cursor_frame), None);
 
         for terminal_string in [
@@ -941,7 +913,8 @@ mod tests {
             nested.observe_output(&format!(
                 "\u{1b}[?2026h{clean_body}\u{1b}[?2026h{clean_body}\u{1b}[?2026l"
             )),
-            None
+            Some((WorkState::Idle, None)),
+            "synchronized-output mode is a rendering hint; current-screen state remains authoritative"
         );
     }
 
@@ -977,12 +950,12 @@ mod tests {
     #[test]
     fn terminal_string_cursor_controls_follow_xterm_global_transitions() {
         for hidden_cursor_lookalike in [
-            "\u{1b}]0;[18;3H[?25h\u{7}",
-            "\u{1b}P[18;3H[?25h\u{1b}\\",
-            "\u{009d}0;[18;3H[?25h\u{009c}",
+            "\u{1b}]0;[11;3H[?25h\u{7}",
+            "\u{1b}P[11;3H[?25h\u{1b}\\",
+            "\u{009d}0;[11;3H[?25h\u{009c}",
         ] {
             let wrong_visible_cursor = live_clean_prompt_frame("future suggestion")
-                .replace("\u{1b}[18;3H", "\u{1b}[18;4H")
+                .replace("\u{1b}[11;3H", "\u{1b}[11;4H")
                 .replacen(
                     "\u{1b}[?2026l",
                     &format!("{hidden_cursor_lookalike}\u{1b}[?2026l"),
@@ -997,12 +970,12 @@ mod tests {
         }
 
         for real_cursor_proof_after_string_exit in [
-            "\u{1b}]0;title\u{1b}[18;3H\u{1b}[?25h\u{7}",
-            "\u{1b}Ppayload\u{1b}[18;3H\u{1b}[?25h\u{7}",
-            "\u{009d}0;title\u{009b}18;3H\u{009b}?25h\u{009c}",
+            "\u{1b}]0;title\u{1b}[11;3H\u{1b}[?25h\u{7}",
+            "\u{1b}Ppayload\u{1b}[11;3H\u{1b}[?25h\u{7}",
+            "\u{009d}0;title\u{009b}11;3H\u{009b}?25h\u{009c}",
         ] {
             let prompt = live_clean_prompt_frame("future suggestion")
-                .replace("\u{1b}[18;3H", "\u{1b}[18;4H")
+                .replace("\u{1b}[11;3H", "\u{1b}[11;4H")
                 .replacen(
                     "\u{1b}[?2026l",
                     &format!("{real_cursor_proof_after_string_exit}\u{1b}[?2026l"),
@@ -1043,10 +1016,9 @@ mod tests {
             "\u{009d}0;unterminated",
             "\u{0090}unterminated",
         ] {
-            let prompt = live_clean_prompt_frame("future suggestion").replacen(
-                "\u{1b}[?2026l",
-                &format!("{terminal_string}\u{1b}[?2026l"),
-                1,
+            let prompt = format!(
+                "{}{terminal_string}",
+                live_clean_prompt_frame("future suggestion")
             );
             let mut tracker = WorkStateTracker::default();
             assert_eq!(
@@ -1058,29 +1030,26 @@ mod tests {
     }
 
     #[test]
-    fn clean_prompt_tracker_rejects_truncated_and_overlong_frames_then_recovers() {
-        let prompt = live_clean_prompt_frame("truncated");
-        let mut truncated = WorkStateTracker::default();
+    fn clean_prompt_tracker_rejects_incomplete_and_unknown_repaints_then_recovers() {
+        let mut tracker = WorkStateTracker::default();
         assert_eq!(
-            truncated.observe_output(prompt.trim_end_matches("\u{1b}[?2026l")),
-            None
+            tracker.observe_output("\u{1b}[?25l\u{1b}[H› partial"),
+            None,
+            "a hidden cursor is not a committed interactive screen"
         );
+        let oversized_control = format!("\u{1b}[{}H", "1".repeat(129));
+        assert_eq!(tracker.observe_output(&oversized_control), None);
 
-        let mut overlong = WorkStateTracker::default();
-        let oversized = format!(
-            "\u{1b}[?2026h{}\u{1b}[?2026l",
-            "x".repeat(PROMPT_FRAME_MAX_BYTES + 1)
-        );
-        assert_eq!(overlong.observe_output(&oversized), None);
-        assert!(overlong.prompt_frames.buffer.len() < SYNC_FRAME_END.len());
+        let recovered =
+            live_clean_prompt_frame("recovered").replacen("\u{1b}[?25l", "\u{1b}[?25l\u{1b}[2J", 1);
         assert_eq!(
-            overlong.observe_output(&live_clean_prompt_frame("recovered")),
+            tracker.observe_output(&recovered),
             Some((WorkState::Idle, None))
         );
     }
 
     #[test]
-    fn clean_prompt_frame_does_not_clear_a_latched_block() {
+    fn trusted_clean_screen_clears_a_resolved_latched_block() {
         let mut tracker = WorkStateTracker::default();
         assert_eq!(
             tracker.observe_output(LIVE_WORKSPACE_TRUST_PROMPT),
@@ -1089,14 +1058,14 @@ mod tests {
         tracker.acknowledge_pending();
         assert_eq!(
             tracker.observe_output(&live_clean_prompt_frame("background redraw")),
-            None
+            Some((WorkState::Idle, None))
         );
-        assert!(tracker.is_blocked());
-        assert_eq!(tracker.blocked_detail(), Some("workspace_trust"));
+        assert!(!tracker.is_blocked());
+        assert_eq!(tracker.blocked_detail(), None);
     }
 
     #[test]
-    fn blocked_prompt_is_latched_until_explicit_non_blocked_state_and_resets_per_run() {
+    fn visible_blocker_stays_latched_until_a_trusted_clean_screen_and_resets_per_run() {
         let mut tracker = WorkStateTracker::default();
         assert_eq!(
             tracker.observe_output(LIVE_WORKSPACE_TRUST_PROMPT),
@@ -1110,13 +1079,13 @@ mod tests {
         assert_eq!(tracker.observe_output("unrelated cursor repaint"), None);
         assert_eq!(
             tracker.observe_output("Working 12s"),
-            Some((WorkState::Thinking, Some("Working 12s".into())))
+            None,
+            "raw activity text cannot override a blocker that remains on the current screen"
         );
+        assert!(tracker.is_blocked());
 
-        tracker.observe_output(LIVE_WORKSPACE_TRUST_PROMPT);
-        tracker.acknowledge_pending();
         assert_eq!(
-            tracker.observe_output("\u{258c}"),
+            tracker.observe_output(&live_clean_prompt_frame("resolved")),
             Some((WorkState::Idle, None))
         );
 
@@ -1140,14 +1109,15 @@ mod tests {
     }
 
     #[test]
-    fn classify_codex_tool_and_idle_patterns() {
+    fn classify_codex_tool_patterns_without_legacy_idle_glyphs() {
         assert_eq!(
             classify_work_state("> Run Get-Content package.json")
                 .unwrap()
                 .0,
             WorkState::ToolCall
         );
-        assert_eq!(classify_work_state("▌").unwrap().0, WorkState::Idle);
+        assert_eq!(classify_work_state("▌"), None);
+        assert_eq!(classify_work_state("esc to interrupt"), None);
     }
 
     #[test]
@@ -1161,10 +1131,7 @@ mod tests {
             assert_eq!(classify_work_state(text), None, "{text:?}");
         }
 
-        assert_eq!(
-            classify_work_state("Codex CLI v1.2.3\n▌").unwrap().0,
-            WorkState::Idle
-        );
+        assert_eq!(classify_work_state("Codex CLI v1.2.3\n▌"), None);
     }
 
     #[test]

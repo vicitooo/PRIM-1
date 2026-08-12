@@ -6396,14 +6396,27 @@ impl SupervisorHandle {
                                 slot.spawn_in_flight = None;
                                 slot.process_id = pty.process_id();
                                 slot.running = Some(RunningSession::new(Some(pty.clone())));
-                                slot.state = if slot.definition.driver == DriverKind::Grok {
-                                    LifecycleState::Starting
-                                } else {
-                                    LifecycleState::Ready
+                                let grok_interactive_ready = slot.definition.driver
+                                    == DriverKind::Grok
+                                    && slot.grok_startup.is_interactive_ready();
+                                slot.state = match (slot.definition.driver, grok_interactive_ready)
+                                {
+                                    (DriverKind::Grok, true) => LifecycleState::Idle,
+                                    (DriverKind::Grok, false) => LifecycleState::Starting,
+                                    _ => LifecycleState::Ready,
                                 };
                                 slot.last_activity_at = Some(now_rfc3339());
                                 slot.last_real_output_at = None;
                                 reset_work_state_locked(slot);
+                                if grok_interactive_ready {
+                                    let _ = transition_work_state_locked(
+                                        &slot.definition.alias.clone(),
+                                        slot,
+                                        run_id,
+                                        WorkState::Idle,
+                                        None,
+                                    );
+                                }
                                 let pending_work_state_event = slot
                                     .codex_work_state
                                     .take_pending_classification()
@@ -6580,7 +6593,11 @@ impl SupervisorHandle {
                     identity,
                     session: snapshot.alias.clone(),
                     state: snapshot.lifecycle_state,
-                    reason: if snapshot.driver == DriverKind::Grok {
+                    reason: if snapshot.driver == DriverKind::Grok
+                        && snapshot.lifecycle_state == LifecycleState::Idle
+                    {
+                        "Grok completed its measured interactive startup repaint".into()
+                    } else if snapshot.driver == DriverKind::Grok {
                         "Grok process started; awaiting interactive session readiness".into()
                     } else {
                         "session ready".into()
@@ -7224,8 +7241,10 @@ impl SupervisorHandle {
                 .ok_or_else(|| anyhow!("session '{session_id}' transport is not available"))?
                 .resize(cols, rows)?;
         }
-        if slot.definition.driver == DriverKind::Grok {
-            slot.grok_startup.resize(cols, rows);
+        match slot.definition.driver {
+            DriverKind::Codex => slot.codex_work_state.resize(cols, rows),
+            DriverKind::Grok => slot.grok_startup.resize(cols, rows),
+            _ => {}
         }
         Ok(())
     }
@@ -7711,6 +7730,12 @@ impl SupervisorHandle {
                         let codex_classification = (slot.definition.driver == DriverKind::Codex)
                             .then(|| slot.codex_work_state.observe_output(&chunk))
                             .flatten();
+                        if slot.definition.driver == DriverKind::Grok {
+                            let bracketed_paste_enabled = slot.bracketed_paste.mode_for(binding)
+                                == BracketedPasteMode::Enabled;
+                            slot.grok_startup
+                                .observe_output_with_mode(&chunk, bracketed_paste_enabled);
+                        }
                         let spawn_is_unconfirmed = slot.spawn_in_flight
                             == Some(SpawnReservation {
                                 generation: event_generation,
@@ -7720,16 +7745,8 @@ impl SupervisorHandle {
                         if ensure_run_event_capacity(slot, required_events).is_err() {
                             return;
                         }
-                        let grok_startup_progress = if !spawn_is_unconfirmed
-                            && slot.definition.driver == DriverKind::Grok
-                            && slot.state == LifecycleState::Starting
-                        {
-                            slot.grok_startup.observe_output(&chunk)
-                        } else {
-                            driver_grok::StartupProgress::None
-                        };
-                        let grok_interactive_ready =
-                            grok_startup_progress == driver_grok::StartupProgress::InteractiveReady;
+                        let grok_interactive_ready = slot.definition.driver == DriverKind::Grok
+                            && slot.grok_startup.is_interactive_ready();
                         let classification = if spawn_is_unconfirmed {
                             None
                         } else if grok_interactive_ready {
@@ -10665,23 +10682,11 @@ mod tests {
         .into()
     }
 
-    fn codex_clean_prompt_frame() -> String {
-        concat!(
-            "\u{1b}[?2004h\u{1b}[?2026h\u{1b}[?25l\u{1b}[1;1H",
-            "\r\n╭───────────────────────────────────────────────╮\r\n",
-            "│ >_ OpenAI Codex (v0.147.0)                    │\r\n",
-            "│                                               │\r\n",
-            "│ model:     gpt-5.6-sol max   /model to change │\r\n",
-            "│ directory: ~\\mywork                           │\r\n",
-            "╰───────────────────────────────────────────────╯\r\n",
-            "\r\n\r\n\r\n",
-            "› Find and fix a bug in @filename\r\n",
-            "\r\n",
-            "  gpt-5.6-sol max · ~\\mywork\r\n",
-            "\r\n\r\n\r\n",
-            "\u{1b}[18;3H\u{1b}[?25h\u{1b}[?2026l",
-        )
-        .into()
+    fn codex_clean_prompt_stream() -> String {
+        serde_json::from_str(include_str!(
+            "../../driver-codex/src/fixtures/codex-clean-prompt-e16a-prefix.json"
+        ))
+        .expect("e16a Codex prompt fixture should remain valid JSON")
     }
 
     struct TestExecutableResolver;
@@ -12578,6 +12583,177 @@ mod tests {
     }
 
     #[test]
+    fn grok_startup_projection_survives_complete_and_split_preinstall_output() {
+        let complete = test_supervisor();
+        let complete_session = create_test_session(
+            &complete,
+            "grok-complete-preinstall",
+            DriverKind::Grok,
+            shared_types::PermissionProfile::Normal,
+        );
+        let (complete_pty, complete_inputs) = recording_pty_session(std::process::id());
+        complete.set_pty_spawner_for_tests(Arc::new(OutputThenReturnPtySpawner {
+            outputs: vec![grok_starting_frame().into(), grok_ready_frame(false)],
+            session: Mutex::new(Some(complete_pty)),
+        }));
+        let complete_events = capture_runtime_events(&complete);
+
+        let complete_snapshot = complete
+            .start_session_by_id(complete_session.session_id)
+            .expect("a complete preinstall Grok repaint should install interactively ready");
+        assert_eq!(complete_snapshot.lifecycle_state, LifecycleState::Idle);
+        {
+            let slots = complete.inner.slots.lock();
+            let slot = slots.get_by_id(complete_session.session_id).unwrap();
+            assert!(slot.grok_startup.is_interactive_ready());
+            assert!(slot.work_state_observed);
+            assert_eq!(slot.work_state, WorkState::Idle);
+        }
+        complete
+            .route_operator_message(OperatorRouteMessageRequest {
+                recipient_id: complete_session.session_id,
+                content: "first Grok route after preinstall readiness".into(),
+            })
+            .expect("preinstall readiness should admit the first route");
+        assert_eq!(complete_inputs.lock().len(), 2);
+        handle_current_pty_event(
+            &complete,
+            "grok-complete-preinstall",
+            complete_snapshot.generation,
+            PtyEvent::Output("post-install publisher sentinel".into()),
+        );
+        let complete_run_id = complete_snapshot.run_id.unwrap();
+        let recorded = complete_events.lock();
+        assert!(recorded.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SessionOutput { identity, chunk, .. }
+                if identity.session_id == complete_session.session_id
+                    && identity.run_id == complete_run_id
+                    && chunk == "post-install publisher sentinel"
+        )));
+        let sequences = recorded
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::SessionState { identity, .. }
+                | RuntimeEvent::SessionOutput { identity, .. }
+                | RuntimeEvent::SessionExit { identity, .. }
+                | RuntimeEvent::SessionWorkState { identity, .. }
+                    if identity.session_id == complete_session.session_id
+                        && identity.run_id == complete_run_id =>
+                {
+                    Some(identity.sequence)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            sequences
+                .windows(2)
+                .all(|pair| pair[1] == pair[0].checked_add(1).unwrap()),
+            "preinstall readiness created a run-event sequence gap: {sequences:?}"
+        );
+        drop(recorded);
+
+        let split = test_supervisor();
+        let split_session = create_test_session(
+            &split,
+            "grok-split-preinstall",
+            DriverKind::Grok,
+            shared_types::PermissionProfile::Normal,
+        );
+        let starting = grok_starting_frame();
+        let cursor_show = starting
+            .find("\x1b[?25h")
+            .expect("starting fixture should finish with a cursor show");
+        let (split_pty, _split_inputs) = recording_pty_session(std::process::id());
+        split.set_pty_spawner_for_tests(Arc::new(OutputThenReturnPtySpawner {
+            outputs: vec![starting[..cursor_show].into()],
+            session: Mutex::new(Some(split_pty)),
+        }));
+
+        let split_snapshot = split
+            .start_session_by_id(split_session.session_id)
+            .expect("a partial preinstall Grok repaint should install fail closed");
+        assert_eq!(split_snapshot.lifecycle_state, LifecycleState::Starting);
+        handle_current_pty_event(
+            &split,
+            "grok-split-preinstall",
+            split_snapshot.generation,
+            PtyEvent::Output(starting[cursor_show..].into()),
+        );
+        assert_eq!(
+            split
+                .inner
+                .slots
+                .lock()
+                .get_by_id(split_session.session_id)
+                .unwrap()
+                .state,
+            LifecycleState::Starting,
+            "finishing the retained starting repaint must not itself claim readiness"
+        );
+        handle_current_pty_event(
+            &split,
+            "grok-split-preinstall",
+            split_snapshot.generation,
+            PtyEvent::Output(grok_ready_frame(false)),
+        );
+        let slots = split.inner.slots.lock();
+        let slot = slots.get_by_id(split_session.session_id).unwrap();
+        assert!(slot.grok_startup.is_interactive_ready());
+        assert_eq!(slot.state, LifecycleState::Idle);
+        assert!(slot.work_state_observed);
+        assert_eq!(slot.work_state, WorkState::Idle);
+    }
+
+    #[test]
+    fn grok_startup_projection_observes_before_the_event_capacity_gate() {
+        let supervisor = test_supervisor();
+        let (pty, _inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "codex",
+            DriverKind::Grok,
+            pty,
+        );
+        let (generation, run_id) = {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_mut("codex").unwrap();
+            slot.state = LifecycleState::Starting;
+            reset_work_state_locked(slot);
+            slot.grok_startup.begin_run();
+            slot.run_event_sequence = u64::MAX - 2;
+            (slot.generation, slot.run_id.unwrap())
+        };
+
+        supervisor.handle_pty_event_by_id(
+            test_session_id(&supervisor, "codex"),
+            generation,
+            run_id,
+            PtyEvent::Output(grok_starting_frame().into()),
+        );
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_mut("codex").unwrap();
+            assert_eq!(slot.state, LifecycleState::Starting);
+            slot.run_event_sequence = 0;
+        }
+
+        supervisor.handle_pty_event_by_id(
+            test_session_id(&supervisor, "codex"),
+            generation,
+            run_id,
+            PtyEvent::Output(grok_ready_frame(false)),
+        );
+        let slots = supervisor.inner.slots.lock();
+        let slot = slots.get("codex").unwrap();
+        assert!(slot.grok_startup.is_interactive_ready());
+        assert_eq!(slot.state, LifecycleState::Idle);
+        assert!(slot.work_state_observed);
+        assert_eq!(slot.work_state, WorkState::Idle);
+    }
+
+    #[test]
     fn grok_startup_blocks_routes_until_the_measured_minimal_repaint() {
         let supervisor = test_supervisor();
         let (pty, inputs) = recording_pty_session(std::process::id());
@@ -12779,6 +12955,11 @@ mod tests {
             slot.state = LifecycleState::Starting;
             reset_work_state_locked(slot);
             slot.grok_startup.begin_run();
+            slot.bracketed_paste.begin_run(RunBinding {
+                session_id: slot.session_id,
+                run_id: replacement_run_id,
+                generation: slot.generation,
+            });
         }
         let events = capture_runtime_events(&supervisor);
 
@@ -13896,6 +14077,14 @@ mod tests {
         );
         let (pty, _, kill_count) = mock_pty_session(None, MockKillBehavior::Immediate);
         install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
+        supervisor
+            .inner
+            .slots
+            .lock()
+            .get_mut("codex")
+            .unwrap()
+            .codex_work_state
+            .resize(196, 22);
         let events = capture_runtime_events(&supervisor);
 
         handle_current_pty_event(
@@ -13908,7 +14097,7 @@ mod tests {
             &supervisor,
             "codex",
             0,
-            PtyEvent::Output("Working 1s".into()),
+            PtyEvent::Output(codex_clean_prompt_stream()),
         );
         thread::sleep(Duration::from_millis(150));
 
@@ -14977,9 +15166,17 @@ mod tests {
     fn preinstall_codex_clean_prompt_establishes_idle_before_ready_and_allows_first_route() {
         let supervisor = test_supervisor();
         let session_id = test_session_id(&supervisor, "codex");
+        supervisor
+            .inner
+            .slots
+            .lock()
+            .get_by_id_mut(session_id)
+            .expect("Codex test session")
+            .codex_work_state
+            .resize(196, 22);
         let (pty, inputs) = recording_pty_session(std::process::id());
         supervisor.set_pty_spawner_for_tests(Arc::new(OutputThenReturnPtySpawner {
-            outputs: vec![codex_clean_prompt_frame()],
+            outputs: vec![codex_clean_prompt_stream()],
             session: Mutex::new(Some(pty)),
         }));
 
@@ -19053,7 +19250,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_workspace_trust_output_blocks_the_next_route_before_any_write() {
+    fn codex_workspace_trust_blocks_route_then_raw_resolution_allows_the_first_clean_route() {
         let supervisor = test_supervisor();
         let codex_alias = test_session_alias(&supervisor, "codex");
         let (pty, inputs) = recording_pty_session(std::process::id());
@@ -19108,6 +19305,40 @@ mod tests {
         assert_eq!(
             fs::read(supervisor.audit_log_path()).unwrap_or_default(),
             audit_before
+        );
+
+        supervisor
+            .send_input(SendInputRequest {
+                session_id,
+                input: "1\r".into(),
+            })
+            .expect("raw operator input must remain available to resolve the modal");
+        supervisor
+            .resize_session_by_id(session_id, 196, 22)
+            .expect("match the measured e16a viewport");
+        handle_current_pty_event(
+            &supervisor,
+            "codex",
+            0,
+            PtyEvent::Output(codex_clean_prompt_stream()),
+        );
+        {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id(session_id).unwrap();
+            assert_eq!(slot.work_state, WorkState::Idle);
+            assert!(!slot.codex_work_state.is_blocked());
+        }
+
+        supervisor
+            .route_operator_message(OperatorRouteMessageRequest {
+                recipient_id: session_id,
+                content: "first route after raw modal resolution".into(),
+            })
+            .expect("the trusted blocker-free screen must admit the first synthetic route");
+        assert_eq!(
+            inputs.lock().len(),
+            3,
+            "one raw resolution write plus payload and submit writes"
         );
     }
 
