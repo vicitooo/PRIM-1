@@ -1457,6 +1457,7 @@ impl AuditLog {
 struct RunningSession {
     pty: Option<Arc<dyn PtySession>>,
     input_gate: Arc<RunInputGate>,
+    last_resize: Option<(u16, u16)>,
 }
 
 impl RunningSession {
@@ -1464,6 +1465,7 @@ impl RunningSession {
         Self {
             pty,
             input_gate: Arc::new(RunInputGate::new()),
+            last_resize: None,
         }
     }
 
@@ -4014,19 +4016,27 @@ impl SupervisorHandle {
                         && ordinary_ready
                         && slot.last_real_output_at == Some(armed_at)
                     {
-                        if ensure_run_event_capacity(slot, 2).is_err() {
+                        let quiesce_updates_work_state =
+                            slot.definition.driver != DriverKind::Codex;
+                        let work_state_event_needed = quiesce_updates_work_state
+                            && (!slot.work_state_observed || slot.work_state != WorkState::Idle);
+                        if ensure_run_event_capacity(slot, 1 + u64::from(work_state_event_needed))
+                            .is_err()
+                        {
                             (Vec::new(), true)
                         } else {
                             slot.state = LifecycleState::Idle;
                             slot.last_activity_at = Some(now_rfc3339());
                             let mut events = Vec::new();
-                            if let Some(event) = transition_work_state_locked(
-                                &session_alias,
-                                slot,
-                                armed_run_id,
-                                WorkState::Idle,
-                                None,
-                            ) {
+                            if quiesce_updates_work_state
+                                && let Some(event) = transition_work_state_locked(
+                                    &session_alias,
+                                    slot,
+                                    armed_run_id,
+                                    WorkState::Idle,
+                                    None,
+                                )
+                            {
                                 events.push(event);
                             }
                             let identity = next_run_event_identity(slot, armed_run_id);
@@ -6387,8 +6397,10 @@ impl SupervisorHandle {
                             } else if let Err(error) = ensure_run_event_capacity(
                                 slot,
                                 1 + u64::from(
-                                    slot.definition.driver == DriverKind::Codex
-                                        && slot.codex_work_state.has_pending_classification(),
+                                    (slot.definition.driver == DriverKind::Codex
+                                        && slot.codex_work_state.has_pending_classification())
+                                        || (slot.definition.driver == DriverKind::Grok
+                                            && slot.grok_startup.is_interactive_ready()),
                                 ),
                             ) {
                                 Err(error)
@@ -6408,27 +6420,27 @@ impl SupervisorHandle {
                                 slot.last_activity_at = Some(now_rfc3339());
                                 slot.last_real_output_at = None;
                                 reset_work_state_locked(slot);
-                                if grok_interactive_ready {
-                                    let _ = transition_work_state_locked(
+                                let pending_work_state_event = if grok_interactive_ready {
+                                    transition_work_state_locked(
                                         &slot.definition.alias.clone(),
                                         slot,
                                         run_id,
                                         WorkState::Idle,
                                         None,
-                                    );
-                                }
-                                let pending_work_state_event = slot
-                                    .codex_work_state
-                                    .take_pending_classification()
-                                    .and_then(|(state, detail)| {
-                                        transition_work_state_locked(
-                                            &slot.definition.alias.clone(),
-                                            slot,
-                                            run_id,
-                                            state,
-                                            detail,
-                                        )
-                                    });
+                                    )
+                                } else {
+                                    slot.codex_work_state
+                                        .take_pending_classification()
+                                        .and_then(|(state, detail)| {
+                                            transition_work_state_locked(
+                                                &slot.definition.alias.clone(),
+                                                slot,
+                                                run_id,
+                                                state,
+                                                detail,
+                                            )
+                                        })
+                                };
                                 let identity = next_run_event_identity(slot, run_id);
                                 Ok((slot.snapshot(), identity, pending_work_state_event))
                             }
@@ -7230,17 +7242,19 @@ impl SupervisorHandle {
         let slot = slots
             .get_by_id_mut(session_id)
             .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
-        {
-            let running = slot
-                .running
-                .as_ref()
-                .ok_or_else(|| anyhow!("session '{session_id}' is not running"))?;
-            running
-                .pty
-                .as_ref()
-                .ok_or_else(|| anyhow!("session '{session_id}' transport is not available"))?
-                .resize(cols, rows)?;
+        let running = slot
+            .running
+            .as_mut()
+            .ok_or_else(|| anyhow!("session '{session_id}' is not running"))?;
+        if running.last_resize == Some((cols, rows)) {
+            return Ok(());
         }
+        running
+            .pty
+            .as_ref()
+            .ok_or_else(|| anyhow!("session '{session_id}' transport is not available"))?
+            .resize(cols, rows)?;
+        running.last_resize = Some((cols, rows));
         match slot.definition.driver {
             DriverKind::Codex => slot.codex_work_state.resize(cols, rows),
             DriverKind::Grok => slot.grok_startup.resize(cols, rows),
@@ -9244,13 +9258,13 @@ fn transition_work_state_locked(
         slot.work_error_observations.clear();
     }
 
-    if slot.work_state == state {
+    if slot.work_state_observed && slot.work_state == state {
         slot.work_state_observed = true;
         slot.work_detail = detail;
         return None;
     }
 
-    let previous_state = Some(slot.work_state);
+    let previous_state = slot.work_state_observed.then_some(slot.work_state);
     slot.work_state = state;
     slot.work_state_observed = true;
     slot.work_detail = detail.clone();
@@ -10006,6 +10020,8 @@ mod tests {
         Error(&'static str),
     }
 
+    type RecordedResizes = Arc<Mutex<Vec<(u16, u16)>>>;
+
     struct MockPtySession {
         process_id: Option<u32>,
         exit_status: Option<pty_host::PtyExitStatus>,
@@ -10030,6 +10046,7 @@ mod tests {
     struct RecordingPtySession {
         process_id: u32,
         inputs: Arc<Mutex<Vec<String>>>,
+        resizes: Option<RecordedResizes>,
     }
 
     struct FirstWriteSignalPtySession {
@@ -10236,7 +10253,10 @@ mod tests {
             Ok(input.len())
         }
 
-        fn resize(&self, _cols: u16, _rows: u16) -> Result<()> {
+        fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+            if let Some(resizes) = &self.resizes {
+                resizes.lock().push((cols, rows));
+            }
             Ok(())
         }
 
@@ -10296,8 +10316,23 @@ mod tests {
             Box::new(RecordingPtySession {
                 process_id,
                 inputs: inputs.clone(),
+                resizes: None,
             }),
             inputs,
+        )
+    }
+
+    fn recording_resize_pty_session(
+        process_id: u32,
+    ) -> (Box<dyn PtySessionTrait>, RecordedResizes) {
+        let resizes = Arc::new(Mutex::new(Vec::new()));
+        (
+            Box::new(RecordingPtySession {
+                process_id,
+                inputs: Arc::new(Mutex::new(Vec::new())),
+                resizes: Some(resizes.clone()),
+            }),
+            resizes,
         )
     }
 
@@ -12465,7 +12500,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_emitted_after_quiesce_threshold() {
+    fn codex_quiescence_emits_lifecycle_idle_without_authorizing_semantic_idle() {
         let supervisor = test_supervisor();
         install_synthetic_running_session(&supervisor, "codex", DriverKind::Codex);
         let codex_alias = test_session_alias(&supervisor, "codex");
@@ -12494,6 +12529,16 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(50));
         }
+
+        let slots = supervisor.inner.slots.lock();
+        let slot = slots.get("codex").unwrap();
+        assert!(!slot.work_state_observed);
+        assert!(
+            !events
+                .lock()
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::SessionWorkState { .. }))
+        );
     }
 
     #[test]
@@ -13268,7 +13313,86 @@ mod tests {
     }
 
     #[test]
-    fn work_state_transitions_idle_thinking_idle() {
+    fn duplicate_resize_does_not_starve_first_codex_idle_observation() {
+        let supervisor = test_supervisor();
+        let (pty, resizes) = recording_resize_pty_session(std::process::id());
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            Some(std::process::id()),
+            pty,
+        );
+        let session_id = test_session_id(&supervisor, "codex");
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id_mut(session_id).unwrap();
+            slot.work_state = WorkState::Idle;
+            slot.work_state_observed = false;
+            slot.work_detail = None;
+        }
+        let events = capture_runtime_events(&supervisor);
+
+        supervisor
+            .resize_session_by_id(session_id, 196, 22)
+            .unwrap();
+        handle_current_pty_event(
+            &supervisor,
+            "codex",
+            0,
+            PtyEvent::Output(
+                concat!(
+                    "\x1b[?2004h\x1b[?25l\x1b[2J\x1b[H",
+                    "\x1b[13;1H› Summarize recent commits",
+                    "\x1b[15;1H  gpt-5.6-sol max · ~\\mywork",
+                )
+                .into(),
+            ),
+        );
+        supervisor
+            .resize_session_by_id(session_id, 196, 22)
+            .unwrap();
+        handle_current_pty_event(
+            &supervisor,
+            "codex",
+            0,
+            PtyEvent::Output("\x1b[13;3H\x1b[?25h".into()),
+        );
+
+        assert_eq!(*resizes.lock(), vec![(196, 22)]);
+        let work_events = work_state_events(&events);
+        assert_eq!(work_events.len(), 1);
+        assert!(matches!(
+            &work_events[0],
+            RuntimeEvent::SessionWorkState {
+                state: WorkState::Idle,
+                detail: None,
+                previous_state: None,
+                ..
+            }
+        ));
+
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id_mut(session_id).unwrap();
+            slot.work_state = WorkState::Thinking;
+            slot.work_state_observed = true;
+        }
+        supervisor
+            .resize_session_by_id(session_id, 196, 24)
+            .unwrap();
+        handle_current_pty_event(
+            &supervisor,
+            "codex",
+            0,
+            PtyEvent::Output("\x1b[13;3H\x1b[?25h".into()),
+        );
+        assert_eq!(*resizes.lock(), vec![(196, 22), (196, 24)]);
+        assert_eq!(work_state_events(&events).len(), 1);
+    }
+
+    #[test]
+    fn codex_quiescence_does_not_override_trusted_thinking_state() {
         let supervisor = test_supervisor();
         install_synthetic_running_session(&supervisor, "codex", DriverKind::Codex);
         let codex_alias = test_session_alias(&supervisor, "codex");
@@ -13294,7 +13418,7 @@ mod tests {
         );
 
         let work_events = work_state_events(&events);
-        assert_eq!(work_events.len(), 2);
+        assert_eq!(work_events.len(), 1);
         match &work_events[0] {
             RuntimeEvent::SessionWorkState {
                 session,
@@ -13305,26 +13429,16 @@ mod tests {
             } => {
                 assert_eq!(session, &codex_alias);
                 assert_eq!(*state, WorkState::Thinking);
-                assert_eq!(*previous_state, Some(WorkState::Idle));
+                assert_eq!(*previous_state, None);
                 assert_eq!(detail.as_deref(), Some("Working 12s"));
             }
             other => panic!("unexpected event: {other:?}"),
         }
-        match &work_events[1] {
-            RuntimeEvent::SessionWorkState {
-                session,
-                state,
-                previous_state,
-                detail,
-                ..
-            } => {
-                assert_eq!(session, &codex_alias);
-                assert_eq!(*state, WorkState::Idle);
-                assert_eq!(*previous_state, Some(WorkState::Thinking));
-                assert_eq!(detail, &None);
-            }
-            other => panic!("unexpected event: {other:?}"),
-        }
+        let slots = supervisor.inner.slots.lock();
+        let slot = slots.get("codex").unwrap();
+        assert_eq!(slot.state, LifecycleState::Idle);
+        assert_eq!(slot.work_state, WorkState::Thinking);
+        assert!(slot.work_state_observed);
     }
 
     #[test]
@@ -13375,7 +13489,7 @@ mod tests {
             RuntimeEvent::SessionWorkState {
                 state: WorkState::Blocked,
                 detail: Some(detail),
-                previous_state: Some(WorkState::Idle),
+                previous_state: None,
                 ..
             } if detail == "usage_limit"
         ));
@@ -14609,6 +14723,7 @@ mod tests {
                 slot.running = Some(RunningSession::new(Some(Arc::new(RecordingPtySession {
                     process_id: std::process::id(),
                     inputs: replacement_inputs_for_sink.clone(),
+                    resizes: None,
                 }))));
                 let replacement_run_id = Uuid::new_v4();
                 set_test_bracketed_paste_mode(

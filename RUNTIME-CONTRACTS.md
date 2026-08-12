@@ -188,9 +188,11 @@ Work-state events:
 - `session_work_state` captures semantic pane activity separately from lifecycle state
 - allowed work states: `idle`, `thinking`, `tool_call`, `blocked`, `error_loop`
 - each event carries a nested `RunEventIdentity` (`SessionId`, `RunId`, generation, monotonic sequence), the current session label, state, optional detail, optional previous state, and timestamp
-- events are transition-based; repeated output in the same work state updates supervisor memory but does not emit another audit event
-- output quiescence can transition Claude, Codex, and Generic Terminal sessions
-  back to lifecycle/work-state `idle`
+- the first explicit observation is emitted even when it is `idle`, with no previous state; later repeated output in the same observed work state updates supervisor memory but does not emit another audit event
+- output quiescence can transition Claude and Generic Terminal sessions back to
+  lifecycle/work-state `idle`; for Codex it changes lifecycle only and never
+  establishes semantic work state or routed-input authority, which require a
+  trusted current-screen observation
 - each Grok launch receives native `--minimal`, a fresh native `--session-id`, and remains lifecycle
   `starting` while the exact run is on the launcher or still producing its
   startup repaint; those states reject synthetic delivery while raw terminal
@@ -208,6 +210,8 @@ Work-state events:
 - replacement runs start with a fresh tracker; resize, malformed, unsupported,
   or over-limit control state fails closed until known output reconstructs the
   screen; no timeout grants readiness, and readiness is not a model-turn receipt
+- a repeated resize request with dimensions already applied to the exact run is
+  a no-op; only a changed size reaches the PTY and invalidates the tracked screen
 - Codex 0.147.0 prompt admission uses the same bounded viewport with Codex-only
   policy: Idle requires one trusted current screen with a visible column-3 cursor
   on an input row exactly `›` or beginning `› `, followed by an indented non-empty
