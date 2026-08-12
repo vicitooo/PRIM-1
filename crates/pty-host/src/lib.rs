@@ -1210,7 +1210,9 @@ mod windows_real_process_tests {
             .expect("release ConPTY cursor handshake");
         let observed = poll_until(Duration::from_secs(4), || {
             let output = output.lock().ok()?.clone();
-            output.contains("IDENTITY=[current-pane]").then_some(output)
+            output
+                .contains("SERVER_STARTED=[987654321]")
+                .then_some(output)
         })
         .expect("environment probe output was not observed");
 
