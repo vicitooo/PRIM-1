@@ -125,7 +125,7 @@ app.innerHTML = `
       </svg>
       <div class="topbar-brand">
         <div class="brand-logo-frame" aria-hidden="true">
-          <span class="brand-logo" aria-hidden="true">P1</span>
+          <img class="brand-logo" src="/textures/prim1-logo.png" alt="" />
           <svg class="brand-logo-bracket" viewBox="0 0 60 60" aria-hidden="true">
             <path d="M 0 14 L 0 0 L 14 0" style="stroke: var(--bronze)" stroke-width="2" fill="none" stroke-linecap="square" />
             <path d="M 46 0 L 60 0 L 60 14" style="stroke: var(--bronze)" stroke-width="2" fill="none" stroke-linecap="square" />
@@ -142,6 +142,7 @@ app.innerHTML = `
         <span class="state-pill" data-session-state="global" hidden>ready</span>
         <span class="activity-pill" hidden>idle</span>
       </div>
+      <button type="button" class="dock-toggle" id="dock-toggle" aria-pressed="false" title="Show system log and rooms">Log · Rooms</button>
       <button class="theme-toggle" id="theme-toggle" aria-label="Toggle theme" title="Toggle theme"></button>
       <span class="mono" id="control-endpoint" hidden>starting...</span>
       <span class="mono" id="audit-path" hidden>loading...</span>
@@ -702,6 +703,29 @@ function wireThemeToggle(): void {
   });
 }
 
+/** Dock = the system log + rooms row. Hidden by default (terminal-first);
+    the topbar toggle opens it. Only presentation: the dock DOM and every
+    handler in it are untouched. */
+function wireDockToggle(): void {
+  const shell = must<HTMLElement>(".app-shell");
+  const toggle = must<HTMLButtonElement>("#dock-toggle");
+  const apply = (open: boolean): void => {
+    shell.dataset.dock = open ? "open" : "closed";
+    toggle.setAttribute("aria-pressed", String(open));
+    toggle.title = open
+      ? "Hide system log and rooms"
+      : "Show system log and rooms";
+    requestAnimationFrame(() => {
+      fitVisiblePanes();
+      systemFit.fit();
+    });
+  };
+  apply(false);
+  toggle.addEventListener("click", () => {
+    apply(shell.dataset.dock !== "open");
+  });
+}
+
 /** Active theme's secondary color as ANSI truecolor — used for system log info
     entries so they shift with the theme (cyan in default, pink in deep). */
 function secondaryAnsiRgb(): string {
@@ -729,6 +753,7 @@ wireControls();
 wireResize();
 wireTerminalShortcuts();
 wireThemeToggle();
+wireDockToggle();
 
 const runtimeEventContext: RuntimeEventContext = {
   writeSystem,
@@ -1422,6 +1447,7 @@ function renderSessionTabs(sessions: SessionSnapshot[]): void {
     tab.setAttribute("aria-controls", "session-panel-" + sessionId);
     tab.tabIndex = tabState.activeId === sessionId ? 0 : -1;
     tab.title = sessionTabDescription(session);
+    tab.dataset.driverTag = driverTag(session.driver);
 
     const label = document.createElement("span");
     label.className = "session-tab-label";
@@ -1461,9 +1487,9 @@ function renderSessionTabs(sessions: SessionSnapshot[]): void {
       tab,
       tabActionButton("←", "Move " + session.label + " left", "move", sessionId, -1, index === 0),
       tabActionButton("→", "Move " + session.label + " right", "move", sessionId, 1, index === tabState.order.length - 1),
-      tabActionButton("Edit", "Edit " + session.label, "edit", sessionId),
+      tabActionButton("✎", "Edit " + session.label, "edit", sessionId),
       tabActionButton(
-        "Close",
+        "×",
         session.running
           ? "Stop " + session.label + " before closing"
           : "Close " + session.label,
@@ -1491,6 +1517,7 @@ function updateSessionTab(session: SessionSnapshot): void {
   const badges = shell.querySelector<HTMLElement>("[data-session-tab-badges]");
   if (tab) {
     tab.title = sessionTabDescription(session);
+    tab.dataset.driverTag = driverTag(session.driver);
   }
   if (label) {
     label.textContent = session.label;
@@ -1528,6 +1555,18 @@ function updateSessionTab(session: SessionSnapshot): void {
     close.title = closeLabel;
     close.setAttribute("aria-label", closeLabel);
   }
+}
+
+const DRIVER_TAGS: Record<DriverKind, string> = {
+  claude: "CL",
+  codex: "CX",
+  grok: "GK",
+  prime: "PR",
+  generic_terminal: "SH",
+};
+
+function driverTag(driver: DriverKind): string {
+  return DRIVER_TAGS[driver] ?? "??";
 }
 
 function tabBadge(
