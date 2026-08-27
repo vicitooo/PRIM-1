@@ -6,7 +6,7 @@ param(
   [ValidateSet("enter", "up", "down", "left", "right", "tab", "esc", "ctrl_c")]
   [string]$Key,
 
-  [string]$InfoFile
+  [string]$Endpoint
 )
 
 $scriptRoot = Split-Path -Parent $PSCommandPath
@@ -16,7 +16,7 @@ $controlPlaneScript = Join-Path $scriptRoot "control-plane.ps1"
   -Action key `
   -Session $Session `
   -Key $Key `
-  -InfoFile $InfoFile `
+  -Endpoint $Endpoint `
   -Quiet
 
 exit $LASTEXITCODE

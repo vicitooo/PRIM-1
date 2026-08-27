@@ -1,0 +1,12 @@
+[package]
+name = "driver-grok"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+shared-types = { path = "../shared-types" }
+terminal-viewport = { path = "../terminal-viewport" }
+uuid.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

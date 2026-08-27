@@ -17,7 +17,7 @@ Build a generic local runtime for terminal-first AI tools where:
 
 The system consists of five main parts:
 
-1. **Supervisor daemon**
+1. **Supervisor runtime**
 2. **PTY host**
 3. **Driver layer**
 4. **Sideband control plane**
@@ -31,22 +31,38 @@ This distinction must stay explicit.
 
 Current product surface:
 
-- two hardcoded panes: Claude and Codex
+- an atomically persisted, backend-ordered set of Claude Code, Codex, Grok,
+  Prime Agent (Ubuntu WSL), and Generic Terminal session definitions
+- stable opaque `SessionId` authority across desktop lifecycle, input, resize,
+  direct routing, renderer state, and run-event lineage; mutable labels are
+  display-only
+- a flat tab UI showing one retained xterm buffer at a time
+- native Windows working-directory selection, backend-qualified Ubuntu paths
+  for Prime, and visible `Normal`/`Unsafe` permission profiles
 - Windows-first validation
-- collaboration through supervisor-mediated routing
+- explicit, atomically persisted `RoomId` definitions and one-room-per-session
+  membership
+- a bounded in-memory room feed with a visible composer, feed-only Post, and
+  explicit one-member / Send All delivery
+- a tokenless, pane-local Windows sideband limited to self
+  `ping`/`wait_quiet`/`send_input`/`send_key` and membership-derived room
+  read/feed-only post
 
 Target architecture:
 
 - generic terminal-first runtime
-- dynamic session set
 - dynamic pane/layout model
+- user-extensible driver catalog
 - portable to Linux/macOS
 
-The current implementation is a **Claude/Codex proof built on a generic-shaped runtime**, not a finished generic terminal product.
+The current implementation is a **generic persistent-session proof with a
+bounded built-in driver catalog and explicit room/feed slice**, not an
+arbitrary-layout or user-extensible-driver product. Production room fidelity,
+two-room isolation, and multi-member acceptance remain verification gates.
 
-## 3. Supervisor daemon
+## 3. Supervisor runtime
 
-The supervisor is the authority.
+The supervisor is the authority and currently lives inside the desktop process; it is not a separate daemon.
 
 Responsibilities:
 
@@ -121,6 +137,13 @@ If native Windows ConPTY proves unstable for a required CLI flow, the fallback p
 
 The fallback is architectural, not product-level. The room model should not change if the PTY backend changes.
 
+Prime is a deliberate current use of this boundary rather than an implicit
+fallback. The Windows supervisor owns the outer `wsl.exe` ConPTY process job;
+inside Ubuntu, a uniquely named transient user-systemd service owns the Prime
+guard and payload control group. A run is `Ready` only after the exact service
+is active with both guard and payload present. Stop/close succeeds only after
+both the Linux service and outer Windows job are proved empty.
+
 ## 5. Driver layer
 
 Drivers translate generic supervisor actions into CLI-specific behavior.
@@ -140,64 +163,100 @@ Each driver should define:
 - hard kill strategy
 - optional output parser hooks
 
-### 5.2 Initial drivers
+### 5.2 Built-in drivers
 
 - `claude_cli`
 - `codex_cli`
+- `grok_cli`
+- `prime_cli` (`wsl:Ubuntu`)
+- `generic_terminal`
 
 ### 5.3 Future drivers
 
 - `hermes_cli`
 - `openclaw_cli`
-- `generic_terminal`
 
 The generic terminal driver is important. It keeps the runtime from becoming product-specific.
 
 ### 5.4 Reality check on current implementation
 
-The runtime already has a generic-terminal driver concept, but the current app does not yet expose it as a first-class product feature.
+The desktop exposes a deliberately bounded built-in driver catalog rather than
+renderer-controlled programs or arguments.
 
 That means:
 
-- the architecture supports generic sessions
-- the current UI still hardcodes Claude and Codex
-- turning the app into a true universal wrapper is a product step still ahead of us
+- the session registry and lifecycle remain driver-agnostic
+- Claude Code, Codex, Grok, Prime Agent, and Generic Terminal are explicit typed choices
+- user-extensible drivers remain a separate product step
 
 ## 6. Sideband control plane
 
-The sideband plane is the reliable control channel.
+The sideband plane is a narrow, pane-local control channel. It is not the
+operator API, recipient-delivery transport, lifecycle API, inventory API, or
+room-management API.
 
-Examples:
+The current Windows surface is deliberately limited to:
 
-- `send --to claude --content "..."`
-- `send --to room --content "..."`
+- `ping`
+- `wait_quiet` for the calling pane
+- `send_input` to the calling pane
+- `send_key` to the calling pane
+- `room_read` for the calling pane's current authorized room and join floor
+- feed-only `room_post` with sender derived from that caller
 
-Primary use cases:
+A named-pipe connection provides transport, not authority. On Windows the
+supervisor obtains and pins the kernel-reported client process, requires it to
+belong to exactly one live PTY job, binds the derived pane identity to that run
+generation, and revalidates both affiliation and generation at mutation time.
+There is no bearer token, credential file, caller-supplied identity, peer target,
+or disk-mailbox fallback. Room requests accept no caller-supplied `RoomId`,
+sender, peer, or recipient. Operator lifecycle, membership, and recipient
+delivery remain direct in-process Tauri commands.
 
-- direct messages
-- room broadcasts
-- restart requests
-- spawn requests
-- close requests
-- ping/health probes
-- command execution requests
+Prime sessions are intentionally excluded from this native sideband. Their
+Linux descendants cannot be authenticated through the Windows Job membership
+proof used by the named pipe, and no bearer or proxy fallback is introduced.
 
-### 6.1 Transport choice
+Room reads/posts use the same kernel-bound caller proof, derive current
+`RoomId` membership and sender `SessionId` under the supervisor locks, and are
+revoked immediately when the run or membership changes. Prime remains excluded.
 
-The default control plane transport should be:
+### 6.1 Model-facing bridge
 
-- **Windows:** named pipe
-- **POSIX:** Unix domain socket
+Claude Code and Codex receive a session-scoped stdio MCP child named
+`prim1_pane`. The child is the signed/packaged PRIM-1 executable in an early
+no-UI mode, configured so the harness creates it inside the same pane Job. Its
+only tools are `ping`, membership-derived `room_read`, and feed-only
+`room_post`. The MCP
+request carries neither caller nor room authority; the helper verifies the
+desktop named-pipe server PID and creation time, and the supervisor derives the
+exact caller/run from the kernel again on every request.
+
+This bridge is deliberately driver-scoped. Grok Build 1.0.0 supports
+session-scoped plugins only through its non-interactive agent host, while its
+TUI has no equivalent flag and its shell-tool subprocesses are empirically not
+members of the pane Job. Redirecting `GROK_HOME` would redirect Grok's sessions
+and logs into PRIM runtime storage. PRIM therefore leaves Grok, Prime, and
+Generic Terminal unchanged rather than adding a bearer, ancestry check,
+global plugin, workspace mutation, or history-redirection fallback.
+
+### 6.2 Transport choice
+
+The control-plane transport model is:
+
+- **Windows (implemented and under production verification):** current-user-local named pipe
+- **POSIX (planned, not a product claim):** Unix domain socket
 
 Not localhost TCP by default.
 
 Reason:
 
-- lower attack surface
-- local file-permission model
-- avoids accidental browser or unrelated local-process access
+- machine-local transport surface
+- kernel-reported peer-process attribution on Windows
+- rejection of unaffiliated clients before their request frame is accepted
 
-Local HTTP can exist later as a compatibility or remote-control layer, but it should not be the default local control path.
+Local HTTP is not a fallback. Any future remote-control layer needs its own
+explicit trust boundary and product contract.
 
 ### Why explicit sideband is required
 
@@ -218,7 +277,7 @@ stdout parsing may still be used for:
 - telemetry
 - fallback stalled-session heuristics
 
-But not for authoritative routing.
+But not for authority, routing, or lifecycle control.
 
 ## 7. Messaging model
 
@@ -228,7 +287,8 @@ But not for authoritative routing.
   One sender, one recipient
 
 - `room`
-  Broadcast to all visible participants
+  Shared feed provenance plus an explicit member-recipient snapshot; posting
+  alone never broadcasts prompts
 
 - `system`
   Supervisor-generated events
@@ -236,50 +296,103 @@ But not for authoritative routing.
 - `private`
   Reserved for future local-only notes or hidden operator metadata
 
-### 7.2 Message types
+### 7.2 Current message types
 
-- `chat_message`
-- `command_request`
-- `command_result`
-- `heartbeat`
-- `health`
-- `spawn_request`
-- `restart_request`
-- `close_request`
+- one-recipient operator-authored direct messages at the backend boundary
+- room messages from the operator or a kernel-derived member
+- room membership events
+- per-recipient room delivery state (`pending`, `written`, `failed`)
+- supervisor-generated lifecycle, delivery, heartbeat, and alert events
+
+Command execution, spawn, restart, and close are not chat message types. They
+remain typed in-process operator actions; the pane-local sideband cannot invoke
+them.
 
 ### 7.3 Routing behavior
 
-On every sideband message, the supervisor should:
+On every operator route, the supervisor must:
 
-1. validate sender permissions
-2. log the event
-3. route it to the target scope
-4. visibly stamp the injection in the target PTY or room
-5. emit any resulting system log entries
+1. derive operator provenance at the Tauri boundary
+2. validate the source request and whole message body
+3. resolve the explicit recipient `SessionId` to one exact run
+4. preflight its framing before any write, including exact-run evidence that DEC private mode 2004 is enabled, that the driver has not observed a blocked/error-loop state, and—on Codex—that an explicit work state has been observed
+5. record pending metadata without retaining message content
+6. hold the recipient run-input permit, revalidate identity/generation/PTY/gate/mode/work-state, and write the complete driver input: one bracketed frame for Claude/Codex, or one Grok-minimal fused buffer containing a bracketed frame per LF line with `ESC CR` (Alt+Enter) between frames; Grok rejects CR, source bodies above 13 KiB, and more than 256 source lines during preflight because those bounds stay inside its measured receiver envelope. From that successful write boundary, wait a one-second base interval plus a conservative proportional 500 milliseconds per MiB of framed input (chosen over the roughly 10/19/174 milliseconds of parser lag observed at 1 KiB/64 KiB/1 MiB), revalidate identity/generation/PTY/gate/work-state, and write one Enter. A partial/error/short first write reports exact progress and sends no Enter or retry; raw single-line drivers remain one PTY input containing only the validated source command because a textual provenance prefix would be executable shell input
+7. emit a written or failed receipt without claiming final-child or model receipt
+
+Claude and Codex receive the visible provenance envelope inside one
+bracketed-paste frame. Grok reconstructs the same envelope from one FIFO-held
+fused buffer of per-line bracketed frames. Generic Terminal carries provenance in PRIM's feed,
+route receipts, and audit instead; its raw command line is not prefixed with
+display text that a shell could parse as code.
+
+The desktop command runs this blocking supervisor operation on Tauri's blocking
+pool, so the driver settle interval does not stall the UI or serialize unrelated
+desktop IPC behind the route.
+
+The mode-2004 scanner consumes the exact run's raw PTY output before desktop
+coalescing or output shedding and resets on every `RunId`; it remains the sole
+delivery-mode authority. Codex and Grok apply separate driver policies over one
+bounded, driver-internal terminal viewport that retains no styling or scrollback.
+Codex's per-run work-state tracker starts before PTY installation, joins arbitrary
+output chunks only for measured classifier context, latches blocking prompts,
+and commits any pre-install block before Ready. Codex 0.147.0 composes its prompt
+across multiple synchronized and ordinary cursor-hide/show transactions, so a
+trusted current screen proves Idle only when it shows a visible column-3 cursor
+on an input row exactly `›` or beginning `› `, followed by an indented non-empty
+footer row whose final ` · ` separates a non-empty model from a path-like cwd.
+A later clean screen clears a
+latched blocker only when no measured blocker remains anywhere on that same
+screen. The legacy `▌` and `esc to interrupt` text are not authority. Terminal-
+string payload cannot supply text or cursor proof; malformed, unsupported,
+resized-but-unreconstructed, and over-limit projections remain Unknown. Unknown or disabled mode, unobserved Codex state, or a
+driver-observed blocked/error-loop state blocks addressed Claude/Codex/Grok
+delivery without blocking raw operator or pane-local input. The paste and Enter
+boundary is FIFO-serialized and rechecked twice. Output is not used as an
+acknowledgement because multiline input may stay
+invisible until Enter; each measured interval is version-sensitive compatibility
+behavior measured against Claude Code 2.1.226, Codex 0.147.0, and Grok Build
+1.0.0, with no automatic retry after an uncertain outcome. The packaged
+real-harness byte oracle remains
+responsible for final-child fidelity and receiver receipt.
+
+Room **Post** validates and appends one provenance-stamped feed message without
+touching any PTY. Room **Send** resolves one membership revision and one or all
+explicit member IDs, preflights every exact run and framing before any
+message-specific mutation, then appends the immutable message plus one pending
+delivery item per recipient. Each recipient uses the same exact-run FIFO writer
+and receives a written or failed feed item with truthful prefix progress. A
+membership change after the commit affects the next message; an in-flight room
+cannot be deleted. Room feed append and publication share one ordering gate so
+cursor order cannot race renderer/audit order.
 
 ### 7.4 Addressing model
 
-The supervisor must not assume one Claude and one Codex forever.
+The current operator boundary identifies each logical session by opaque
+`SessionId`; restart preserves that ID while creating a new `RunId`, and rename
+changes only its display label. Direct routing accepts one recipient ID. Room
+delivery accepts one member ID or explicit `all` resolved from one `RoomId`
+membership revision. Unknown or stale IDs fail closed, including
+delete/recreate with the same label. There is no name, label, implicit
+multi-recipient, or all-session fallback.
 
-Addressing should support:
-
-- `claude`
-- `codex`
-- `claude:work`
-- `claude:research`
-- `codex:test`
-- `room`
-
-The routing model should treat agent instances as named sessions, not hardcoded singular roles.
+The registry is keyed by `SessionId` with a separate persisted order and a
+deterministic immutable alias table used only by the narrow self-pane sideband.
+The private version-1 catalog stores the workspace preference and ordered
+session intent. A separate private version-1 room catalog stores ordered room
+identity, label, member IDs, and membership revision. Neither persists `RunId`,
+process state, launch arguments, environment variables, terminal output, room
+feed events, or message content.
 
 ## 8. UI model
 
-The first useful UI is a four-surface room:
+The current useful UI has four surfaces:
 
-- Claude pane
-- Codex pane
-- System log pane
-- the operator input/router
+- backend-ordered session tabs
+- one active terminal with inactive terminal buffers retained
+- the system log
+- the active room's member list, bounded feed, and Post / explicit-delivery
+  composer
 
 There should also be a small retractable control surface for:
 
@@ -288,21 +401,23 @@ There should also be a small retractable control surface for:
 - reconnect
 - close
 - health
-- room actions
+- refresh and room actions
 
 The control surface should stay minimal and subordinate to the core room UX.
 
-### 8.2 Future pane model
+### 8.2 Current tab model
 
-The current fixed two-pane layout is acceptable for the first proof, but it is not the final UI model.
+The current UI creates, renames, reorders, configures, and deletes persistent
+session tabs. Every tab, snapshot, pending-output buffer, and terminal reference
+is keyed by `SessionId`. Duplicate labels are disambiguated by driver, cwd, and
+short ID. A tab switch hides rather than disposes the inactive xterm; only exact
+`SessionDeleted` lineage retirement discards it.
 
-Future UI requirements:
+Future layout requirements:
 
-- add/remove panes
-- dynamic pane count
-- agent instance labels and IDs
 - layout presets for one, two, or many sessions
 - workspace-specific session groupings
+- simultaneous terminal/room arrangements beyond the current active-room card
 
 ### 8.3 Workspace / home model
 
@@ -317,17 +432,15 @@ That layer should support:
 
 The room remains the core interaction surface, but it should no longer be the only surface.
 
-### 8.1 Reconnect behavior
+### 8.1 Desktop and renderer lifetime
 
-The UI is not the source of truth. The supervisor is.
-
-If the UI crashes or is closed:
-
-- supervised agents may continue running
-- the supervisor continues logging and routing
-- reopening the UI should reattach to live sessions and replay recent log state
-
-This prevents the room from depending on one fragile window process.
+The native supervisor is the source of runtime truth while the desktop process is
+alive. A renderer reload may reconcile from its current snapshot without replacing
+the supervised runs. Closing or crashing the desktop process is different: the
+current product deliberately ends every owned process job. A later launch restores
+the ordered persisted session definitions as closed tabs and starts no harness
+until the operator explicitly starts one. Reattaching live runs across desktop
+processes would require a separately hosted supervisor service and is not claimed.
 
 ## 9. Lifecycle model
 
@@ -343,6 +456,10 @@ This prevents the room from depending on one fragile window process.
 - `closed`
 
 ### 9.2 Definitions
+
+Process exit is derived only from PTY/OS process evidence. Terminal text, including
+normal CLI version banners or strings that resemble shell/exit output, cannot close
+or fail a run.
 
 **Idle**
 
@@ -373,6 +490,14 @@ An agent should only be closed or restarted because of:
 
 This separates normal completion from process teardown.
 
+`closed` is a termination-proof claim, not a display convenience. Every explicit
+stop and every natural PTY EOF/error or liveness retirement serializes through the
+same per-session lifecycle reservation and must prove that the exact run's owned
+process job is empty. A failed or bounded-out proof retains the exact run ownership
+and reports `failed` with termination uncertainty; start, restart, and delete remain
+blocked until a later reserved termination attempt proves the scope empty. Dropping
+a PTY/job handle or observing terminal EOF is never accepted as that proof.
+
 ### 9.4 Heartbeat strategy for v1
 
 V1 heartbeat strategy is:
@@ -391,9 +516,26 @@ Active heartbeats can be added later, but v1 should not block on them.
 
 Generic wrapper does not imply generic trust.
 
+The desktop renderer is bundled-only and runs under an explicit CSP: scripts
+come from the application bundle, objects/frames/forms are denied, and the one
+inline-style allowance exists for xterm and the current static HUD markup. The
+normal renderer has no `window.__TAURI__` global and the release binary omits
+the in-app devtools feature. Its capability manifest grants only runtime-event
+listen/unlisten plus read-only focused/fullscreen/minimized queries used by the
+test seam; filesystem, shell, menu, image, tray, and devtools-toggle commands
+are not granted.
+
+Production-artifact automation is an explicit local diagnostic mode rather
+than a second build. A strictly parsed `PRIM1_CDP_PORT` binds WebView2 debugging
+to `127.0.0.1` without wildcard origins. Only in that mode does trusted bundled
+frontend code install a frozen compatibility bridge containing `invoke`,
+`listen`, and `getCurrentWindow`, allowing the same exact artifact to run the
+verification matrix and built-in `Page.captureScreenshot` receipts. Without
+the opt-in port, the bridge and debugging endpoint are absent.
+
 Per-agent policy should include:
 
-- working directory restrictions
+- qualified working-directory selection
 - network policy
 - sandbox mode
 - allowed sideband commands
@@ -403,37 +545,81 @@ Per-agent policy should include:
 
 These are not deferred hardening tasks. They are mandatory from the first working supervisor:
 
-1. **working-directory whitelist**
-   The supervisor refuses to spawn an agent without an explicit allowed root.
+1. **native working-directory qualification**
+   The renderer cannot submit a raw path. A native chooser selects an existing
+   directory; the supervisor resolves its final path and stable identity,
+   rejects runtime overlap, persists that qualified selection, and revalidates
+   it immediately before spawn. The workspace preference is a default, not an
+   allow-root or OS sandbox.
+
+   Prime uses a separate typed `wsl:Ubuntu` namespace. The backend resolves the
+   Ubuntu path and persists its canonical path plus device/inode identity,
+   revalidates that identity before every start, and passes it to an immutable
+   launch guard that checks it again immediately before spawning Prime. Windows
+   paths and `/mnt/c/...` are never silently equated.
 
 2. **sideband capability whitelist**
-   By default, an agent can act on itself and send messages. Cross-agent lifecycle requests require explicit policy.
+   After kernel-bound affiliation succeeds, the pane-local schema permits only
+   ping, wait, input, a supported key, membership-derived room read, or
+   feed-only room post for that caller's live run. Peer targeting, room IDs,
+   recipient delivery, lifecycle, inventory, and membership actions are absent.
+   This is a protocol boundary, not hostile same-user OS isolation.
 
 3. **named-pipe / socket access control**
-   Only authorized local clients should be able to issue control-plane requests.
+   A successful transport connection grants no authority. On Windows, requests proceed only after the kernel-reported peer process is pinned and verified against exactly one live pane job and generation. A future POSIX transport must establish an equivalent peer-identity boundary before becoming a product claim.
 
 ### Important CLI reality
 
-- Codex exposes native sandbox modes directly.
-- Claude appears to expose permission modes and resume, but not Codex-style OS-enforced read-only sandbox.
+- Claude `Normal` launches directly with `--permission-mode manual`; `Unsafe`
+  adds only `--dangerously-skip-permissions`.
+- Codex `Normal` launches directly with
+  `--ask-for-approval on-request --sandbox workspace-write`; `Unsafe` adds only
+  `--dangerously-bypass-approvals-and-sandbox`.
+- Grok `Normal` launches directly with `--minimal --permission-mode default`;
+  `Unsafe` changes only the permission value to `bypassPermissions`. Every run
+  also receives one fresh native `--session-id`. Minimal mode replaces the
+  suppressible full-screen response repaint with finalized answer blocks while
+  preserving raw operator input and Grok-owned history.
+- Prime launches only with `Normal`. The Windows command is direct `wsl.exe`;
+  the Linux side uses absolute `systemd-run`, Python, and `prime-agent` paths,
+  with no shell evaluation or renderer-controlled arguments.
+- Generic Terminal accepts `Normal` only.
 
-Implication:
+These are visible harness permission profiles, not hostile same-user OS
+isolation. Stronger containment would require a separately measured restricted
+user, ACL, container, VM, or equivalent boundary.
 
-- Codex secure modes can start as a driver setting.
-- Claude secure continuous modes will need external sandboxing later:
-  restricted worktree, lower-privilege user, ACLs, container, or equivalent.
+Grok remains lifecycle `Starting` through its launcher and minimal startup repaint, so
+synthetic delivery fails closed while raw input remains available. A per-run,
+bounded fixed-grid projector follows only Grok Build 1.0.0's measured cursor,
+erase, scroll, terminal-string, mode, and decoded-text subset across completed
+cursor-hide/show frames; Unicode cell widths follow Unicode Standard Annex #11.
+It is not a general terminal emulator and
+requires a trusted screen containing `Starting session…`, then a later trusted
+screen with the launcher gone, the interactive composer, exact `minimal · /help`
+chrome, and bracketed paste enabled. The exact minimal marker can establish the
+second phase even when the prior startup row remains visible. The projector
+retains neither styling nor scrollback, caps its grid at
+64 Ki cells, and fails closed after resize or unsupported control state until
+known output reconstructs the screen. Partial composer repaints and the
+independent MCP spinner cannot admit; replacement runs cannot inherit progress;
+no timer grants readiness, and structural readiness is not a model-turn receipt.
+The startup-completion frame makes the run's initial semantic Idle pending
+exactly once. Event admission publishes it unless a later admitted output
+carries a newer semantic marker, which supersedes it. After admission ordinary
+Grok silence is not an idle signal, and the measured Grok 1.0.3
+`Thinking`/`Responding`, tool, and `Worked for` markers own subsequent work
+state.
 
-This later work does not remove the need for the early mandatory protections above.
+## 11. 24/7 target model
 
-## 11. 24/7 model
-
-The 24/7 property belongs to the supervisor service, not to one immortal child process.
+The current supervisor lifetime is the desktop-process lifetime. A future 24/7 property would belong to a separately hosted supervisor service, not to one immortal child process.
 
 What remains continuous:
 
-- supervisor daemon
+- supervisor runtime
 - session identity and state
-- audit history
+- metadata audit history
 - routing and health model
 
 What may come and go:
@@ -453,27 +639,35 @@ Recommended first implementation:
 
 This is separate from child-agent lifecycle and should be treated as part of the runtime envelope.
 
-## 12. Audit log and replay
+## 12. Metadata audit and live state
 
-The audit log is the source of truth for replay.
+The audit log is a durable operational ledger, not a transcript or room-replay store.
 
 Format:
 
 - JSONL, one structured event per line
 - rolling daily files
 
-Minimum fields:
+Every record carries an event type and timestamp. Event-specific metadata may add session/actor/target identity, request or route IDs, lifecycle state, action/phase/result, and delivery counts.
 
-- timestamp
-- event type
-- actor
-- target
-- session id
-- driver
-- payload summary
-- result
+Terminal output and message content remain available only through the live
+runtime and desktop event path. `session_output` is not written to audit;
+routed and room-message content is replaced with `[content omitted]`. Room
+definitions/membership persist separately, while every room feed is bounded to
+512 events / 16 MiB in memory and every page to 64 events / 2 MiB, with epoch
+reset and eviction gaps explicit. The renderer retains only the active room's
+same-sized feed window and reloads inactive rooms from the supervisor.
 
-Replay should read the audit log forward. A separate transcript system should not be invented unless the audit log proves insufficient.
+The PTY host carries split UTF-8 code points across reads, then the exact-run
+mode-2004 scanner consumes that same incrementally decoded stream before
+renderer sanitization, coalescing, or shedding. The desktop bridge holds at
+most 512 queued events. Lifecycle and control events use lossless bounded
+backpressure; only already-sanitized `session_output` display events may be
+shed under saturation. Every such loss produces a visible, run-scoped gap
+notice before the next surviving event (or at drain), and renderer
+terminal-control parsing remains synchronized. Live terminal history can
+therefore be incomplete under sustained renderer pressure; full output
+fidelity under saturation is not claimed.
 
 ## 12.1 Multi-instance identity
 
@@ -494,9 +688,12 @@ The room itself needs first-class failure behavior.
 At minimum the architecture must support:
 
 - output throttling when an agent floods the pane
-- parse-and-drop behavior for malformed sideband messages
+- fail-closed behavior for malformed or unaffiliated sideband requests
 - reconnecting the UI without dropping supervised sessions
-- serializing room/system events in the audit log even when multiple agents emit concurrently
+- serializing room feed append/publication so cursor order is identical in the
+  renderer and metadata audit even when multiple agents post concurrently
+- refusing room deletion while delivery is in flight and recording truthful
+  partial per-recipient outcomes without retry
 
 ## 14. Reuse of current bridge code
 
@@ -508,7 +705,6 @@ Reusable parts:
 - partial Claude subprocess logic
 - archive and dispatch patterns
 - session registry concepts
-- watcher loop structure
 
 To be replaced:
 
@@ -544,7 +740,7 @@ What portability means here:
 
 - same supervisor model
 - same PTY ownership model
-- same sideband control-plane model
+- the same narrow, identity-derived sideband policy after each OS boundary is empirically verified
 - different OS-specific validation and packaging work
 
 So the correct claim is:

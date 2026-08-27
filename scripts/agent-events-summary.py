@@ -1,7 +1,8 @@
-"""Summarize PRIM-1 audit receipt/signal events for operators.
+"""Summarize PRIM-1 durable metadata events for operators.
 
-This complements agent-events.ps1: that script streams raw event JSON; this
-script groups the new receipt/signal families into one-line summaries.
+This reads the local JSONL audit directly and groups lifecycle, health, and
+delivery receipts into one-line summaries. The durable audit intentionally
+contains no terminal or routed-message content.
 """
 from __future__ import annotations
 
@@ -17,17 +18,12 @@ from typing import Iterable
 
 
 SUMMARY_EVENTS = {
-    "pane_signal",
     "session_exit",
     "session_work_state",
     "supervisor_heartbeat",
     "supervisor_alert",
-    "dispatch_template_warning",
     "route_delivery",
     "dispatch_attempt",
-    "request_ack",
-    "request_ack_timeout",
-    "sideband_request_lifecycle",
 }
 
 FAIL_ON_VALUES = {"alert", "blocked", "failed", "timeout"}
@@ -99,11 +95,23 @@ class RouteSummary:
         return SummaryLine(self.timestamp, self.last_sequence, line, conditions)
 
 
+def default_runtime_dir() -> Path:
+    override = os.environ.get("PRIM1_RUNTIME_DIR")
+    if override:
+        return Path(override).expanduser()
+    if os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if not local_app_data:
+            raise ValueError("LOCALAPPDATA is required when PRIM1_RUNTIME_DIR is unset")
+        return Path(local_app_data) / "io.prim1.runtime" / "runtime"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "io.prim1.runtime" / "runtime"
+    data_home = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
+    return data_home / "io.prim1.runtime" / "runtime"
+
+
 def default_audit_path() -> Path:
-    audit_dir = Path(
-        os.environ.get("PRIM1_AUDIT_DIR")
-        or Path(__file__).resolve().parent.parent / ".runtime" / "audit"
-    )
+    audit_dir = Path(os.environ.get("PRIM1_AUDIT_DIR") or default_runtime_dir() / "audit")
     today = audit_dir / f"{datetime.now(timezone.utc).date().isoformat()}.jsonl"
     if today.exists():
         return today
@@ -114,15 +122,8 @@ def default_audit_path() -> Path:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Summarize PRIM-1 receipt/signal audit events.")
-    mode = ap.add_mutually_exclusive_group()
-    mode.add_argument("--audit-log", help="Read a JSONL audit log file directly.")
-    mode.add_argument(
-        "--events-since-stdin",
-        action="store_true",
-        help="Read events_since JSON from stdin instead of an audit log.",
-    )
-    ap.add_argument("--task-id", help="Restrict to pane_signal events with this task_id.")
+    ap = argparse.ArgumentParser(description="Summarize PRIM-1 durable metadata events.")
+    ap.add_argument("--audit-log", help="Read this JSONL audit log instead of the runtime default.")
     ap.add_argument("--request-id", help="Restrict to events with this request_id.")
     ap.add_argument("--since-minutes", type=float, help="Only include events newer than N minutes.")
     ap.add_argument("--watch", action="store_true", help="Poll the audit log every 2s and emit new summaries.")
@@ -195,41 +196,9 @@ def iter_jsonl_events(path: Path) -> Iterable[dict]:
                 yield event
 
 
-def read_events_since_stdin() -> list[dict]:
-    raw = sys.stdin.read()
-    if not raw.strip():
-        raise ValueError("stdin was empty")
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        events = []
-        for line in raw.splitlines():
-            if not line.strip():
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(event, dict):
-                events.append(event)
-        return events
-
-    if isinstance(parsed, list):
-        return [event for event in parsed if isinstance(event, dict)]
-    if isinstance(parsed, dict):
-        if isinstance(parsed.get("events"), list):
-            return [event for event in parsed["events"] if isinstance(event, dict)]
-        payload = parsed.get("payload")
-        if isinstance(payload, dict) and isinstance(payload.get("events"), list):
-            return [event for event in payload["events"] if isinstance(event, dict)]
-    raise ValueError("stdin did not contain an events_since object or event list")
-
-
 def event_matches(event: dict, args: argparse.Namespace, since_cutoff: datetime | None) -> bool:
     kind = event.get("event")
     if kind not in SUMMARY_EVENTS:
-        return False
-    if args.task_id and not (kind == "pane_signal" and event.get("task_id") == args.task_id):
         return False
     if args.request_id and event.get("request_id") != args.request_id:
         return False
@@ -243,16 +212,6 @@ def event_matches(event: dict, args: argparse.Namespace, since_cutoff: datetime 
 def event_to_line(event: dict, sequence: int) -> SummaryLine | None:
     kind = event.get("event")
     timestamp = event.get("timestamp")
-    if kind == "pane_signal":
-        signal_type = str(event.get("signal_type") or "?")
-        conditions = {"blocked"} if signal_type == "blocked" else set()
-        line = (
-            f"{format_time(timestamp)} pane_signal      task={event.get('task_id') or '?'}  "
-            f"type={signal_type}  session={event.get('session') or '?'}  "
-            f"summary={quote_summary(event.get('summary'))}"
-        )
-        return SummaryLine(timestamp, sequence, line, conditions)
-
     if kind == "session_work_state":
         state = str(event.get("state") or "?")
         conditions = {"blocked"} if state in {"blocked", "error_loop"} else set()
@@ -298,23 +257,6 @@ def event_to_line(event: dict, sequence: int) -> SummaryLine | None:
         )
         return SummaryLine(timestamp, sequence, line, conditions)
 
-    if kind == "dispatch_template_warning":
-        missing = ",".join(str(value) for value in event.get("missing_patterns") or [])
-        line = (
-            f"{format_time(timestamp)} template_warning req={short_id(event.get('request_id'))}  "
-            f"session={event.get('session') or '?'}  severity={event.get('severity') or '?'}  "
-            f"missing={quote_summary(missing)}"
-        )
-        return SummaryLine(timestamp, sequence, line)
-
-    if kind == "request_ack":
-        line = (
-            f"{format_time(timestamp)} request_ack      req={short_id(event.get('request_id'))}  "
-            f"session={event.get('session') or '?'}  action={event.get('action') or '?'}  "
-            f"bytes={event.get('bytes_written') or 0}"
-        )
-        return SummaryLine(timestamp, sequence, line)
-
     if kind == "dispatch_attempt":
         if not event.get("overlap"):
             return None
@@ -324,27 +266,6 @@ def event_to_line(event: dict, sequence: int) -> SummaryLine | None:
             f"action={event.get('action') or '?'}  reason={event.get('reason') or 'overlap'}"
         )
         return SummaryLine(timestamp, sequence, line)
-
-    if kind == "request_ack_timeout":
-        line = (
-            f"{format_time(timestamp)} ack_timeout      req={short_id(event.get('request_id'))}  "
-            f"session={event.get('session') or '?'}  action={event.get('action') or '?'}  "
-            f"elapsed={event.get('elapsed_ms') or 0}ms"
-        )
-        return SummaryLine(timestamp, sequence, line, {"timeout"})
-
-    if kind == "sideband_request_lifecycle":
-        phase = str(event.get("phase") or "?")
-        if phase not in {"failed", "timed_out"}:
-            return None
-        label = "lifecycle_failed" if phase == "failed" else "lifecycle_timeout"
-        conditions = {"failed"} if phase == "failed" else {"timeout"}
-        line = (
-            f"{format_time(timestamp)} {label:<16} req={short_id(event.get('request_id'))}  "
-            f"session={event.get('session') or '?'}  action={event.get('action') or '?'}  "
-            f"error={quote_summary(event.get('error') or event.get('message'))}"
-        )
-        return SummaryLine(timestamp, sequence, line, conditions)
 
     return None
 
@@ -459,24 +380,17 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return 2
 
-    if args.events_since_stdin and args.watch:
-        print("--watch is only supported with audit-log input", file=sys.stderr)
-        return 2
-
-    if args.events_since_stdin:
-        try:
-            events = read_events_since_stdin()
-        except ValueError as exc:
-            print(str(exc), file=sys.stderr)
-            return 1
-    else:
+    try:
         audit_path = Path(args.audit_log) if args.audit_log else default_audit_path()
-        if args.watch:
-            return watch_audit(audit_path, args, fail_on)
-        if not audit_path.exists():
-            print(f"audit log not found: {audit_path}", file=sys.stderr)
-            return 1
-        events = list(iter_jsonl_events(audit_path))
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if args.watch:
+        return watch_audit(audit_path, args, fail_on)
+    if not audit_path.exists():
+        print(f"audit log not found: {audit_path}", file=sys.stderr)
+        return 1
+    events = list(iter_jsonl_events(audit_path))
 
     lines, conditions = summarize_events(events, args)
     print_lines(lines)

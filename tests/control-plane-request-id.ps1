@@ -1,5 +1,6 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+. "$PSScriptRoot\control-plane-test-helpers.ps1"
 
 function Assert-True {
   param(
@@ -32,124 +33,68 @@ function Invoke-Script {
   $previousPreference = $ErrorActionPreference
   $ErrorActionPreference = "Continue"
   $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass @Arguments 2>&1
+  $exitCode = $LASTEXITCODE
   $ErrorActionPreference = $previousPreference
 
   return [pscustomobject]@{
-    ExitCode = $LASTEXITCODE
+    ExitCode = $exitCode
     Lines = @($output | ForEach-Object { [string]$_ })
     Output = (($output | Out-String).Trim())
   }
 }
 
-function New-TestRuntime {
-  $root = Join-Path ([System.IO.Path]::GetTempPath()) ("prim1-request-id-test-" + [guid]::NewGuid())
-  $runtimeDir = Join-Path $root "runtime"
-  $sidebandDir = Join-Path $runtimeDir "sideband"
-  $null = New-Item -ItemType Directory -Force -Path (Join-Path $sidebandDir "inbox")
-  $null = New-Item -ItemType Directory -Force -Path (Join-Path $sidebandDir "outbox")
-
-  $infoPath = Join-Path $runtimeDir "control-plane.json"
-  $capturePath = Join-Path $runtimeDir "captured-request.json"
-  $status = @{
-    transport = "named_pipe"
-    endpoint = "\\.\pipe\prim1-request-id-test"
-    token = "test-token"
-    info_path = $infoPath
-  }
-  $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-  [System.IO.File]::WriteAllText($infoPath, ($status | ConvertTo-Json -Compress), $utf8NoBom)
-
-  return @{
-    Root = $root
-    RuntimeDir = $runtimeDir
-    InfoPath = $infoPath
-    CapturePath = $capturePath
-  }
-}
-
-function Start-MailboxResponder {
-  param(
-    [string]$RuntimeDir,
-    [string]$CapturePath,
-    [string]$Message,
-    [string]$RequestId
-  )
-
-  return Start-Job -ScriptBlock {
-    param($RuntimeDir, $CapturePath, $Message, $RequestId)
-
-    $inboxDir = Join-Path $RuntimeDir "sideband\inbox"
-    $outboxDir = Join-Path $RuntimeDir "sideband\outbox"
-    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-    $deadline = [DateTime]::UtcNow.AddSeconds(20)
-
-    while ([DateTime]::UtcNow -lt $deadline) {
-      $request = Get-ChildItem -LiteralPath $inboxDir -Filter "*.json" | Sort-Object LastWriteTime | Select-Object -First 1
-      if ($request) {
-        $raw = Get-Content -LiteralPath $request.FullName -Raw
-        [System.IO.File]::WriteAllText($CapturePath, $raw, $utf8NoBom)
-
-        $response = @{
-          ok = $true
-          message = $Message
-          snapshot = $null
-          request_id = $RequestId
-        } | ConvertTo-Json -Compress
-        $responsePath = Join-Path $outboxDir $request.Name
-        [System.IO.File]::WriteAllText($responsePath, $response, $utf8NoBom)
-        Remove-Item -LiteralPath $request.FullName -Force
-        return
-      }
-
-      Start-Sleep -Milliseconds 100
-    }
-
-    throw "Timed out waiting for mailbox payload."
-  } -ArgumentList $RuntimeDir, $CapturePath, $Message, $RequestId
-}
-
-function Wait-Responder {
-  param($Job)
-
-  Wait-Job -Job $Job -Timeout 25 | Out-Null
-  Receive-Job -Job $Job -ErrorAction Stop | Out-Null
-  Assert-True ($Job.State -eq "Completed") "Mailbox responder job did not complete cleanly."
-}
-
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $controlPlaneScript = Join-Path $repoRoot "scripts\control-plane.ps1"
-$agentRouteScript = Join-Path $repoRoot "scripts\agent-route.ps1"
+$agentKeyScript = Join-Path $repoRoot "scripts\agent-key.ps1"
+$agentSlashScript = Join-Path $repoRoot "scripts\agent-slash.ps1"
+$controlPlaneCommand = Get-Command -Name $controlPlaneScript
+$actionValidateSet = @(
+  $controlPlaneCommand.Parameters["Action"].Attributes |
+    Where-Object { $_ -is [System.Management.Automation.ValidateSetAttribute] } |
+    Select-Object -First 1
+)
+Assert-Equal ($actionValidateSet[0].ValidValues -join ",") "ping,wait_quiet,input,key,room_read,room_post" "The script action surface must stay closed to the six pane-local actions."
+Assert-True (-not $controlPlaneCommand.Parameters.ContainsKey("InfoFile")) "Legacy InfoFile discovery must not remain callable."
+Assert-True (-not $controlPlaneCommand.Parameters.ContainsKey("RequireIdle")) "Legacy idle compatibility must not remain callable."
 
-$testRuntime = New-TestRuntime
+$testRuntime = New-ControlPlaneTestRuntime -Prefix "prim1-request-id-test"
 try {
-  $job = Start-MailboxResponder -RuntimeDir $testRuntime.RuntimeDir -CapturePath $testRuntime.CapturePath -Message "pong" -RequestId "req-pass"
+  $response = @{ ok = $true; message = "pong"; request_id = "req-pass" } | ConvertTo-Json -Compress
+  $responder = Start-ControlPlanePipeResponder -PipeName $testRuntime.PipeName -CapturePath $testRuntime.CapturePath -ResponseJson $response
   try {
-    $result = Invoke-Script -Arguments @(
-      "-File", $controlPlaneScript,
-      "-Action", "ping",
-      "-InfoFile", $testRuntime.InfoPath,
-      "-Quiet",
-      "-PassThruJson"
-    )
+    $originalEndpoint = $env:PRIM1_CONTROL_PLANE_ENDPOINT
+    try {
+      $env:PRIM1_CONTROL_PLANE_ENDPOINT = $testRuntime.Endpoint
+      $result = Invoke-Script -Arguments @(
+        "-File", $controlPlaneScript,
+        "-Action", "ping",
+        "-Quiet",
+        "-PassThruJson"
+      )
+    } finally {
+      $env:PRIM1_CONTROL_PLANE_ENDPOINT = $originalEndpoint
+    }
     Assert-Equal $result.ExitCode 0 "Ping with -PassThruJson should succeed."
     Assert-Equal $result.Lines[0] "pong" "Quiet mode should keep the human-readable success message."
     $json = $result.Lines[1] | ConvertFrom-Json
     Assert-Equal $json.request_id "req-pass" "PassThruJson should include request_id."
 
-    Wait-Responder -Job $job
+    Wait-ControlPlanePipeResponder -Responder $responder
     $captured = Get-Content -LiteralPath $testRuntime.CapturePath -Raw | ConvertFrom-Json
     Assert-Equal $captured.kind "ping" "Expected a ping request."
+    Assert-True (-not ($captured.PSObject.Properties.Name -contains "token")) "Ping must not emit a token field."
   } finally {
-    if ($job) { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
+    Remove-ControlPlanePipeResponder -Responder $responder
   }
 
   $requestIdPath = Join-Path $testRuntime.RuntimeDir "request-id.txt"
-  $job = Start-MailboxResponder -RuntimeDir $testRuntime.RuntimeDir -CapturePath $testRuntime.CapturePath -Message "pong" -RequestId "req-file"
+  $response = @{ ok = $true; message = "pong"; request_id = "req-file" } | ConvertTo-Json -Compress
+  $responder = Start-ControlPlanePipeResponder -PipeName $testRuntime.PipeName -CapturePath $testRuntime.CapturePath -ResponseJson $response
   try {
     $result = Invoke-Script -Arguments @(
       "-File", $controlPlaneScript,
       "-Action", "ping",
-      "-InfoFile", $testRuntime.InfoPath,
+      "-Endpoint", $testRuntime.Endpoint,
       "-Quiet",
       "-OutRequestIdFile", $requestIdPath
     )
@@ -157,36 +102,94 @@ try {
     Assert-Equal $result.Output "pong" "Quiet mode should remain message-only without -PassThruJson."
     Assert-Equal (Get-Content -LiteralPath $requestIdPath -Raw) "req-file" "Request id file should contain the raw request id."
 
-    Wait-Responder -Job $job
+    Wait-ControlPlanePipeResponder -Responder $responder
   } finally {
-    if ($job) { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
+    Remove-ControlPlanePipeResponder -Responder $responder
   }
 
-  $routeRequestIdPath = Join-Path $testRuntime.RuntimeDir "route-request-id.txt"
-  $job = Start-MailboxResponder -RuntimeDir $testRuntime.RuntimeDir -CapturePath $testRuntime.CapturePath -Message "message routed" -RequestId "req-route"
+  $legacyResult = Invoke-Script -Arguments @(
+    "-File", $controlPlaneScript,
+    "-Action", "route"
+  )
+  Assert-True ($legacyResult.ExitCode -ne 0) "Legacy route action must be rejected by parameter validation."
+  Assert-True ($legacyResult.Output -like "*route*ValidateSet*") "Legacy route rejection must identify the closed action set."
+
+  $response = @{ ok = $true; message = "key sent"; request_id = "req-key" } | ConvertTo-Json -Compress
+  $responder = Start-ControlPlanePipeResponder -PipeName $testRuntime.PipeName -CapturePath $testRuntime.CapturePath -ResponseJson $response
   try {
     $result = Invoke-Script -Arguments @(
-      "-File", $agentRouteScript,
-      "-From", "codex",
-      "-To", "claude",
-      "-Content", "hello",
-      "-InfoFile", $testRuntime.InfoPath,
-      "-OutRequestIdFile", $routeRequestIdPath,
-      "-PassThruJson"
+      "-File", $agentKeyScript,
+      "-Session", "claude",
+      "-Key", "enter",
+      "-Endpoint", $testRuntime.Endpoint
     )
-    Assert-Equal $result.ExitCode 0 "agent-route passthrough should succeed."
-    Assert-Equal $result.Lines[0] "message routed" "agent-route should preserve quiet message output."
-    $routeJson = $result.Lines[1] | ConvertFrom-Json
-    Assert-Equal $routeJson.request_id "req-route" "agent-route PassThruJson should expose request_id."
-    Assert-Equal (Get-Content -LiteralPath $routeRequestIdPath -Raw) "req-route" "agent-route should forward OutRequestIdFile."
+    Assert-Equal $result.ExitCode 0 "agent-key endpoint passthrough should succeed."
+    Assert-Equal $result.Output "key sent" "agent-key should preserve quiet message output."
 
-    Wait-Responder -Job $job
+    Wait-ControlPlanePipeResponder -Responder $responder
     $captured = Get-Content -LiteralPath $testRuntime.CapturePath -Raw | ConvertFrom-Json
-    Assert-Equal $captured.kind "route_message" "Expected a route_message request."
-    Assert-Equal $captured.request.from "codex" "Expected route source to round-trip."
-    Assert-Equal $captured.request.to "claude" "Expected route target to round-trip."
+    Assert-Equal $captured.kind "send_key" "Expected a send_key request."
+    Assert-Equal $captured.name "claude" "Expected agent-key to preserve its pane target."
+    Assert-Equal $captured.key "enter" "Expected agent-key to preserve its control key."
+    Assert-True (-not ($captured.PSObject.Properties.Name -contains "token")) "Key requests must not emit a token field."
   } finally {
-    if ($job) { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
+    Remove-ControlPlanePipeResponder -Responder $responder
+  }
+
+  $response = @{ ok = $true; message = "input sent"; request_id = "req-slash" } | ConvertTo-Json -Compress
+  $responder = Start-ControlPlanePipeResponder -PipeName $testRuntime.PipeName -CapturePath $testRuntime.CapturePath -ResponseJson $response
+  try {
+    $result = Invoke-Script -Arguments @(
+      "-File", $agentSlashScript,
+      "-Session", "claude",
+      "-Slash", "compact",
+      "-Args", "keep context",
+      "-Endpoint", $testRuntime.Endpoint
+    )
+    Assert-Equal $result.ExitCode 0 "agent-slash endpoint passthrough should succeed."
+    Assert-Equal $result.Output "input sent" "agent-slash should preserve quiet message output."
+
+    Wait-ControlPlanePipeResponder -Responder $responder
+    $captured = Get-Content -LiteralPath $testRuntime.CapturePath -Raw | ConvertFrom-Json
+    Assert-Equal $captured.kind "send_input" "Expected agent-slash to send raw input."
+    Assert-Equal $captured.name "claude" "Expected agent-slash to preserve its pane target."
+    Assert-Equal $captured.input "/compact keep context" "Expected agent-slash to preserve its command."
+    Assert-True (-not ($captured.PSObject.Properties.Name -contains "token")) "Slash requests must not emit a token field."
+  } finally {
+    Remove-ControlPlanePipeResponder -Responder $responder
+  }
+
+  $argsFile = Join-Path $testRuntime.RuntimeDir "slash-args.txt"
+  $lambda = [char]0x03BB
+  $emoji = [char]::ConvertFromUtf32(0x1F680)
+  $cjk = "{0}{1}" -f [char]0x6F22, [char]0x5B57
+  $expectedArgs = "preserve $lambda $emoji $cjk`r`nand trailing newline`r`n"
+  [System.IO.File]::WriteAllText(
+    $argsFile,
+    $expectedArgs,
+    [System.Text.UTF8Encoding]::new($false)
+  )
+  $response = @{ ok = $true; message = "input sent"; request_id = "req-slash-file" } | ConvertTo-Json -Compress
+  $responder = Start-ControlPlanePipeResponder -PipeName $testRuntime.PipeName -CapturePath $testRuntime.CapturePath -ResponseJson $response
+  try {
+    $result = Invoke-Script -Arguments @(
+      "-File", $agentSlashScript,
+      "-Session", "claude",
+      "-Slash", "compact",
+      "-ArgsFile", $argsFile,
+      "-Endpoint", $testRuntime.Endpoint
+    )
+    Assert-Equal $result.ExitCode 0 "agent-slash UTF-8 argument-file passthrough should succeed."
+    Assert-Equal $result.Output "input sent" "agent-slash argument-file invocation should preserve quiet output."
+
+    Wait-ControlPlanePipeResponder -Responder $responder
+    $strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+    $captured = [System.IO.File]::ReadAllText($testRuntime.CapturePath, $strictUtf8) | ConvertFrom-Json
+    Assert-Equal $captured.kind "send_input" "Expected agent-slash argument-file input."
+    Assert-Equal $captured.name "claude" "Expected agent-slash to preserve its pane target."
+    Assert-Equal $captured.input "/compact $expectedArgs" "Expected strict UTF-8, CRLF, and trailing-newline fidelity."
+  } finally {
+    Remove-ControlPlanePipeResponder -Responder $responder
   }
 } finally {
   Remove-Item -LiteralPath $testRuntime.Root -Recurse -Force -ErrorAction SilentlyContinue

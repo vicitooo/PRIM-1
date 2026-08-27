@@ -4,7 +4,7 @@ A short, public-facing reference for current limitations, known bugs, and versio
 
 ## Platform support
 
-PRIM-1 is currently **Windows-first**. The wrapper uses Windows named pipes for the control plane and assumes ConPTY/PTY semantics that have been validated on Windows 10/11. Linux/macOS work is on the roadmap (Unix sockets for the control plane, portable-pty already abstracts the PTY layer) but is not yet validated. See `ROADMAP.md`.
+PRIM-1 is currently **Windows-first**. The wrapper uses Windows named pipes for the control plane and assumes ConPTY/PTY semantics that have been validated on Windows 10/11. Prime is the one explicit cross-boundary driver: it runs inside the Ubuntu WSL distribution under a user-systemd transient service while the Windows supervisor retains the outer ConPTY job. This is not a general Linux desktop port. Native Linux/macOS work remains on the roadmap. See `ROADMAP.md`.
 
 ## Pinned CLI versions known to work
 
@@ -12,53 +12,89 @@ The wrapper drives external CLI tools whose UIs evolve. Known-good versions (val
 
 | CLI | Version |
 |---|---|
-| Claude Code | 2.1.109 |
-| Codex CLI | 0.120.0 |
+| Claude Code | 2.1.226 |
+| Codex CLI | 0.147.0 |
+| Grok Build | 1.0.0 (`3cd0d0cbce`) |
+| Prime Agent (Ubuntu WSL) | 0.7.0 |
 
-If you upgrade either CLI and observe regressions (PTY behavior, startup timing, prompt rendering, routing behavior after injected stdin, paste-threshold behavior), record the wrapper commit + Claude version + Codex version together. Upstream CLI changes can break wrapper assumptions independent of wrapper code.
+If you upgrade any CLI and observe regressions (PTY behavior, startup timing, prompt rendering, routing behavior after injected stdin, paste-threshold behavior), record the wrapper commit and every affected CLI version together. Upstream CLI changes can break wrapper assumptions independent of wrapper code.
+
+Grok Build 1.0.0 periodically repaints its full-screen TUI even while waiting at
+the prompt, and its independent MCP spinner can repaint continuously, so
+ordinary silence cannot identify readiness or idleness. PRIM launches each run
+with a fresh native `--session-id` and holds it in lifecycle `Starting` until a
+bounded exact-run tracker observes the measured ordered cursor-hide/show startup
+frames: `Starting session…`, then a later full-screen Home repaint containing
+the interactive composer and both shortcut labels. Partial and spinner-only
+frames do not admit, replacement runs cannot inherit progress, and no timeout
+grants readiness. The optional telemetry banner is non-modal in the pinned build
+and is ignored. After admission, only measured semantic markers report `Idle`,
+`Thinking`, or `ToolCall`; no generic quiet timer runs. A Grok UI/copy change can
+therefore fail closed in `Starting` until the pinned markers are re-measured.
+The fresh native session ID intentionally creates a separate Grok conversation
+record for each PRIM run. PRIM never reuses or deletes Grok-owned history, so
+long-lived installations should manage that history through Grok's own tools.
 
 ## Behavioral notes the wrapper does not yet abstract
 
 These are documented runtime behaviors that callers should know. Each is on the roadmap to be hidden behind a wrapper abstraction; until then, callers compensate.
 
+### Pane sideband requires an empirically verified native-caller boundary
+
+The pane-local Windows sideband carries no bearer token and scripts do not discover authority from runtime files. Its production boundary therefore depends on the supervisor deriving the named-pipe caller from the kernel and binding that caller to one live PTY process job and generation at mutation time. An endpoint name alone is not authority.
+
+The native Windows boundary and stable per-user desktop singleton still require
+exact-artifact adversarial receipts for each release candidate. Prime/WSL is
+intentionally ineligible for the named-pipe sideband because Windows Job
+membership cannot identify Linux tasks. No bearer fallback exists; external
+operators use the desktop UI.
+
+Claude Code and Codex receive a PRIM-owned session-scoped stdio MCP child for
+model-facing `ping`, `room_read`, and `room_post`. Grok Build 1.0.0 does not:
+its normal TUI has no session-scoped plugin/config flag, `GROK_HOME` also owns
+session/log storage, and a real Grok shell-tool child failed the Job-bound pipe
+check. Grok remains usable through raw terminal input and explicit operator
+room delivery, but it cannot autonomously read/post the PRIM room feed in this
+release.
+
+### Prime is raw-input-only in the current release
+
+Prime supports `Normal` permission only, one qualified absolute path inside the
+Ubuntu distribution, and raw operator terminal input. Synthetic routed delivery
+and pane-sideband actions are rejected before write. Prime startup also requires
+an operational Ubuntu user-systemd manager and an absolute executable
+`prime-agent`; a stale-service cleanup failure blocks only Prime create/start.
+
 ### Multi-line content submission
 
 `control-plane.ps1 -Action input` with multi-line content (`-Content` containing `\n`, or `-ContentFile <path>` for files with newlines) does not reliably submit on Claude Code's TUI. The text renders in the input buffer but the TUI may not accept it as a complete turn.
 
-**Workaround:** Use the `-Action deliver` action for multi-line content — it is driver-aware and handles submission per driver. For `input`, send a single-line pointer ("Read <filepath> and follow instructions.") plus `-Action key -Key enter` as a separate call.
+**Workaround:** Use the desktop terminal for interactive multi-line submission. From a pane script, send a single-line pointer ("Read <filepath> and follow instructions.") plus `-Action key -Key enter` as a separate call.
 
 ### Paste-threshold no-submit on Codex CLI
 
 Codex CLI's TUI has a content-length threshold above which pasted content is staged as `[Pasted Content N chars]` and does not auto-submit on Enter. The threshold is around 1000 characters in observed cases.
 
-**Workaround:** Keep `input` content under the threshold, OR use `deliver` which chunks below the threshold.
+**Workaround:** Keep pane-script `input` content under the threshold. Use the visible desktop terminal for larger interactive transfers.
 
-### Restart action does not always reach `Ready` on Codex pane
+### Room history is bounded and process-memory-only
 
-`control-plane.ps1 -Action restart -Session codex` returns success but the pane lifecycle sometimes stays `Closed` rather than transitioning to `Ready`. An explicit follow-up `-Action start -Session codex` brings it back.
+Room definitions and membership survive restart, but room messages and delivery
+details do not. Each room retains at most 512 events / 16 MiB while the desktop
+process is alive. A reader that falls behind receives an explicit eviction or
+epoch-reset gap; PRIM-1 does not silently reconstruct missing conversation from
+the metadata audit.
 
-**Workaround:** After restart on Codex, check `lifecycle_state` via `-Action list`; re-issue `start` if state is `Closed`.
+### Durable audit is metadata-only
 
-### Audit-event count is not a health signal
-
-The audit log emits a `session_output` event per output chunk from the PTY. TUI animation (cursor blink, spinner frames, status bar redraws) produces these continuously regardless of whether the underlying CLI is doing real work. Counting `session_output` events as a "is the agent active?" proxy will report idle panes as busy.
-
-**Workaround:** Use `lifecycle_state` from `-Action list`, the existence of expected output artifacts on disk, and `routed_message` events from the pane (which only fire when the agent actually sends a routed message) as the canonical signals.
-
-### MSYS pipe buffering on `tail | awk` (Windows Git Bash)
-
-On Windows Git Bash, the pipeline `tail -F audit.jsonl | awk '/pattern/ {...}'` buffers output for minutes before lines propagate. Each side of the pipe must be wrapped in `stdbuf -oL` to enforce line-buffered stdout:
-
-```bash
-stdbuf -oL tail -F -n 0 .runtime/audit/$(date +%F).jsonl | stdbuf -oL awk '...'
-```
-
-PowerShell `Get-Content -Wait` does not have this issue.
+The durable audit intentionally excludes terminal output and routed/room-message
+content. Use the live desktop panes and room feed to inspect conversation
+content; use audit events for lifecycle, authorization, membership, dispatch,
+and delivery receipts only. A receipt proves that the supervisor wrote to a
+pane, not that the model understood or completed the request.
 
 ## Roadmap items tracked publicly
 
 The following are not bugs but in-progress structural improvements. They affect what consumers can rely on:
 
-- **Reattach-after-relaunch.** Today the supervisor lives in the Tauri process; closing the desktop kills the supervisor and orphans all panes. Service-extraction is on the roadmap.
-- **Configurable wrapper root for the Claude pane's --add-dir.** The Claude driver computes the wrapper source-tree path so the `claude` pane gets `--add-dir <wrapper_root>` alongside `--add-dir <working_dir>`. Behavior: (1) `PRIM1_WRAPPER_ROOT` env var is the canonical override — set this to an absolute path to point Claude at any wrapper source tree. (2) If unset, the driver falls back to `<working_dir>/<name>`, where `<name>` defaults to `PRIM-1` and can be overridden via `PRIM1_WRAPPER_DIRNAME`. (3) When the working_dir basename is itself `PRIM-1` (or, for backward compatibility, `CLI-master-wrapper`), the driver treats working_dir AS the wrapper root.
-- **Request ACK protocol.** `request_ack` now means the target pane reacted after the write (output, work-state transition, or routed message), not that the model accepted or completed the task. If a pane accepts bytes but does not react within `PRIM1_REACTION_WINDOW_SECS`, the supervisor emits `dispatch_no_reaction` plus a Critical alert. Task-level acceptance still requires a later pane signal or expected artifact.
+- **Reattach-after-relaunch is unsupported.** The supervisor lives in the Tauri process, so quitting the desktop shuts down its owned pane process trees. Relaunch starts new runs; it does not reattach to an earlier PTY.

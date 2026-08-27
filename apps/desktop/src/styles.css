@@ -12,6 +12,7 @@
   --bg-inset:      #02040a;
   --bg-hover:      #0d1208;
   --bg-active:     #1a2010;
+  --terminal-session-bg: #03060a;
 
   /* ── Primary (lemon yellow) — frames, brand, dominant chrome ── */
   --bronze:        #d8e02a;
@@ -218,44 +219,11 @@ button, input, select, textarea { font: inherit; }
   z-index: 2;
   opacity: 0.85;
 }
-
-/* Sidebar border: mostly primary, just a hint of secondary at top + bottom corners */
-.group-picker.panel {
-  background: linear-gradient(
-    180deg,
-    var(--copper-hot) 0%,
-    var(--bronze) 5%,
-    var(--bronze) 95%,
-    var(--copper-hot) 100%
-  );
-}
-
-/* Inner offset U-frame as SVG: cyan U with step-in notches at top, yellow chamfered bottom */
-.sidebar-inner-frame {
-  position: absolute;
-  top: 96px;
-  left: 12px;
-  right: 12px;
-  height: calc(100% - 96px - 60px);
-  pointer-events: none;
-  z-index: 3;
-  display: block;
-  filter: drop-shadow(0 0 6px color-mix(in srgb, var(--copper-hot) 55%, transparent));
-}
-.sidebar-inner-frame svg, svg.sidebar-inner-frame {
-  width: 100%;
-  height: 100%;
-}
-
-/* Sidebar accent stripe replaced by the inner U-frame's right border */
-.sidebar-accent-stripe { display: none; }
-
 /* Staggered boot */
 .topbar                       { animation-delay: 0s; }
 .terminal-card:nth-of-type(1) { animation-delay: 0.08s; }
 .terminal-card:nth-of-type(2) { animation-delay: 0.16s; }
 .system-card                  { animation-delay: 0.24s; }
-.router-card                  { animation-delay: 0.32s; }
 
 @keyframes cardBoot {
   from { opacity: 0; transform: translateY(6px); }
@@ -263,13 +231,13 @@ button, input, select, textarea { font: inherit; }
 }
 
 /* Hover lift */
-.terminal-card, .system-card, .router-card, .group-picker {
+.terminal-card, .system-card, .room-card, .session-editor, .zero-session {
   transition:
     box-shadow var(--duration-smooth) var(--easing),
     border-color var(--duration-smooth) ease;
 }
 
-.terminal-card:hover, .system-card:hover, .router-card:hover, .group-picker:hover {
+.terminal-card:hover, .system-card:hover, .room-card:hover, .session-editor:hover, .zero-session:hover {
   border-color: var(--bronze);
   box-shadow:
     inset 0 0 0 1px rgba(0, 0, 0, 0.6),
@@ -417,7 +385,7 @@ button, input, select, textarea { font: inherit; }
    CARDS — generic
    ══════════════════════════════════════ */
 
-.terminal-card, .system-card, .router-card, .group-picker {
+.terminal-card, .system-card, .room-card, .session-editor, .zero-session {
   padding: 0.85rem 1.0rem;
   display: flex;
   flex-direction: column;
@@ -466,21 +434,12 @@ button, input, select, textarea { font: inherit; }
   font-size: 24px;
 }
 
-/* System log + Route a message — cyan */
-.system-card .card-head h2,
-.router-card .card-head h2 {
+/* System log — cyan */
+.system-card .card-head h2 {
   color: var(--copper-hot);
   font-size: 17px;
   letter-spacing: 0.16em;
   text-shadow: 0 0 10px color-mix(in srgb, var(--copper-hot) 55%, transparent);
-}
-
-.group-picker .card-head h2 {
-  color: var(--prim1);
-  font-size: 19px;
-  text-shadow:
-    0 0 10px rgba(255, 45, 140, 0.6),
-    0 0 22px rgba(255, 45, 140, 0.25);
 }
 
 .card-title {
@@ -489,18 +448,8 @@ button, input, select, textarea { font: inherit; }
   gap: 0.55rem;
 }
 
-.card-title-block { display: grid; gap: 0.15rem; flex: 1; min-width: 0; }
-
-.kicker-row {
-  display: flex;
-  align-items: center;
-  gap: 0.55rem;
-  justify-content: flex-start;
-  width: 100%;
-}
-
-/* Mini HUD strip filling the empty horizontal space inside system-log + router
-   card heads. Matches the topbar HUD strip aesthetic at smaller scale. Themes
+/* Mini HUD strip filling the empty horizontal space inside the system-log
+   card head. Matches the topbar HUD strip aesthetic at smaller scale. Themes
    via var() so it follows the active palette. */
 .card-head-hud {
   flex: 1 1 auto;
@@ -531,44 +480,11 @@ button, input, select, textarea { font: inherit; }
   -webkit-mask-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.4' stroke-linecap='square'><path d='M3 6h18M3 12h18M3 18h18'/></svg>");
           mask-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.4' stroke-linecap='square'><path d='M3 6h18M3 12h18M3 18h18'/></svg>");
 }
-.card-icon.icon-send {
-  -webkit-mask-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round' stroke-linecap='round'><path d='M22 2 L11 13'/><path d='M22 2 L15 22 L11 13 L2 9 Z'/></svg>");
-          mask-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round' stroke-linecap='round'><path d='M22 2 L11 13'/><path d='M22 2 L15 22 L11 13 L2 9 Z'/></svg>");
-}
-
-/* Live pill (kept hidden in target but here for state) */
 .card-head-meta {
   display: flex;
   align-items: center;
   gap: 0.65rem;
   flex-wrap: nowrap;
-}
-
-.live-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.35rem;
-  padding: 0.18rem 0.6rem;
-  border: 1px solid var(--copper-hot);
-  color: var(--copper-hot);
-  font-family: "JetBrains Mono", Consolas, monospace;
-  font-size: 10px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.14em;
-}
-
-.live-dot {
-  width: 6px; height: 6px;
-  border-radius: 999px;
-  background: var(--copper-hot);
-  box-shadow: 0 0 6px var(--copper-hot);
-  animation: livePulse 1.6s ease-in-out infinite;
-}
-
-@keyframes livePulse {
-  0%, 100% { opacity: 1; }
-  50%      { opacity: 0.4; }
 }
 
 .log-toggle {
@@ -678,13 +594,13 @@ button:focus-visible {
   background: color-mix(in srgb, var(--red) 22%, transparent);
 }
 
-/* Decorative right-side buttons (Clear / Tile / Close) */
+/* Secondary actions */
 button.ghost {
   --btn-color: var(--copper-hot);
   --btn-glow: color-mix(in srgb, var(--copper-hot) 40%, transparent);
 }
 
-/* Primary CTA — Send routed message: outlined red, red text (matches STOP styling) */
+/* Primary CTA */
 button.primary {
   --btn-color: var(--red);
   --btn-glow: rgba(230, 41, 58, 0.55);
@@ -752,7 +668,7 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
   max-height: 100vh;
   padding: 0.7rem;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) minmax(220px, 0.38fr);
+  grid-template-rows: auto minmax(0, 1fr) minmax(320px, 0.42fr);
   gap: 0.7rem;
   overflow: hidden;
 }
@@ -760,411 +676,247 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
 .workspace-shell {
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(190px, 230px) minmax(0, 1fr);
-  grid-template-rows: minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr);
   gap: 0.7rem;
   overflow: hidden;
 }
 
-/* ── Sidebar ── */
-.group-picker {
-  min-height: 0;
+.session-tabs-shell {
+  min-width: 0;
   display: flex;
-  flex-direction: column;
+  align-items: stretch;
   gap: 0.55rem;
-  position: relative;
 }
 
-.online-pill {
-  display: inline-flex;
-  align-items: center;
+.session-tabs {
+  min-width: 0;
+  flex: 1 1 auto;
+  display: flex;
+  align-items: stretch;
+  gap: 0.4rem;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.15rem 0.1rem 0.35rem;
+  scrollbar-width: thin;
+}
+
+.session-tab-shell {
+  flex: 0 0 clamp(260px, 26vw, 390px);
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) repeat(4, auto);
+  align-items: stretch;
+  border: 1px solid var(--frame);
+  background: color-mix(in srgb, var(--bg-panel) 92%, transparent);
+}
+
+.session-tab {
+  min-width: 0;
+  display: grid;
+  gap: 0.12rem;
+  justify-items: start;
+  align-content: center;
+  padding: 0.38rem 0.55rem;
+  border: 0;
+  clip-path: none;
+  text-align: left;
+  background: transparent;
+  box-shadow: none;
+}
+
+.session-tab[aria-selected="true"] {
+  color: var(--prim1);
+  background: color-mix(in srgb, var(--prim1) 10%, transparent);
+  box-shadow: inset 3px 0 0 var(--prim1);
+}
+
+.session-tab-label,
+.session-tab-detail {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-tab-label {
+  color: var(--text-primary);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: none;
+}
+
+.session-tab-detail {
+  color: var(--text-secondary);
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 9px;
+  letter-spacing: 0.02em;
+  text-transform: none;
+}
+
+.session-tab-badges {
+  display: flex;
   gap: 0.3rem;
-  padding: 0.05rem 0.45rem;
-  border: 1px solid var(--copper-hot);
-  color: var(--copper-hot);
+  min-width: 0;
+}
+
+.session-tab-badge {
+  padding: 0.06rem 0.3rem;
+  border: 1px solid var(--frame-soft);
+  color: var(--text-secondary);
   font-family: "JetBrains Mono", Consolas, monospace;
   font-size: 8px;
-  letter-spacing: 0.18em;
-  font-weight: 700;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
-  text-shadow: 0 0 4px color-mix(in srgb, var(--copper-hot) 45%, transparent);
-}
-.online-dot {
-  width: 5px; height: 5px;
-  border-radius: 999px;
-  background: var(--copper-hot);
-  box-shadow: 0 0 5px var(--copper-hot);
-  animation: livePulse 1.8s ease-in-out infinite;
 }
 
-.group-picker .card-kicker {
+.session-tab-badge[data-badge-value="unsafe"],
+[data-session-permission][data-permission="unsafe"] {
+  color: var(--red-bright);
+  border-color: var(--red);
+  text-shadow: 0 0 5px color-mix(in srgb, var(--red) 45%, transparent);
+}
+
+.session-tab-action {
+  min-width: 28px;
+  padding: 0.25rem 0.35rem;
+  border-width: 0 0 0 1px;
+  clip-path: none;
   font-size: 9px;
-  letter-spacing: 0.22em;
+  letter-spacing: 0;
+  text-transform: none;
 }
 
-.sidebar-grid {
-  position: absolute;
-  inset: 100px 18px 80px 18px;
-  background-image: radial-gradient(
-    color-mix(in srgb, var(--copper-hot) 65%, transparent) 1.2px,
-    transparent 1.7px
-  );
-  background-size: 11px 11px;
-  background-position: 3px 3px;
-  pointer-events: none;
-  z-index: 1;
-  /* Tight cluster at bottom-right — matches target reference */
-  mask-image: radial-gradient(
-    ellipse 70% 45% at 100% 100%,
-    #000 0%,
-    rgba(0, 0, 0, 0.7) 30%,
-    rgba(0, 0, 0, 0.18) 70%,
-    transparent 100%
-  );
-  -webkit-mask-image: radial-gradient(
-    ellipse 70% 45% at 100% 100%,
-    #000 0%,
-    rgba(0, 0, 0, 0.7) 30%,
-    rgba(0, 0, 0, 0.18) 70%,
-    transparent 100%
-  );
+.new-session-button {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  align-self: stretch;
 }
 
-/* Second layer: warm-primary dot tint at bottom-right for color depth */
-.sidebar-grid::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  background-image: radial-gradient(
-    color-mix(in srgb, var(--bronze) 50%, transparent) 1.1px,
-    transparent 1.6px
-  );
-  background-size: 11px 11px;
-  background-position: 3px 3px;
-  mask-image: radial-gradient(
-    ellipse 35% 35% at 90% 95%,
-    #000 0%,
-    rgba(0, 0, 0, 0.55) 50%,
-    transparent 100%
-  );
-  -webkit-mask-image: radial-gradient(
-    ellipse 35% 35% at 90% 95%,
-    #000 0%,
-    rgba(0, 0, 0, 0.55) 50%,
-    transparent 100%
-  );
-  pointer-events: none;
+.session-editor {
+  padding: 0.8rem 1rem;
 }
 
-.sidebar-footer {
-  margin-top: auto;
-  padding: 0.4rem 0.1rem 0.2rem;
-  display: flex;
-  flex-direction: column;
-  gap: 0.4rem;
-  z-index: 2;
-}
-.sidebar-version {
-  font-family: "JetBrains Mono", Consolas, monospace;
-  font-size: 9px;
-  letter-spacing: 0.2em;
-  color: var(--copper-hot);
-  text-transform: uppercase;
-  text-shadow: 0 0 5px color-mix(in srgb, var(--copper-hot) 40%, transparent);
-}
-/* Loading / health gauge — animated primary-color bar with secondary tick cluster at right end */
-.sidebar-progress {
-  position: relative;
-  height: 7px;
-  background: color-mix(in srgb, var(--bronze) 8%, transparent);
-  border: 1px solid color-mix(in srgb, var(--bronze) 40%, transparent);
-  overflow: hidden;
-}
-.sidebar-progress > span {
-  display: block;
-  height: 100%;
-  width: 62%;
-  background: linear-gradient(90deg, var(--bronze) 0%, var(--bronze-light) 70%, var(--copper-hot) 100%);
-  box-shadow: 0 0 10px color-mix(in srgb, var(--bronze) 60%, transparent);
-  animation: progressPulse 4s ease-in-out infinite;
-}
-/* Tick cluster pinned to the right edge — uses active theme's secondary color */
-.sidebar-progress::after {
-  content: '';
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  right: 0;
-  width: 18px;
-  background: repeating-linear-gradient(
-    90deg,
-    color-mix(in srgb, var(--copper-hot) 85%, transparent) 0,
-    color-mix(in srgb, var(--copper-hot) 85%, transparent) 1.5px,
-    transparent 1.5px,
-    transparent 4px
-  );
-  pointer-events: none;
-}
-@keyframes progressPulse {
-  0%, 100% { width: 58%; }
-  50%      { width: 72%; }
+.session-form {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) minmax(150px, 0.7fr) minmax(190px, 0.8fr);
+  gap: 0.65rem;
+  align-items: end;
 }
 
-.group-picker-tools {
+.session-editor-heading,
+.session-path-field,
+.session-linux-directory,
+.permission-warning,
+.session-form-note,
+.session-form-error,
+.session-form-actions {
+  grid-column: 1 / -1;
+}
+
+.session-editor-heading {
   display: flex;
   align-items: center;
-  gap: 0.5rem;
-  margin-left: auto;
-  align-self: flex-end;
-  margin-bottom: 2px;
+  justify-content: space-between;
+  gap: 1rem;
 }
 
-#pair-create-slot { min-width: 0; }
-
-.group-list {
-  list-style: none;
-  margin: 0;
-  padding: 0 0.55rem;
-  display: grid;
-  gap: 0.4rem;
-  overflow: visible;
-  z-index: 2;
-  position: relative;
-}
-
-.group-list li { min-width: 0; }
-
-.pair-inline-editor { display: grid; gap: 0.3rem; }
-
-.group-chip-shell {
-  position: relative;
-  display: grid;
-  gap: 0.3rem;
-}
-
-.group-chip {
-  width: 100%;
-  justify-content: flex-start;
-  text-align: left;
-  padding: 0.55rem 2rem 0.55rem 0.85rem;
-  position: relative;
-  font-size: 13px;
-  letter-spacing: 0.12em;
-  font-weight: 700;
-}
-
-.group-chip::before {
-  content: "";
-  position: absolute;
-  top: 22%;
-  bottom: 22%;
-  left: 0.4rem;
-  width: 2px;
-  background: transparent;
-  transition: background var(--duration-fast) ease;
-}
-
-.group-chip[data-active="true"] {
-  --btn-color: var(--prim1);
-  --btn-glow: rgba(255, 45, 140, 0.65);
+.session-editor-heading h2,
+.zero-session h2 {
+  margin: 0.1rem 0 0;
   color: var(--prim1);
-  background: transparent;
-  text-shadow:
-    0 0 8px rgba(255, 45, 140, 0.7),
-    0 0 3px rgba(180, 30, 90, 0.5);
-  box-shadow:
-    inset 0 0 0 1px rgba(255, 45, 140, 0.30),
-    0 0 18px rgba(255, 45, 140, 0.55);
 }
 
-.group-chip[data-active="true"]:hover {
-  background: rgba(255, 45, 140, 0.08);
-  box-shadow:
-    inset 0 0 0 1px rgba(255, 45, 140, 0.50),
-    0 0 24px rgba(255, 45, 140, 0.65);
+.session-form label,
+.session-path-field {
+  min-width: 0;
+  display: grid;
+  gap: 0.28rem;
 }
 
-.group-chip[data-active="true"]::before {
-  background: var(--prim1);
-  box-shadow: 0 0 8px rgba(255, 45, 140, 0.7);
-}
-
-.new-pair-button {
-  white-space: nowrap;
-  padding: 0.32rem 0.7rem;
+.session-form label > span,
+.session-path-field > span {
+  color: var(--copper-hot);
   font-size: 10px;
-  letter-spacing: 0.1em;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
 }
 
-.new-pair-input {
-  width: 100%;
+.session-form label small {
+  color: var(--text-tertiary);
+  font-size: 9px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.session-path-field {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+}
+
+.session-path-field > span {
+  grid-column: 1 / -1;
+}
+
+.session-path {
+  min-width: 0;
+  min-height: 2rem;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  padding: 0.45rem 0.7rem;
   border: 1px solid var(--frame);
   background: var(--bg-inset);
   color: var(--text-primary);
-  padding: 0.4rem 0.65rem;
-  text-transform: none;
-  font-size: 12px;
-  letter-spacing: 0.02em;
-  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.2);
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.new-pair-input:focus-visible {
-  outline: 2px solid var(--copper-hot);
-  outline-offset: 1px;
-}
-
-.chip-menu-root {
-  position: absolute;
-  top: 0.3rem;
-  right: 0.3rem;
-}
-
-.chip-menu-button {
-  width: 20px;
-  height: 20px;
-  padding: 0;
-  display: grid;
-  place-items: center;
-  border-radius: 999px;
-  font-size: 14px;
-  line-height: 1;
-  clip-path: none;
-}
-
-.chip-menu {
-  position: absolute;
-  top: calc(100% + 0.25rem);
-  right: 0;
-  display: grid;
-  gap: 0.3rem;
-  min-width: 132px;
-  padding: 0;
-  background: transparent;
-  border: none;
-  box-shadow: none;
-  z-index: 4;
-}
-
-.chip-menu-action {
-  width: 100%;
-  justify-content: flex-start;
-  text-align: left;
-  padding: 0.4rem 0.6rem;
-  background: var(--bg-panel);
-}
-.chip-menu-action:disabled {
-  cursor: not-allowed;
-  color: var(--text-tertiary);
-}
-
-.pair-dialog-overlay {
-  /* Legacy — no longer rendered, kept zeroed in case anything still references it */
-  display: none;
-}
-
-/* Inline confirmation popover — anchored below the chip it targets.
-   Chamfered cyan border on dark fill, no backdrop overlay. */
-.pair-dialog {
-  position: absolute;
-  top: calc(100% + 0.45rem);
-  left: -0.2rem;
-  right: -0.2rem;
-  padding: 0.75rem 0.85rem 0.7rem;
-  display: grid;
-  gap: 0.45rem;
-  background: var(--copper-hot);
-  --dialog-chamfer: 12px;
-  z-index: 12;
-  clip-path: polygon(
-    var(--dialog-chamfer) 0,
-    calc(100% - var(--dialog-chamfer)) 0,
-    100% var(--dialog-chamfer),
-    100% calc(100% - var(--dialog-chamfer)),
-    calc(100% - var(--dialog-chamfer)) 100%,
-    var(--dialog-chamfer) 100%,
-    0 calc(100% - var(--dialog-chamfer)),
-    0 var(--dialog-chamfer)
-  );
-  filter: drop-shadow(0 0 18px color-mix(in srgb, var(--copper-hot) 35%, transparent));
-}
-.pair-dialog::before {
-  content: '';
-  position: absolute;
-  inset: 1.5px;
-  background: var(--bg-panel);
-  clip-path: polygon(
-    calc(var(--dialog-chamfer) - 1.5px) 0,
-    calc(100% - var(--dialog-chamfer) + 1.5px) 0,
-    100% calc(var(--dialog-chamfer) - 1.5px),
-    100% calc(100% - var(--dialog-chamfer) + 1.5px),
-    calc(100% - var(--dialog-chamfer) + 1.5px) 100%,
-    calc(var(--dialog-chamfer) - 1.5px) 100%,
-    0 calc(100% - var(--dialog-chamfer) + 1.5px),
-    0 calc(var(--dialog-chamfer) - 1.5px)
-  );
-  z-index: 0;
-  pointer-events: none;
-}
-.pair-dialog > * {
-  position: relative;
-  z-index: 1;
-}
-.pair-dialog .card-kicker {
-  color: var(--copper-hot);
-  font-size: 10px;
-  letter-spacing: 0.2em;
-}
-.pair-dialog h3 {
+.permission-warning,
+.session-form-error,
+.session-form-note {
   margin: 0;
-  color: var(--prim1);
-  font-family: "Rajdhani", "Montserrat", system-ui, sans-serif;
-  font-size: 16px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  line-height: 1.2;
-  text-shadow: 0 0 8px rgba(255, 45, 140, 0.55);
-}
-.pair-dialog p {
-  margin: 0;
-  color: color-mix(in srgb, var(--bronze) 85%, transparent);
-  font-size: 12px;
-  line-height: 1.45;
-  text-shadow: 0 0 5px color-mix(in srgb, var(--bronze) 30%, transparent);
+  font-size: 11px;
+  line-height: 1.4;
 }
 
-.pair-dialog h3,
-.pair-dialog p { margin: 0; }
+.permission-warning,
+.session-form-error {
+  color: var(--red-bright);
+}
 
-.pair-dialog-actions {
+.session-form-note {
+  color: var(--text-secondary);
+}
+
+.session-form-actions {
   display: flex;
   justify-content: flex-end;
-  gap: 0.35rem;
 }
 
-button.danger {
-  --btn-color: var(--red);
-  --btn-glow: rgba(230, 41, 58, 0.55);
-  color: var(--red);
-  background: transparent;
-  border-color: var(--red);
-  text-shadow: 0 0 6px rgba(230, 41, 58, 0.6);
-}
-button.danger:hover {
-  background: color-mix(in srgb, var(--red) 14%, transparent);
-  border-color: var(--red-bright);
+.zero-session {
+  min-height: 240px;
+  padding: 2rem;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 0.7rem;
+  text-align: center;
 }
 
-.pair-error {
-  color: var(--red-bright);
-  font-size: 11px;
-  line-height: 1.3;
+.zero-session p {
+  margin: 0;
+  color: var(--text-secondary);
 }
 
 /* ── Workspace + bottom grids ── */
 .workspace-grid {
   min-height: 0;
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: minmax(0, 1fr);
   gap: 0.7rem;
   overflow: hidden;
@@ -1173,6 +925,33 @@ button.danger:hover {
 /* Pane card layout */
 .terminal-card {
   position: relative;
+}
+
+.terminal-card[hidden] {
+  display: none !important;
+}
+
+.terminal-identity {
+  min-width: 0;
+  display: grid;
+  gap: 0.25rem;
+}
+
+.terminal-facts {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.7rem;
+  color: var(--text-secondary);
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 9px;
+}
+
+.terminal-facts [data-session-cwd] {
+  max-width: min(48vw, 720px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .terminal-head {
   display: flex;
@@ -1206,20 +985,249 @@ button.danger:hover {
   z-index: 2;
 }
 
+.terminal-prelaunch {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  gap: 0.25rem;
+  padding: 0.8rem 0.9rem;
+  color: var(--copper-hot);
+  background: var(--terminal-session-bg);
+  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.35;
+  pointer-events: none;
+}
+
+.terminal-prelaunch strong {
+  color: var(--prim1);
+}
+
 .bottom-grid {
   min-height: 0;
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(320px, 0.8fr) minmax(520px, 1.2fr);
   gap: 0.7rem;
 }
 
-.terminal-card[data-group-active="false"] {
-  display: none;
+.system-card { position: relative; }
+
+.room-card {
+  position: relative;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
 }
 
-.system-card, .router-card { position: relative; }
+.room-card-head {
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
 
-/* CTRL chip — bottom-right of system + router cards */
+.room-toolbar {
+  min-width: 0;
+  margin-left: auto;
+  display: flex;
+  align-items: stretch;
+  gap: 0.3rem;
+}
+
+.room-toolbar select {
+  min-width: 150px;
+  max-width: 240px;
+}
+
+.room-toolbar button {
+  padding-inline: 0.55rem;
+}
+
+.room-create-form,
+.room-content {
+  min-height: 0;
+  flex: 1;
+  margin-top: 0.55rem;
+}
+
+.room-create-form {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.7fr) minmax(300px, 1.3fr);
+  gap: 0.55rem;
+  overflow: auto;
+}
+
+.room-create-form > label,
+.room-create-form fieldset {
+  min-width: 0;
+}
+
+.room-create-form label > span,
+.room-create-form legend,
+.room-composer-label {
+  color: var(--copper-hot);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.room-create-form fieldset {
+  margin: 0;
+  padding: 0.45rem;
+  border: 1px solid var(--frame);
+}
+
+.room-member-choices {
+  max-height: 90px;
+  overflow: auto;
+  display: grid;
+  gap: 0.25rem;
+}
+
+.room-member-choice {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--text-secondary);
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 10px;
+}
+
+.room-member-choice input {
+  width: auto;
+}
+
+.room-form-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.4rem;
+}
+
+.room-empty {
+  flex: 1;
+  display: grid;
+  place-items: center;
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+.room-content {
+  display: grid;
+  grid-template-rows: auto minmax(74px, 1fr) auto auto auto;
+  gap: 0.4rem;
+}
+
+.room-members-row,
+.room-composer-actions {
+  min-width: 0;
+  display: flex;
+  align-items: stretch;
+  gap: 0.35rem;
+}
+
+.room-members {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  overflow-x: auto;
+}
+
+.room-member-chip {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--frame);
+  color: var(--text-secondary);
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 9px;
+}
+
+.room-member-chip > span {
+  padding: 0.3rem 0.45rem;
+}
+
+.room-member-remove {
+  min-width: 24px;
+  padding: 0.25rem;
+  border-width: 0 0 0 1px;
+  clip-path: none;
+}
+
+#room-add-member-select {
+  max-width: 160px;
+}
+
+.room-feed {
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid var(--frame-inner);
+  background: var(--bg-inset);
+  padding: 0.35rem;
+}
+
+.room-feed-entry {
+  padding: 0.35rem 0.45rem;
+  border-bottom: 1px solid var(--frame-soft);
+}
+
+.room-feed-entry:last-child {
+  border-bottom: 0;
+}
+
+.room-feed-meta,
+.room-feed-empty,
+.room-feed-error,
+.room-status {
+  margin: 0;
+  color: var(--text-secondary);
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 9px;
+  line-height: 1.35;
+}
+
+.room-feed-entry pre {
+  margin: 0.25rem 0 0;
+  color: var(--text-primary);
+  font: 11px/1.35 "JetBrains Mono", Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.room-feed-error,
+.room-status[data-level="error"] {
+  color: var(--red-bright);
+}
+
+.room-status[data-level="warn"] {
+  color: var(--copper-hot);
+}
+
+.room-composer-label {
+  align-self: end;
+}
+
+.room-card textarea {
+  min-height: 52px;
+  resize: vertical;
+}
+
+.room-composer-actions select {
+  min-width: 180px;
+  flex: 1;
+}
+
+.room-create-form[hidden],
+.room-empty[hidden],
+.room-content[hidden] {
+  display: none !important;
+}
+
+/* CTRL chip — bottom-right of the system card */
 .card-ctrl-chip {
   position: absolute;
   bottom: 6px;
@@ -1242,6 +1250,8 @@ button.danger:hover {
    FORM ELEMENTS
    ══════════════════════════════════════ */
 
+input,
+select,
 textarea {
   width: 100%;
   border: 1px solid var(--frame);
@@ -1251,184 +1261,20 @@ textarea {
   font-size: 11px;
   letter-spacing: 0.06em;
   box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.3);
-  resize: none;
-  overflow: auto;
 }
 
+input:focus-visible,
+select:focus-visible,
 textarea:focus-visible {
   outline: 2px solid var(--copper-hot);
   outline-offset: 1px;
 }
 
-/* ══════════════════════════════════════
-   COMBOBOX — custom dropdown replacing native <select>
-   so we can fully theme the open-list hover state
-   (WebView2 overrides option:hover with native OS highlight).
-   ══════════════════════════════════════ */
-
-.combobox {
-  position: relative;
-  width: 100%;
+.session-editor[hidden],
+.zero-session[hidden],
+.workspace-grid[hidden] {
+  display: none !important;
 }
-
-.combobox-trigger {
-  width: 100%;
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  border: 1px solid var(--frame);
-  background: var(--bg-inset);
-  color: var(--copper-hot);
-  padding: 0.45rem 0.7rem;
-  text-transform: uppercase;
-  font-family: "Rajdhani", "Montserrat", system-ui, sans-serif;
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.1em;
-  text-shadow: 0 0 6px color-mix(in srgb, var(--copper-hot) 40%, transparent);
-  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.3);
-  cursor: pointer;
-  /* Override the global button chamfer — combobox triggers are rectangular */
-  clip-path: none;
-  text-align: left;
-  justify-content: flex-start;
-}
-
-.combobox-label {
-  flex: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.combobox-chevron {
-  flex-shrink: 0;
-  width: 11px;
-  height: 7px;
-  background-color: var(--red);
-  -webkit-mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8' fill='none' stroke='black' stroke-width='2' stroke-linecap='square'><path d='M 1 1 L 6 6 L 11 1'/></svg>") no-repeat center / contain;
-          mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8' fill='none' stroke='black' stroke-width='2' stroke-linecap='square'><path d='M 1 1 L 6 6 L 11 1'/></svg>") no-repeat center / contain;
-  -webkit-mask-mode: alpha;
-          mask-mode: alpha;
-  transition: transform var(--duration-fast) var(--easing);
-}
-
-.combobox-trigger[aria-expanded="true"] .combobox-chevron {
-  transform: rotate(180deg);
-}
-
-.combobox-trigger:hover {
-  border-color: var(--copper-hot);
-  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.3), 0 0 10px color-mix(in srgb, var(--copper-hot) 25%, transparent);
-}
-
-.combobox-trigger:focus-visible {
-  outline: 2px solid var(--copper-hot);
-  outline-offset: 1px;
-}
-
-.combobox-listbox {
-  position: absolute;
-  top: calc(100% + 4px);
-  left: 0;
-  right: 0;
-  background: var(--bg-panel);
-  border: 1px solid var(--copper-hot);
-  box-shadow:
-    0 0 0 1px var(--frame-dark),
-    0 0 18px color-mix(in srgb, var(--copper-hot) 25%, transparent),
-    0 6px 16px rgba(0, 0, 0, 0.55);
-  z-index: 50;
-  display: flex;
-  flex-direction: column;
-  padding: 4px;
-  gap: 1px;
-}
-
-.combobox-option {
-  display: block;
-  width: 100%;
-  text-align: left;
-  background: transparent;
-  border: 1px solid transparent;
-  color: var(--copper-hot);
-  padding: 0.45rem 0.7rem;
-  text-transform: uppercase;
-  font-family: "Rajdhani", "Montserrat", system-ui, sans-serif;
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.1em;
-  cursor: pointer;
-  /* Override global button chamfer */
-  clip-path: none;
-  box-shadow: none;
-  text-shadow: 0 0 4px color-mix(in srgb, var(--copper-hot) 30%, transparent);
-  transition: background var(--duration-fast) ease, color var(--duration-fast) ease;
-}
-
-.combobox-option:hover,
-.combobox-option:focus-visible {
-  background: color-mix(in srgb, var(--copper-hot) 18%, transparent);
-  color: var(--cyan-bright);
-  border-color: color-mix(in srgb, var(--copper-hot) 40%, transparent);
-  outline: none;
-  box-shadow: 0 0 12px color-mix(in srgb, var(--copper-hot) 35%, transparent);
-  text-shadow: 0 0 6px color-mix(in srgb, var(--copper-hot) 55%, transparent);
-}
-
-.combobox-option[data-selected="true"] {
-  background: color-mix(in srgb, var(--copper-hot) 10%, transparent);
-  color: var(--cyan-bright);
-}
-
-.combobox-option[data-selected="true"]:hover,
-.combobox-option[data-selected="true"]:focus-visible {
-  background: color-mix(in srgb, var(--copper-hot) 22%, transparent);
-}
-
-.router-form {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0.55rem;
-  margin-top: 0.55rem;
-  min-height: 0;
-  align-content: start;
-  overflow: hidden;
-  position: relative;
-  z-index: 2;
-}
-
-.router-form label { display: grid; gap: 0.25rem; }
-.router-form span {
-  color: var(--copper-hot);
-  font-size: 10px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.18em;
-  text-shadow: 0 0 5px color-mix(in srgb, var(--copper-hot) 35%, transparent);
-}
-
-.message-field {
-  grid-column: 1 / -1;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-}
-
-.message-field textarea {
-  min-height: 5rem;
-  max-height: min(12rem, 100%);
-  flex: 1 1 auto;
-}
-
-.router-actions {
-  grid-column: 1 / -1;
-  display: flex;
-  gap: 0.4rem;
-  align-items: center;
-  margin-top: 0.2rem;
-}
-
 /* ══════════════════════════════════════
    CONTROL FLYOUT  (kept tucked away)
    ══════════════════════════════════════ */
@@ -1519,6 +1365,7 @@ textarea:focus-visible {
   --bg-inset:      #050207;
   --bg-hover:      #150815;
   --bg-active:     #20102a;
+  --terminal-session-bg: #000000;
 
   /* Primary — magenta replaces yellow as the dominant frame color */
   --bronze:        #d8389a;
@@ -1612,7 +1459,7 @@ textarea:focus-visible {
   }
 }
 
-/* Status ticker — scrolling netrunner-deck flavor banner above the topbar.
+/* Product identity ribbon above the topbar.
    Hidden in default theme, scrolls slowly in deep theme. Absolutely positioned
    so it doesn't steal a grid row from app-shell — the deep-theme app-shell
    padding-top is bumped to make room for it. */
@@ -1782,14 +1629,6 @@ textarea:focus-visible {
   filter: url(#prim1-dissolve);
 }
 
-[data-theme="prim1-deep"] .group-picker .card-head h2 {
-  filter: url(#prim1-dissolve);
-}
-
-[data-theme="prim1-deep"] .group-chip[data-active="true"] {
-  filter: url(#prim1-dissolve);
-}
-
 /* ══════════════════════════════════════
    LIGHT THEME
    ══════════════════════════════════════ */
@@ -1798,6 +1637,7 @@ textarea:focus-visible {
   --bg-base:       #e8e4df;
   --bg-panel:      #f2efeb;
   --bg-inset:      #ddd9d4;
+  --terminal-session-bg: #e8e4df;
 
   --bronze:        #7a6048;
   --bronze-light:  #8a7058;
@@ -1847,15 +1687,164 @@ textarea:focus-visible {
    RESPONSIVE
    ══════════════════════════════════════ */
 
-@media (max-width: 1280px) {
-  .app-shell {
-    grid-template-rows: auto minmax(0, 1fr) minmax(220px, auto);
+@media (max-width: 1024px) {
+  html,
+  body {
+    height: auto;
+    min-height: 100%;
+    overflow-x: hidden;
+    overflow-y: auto;
   }
+
+  #app {
+    height: auto;
+    min-height: 100vh;
+    overflow: visible;
+  }
+
+  .app-shell {
+    height: auto;
+    min-height: 100vh;
+    max-height: none;
+    grid-template-rows: auto auto auto;
+    overflow: visible;
+  }
+
   .workspace-shell,
   .workspace-grid,
-  .bottom-grid,
-  .router-form {
+  .bottom-grid {
     grid-template-columns: 1fr;
   }
+
+  .workspace-shell {
+    grid-template-rows: auto auto auto;
+    overflow: visible;
+  }
+
+  .workspace-grid {
+    grid-template-rows: none;
+    grid-auto-rows: minmax(240px, auto);
+    overflow: visible;
+  }
+
+  .terminal-card {
+    min-height: 480px;
+  }
+
+  .system-card {
+    min-height: 260px;
+  }
+
+  .room-card {
+    min-height: 520px;
+  }
+
+  .room-create-form {
+    grid-template-columns: 1fr;
+  }
+
+  .room-form-actions {
+    grid-column: 1;
+  }
+
   :root { --corner: 44px; }
+}
+
+@media (max-width: 480px) {
+  .app-shell {
+    padding: 0.55rem;
+    gap: 0.55rem;
+  }
+
+  .topbar {
+    min-height: 72px;
+    padding: 0.65rem 0.75rem;
+    gap: 0.5rem;
+  }
+
+  .topbar-brand {
+    min-width: 0;
+    flex-shrink: 1;
+    gap: 0.45rem;
+  }
+
+  .brand-logo-frame {
+    width: 50px;
+    height: 50px;
+  }
+
+  .topbar h1 {
+    font-size: 34px;
+    letter-spacing: 0.04em;
+  }
+
+  .topbar-active-tag {
+    flex-shrink: 0;
+    font-size: 13px;
+    letter-spacing: 0.13em;
+    white-space: nowrap;
+  }
+
+  .topbar-status {
+    display: none;
+  }
+
+  .theme-toggle {
+    width: 30px;
+    height: 30px;
+    margin-left: auto;
+  }
+
+  .terminal-card,
+  .system-card,
+  .room-card,
+  .session-editor,
+  .zero-session {
+    padding: 0.75rem 0.85rem;
+  }
+
+  .session-tabs-shell {
+    align-items: stretch;
+  }
+
+  .session-tab-shell {
+    flex-basis: min(88vw, 340px);
+  }
+
+  .new-session-button {
+    padding-inline: 0.65rem;
+  }
+
+  .session-form {
+    grid-template-columns: 1fr;
+  }
+
+  .session-editor-heading,
+  .session-path-field,
+  .session-linux-directory,
+  .permission-warning,
+  .session-form-note,
+  .session-form-error,
+  .session-form-actions {
+    grid-column: 1;
+  }
+
+  .terminal-head,
+  .terminal-actions {
+    gap: 0.35rem;
+  }
+
+  .room-toolbar,
+  .room-members-row,
+  .room-composer-actions {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .room-toolbar select,
+  .room-composer-actions select,
+  #room-add-member-select {
+    max-width: none;
+    flex: 1 1 180px;
+  }
 }

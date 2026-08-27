@@ -8,7 +8,7 @@ param(
 
   [string]$Args,
   [string]$ArgsFile,
-  [string]$InfoFile
+  [string]$Endpoint
 )
 
 if ($Args -and $ArgsFile) {
@@ -18,7 +18,8 @@ if ($Args -and $ArgsFile) {
 $resolvedArgs = $Args
 if ($ArgsFile) {
   $resolvedArgsPath = (Resolve-Path -LiteralPath $ArgsFile -ErrorAction Stop).Path
-  $resolvedArgs = Get-Content -LiteralPath $resolvedArgsPath -Raw -ErrorAction Stop
+  $strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+  $resolvedArgs = [System.IO.File]::ReadAllText($resolvedArgsPath, $strictUtf8)
 }
 
 $content = "/$Slash"
@@ -33,7 +34,7 @@ $controlPlaneScript = Join-Path $scriptRoot "control-plane.ps1"
   -Action input `
   -Session $Session `
   -Content $content `
-  -InfoFile $InfoFile `
+  -Endpoint $Endpoint `
   -Quiet
 
 exit $LASTEXITCODE

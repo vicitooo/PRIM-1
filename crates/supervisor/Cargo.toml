@@ -10,6 +10,8 @@ control-plane = { path = "../control-plane" }
 driver-claude = { path = "../driver-claude" }
 driver-codex = { path = "../driver-codex" }
 driver-generic-terminal = { path = "../driver-generic-terminal" }
+driver-grok = { path = "../driver-grok" }
+driver-prime = { path = "../driver-prime" }
 flate2.workspace = true
 libc.workspace = true
 parking_lot.workspace = true

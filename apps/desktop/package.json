@@ -2,7 +2,7 @@
   "name": "prim1-desktop",
   "version": "0.1.0",
   "type": "module",
-  "description": "PRIM-1 desktop runtime — Tauri shell hosting supervised PTY panes for Claude Code + Codex CLI.",
+  "description": "PRIM-1 desktop runtime for persistent, supervised terminal-first agent sessions.",
   "author": "Victor Valtchev",
   "license": "Apache-2.0",
   "repository": {
@@ -19,14 +19,14 @@
     "tauri": "tauri"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2",
+    "@tauri-apps/api": "^2.11.1",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2",
-    "vite": "^6.0.3",
+    "@tauri-apps/cli": "^2.11.4",
+    "vite": "^6.4.3",
     "typescript": "~5.6.2",
-    "vitest": "^3.2.4"
+    "vitest": "^3.2.7"
   }
 }

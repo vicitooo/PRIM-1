@@ -10,7 +10,7 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "withGlobalTauri": true,
+    "withGlobalTauri": false,
     "windows": [
       {
         "title": "PRIM-1",
@@ -18,12 +18,14 @@
         "height": 980,
         "minWidth": 1280,
         "minHeight": 780,
-        "fullscreen": true,
+        "fullscreen": false,
+        "focus": false,
+        "visible": false,
         "resizable": true
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: asset: http://asset.localhost; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'; frame-ancestors 'none'"
     }
   },
   "bundle": {

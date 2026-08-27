@@ -5,3 +5,7 @@ edition.workspace = true
 
 [dependencies]
 shared-types = { path = "../shared-types" }
+terminal-viewport = { path = "../terminal-viewport" }
+
+[dev-dependencies]
+serde_json.workspace = true
