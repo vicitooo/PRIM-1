@@ -125,7 +125,7 @@ app.innerHTML = `
       </svg>
       <div class="topbar-brand">
         <div class="brand-logo-frame" aria-hidden="true">
-          <span class="brand-logo" aria-hidden="true">P1</span>
+          <img class="brand-logo" src="/textures/prim1-logo.png" alt="" />
           <svg class="brand-logo-bracket" viewBox="0 0 60 60" aria-hidden="true">
             <path d="M 0 14 L 0 0 L 14 0" style="stroke: var(--bronze)" stroke-width="2" fill="none" stroke-linecap="square" />
             <path d="M 46 0 L 60 0 L 60 14" style="stroke: var(--bronze)" stroke-width="2" fill="none" stroke-linecap="square" />

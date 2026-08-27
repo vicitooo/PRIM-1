@@ -309,20 +309,11 @@ button, input, select, textarea { font: inherit; }
 }
 .brand-logo {
   width: 48px;
-  height: 48px;
+  height: auto;
   position: absolute;
   top: 50%;
   left: 50%;
   transform: translate(-50%, -50%);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-family: "Rajdhani", "Montserrat", system-ui, sans-serif;
-  font-size: 22px;
-  font-weight: 700;
-  line-height: 1;
-  letter-spacing: 0;
-  color: var(--bronze);
   filter: drop-shadow(0 0 12px color-mix(in srgb, var(--bronze) 60%, transparent));
   user-select: none;
   pointer-events: none;
@@ -1544,9 +1535,8 @@ textarea:focus-visible {
   100% { transform: translateX(-100%); }
 }
 
-/* Text mark follows the active signal palette. */
+/* Mark glow follows the active signal palette. */
 [data-theme="prim1-deep"] .brand-logo {
-  color: var(--prim1);
   filter: drop-shadow(0 0 12px color-mix(in srgb, var(--prim1) 65%, transparent));
 }
 
