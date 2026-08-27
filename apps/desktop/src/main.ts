@@ -1,6 +1,7 @@
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { LogicalSize } from "@tauri-apps/api/dpi";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import { InitialTerminalBanner } from "./terminal-banner";
@@ -87,7 +88,7 @@ if (!(app instanceof HTMLDivElement)) {
 }
 
 app.innerHTML = `
-  <div class="app-shell">
+  <div class="app-shell" data-view="sessions" data-log="closed">
     <div class="prim1-ticker" aria-hidden="true">
       <div class="prim1-ticker-track">
         <span class="prim1-ticker-cell">PRIM-1 <span class="prim1-ticker-glyph">&#8756;</span> LOCAL MULTI-HARNESS RUNTIME</span>
@@ -104,29 +105,14 @@ app.innerHTML = `
         <span class="prim1-ticker-sep">&#9670;</span>
       </div>
     </div>
-    <header class="topbar panel">
+    <!-- The bar IS the window title bar (decorations off): drag region, tabs, window controls. -->
+    <header class="topbar panel" data-tauri-drag-region>
       <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
       <span class="hud-antenna" aria-hidden="true"></span>
-      <svg class="topbar-hud-strip" viewBox="0 0 2400 30" preserveAspectRatio="none" aria-hidden="true">
-        <path d="M 600 6 L 920 6 M 960 6 L 1280 6 M 1340 6 L 1620 6 M 1680 6 L 2000 6 M 2060 6 L 2320 6"
-              style="stroke: var(--bronze)" stroke-width="1.5" fill="none" stroke-linecap="square" />
-        <path d="M 940 0 L 940 14 M 1310 0 L 1310 14 M 1650 0 L 1650 14 M 2030 0 L 2030 14"
-              style="stroke: var(--bronze)" stroke-width="1.4" fill="none" stroke-linecap="square" />
-        <rect x="930" y="2" width="14" height="6" style="fill: var(--bronze)" opacity="0.55" />
-        <rect x="1300" y="2" width="14" height="6" style="fill: var(--bronze)" opacity="0.55" />
-        <rect x="1640" y="2" width="14" height="6" style="fill: var(--bronze)" opacity="0.55" />
-        <rect x="2020" y="2" width="14" height="6" style="fill: var(--bronze)" opacity="0.55" />
-        <path d="M 1000 16 L 1260 16 M 1700 16 L 1980 16"
-              style="stroke: var(--bronze)" stroke-width="1" fill="none" opacity="0.5" stroke-linecap="square" />
-        <path d="M 600 22 L 700 22 M 1380 22 L 1580 22"
-              style="stroke: var(--copper-hot)" stroke-width="1" fill="none" opacity="0.55" stroke-linecap="square" />
-        <rect x="592" y="20" width="4" height="4" style="fill: var(--copper-hot)" opacity="0.7" />
-        <rect x="1372" y="20" width="4" height="4" style="fill: var(--copper-hot)" opacity="0.7" />
-      </svg>
-      <div class="topbar-brand">
-        <div class="brand-logo-frame" aria-hidden="true">
-          <img class="brand-logo" src="/textures/prim1-logo.png" alt="" />
-          <svg class="brand-logo-bracket" viewBox="0 0 60 60" aria-hidden="true">
+      <div class="topbar-brand" data-tauri-drag-region>
+        <div class="brand-logo-frame" aria-hidden="true" data-tauri-drag-region>
+          <img class="brand-logo" src="/textures/prim1-logo.png" alt="" data-tauri-drag-region />
+          <svg class="brand-logo-bracket" viewBox="0 0 60 60" aria-hidden="true" data-tauri-drag-region>
             <path d="M 0 14 L 0 0 L 14 0" style="stroke: var(--bronze)" stroke-width="2" fill="none" stroke-linecap="square" />
             <path d="M 46 0 L 60 0 L 60 14" style="stroke: var(--bronze)" stroke-width="2" fill="none" stroke-linecap="square" />
             <path d="M 60 46 L 60 60 L 46 60" style="stroke: var(--bronze)" stroke-width="2" fill="none" stroke-linecap="square" />
@@ -135,25 +121,34 @@ app.innerHTML = `
             <path d="M 60 22 L 60 38" style="stroke: var(--copper-hot)" stroke-width="1.5" fill="none" opacity="0.7" />
           </svg>
         </div>
-        <h1>PRIM-1</h1>
-        <span class="topbar-active-tag">Sessions</span>
+        <h1 data-tauri-drag-region>PRIM-1</h1>
+        <span class="topbar-active-tag" id="brand-active-tag" data-tauri-drag-region>Sessions</span>
       </div>
-      <div class="topbar-status">
+      <nav class="session-tabs-shell" aria-label="Terminal sessions">
+        <div class="session-tabs" id="session-tabs" role="tablist" aria-label="Sessions" data-tauri-drag-region></div>
+        <button type="button" class="new-session-button" id="new-session-button">+ New session</button>
+      </nav>
+      <div class="topbar-status" data-tauri-drag-region>
         <span class="state-pill" data-session-state="global" hidden>ready</span>
         <span class="activity-pill" hidden>idle</span>
       </div>
-      <button type="button" class="dock-toggle" id="dock-toggle" aria-pressed="false" title="Show system log and rooms">Log · Rooms</button>
-      <button class="theme-toggle" id="theme-toggle" aria-label="Toggle theme" title="Toggle theme"></button>
       <span class="mono" id="control-endpoint" hidden>starting...</span>
       <span class="mono" id="audit-path" hidden>loading...</span>
+      <div class="window-controls" role="group" aria-label="Window">
+        <button type="button" class="window-control" data-window="minimize" aria-label="Minimize" title="Minimize">
+          <svg viewBox="0 0 10 10" aria-hidden="true"><path d="M0 5h10" /></svg>
+        </button>
+        <button type="button" class="window-control" data-window="maximize" aria-label="Maximize" title="Maximize">
+          <svg class="glyph-max" viewBox="0 0 10 10" aria-hidden="true"><rect x="0.5" y="0.5" width="9" height="9" /></svg>
+          <svg class="glyph-restore" viewBox="0 0 10 10" aria-hidden="true"><path d="M2.5 2.5V0.5h7v7h-2" /><rect x="0.5" y="2.5" width="7" height="7" /></svg>
+        </button>
+        <button type="button" class="window-control window-control-close" data-window="close" aria-label="Close" title="Close">
+          <svg viewBox="0 0 10 10" aria-hidden="true"><path d="M0.5 0.5l9 9M9.5 0.5l-9 9" /></svg>
+        </button>
+      </div>
     </header>
 
     <section class="workspace-shell">
-      <nav class="session-tabs-shell" aria-label="Terminal sessions">
-        <div class="session-tabs" id="session-tabs" role="tablist" aria-label="Sessions"></div>
-        <button type="button" class="new-session-button" id="new-session-button">+ New session</button>
-      </nav>
-
       <section class="session-editor panel" id="session-editor" hidden aria-labelledby="session-editor-title">
         <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
         <form id="session-form" class="session-form">
@@ -213,39 +208,14 @@ app.innerHTML = `
       <section class="workspace-grid" id="workspace-grid" aria-live="polite"></section>
     </section>
 
-    <section class="bottom-grid">
-      <article class="system-card panel">
-        <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
-        <span class="hud-antenna" aria-hidden="true"></span>
-        <div class="card-head">
-          <div class="card-title">
-            <span class="card-icon icon-log" aria-hidden="true"></span>
-            <h2>System log</h2>
-          </div>
-          <svg class="card-head-hud" viewBox="0 0 800 12" preserveAspectRatio="none" aria-hidden="true">
-            <path d="M 0 6 L 180 6 M 220 6 L 420 6 M 460 6 L 700 6 M 740 6 L 800 6"
-                  style="stroke: var(--bronze)" stroke-width="1.2" fill="none" stroke-linecap="square" />
-            <path d="M 200 0 L 200 12 M 440 0 L 440 12 M 720 0 L 720 12"
-                  style="stroke: var(--bronze)" stroke-width="1" fill="none" stroke-linecap="square" />
-            <rect x="195" y="3" width="10" height="6" style="fill: var(--bronze)" opacity="0.55" />
-            <rect x="435" y="3" width="10" height="6" style="fill: var(--copper-hot)" opacity="0.75" />
-            <rect x="715" y="3" width="10" height="6" style="fill: var(--bronze)" opacity="0.55" />
-          </svg>
-          <div class="card-head-meta">
-            <span class="mono" id="runtime-path" hidden>runtime pending</span>
-            <span class="log-toggle" aria-hidden="true">&lt; Log &gt;</span>
-          </div>
-        </div>
-        <div class="system-terminal" id="system-terminal"></div>
-        <span class="card-ctrl-chip" aria-hidden="true">CTRL</span>
-      </article>
-
+    <!-- Rooms view: swaps in for the workspace (corner menu → Rooms). Same room DOM + handlers. -->
+    <section class="rooms-view" id="rooms-view" hidden aria-label="Rooms">
       <article class="room-card panel" id="room-card">
         <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
         <div class="card-head room-card-head">
           <div class="card-title">
             <span class="card-icon icon-room" aria-hidden="true"></span>
-            <h2>Room feed</h2>
+            <h2>Rooms</h2>
           </div>
           <div class="room-toolbar">
             <select id="room-select" aria-label="Active room"></select>
@@ -288,15 +258,71 @@ app.innerHTML = `
           <p id="room-status" class="room-status" aria-live="polite"></p>
         </div>
       </article>
-
     </section>
 
-    <div class="control-flyout">
-      <button class="control-toggle" aria-label="Open controls">CTRL</button>
-      <div class="control-menu">
-        <button data-control="refresh">Refresh snapshot</button>
-      </div>
-    </div>
+    <!-- System log drawer: off by default (corner menu → System log). -->
+    <section class="log-drawer" id="log-drawer" aria-label="System log">
+      <article class="system-card panel">
+        <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
+        <span class="hud-antenna" aria-hidden="true"></span>
+        <div class="card-head">
+          <div class="card-title">
+            <span class="card-icon icon-log" aria-hidden="true"></span>
+            <h2>System log</h2>
+          </div>
+          <svg class="card-head-hud" viewBox="0 0 800 12" preserveAspectRatio="none" aria-hidden="true">
+            <path d="M 0 6 L 180 6 M 220 6 L 420 6 M 460 6 L 700 6 M 740 6 L 800 6"
+                  style="stroke: var(--bronze)" stroke-width="1.2" fill="none" stroke-linecap="square" />
+            <path d="M 200 0 L 200 12 M 440 0 L 440 12 M 720 0 L 720 12"
+                  style="stroke: var(--bronze)" stroke-width="1" fill="none" stroke-linecap="square" />
+            <rect x="195" y="3" width="10" height="6" style="fill: var(--bronze)" opacity="0.55" />
+            <rect x="435" y="3" width="10" height="6" style="fill: var(--copper-hot)" opacity="0.75" />
+            <rect x="715" y="3" width="10" height="6" style="fill: var(--bronze)" opacity="0.55" />
+          </svg>
+          <div class="card-head-meta">
+            <span class="mono" id="runtime-path" hidden>runtime pending</span>
+            <button type="button" class="ghost log-close" data-corner="log" aria-label="Hide system log" title="Hide system log">Hide</button>
+          </div>
+        </div>
+        <div class="system-terminal" id="system-terminal"></div>
+      </article>
+    </section>
+  </div>
+
+  <!-- Corner button + menu. Mounted beside the shell so no panel clip-path can trap it.
+       Left-click opens the menu; left-drag moves the button (position persists). -->
+  <button type="button" class="corner-button" id="corner-button" aria-haspopup="menu" aria-expanded="false" aria-label="PRIM-1 menu" title="Menu — drag to move">
+    <span class="corner-button-particles" aria-hidden="true">
+      <span></span><span></span><span></span><span></span><span></span><span></span>
+    </span>
+    <span class="corner-button-glyph" aria-hidden="true">&#8644;</span>
+    <span class="corner-button-alert" aria-hidden="true"></span>
+  </button>
+  <div class="corner-menu" id="corner-menu" role="menu" hidden>
+    <button type="button" class="corner-action" data-corner="rooms" role="menuitem">
+      <span class="corner-action-glyph" aria-hidden="true">&#8644;</span>
+      <span class="corner-action-label" data-corner-rooms-label>Rooms</span>
+    </button>
+    <button type="button" class="corner-action" data-corner="log" role="menuitemcheckbox" aria-checked="false">
+      <span class="corner-action-glyph" aria-hidden="true">&#8801;</span>
+      <span class="corner-action-label">System log</span>
+      <span class="corner-action-state" data-corner-log-state>off</span>
+    </button>
+    <div class="corner-menu-sep" role="separator"></div>
+    <label class="corner-action corner-action-row" for="theme-toggle">
+      <span class="corner-action-glyph" aria-hidden="true">&#9673;</span>
+      <span class="corner-action-label">Theme</span>
+      <button type="button" class="theme-toggle" id="theme-toggle" aria-label="Toggle theme" title="Toggle theme"></button>
+    </label>
+    <button type="button" class="corner-action" data-corner="fullscreen" role="menuitem">
+      <span class="corner-action-glyph" aria-hidden="true">&#9974;</span>
+      <span class="corner-action-label">Fullscreen</span>
+      <span class="corner-action-hint">F11</span>
+    </button>
+    <button type="button" class="corner-action" data-control="refresh" role="menuitem">
+      <span class="corner-action-glyph" aria-hidden="true">&#8635;</span>
+      <span class="corner-action-label">Refresh snapshot</span>
+    </button>
   </div>
 `;
 
@@ -498,6 +524,14 @@ const sessionFormNote = must<HTMLElement>("#session-form-note");
 const sessionFormError = must<HTMLElement>("#session-form-error");
 const saveSessionButton = must<HTMLButtonElement>("#save-session");
 const zeroSession = must<HTMLElement>("#zero-session");
+const appShell = must<HTMLElement>(".app-shell");
+const roomsView = must<HTMLElement>("#rooms-view");
+const brandActiveTag = must<HTMLElement>("#brand-active-tag");
+const cornerButton = must<HTMLButtonElement>("#corner-button");
+const cornerMenu = must<HTMLDivElement>("#corner-menu");
+type ShellView = "sessions" | "rooms";
+let shellView: ShellView = "sessions";
+let cornerMenuOpen = false;
 const zeroWorkspace = must<HTMLElement>("#zero-workspace");
 const zeroNewSession = must<HTMLButtonElement>("#zero-new-session");
 const roomSelect = must<HTMLSelectElement>("#room-select");
@@ -703,27 +737,390 @@ function wireThemeToggle(): void {
   });
 }
 
-/** Dock = the system log + rooms row. Hidden by default (terminal-first);
-    the topbar toggle opens it. Only presentation: the dock DOM and every
-    handler in it are untouched. */
-function wireDockToggle(): void {
-  const shell = must<HTMLElement>(".app-shell");
-  const toggle = must<HTMLButtonElement>("#dock-toggle");
-  const apply = (open: boolean): void => {
-    shell.dataset.dock = open ? "open" : "closed";
-    toggle.setAttribute("aria-pressed", String(open));
-    toggle.title = open
-      ? "Hide system log and rooms"
-      : "Show system log and rooms";
-    requestAnimationFrame(() => {
-      fitVisiblePanes();
-      systemFit.fit();
-    });
-  };
-  apply(false);
-  toggle.addEventListener("click", () => {
-    apply(shell.dataset.dock !== "open");
+/** Shell views + drawers. Only presentation: the room and system-log DOM and
+    every handler in them are untouched; the view swap hides/shows containers
+    and refits xterm on the next frame (the body ResizeObserver cannot see
+    internal grid changes). */
+function setShellView(view: ShellView): void {
+  shellView = view;
+  appShell.dataset.view = view;
+  roomsView.hidden = view !== "rooms";
+  brandActiveTag.textContent = view === "rooms" ? "Rooms" : "Sessions";
+  const label = cornerMenu.querySelector<HTMLElement>("[data-corner-rooms-label]");
+  if (label) {
+    label.textContent = view === "rooms" ? "Back to sessions" : "Rooms";
+  }
+  requestAnimationFrame(() => {
+    fitVisiblePanes();
+    systemFit.fit();
   });
+}
+
+function setLogDrawer(open: boolean): void {
+  appShell.dataset.log = open ? "open" : "closed";
+  const item = cornerMenu.querySelector<HTMLButtonElement>('[data-corner="log"]');
+  item?.setAttribute("aria-checked", String(open));
+  const state = cornerMenu.querySelector<HTMLElement>("[data-corner-log-state]");
+  if (state) {
+    state.textContent = open ? "on" : "off";
+  }
+  if (open) {
+    delete cornerButton.dataset.alert;
+  }
+  requestAnimationFrame(() => {
+    fitVisiblePanes();
+    systemFit.fit();
+  });
+}
+
+const CORNER_POSITION_KEY = "prim1-corner-button";
+
+/** Corner button: click opens the menu; left-drag moves it (clamped to the
+    viewport, persisted). Drag vs click is decided by a 5 px threshold. */
+function wireCornerButton(): void {
+  try {
+    const raw = localStorage.getItem(CORNER_POSITION_KEY);
+    if (raw) {
+      const saved = JSON.parse(raw) as { x?: unknown; y?: unknown };
+      if (typeof saved.x === "number" && typeof saved.y === "number") {
+        placeCornerButton(saved.x, saved.y);
+      }
+    }
+  } catch {
+    /* ignore a corrupt saved position */
+  }
+
+  let drag: {
+    pointerId: number;
+    startX: number;
+    startY: number;
+    originX: number;
+    originY: number;
+    moved: boolean;
+  } | null = null;
+
+  cornerButton.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) {
+      return;
+    }
+    const rect = cornerButton.getBoundingClientRect();
+    drag = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      originX: rect.left,
+      originY: rect.top,
+      moved: false,
+    };
+    cornerButton.setPointerCapture(event.pointerId);
+  });
+
+  cornerButton.addEventListener("pointermove", (event) => {
+    if (!drag || event.pointerId !== drag.pointerId) {
+      return;
+    }
+    const dx = event.clientX - drag.startX;
+    const dy = event.clientY - drag.startY;
+    if (!drag.moved && Math.hypot(dx, dy) < 5) {
+      return;
+    }
+    drag.moved = true;
+    cornerButton.dataset.dragging = "true";
+    placeCornerButton(drag.originX + dx, drag.originY + dy);
+  });
+
+  const endDrag = (event: PointerEvent): void => {
+    if (!drag || event.pointerId !== drag.pointerId) {
+      return;
+    }
+    const wasDrag = drag.moved;
+    drag = null;
+    delete cornerButton.dataset.dragging;
+    try {
+      cornerButton.releasePointerCapture(event.pointerId);
+    } catch {
+      /* already released */
+    }
+    if (wasDrag) {
+      const rect = cornerButton.getBoundingClientRect();
+      try {
+        localStorage.setItem(
+          CORNER_POSITION_KEY,
+          JSON.stringify({ x: rect.left, y: rect.top }),
+        );
+      } catch {
+        /* storage unavailable — position just won't persist */
+      }
+      if (cornerMenuOpen) {
+        placeCornerMenu();
+      }
+      return;
+    }
+    if (event.type === "pointerup") {
+      setCornerMenuOpen(!cornerMenuOpen);
+    }
+  };
+  cornerButton.addEventListener("pointerup", endDrag);
+  cornerButton.addEventListener("pointercancel", endDrag);
+
+  window.addEventListener("resize", () => {
+    const rect = cornerButton.getBoundingClientRect();
+    if (cornerButton.style.left) {
+      placeCornerButton(rect.left, rect.top);
+    }
+    if (cornerMenuOpen) {
+      placeCornerMenu();
+    }
+  });
+
+  cornerMenu.addEventListener("click", (event) => {
+    if (!(event.target instanceof Element)) {
+      return;
+    }
+    const action = event.target.closest<HTMLElement>("[data-corner]");
+    if (!action) {
+      return;
+    }
+    runCornerAction(action.dataset.corner ?? "");
+  });
+  // The system-log card's own Hide button shares the same action.
+  for (const button of document.querySelectorAll<HTMLButtonElement>(
+    ".log-close[data-corner]",
+  )) {
+    button.addEventListener("click", () => runCornerAction("log"));
+  }
+
+  document.addEventListener("click", (event) => {
+    if (!cornerMenuOpen || !(event.target instanceof Node)) {
+      return;
+    }
+    if (!cornerButton.contains(event.target) && !cornerMenu.contains(event.target)) {
+      setCornerMenuOpen(false);
+    }
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && cornerMenuOpen) {
+      setCornerMenuOpen(false);
+    }
+  });
+}
+
+function runCornerAction(kind: string): void {
+  switch (kind) {
+    case "rooms":
+      setShellView(shellView === "rooms" ? "sessions" : "rooms");
+      setCornerMenuOpen(false);
+      break;
+    case "log":
+      setLogDrawer(appShell.dataset.log !== "open");
+      break;
+    case "fullscreen":
+      setCornerMenuOpen(false);
+      void toggleFullscreen();
+      break;
+    default:
+      break;
+  }
+}
+
+function placeCornerButton(x: number, y: number): void {
+  const margin = 8;
+  const width = cornerButton.offsetWidth || 64;
+  const height = cornerButton.offsetHeight || 64;
+  const left = Math.min(Math.max(x, margin), Math.max(margin, window.innerWidth - width - margin));
+  const top = Math.min(Math.max(y, margin), Math.max(margin, window.innerHeight - height - margin));
+  cornerButton.style.left = `${Math.round(left)}px`;
+  cornerButton.style.top = `${Math.round(top)}px`;
+  cornerButton.style.right = "auto";
+  cornerButton.style.bottom = "auto";
+}
+
+function placeCornerMenu(): void {
+  const button = cornerButton.getBoundingClientRect();
+  const menu = cornerMenu.getBoundingClientRect();
+  const gap = 10;
+  const margin = 8;
+  let top = button.top - menu.height - gap;
+  if (top < margin) {
+    top = button.bottom + gap;
+  }
+  let left = button.right - menu.width;
+  if (left < margin) {
+    left = margin;
+  }
+  if (left + menu.width > window.innerWidth - margin) {
+    left = Math.max(margin, window.innerWidth - margin - menu.width);
+  }
+  cornerMenu.style.top = `${Math.round(top)}px`;
+  cornerMenu.style.left = `${Math.round(left)}px`;
+}
+
+function setCornerMenuOpen(open: boolean): void {
+  cornerMenuOpen = open;
+  cornerMenu.hidden = !open;
+  cornerButton.setAttribute("aria-expanded", String(open));
+  if (open) {
+    placeCornerMenu();
+  }
+}
+
+/** Window controls for the undecorated window. Close goes through the same
+    close-requested path as the native button (supervisor shutdown in lib.rs). */
+function wireWindowControls(): void {
+  const win = getCurrentWindow();
+  const refresh = async (): Promise<void> => {
+    try {
+      const [maximized, fullscreen] = await Promise.all([
+        win.isMaximized(),
+        win.isFullscreen(),
+      ]);
+      appShell.dataset.maximized = String(maximized);
+      appShell.dataset.fullscreen = String(fullscreen);
+      const maxButton = document.querySelector<HTMLButtonElement>('[data-window="maximize"]');
+      if (maxButton) {
+        const label = fullscreen
+          ? "Exit fullscreen"
+          : maximized
+            ? "Restore"
+            : "Maximize";
+        maxButton.title = label;
+        maxButton.setAttribute("aria-label", label);
+      }
+      if (!fullscreen) {
+        // Anything that un-fullscreens the window can hand it a broken rect;
+        // settle it whenever the window is not fullscreen.
+        void settleWindowRect();
+      }
+    } catch {
+      /* window state unavailable — leave the flags as they are */
+    }
+  };
+  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-window]")) {
+    button.addEventListener("click", async () => {
+      const kind = button.dataset.window;
+      try {
+        if (kind === "minimize") {
+          await win.minimize();
+        } else if (kind === "maximize") {
+          if (appShell.dataset.fullscreen === "true") {
+            await toggleFullscreen();
+          } else {
+            await win.toggleMaximize();
+            await refresh();
+          }
+        } else if (kind === "close") {
+          await win.close();
+        }
+      } catch (error) {
+        writeSystem("error", `window ${kind ?? "control"} failed: ${String(error)}`);
+      }
+    });
+  }
+  void win.onResized(() => {
+    void refresh();
+  });
+  void refresh();
+
+  // Double-click on the drag region: Tauri's built-in handler toggles
+  // *maximize*, which on a fullscreen window leaves it with a broken rect
+  // (looked like a crash). In fullscreen, double-click exits fullscreen
+  // instead; windowed, Tauri's maximize toggle stays.
+  window.addEventListener(
+    "mousedown",
+    (event) => {
+      if (event.button !== 0 || event.detail < 2) {
+        return;
+      }
+      if (!(event.target instanceof Element) || !event.target.hasAttribute("data-tauri-drag-region")) {
+        return;
+      }
+      if (appShell.dataset.fullscreen !== "true") {
+        return;
+      }
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      void toggleFullscreen();
+    },
+    { capture: true },
+  );
+}
+
+async function toggleFullscreen(): Promise<void> {
+  try {
+    await command<void>("toggle_fullscreen");
+  } catch (error) {
+    writeSystem("error", `fullscreen toggle failed: ${String(error)}`);
+    return;
+  }
+  await settleWindow();
+}
+
+/** After leaving fullscreen the window can come back with a degenerate rect
+    (observed: -25600,-25600 159×27 — it was created hidden and fullscreened
+    before it ever had a restore size). Put it back to the configured size,
+    centred. No-op while fullscreen or when the rect is sane. */
+async function settleWindow(): Promise<void> {
+  const win = getCurrentWindow();
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const fullscreen = await win.isFullscreen();
+    appShell.dataset.fullscreen = String(fullscreen);
+    if (fullscreen) {
+      return;
+    }
+  } catch (error) {
+    writeSystem("warn", `window settle failed: ${String(error)}`);
+    return;
+  }
+  await settleWindowRect();
+}
+
+let settlingRect = false;
+
+async function settleWindowRect(): Promise<void> {
+  if (settlingRect) {
+    return;
+  }
+  settlingRect = true;
+  const win = getCurrentWindow();
+  try {
+    if ((await win.isFullscreen()) || (await win.isMaximized())) {
+      return;
+    }
+    if (!(await win.isVisible())) {
+      await win.show();
+      writeSystem("warn", "window came back hidden after a state change — shown again");
+    }
+    const [size, position] = await Promise.all([win.outerSize(), win.outerPosition()]);
+    // outerSize/outerPosition are physical px; screen.avail* are logical (CSS) px.
+    const dpr = window.devicePixelRatio || 1;
+    const availWidth = window.screen.availWidth;
+    const availHeight = window.screen.availHeight;
+    const degenerate =
+      size.width < 640
+      || size.height < 400
+      || position.x < -4000
+      || position.y < -4000;
+    // Tolerate the invisible resize border (≈7 px logical per side).
+    const oversized =
+      size.width > (availWidth + 24) * dpr
+      || size.height > (availHeight + 24) * dpr;
+    if (!degenerate && !oversized) {
+      return;
+    }
+    const width = Math.min(1560, Math.max(960, availWidth - 48));
+    const height = Math.min(980, Math.max(600, availHeight - 48));
+    await win.setSize(new LogicalSize(width, height));
+    await win.center();
+    writeSystem(
+      "info",
+      `window restored: was ${size.width}x${size.height} @${position.x},${position.y} (${degenerate ? "invalid" : "larger than the screen"}); now ${width}x${height} centred`,
+    );
+  } catch (error) {
+    writeSystem("warn", `window settle failed: ${String(error)}`);
+  } finally {
+    settlingRect = false;
+  }
 }
 
 /** Active theme's secondary color as ANSI truecolor — used for system log info
@@ -753,7 +1150,9 @@ wireControls();
 wireResize();
 wireTerminalShortcuts();
 wireThemeToggle();
-wireDockToggle();
+wireWindowControls();
+wireCornerButton();
+void settleWindow();
 
 const runtimeEventContext: RuntimeEventContext = {
   writeSystem,
@@ -1478,7 +1877,12 @@ function renderSessionTabs(sessions: SessionSnapshot[]): void {
       ),
     );
     tab.append(label, detail, badges);
-    tab.addEventListener("click", () => setActiveSession(sessionId, false));
+    tab.addEventListener("click", () => {
+      if (shellView !== "sessions") {
+        setShellView("sessions");
+      }
+      setActiveSession(sessionId, false);
+    });
     tab.addEventListener("keydown", (event) =>
       handleFocusedTabKeydown(event, sessionId),
     );
@@ -2515,9 +2919,7 @@ function wireTerminalShortcuts(): void {
       }
 
       event.preventDefault();
-      void command<void>("toggle_fullscreen").catch((error) =>
-        writeSystem("error", `fullscreen toggle failed: ${String(error)}`),
-      );
+      void toggleFullscreen();
     },
     { capture: true },
   );
@@ -2743,6 +3145,9 @@ function writeSystem(level: "info" | "warn" | "error", message: string): void {
   systemTerminal.writeln(
     `${color}[${new Date().toLocaleTimeString()}] ${message}\x1b[0m`,
   );
+  if (level === "error" && appShell.dataset.log !== "open") {
+    cornerButton.dataset.alert = "true";
+  }
 }
 
 async function resizeSession(sessionId: string, cols: number, rows: number): Promise<void> {

@@ -1237,42 +1237,22 @@ fn parse_start_minimized(value: Option<OsString>) -> Result<bool, String> {
 }
 
 fn present_main_window(window: &WebviewWindow, start_minimized: bool) -> Result<(), String> {
-    if !start_minimized {
+    // Show through Tauri so its window layer (tao) records the window as
+    // visible. The previous raw Win32 `ShowWindow` bypassed that state: tao
+    // still believed the window was hidden and re-hid it (SW_HIDE) whenever it
+    // re-applied window state — every exit from fullscreen made the window
+    // vanish. `hwnd()` is also not always available inside the setup hook,
+    // which could panic the whole launch. With `focus: false` in the window
+    // config this show does not activate the window.
+    window.show().map_err(|error| error.to_string())?;
+    if start_minimized {
+        window.minimize().map_err(|error| error.to_string())?;
+    } else {
         window
             .set_fullscreen(true)
             .map_err(|error| error.to_string())?;
     }
-
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::UI::WindowsAndMessaging::{
-            SW_SHOW, SW_SHOWMINNOACTIVE, ShowWindow,
-        };
-
-        let hwnd = window.hwnd().map_err(|error| error.to_string())?;
-        unsafe {
-            let _ = ShowWindow(
-                hwnd.0,
-                if start_minimized {
-                    SW_SHOWMINNOACTIVE
-                } else {
-                    SW_SHOW
-                },
-            );
-        }
-        Ok(())
-    }
-
-    #[cfg(not(windows))]
-    {
-        if start_minimized {
-            window.minimize().map_err(|error| error.to_string())?;
-            window.show().map_err(|error| error.to_string())
-        } else {
-            window.show().map_err(|error| error.to_string())?;
-            window.set_focus().map_err(|error| error.to_string())
-        }
-    }
+    Ok(())
 }
 
 fn default_runtime_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -2764,7 +2744,19 @@ mod tests {
                 "core:event:allow-unlisten",
                 "core:window:allow-is-focused",
                 "core:window:allow-is-fullscreen",
-                "core:window:allow-is-minimized"
+                "core:window:allow-is-minimized",
+                "core:window:allow-is-maximized",
+                "core:window:allow-minimize",
+                "core:window:allow-toggle-maximize",
+                "core:window:allow-internal-toggle-maximize",
+                "core:window:allow-close",
+                "core:window:allow-start-dragging",
+                "core:window:allow-outer-size",
+                "core:window:allow-outer-position",
+                "core:window:allow-set-size",
+                "core:window:allow-center",
+                "core:window:allow-is-visible",
+                "core:window:allow-show"
             ])
         );
 

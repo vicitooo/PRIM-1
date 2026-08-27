@@ -189,21 +189,6 @@ button, input, select, textarea { font: inherit; }
 /* Antenna decoration removed — too noisy on the chamfered bezel */
 .hud-antenna { display: none; }
 
-/* Topbar HUD strip — multi-segment yellow tech line with ticks + parallel sub-line.
-   Drawn on the inner panel surface so the chamfer border stays clean. */
-.topbar-hud-strip {
-  position: absolute;
-  top: 3px;
-  left: 0;
-  right: 0;
-  width: 100%;
-  height: 12px;
-  opacity: 0.6;
-  pointer-events: none;
-  z-index: 4;
-  filter: drop-shadow(0 0 4px color-mix(in srgb, var(--bronze) 40%, transparent));
-}
-
 /* Side stripe accent for terminal cards — masked SVG so color follows the active theme */
 .hud-side-stripe {
   position: absolute;
@@ -259,11 +244,11 @@ button, input, select, textarea { font: inherit; }
    ══════════════════════════════════════ */
 
 .topbar {
-  --chamfer: 14px;
-  padding: 0.2rem 0.85rem 0.2rem 0.55rem;
+  --chamfer: 10px;
+  padding: 0 0 0 0.45rem;
   display: flex;
   align-items: center;
-  gap: 0.7rem;
+  gap: 0.6rem;
   user-select: none;
   overflow: hidden;
   min-height: 40px;
@@ -666,48 +651,66 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
   overflow: hidden;
 }
 
-/* The dock (system log + rooms) is off the main screen by default. The topbar
-   "Log · Rooms" toggle opens it as a bottom row; its DOM stays mounted + wired. */
-.app-shell[data-dock="open"] {
-  grid-template-rows: auto minmax(0, 1fr) minmax(320px, 0.42fr);
+/* System log drawer: a bottom row that exists only while open (corner menu). */
+.app-shell[data-log="open"] {
+  grid-template-rows: auto minmax(0, 1fr) minmax(180px, 0.3fr);
 }
-.app-shell:not([data-dock="open"]) .bottom-grid {
+.log-drawer {
   display: none;
+  min-height: 0;
+}
+.app-shell[data-log="open"] .log-drawer {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+}
+
+/* Views: sessions (terminals) or rooms — one occupies the middle row. */
+.app-shell[data-view="rooms"] .workspace-shell {
+  display: none;
+}
+.rooms-view {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
 }
 
 .workspace-shell {
   min-height: 0;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
   gap: 0.3rem;
   overflow: hidden;
 }
 
-/* Pin sections to rows: with the editor and zero-state hidden there are only
-   two grid items, and auto-placement would drop the terminal into the `auto`
-   row (sized to xterm's default 24 rows). The terminal always owns the 1fr row. */
-.workspace-shell > .session-tabs-shell { grid-row: 1; }
+/* Pin sections to rows: with the editor and zero-state hidden only one item
+   is left, and auto-placement would drop the terminal into the `auto` row
+   (sized to xterm's default 24 rows). The terminal always owns the 1fr row. */
 .workspace-shell > .session-editor,
-.workspace-shell > .zero-session { grid-row: 2; }
-.workspace-shell > .workspace-grid { grid-row: 3; }
+.workspace-shell > .zero-session { grid-row: 1; }
+.workspace-shell > .workspace-grid { grid-row: 2; }
 
 .session-tabs-shell {
   min-width: 0;
+  flex: 0 1 auto;
+  max-width: 70%;
+  align-self: center;
   display: flex;
-  align-items: stretch;
-  gap: 0.55rem;
+  align-items: center;
+  gap: 0.45rem;
+  z-index: 2;
 }
 
 .session-tabs {
   min-width: 0;
-  flex: 1 1 auto;
+  flex: 0 1 auto;
   display: flex;
   align-items: stretch;
   gap: 0.25rem;
   overflow-x: auto;
   overflow-y: hidden;
-  padding: 0.1rem 0.1rem 0.15rem;
+  padding: 0;
+  min-height: 30px;
   scrollbar-width: thin;
 }
 
@@ -1143,13 +1146,6 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
   color: var(--prim1);
 }
 
-.bottom-grid {
-  min-height: 0;
-  display: grid;
-  grid-template-columns: minmax(320px, 0.8fr) minmax(520px, 1.2fr);
-  gap: 0.7rem;
-}
-
 .system-card { position: relative; }
 
 .room-card {
@@ -1364,25 +1360,6 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
   display: none !important;
 }
 
-/* CTRL chip — bottom-right of the system card */
-.card-ctrl-chip {
-  position: absolute;
-  bottom: 6px;
-  right: 6px;
-  font-family: "JetBrains Mono", Consolas, monospace;
-  font-size: 9px;
-  letter-spacing: 0.22em;
-  font-weight: 700;
-  text-transform: uppercase;
-  color: var(--copper-hot);
-  padding: 0.15rem 0.45rem;
-  border: 1px solid color-mix(in srgb, var(--copper-hot) 55%, transparent);
-  background: color-mix(in srgb, var(--copper-hot) 5%, transparent);
-  text-shadow: 0 0 5px color-mix(in srgb, var(--copper-hot) 40%, transparent);
-  z-index: 5;
-  user-select: none;
-}
-
 /* ══════════════════════════════════════
    FORM ELEMENTS
    ══════════════════════════════════════ */
@@ -1412,52 +1389,6 @@ textarea:focus-visible {
 .workspace-grid[hidden] {
   display: none !important;
 }
-/* ══════════════════════════════════════
-   CONTROL FLYOUT  (kept tucked away)
-   ══════════════════════════════════════ */
-
-.control-flyout {
-  position: fixed;
-  right: 0.85rem;
-  bottom: 0.85rem;
-  display: flex;
-  align-items: flex-end;
-  gap: 0.4rem;
-  z-index: 10;
-  opacity: 0.0;
-  pointer-events: none;
-}
-.control-flyout:hover, .control-flyout:focus-within {
-  opacity: 1;
-  pointer-events: auto;
-}
-
-.control-toggle {
-  width: 38px;
-  height: 38px;
-  font-size: 9px;
-}
-
-.control-menu {
-  opacity: 0;
-  pointer-events: none;
-  transform: translateY(6px);
-  transition: opacity var(--duration-fast) ease, transform var(--duration-fast) var(--easing);
-  display: grid;
-  gap: 0.25rem;
-  padding: 0.4rem;
-  border: 1px solid var(--frame);
-  background: var(--bg-panel);
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
-}
-
-.control-flyout:hover .control-menu,
-.control-flyout:focus-within .control-menu {
-  opacity: 1;
-  pointer-events: auto;
-  transform: translateY(0);
-}
-
 /* Theme toggle (compact, top-right) — glyph + brand-color tint per active theme */
 .theme-toggle {
   display: flex;
@@ -1475,21 +1406,6 @@ textarea:focus-visible {
   --btn-color: var(--prim1);
   --btn-glow: var(--prim1-glow);
   text-shadow: 0 0 6px var(--prim1-glow);
-}
-
-/* Dock toggle (topbar) — opens the system log + rooms row on demand.
-   Step 4 folds this into the corner button. */
-.dock-toggle {
-  height: 26px;
-  padding: 0 0.6rem;
-  font-size: 10px;
-  letter-spacing: 0.14em;
-  flex-shrink: 0;
-  z-index: 2;
-}
-.dock-toggle[aria-pressed="true"] {
-  background: color-mix(in srgb, var(--copper-hot) 18%, transparent);
-  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.4), 0 0 14px var(--btn-glow);
 }
 
 /* ══════════════════════════════════════
@@ -1999,3 +1915,346 @@ textarea:focus-visible {
     flex: 1 1 180px;
   }
 }
+
+/* ══════════════════════════════════════
+   WINDOW CONTROLS — the bar is the title bar (decorations off)
+   ══════════════════════════════════════ */
+
+.window-controls {
+  display: flex;
+  align-self: stretch;
+  align-items: stretch;
+  margin-left: 0.2rem;
+  z-index: 3;
+}
+.window-control {
+  width: 40px;
+  min-width: 40px;
+  height: 100%;
+  min-height: 34px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  clip-path: none;
+  box-shadow: none;
+  text-shadow: none;
+  background: transparent;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background var(--duration-fast) ease, color var(--duration-fast) ease;
+}
+.window-control svg {
+  width: 10px;
+  height: 10px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.2;
+  shape-rendering: crispEdges;
+}
+.window-control:hover {
+  background: color-mix(in srgb, var(--copper-hot) 16%, transparent);
+  color: var(--text-primary);
+  box-shadow: none;
+}
+.window-control:active {
+  background: color-mix(in srgb, var(--copper-hot) 26%, transparent);
+}
+.window-control-close:hover {
+  background: #c42b1c;
+  color: #ffffff;
+}
+.window-control-close:active {
+  background: #a5241a;
+}
+.window-control .glyph-restore { display: none; }
+.app-shell[data-maximized="true"] .window-control .glyph-max { display: none; }
+.app-shell[data-maximized="true"] .window-control .glyph-restore { display: block; }
+/* Fullscreen keeps the controls (the app starts fullscreen); ▢ = exit fullscreen there. */
+.app-shell[data-fullscreen="true"] .window-control .glyph-max { display: none; }
+.app-shell[data-fullscreen="true"] .window-control .glyph-restore { display: block; }
+
+/* ══════════════════════════════════════
+   CORNER BUTTON + MENU — draggable, persists its position
+   ══════════════════════════════════════ */
+
+.corner-button {
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
+  z-index: 9000;
+  width: 64px;
+  height: 64px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: radial-gradient(
+    circle at 30% 26%,
+    color-mix(in srgb, var(--prim1) 70%, white 22%),
+    var(--prim1) 55%,
+    var(--prim1-deep) 100%
+  );
+  border: 1.5px solid color-mix(in srgb, var(--prim1) 80%, white 14%);
+  cursor: grab;
+  color: white;
+  text-shadow: none;
+  filter: drop-shadow(0 0 18px color-mix(in srgb, var(--prim1) 65%, transparent));
+  animation: cornerPulse 2.4s ease-in-out infinite;
+  clip-path: polygon(
+    12px 0,
+    calc(100% - 12px) 0,
+    100% 12px,
+    100% calc(100% - 12px),
+    calc(100% - 12px) 100%,
+    12px 100%,
+    0 calc(100% - 12px),
+    0 12px
+  );
+  overflow: visible;
+  touch-action: none;
+  transition: filter var(--duration-smooth) var(--easing), transform var(--duration-fast) var(--easing);
+}
+.corner-button:hover {
+  background: radial-gradient(
+    circle at 30% 26%,
+    color-mix(in srgb, var(--prim1) 70%, white 22%),
+    var(--prim1) 55%,
+    var(--prim1-deep) 100%
+  );
+  filter: drop-shadow(0 0 28px color-mix(in srgb, var(--prim1) 90%, transparent));
+  transform: translateY(-1px);
+  box-shadow: none;
+}
+.corner-button:active {
+  cursor: grabbing;
+  transform: translateY(0) scale(0.97);
+}
+.corner-button[data-dragging="true"] {
+  cursor: grabbing;
+  transform: none !important;
+  transition: none !important;
+  animation: none;
+  filter: drop-shadow(0 0 18px color-mix(in srgb, var(--prim1) 65%, transparent));
+}
+.corner-button:focus-visible {
+  outline: 1px solid var(--prim1);
+  outline-offset: 3px;
+}
+.corner-button-glyph {
+  font-size: 24px;
+  line-height: 1;
+  position: relative;
+  z-index: 2;
+  text-shadow:
+    1px 0 color-mix(in srgb, var(--copper-hot) 70%, transparent),
+    -1px 0 color-mix(in srgb, var(--red) 60%, transparent);
+}
+[data-theme="prim1-deep"] .corner-button-glyph {
+  filter: url(#prim1-dissolve-strong);
+}
+@keyframes cornerPulse {
+  0%, 100% {
+    box-shadow:
+      0 0 18px color-mix(in srgb, var(--prim1) 50%, transparent),
+      inset 0 0 12px color-mix(in srgb, var(--prim1-deep) 80%, transparent);
+  }
+  50% {
+    box-shadow:
+      0 0 36px color-mix(in srgb, var(--prim1) 90%, transparent),
+      inset 0 0 24px color-mix(in srgb, var(--prim1-deep) 100%, transparent);
+  }
+}
+.corner-button-particles {
+  position: absolute;
+  left: -2px;
+  right: -2px;
+  bottom: 0;
+  height: 130%;
+  pointer-events: none;
+  overflow: visible;
+  z-index: 1;
+}
+.corner-button-particles > span {
+  position: absolute;
+  bottom: 6px;
+  width: 5px;
+  height: 5px;
+  background: color-mix(in srgb, var(--prim1) 92%, white 8%);
+  border-radius: 50%;
+  opacity: 0;
+  filter: blur(0.7px);
+  animation: cornerGas 3s ease-out infinite;
+}
+.corner-button-particles > span:nth-child(1) { left: 12%; animation-delay: 0s; }
+.corner-button-particles > span:nth-child(2) { left: 26%; animation-delay: 0.5s; }
+.corner-button-particles > span:nth-child(3) { left: 42%; animation-delay: 1.0s; }
+.corner-button-particles > span:nth-child(4) { left: 58%; animation-delay: 1.5s; }
+.corner-button-particles > span:nth-child(5) { left: 74%; animation-delay: 2.0s; }
+.corner-button-particles > span:nth-child(6) { left: 88%; animation-delay: 2.5s; }
+@keyframes cornerGas {
+  0%   { transform: translateY(0) scale(1); opacity: 0; }
+  20%  { opacity: 0.85; }
+  60%  { opacity: 0.55; }
+  100% { transform: translateY(-50px) scale(0.4); opacity: 0; }
+}
+.corner-button[data-dragging="true"] .corner-button-particles { display: none; }
+
+/* Error-level system-log line while the drawer is hidden */
+.corner-button-alert {
+  display: none;
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--red-bright);
+  border: 1.5px solid #000;
+  box-shadow: 0 0 10px var(--red-bright);
+  z-index: 3;
+}
+.corner-button[data-alert="true"] .corner-button-alert { display: block; }
+
+.corner-menu {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 9001;
+  min-width: 15rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  padding: 0.6rem;
+  background: var(--bg-panel);
+  border: 1px solid color-mix(in srgb, var(--prim1) 60%, transparent);
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.6),
+    0 14px 30px rgba(0, 0, 0, 0.55),
+    0 0 28px color-mix(in srgb, var(--prim1) 30%, transparent);
+  clip-path: polygon(
+    8px 0,
+    100% 0,
+    100% calc(100% - 8px),
+    calc(100% - 8px) 100%,
+    0 100%,
+    0 8px
+  );
+}
+.corner-action {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.5rem 0.65rem;
+  background: color-mix(in srgb, var(--bg-inset) 80%, transparent);
+  border: 1px solid color-mix(in srgb, var(--prim1) 35%, transparent);
+  border-radius: 0;
+  clip-path: none;
+  box-shadow: none;
+  text-shadow: none;
+  color: color-mix(in srgb, var(--prim1) 70%, white 22%);
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  cursor: pointer;
+  text-align: left;
+  transition:
+    background var(--duration-fast) var(--easing),
+    border-color var(--duration-fast) var(--easing),
+    color var(--duration-fast) var(--easing);
+}
+.corner-action:hover {
+  background: color-mix(in srgb, var(--prim1) 18%, var(--bg-inset));
+  border-color: var(--prim1);
+  color: white;
+  box-shadow: none;
+}
+.corner-action[aria-checked="true"] {
+  border-color: var(--copper-hot);
+  color: var(--cyan-bright);
+}
+.corner-action-glyph {
+  font-size: 14px;
+  color: var(--prim1);
+  flex-shrink: 0;
+  width: 1.1em;
+  text-align: center;
+}
+.corner-action-label { flex: 1; }
+.corner-action-state,
+.corner-action-hint {
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  color: var(--text-tertiary);
+}
+.corner-action[aria-checked="true"] .corner-action-state { color: var(--cyan-bright); }
+.corner-action-row .theme-toggle {
+  width: 26px;
+  height: 26px;
+  margin-left: auto;
+}
+.corner-menu-sep {
+  height: 1px;
+  margin: 0.15rem 0.2rem;
+  background: color-mix(in srgb, var(--prim1) 30%, transparent);
+}
+
+/* ══════════════════════════════════════
+   ROOMS VIEW — feed + composer left, members right
+   ══════════════════════════════════════ */
+
+.rooms-view .room-card {
+  padding: 0.55rem 0.8rem 0.7rem;
+}
+.rooms-view .room-card .card-head h2 {
+  color: var(--prim1);
+  text-shadow:
+    0 0 10px rgba(255, 45, 140, 0.65),
+    0 0 22px rgba(255, 45, 140, 0.25);
+}
+.rooms-view .room-content {
+  grid-template-columns: minmax(0, 1fr) minmax(260px, 340px);
+  grid-template-rows: minmax(0, 1fr) auto auto auto auto;
+  grid-template-areas:
+    "feed members"
+    "label members"
+    "composer members"
+    "actions members"
+    "status members";
+  column-gap: 0.8rem;
+}
+.rooms-view #room-feed { grid-area: feed; }
+.rooms-view .room-composer-label { grid-area: label; }
+.rooms-view #room-message { grid-area: composer; }
+.rooms-view .room-composer-actions { grid-area: actions; }
+.rooms-view #room-status { grid-area: status; }
+.rooms-view .room-members-row {
+  grid-area: members;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.45rem;
+  min-height: 0;
+  padding: 0.5rem;
+  border: 1px solid var(--frame-inner);
+  background: var(--bg-inset);
+}
+.rooms-view .room-members-row::before {
+  content: "Members";
+  color: var(--copper-hot);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.rooms-view .room-members {
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  align-content: flex-start;
+  overflow: auto;
+}
+.rooms-view #room-add-member-select { max-width: none; }
+.rooms-view .room-empty { min-height: 200px; }
+.rooms-view .room-create-form { align-content: start; }
