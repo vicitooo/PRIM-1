@@ -717,10 +717,12 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
 /* Compact, terminal-style tabs: harness monogram + label + state dot. Working
    dir and id live in the tooltip; the four actions overlay the right edge on
    hover / focus. */
+/* Tabs size to their name — the full label always shows; the strip scrolls
+   sideways when they overflow. */
 .session-tab-shell {
   position: relative;
-  flex: 0 1 220px;
-  min-width: 150px;
+  flex: 0 0 auto;
+  min-width: 0;
   display: flex;
   align-items: stretch;
   border: 1px solid var(--frame-soft);
@@ -764,15 +766,6 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
   color: var(--prim1);
   background: color-mix(in srgb, var(--prim1) 10%, transparent);
   box-shadow: inset 0 -2px 0 var(--prim1);
-}
-
-.session-tab-shell:hover .session-tab,
-.session-tab-shell:focus-within .session-tab {
-  padding-right: 98px;
-}
-.session-tab-shell:hover .session-tab-badges,
-.session-tab-shell:focus-within .session-tab-badges {
-  display: none;
 }
 
 .session-tab-label,
@@ -858,45 +851,63 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
   text-shadow: 0 0 5px color-mix(in srgb, var(--red) 45%, transparent);
 }
 
-/* Tab actions (← → ✎ ×) overlay the tab's right edge; shown on hover / focus.
-   Same four buttons and handlers as before — only the presentation changed. */
+/* The × sits in the tab's own flow — its space is always reserved, so nothing
+   squeezes the name; dim until hover / focus / active. Move and edit live in
+   the right-click tab menu. Same handlers as before — only the presentation changed. */
 .session-tab-action {
-  position: absolute;
-  top: 50%;
-  transform: translateY(-50%);
+  align-self: center;
   width: 20px;
   height: 20px;
   min-width: 0;
+  margin: 0 4px 0 0;
   padding: 0;
   border: 1px solid transparent;
   clip-path: none;
   box-shadow: none;
-  font-size: 12px;
+  transform: none;
+  font-size: 15px;
   line-height: 1;
   letter-spacing: 0;
   text-transform: none;
   text-shadow: none;
-  opacity: 0;
-  pointer-events: none;
+  opacity: 0.4;
   transition: opacity var(--duration-fast) ease, background var(--duration-fast) ease;
 }
-.session-tab-action[data-delta="-1"] { right: 72px; }
-.session-tab-action[data-delta="1"]  { right: 50px; }
-.session-tab-action[data-tab-action="edit"]  { right: 28px; }
-.session-tab-action[data-tab-action="close"] { right: 6px; font-size: 15px; }
-
 .session-tab-shell:hover .session-tab-action,
-.session-tab-shell:focus-within .session-tab-action {
+.session-tab-shell:focus-within .session-tab-action,
+.session-tab-shell:has(.session-tab[aria-selected="true"]) .session-tab-action {
   opacity: 1;
-  pointer-events: auto;
-}
-.session-tab-shell:hover .session-tab-action:disabled,
-.session-tab-shell:focus-within .session-tab-action:disabled {
-  opacity: 0.35;
-  pointer-events: none;
 }
 .session-tab-action:hover {
   border-color: var(--btn-color);
+  color: var(--red-bright);
+  transform: none;
+}
+
+/* Right-click tab menu — corner-menu chrome */
+.tab-menu {
+  min-width: 13rem;
+}
+.tab-menu-title {
+  max-width: 22rem;
+  margin: 0 0.2rem 0.15rem;
+  overflow: hidden;
+  color: var(--prim1);
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.corner-action:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.corner-action:disabled:hover {
+  background: color-mix(in srgb, var(--bg-inset) 80%, transparent);
+  border-color: color-mix(in srgb, var(--prim1) 35%, transparent);
+  color: color-mix(in srgb, var(--prim1) 70%, white 22%);
 }
 
 .new-session-button {
@@ -904,8 +915,47 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
   white-space: nowrap;
   align-self: center;
   height: 30px;
-  padding: 0 0.7rem;
-  font-size: 11px;
+  min-width: 30px;
+  padding: 0 0.55rem;
+  font-size: 16px;
+  line-height: 1;
+}
+.new-session-button[data-busy] {
+  opacity: 0.55;
+  cursor: progress;
+}
+
+/* ── Attach popover (the "+") — shares the corner-menu chrome ── */
+.attach-menu {
+  min-width: 17rem;
+}
+.attach-choices {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+.attach-tag {
+  flex-shrink: 0;
+  min-width: 22px;
+  padding: 0.05rem 0.25rem;
+  border: 1px solid color-mix(in srgb, var(--copper-hot) 55%, transparent);
+  color: var(--copper-hot);
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-align: center;
+}
+.attach-menu-foot {
+  max-width: 24rem;
+  margin: 0.15rem 0.2rem 0;
+  overflow: hidden;
+  color: var(--text-tertiary);
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .session-editor {
