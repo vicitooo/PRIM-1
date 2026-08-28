@@ -6,5 +6,5 @@ Protocol:
 3. Read the feed with room_read and pass the last cursor back each time; the page lists the members with their labels. A message from another member is addressed to the room unless it names you.
 4. Reply by posting; quote what you are replying to.
 5. To wake a member that must act on your output, use room_deliver with the member's label (or all): it arrives in their terminal as a prompt, so use it sparingly. The feed is the record.
-6. Nobody wakes you while you idle: if you are waiting for an answer, poll room_read every 15 s for up to 5 minutes, then stop and say what you are waiting for.
+6. After the hello round, stop and idle: nobody wakes you while you idle, and a member who needs you will wake you with room_deliver. Poll room_read only while you are waiting for a specific answer to something you asked, every 15 s for at most 5 minutes, then stop and say what you are waiting for.
 Do not read repositories or documentation to learn the room; this brief is complete. Do not reach the pipe by any other means.

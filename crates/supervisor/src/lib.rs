@@ -560,7 +560,10 @@ fn render_room_brief(
             )
         }
     };
+    // The template is LF; a checkout that turned it into CRLF must not leak a
+    // carriage return into Grok's LF-only framing.
     let mut text = ROOM_BRIEF_TEMPLATE
+        .replace("\r\n", "\n")
         .replace("{tools}", &tools)
         .replace("{members}", &others)
         .replace("{your_label}", &you.label)
