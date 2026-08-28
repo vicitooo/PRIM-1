@@ -1920,55 +1920,292 @@ textarea:focus-visible {
    LIGHT THEME
    ══════════════════════════════════════ */
 
+/* ══════════════════════════════════════
+   PLAIN THEMES — dark (default) and light.
+   Flat chrome, no scanlines / vignette / glow / ticker / filters; the
+   terminal is a plain console. Only palette + effect overrides live here —
+   layout is shared with the HUD themes.
+   ══════════════════════════════════════ */
+
+[data-theme="dark"] {
+  --bg-base:       #000000;
+  --bg-panel:      #000000;
+  --bg-inset:      #101010;
+  --bg-hover:      #1a1a1a;
+  --bg-active:     #262626;
+  --terminal-session-bg: #000000;
+
+  --bronze:        #8c8c8c;
+  --bronze-light:  #b0b0b0;
+  --bronze-dim:    rgba(140, 140, 140, 0.40);
+  --bronze-glow:   rgba(140, 140, 140, 0);
+  --copper-hot:    #a8a8a8;
+  --cyan-bright:   #ffffff;
+
+  --red:           #c50f1f;
+  --red-bright:    #e74856;
+  --red-deep:      #7a0a14;
+
+  --prim1:        #ffffff;
+  --prim1-deep:   #b0b0b0;
+  --prim1-glow:   rgba(255, 255, 255, 0);
+
+  --green:         #16c60c;
+  --amber:         #f9f1a5;
+
+  --text-primary:   #f2f2f2;
+  --text-secondary: #b0b0b0;
+  --text-tertiary:  #6e6e6e;
+
+  --frame:          rgba(255, 255, 255, 0.30);
+  --frame-soft:     rgba(255, 255, 255, 0.18);
+  --frame-inner:    rgba(255, 255, 255, 0.10);
+  --frame-dark:     rgba(0, 0, 0, 0.55);
+}
+
 [data-theme="light"] {
-  --bg-base:       #e8e4df;
-  --bg-panel:      #f2efeb;
-  --bg-inset:      #ddd9d4;
-  --terminal-session-bg: #e8e4df;
+  --bg-base:       #ffffff;
+  --bg-panel:      #ffffff;
+  --bg-inset:      #f3f3f3;
+  --bg-hover:      #e9e9e9;
+  --bg-active:     #dcdcdc;
+  --terminal-session-bg: #ffffff;
 
-  --bronze:        #7a6048;
-  --bronze-light:  #8a7058;
-  --bronze-dim:    rgba(122, 96, 72, 0.35);
-  --bronze-glow:   rgba(122, 96, 72, 0.10);
-  --copper-hot:    #2a5a5a;
+  --bronze:        #6b6b6b;
+  --bronze-light:  #4a4a4a;
+  --bronze-dim:    rgba(107, 107, 107, 0.40);
+  --bronze-glow:   rgba(107, 107, 107, 0);
+  --copper-hot:    #3a3a3a;
+  --cyan-bright:   #000000;
 
-  --red:           #b22552;
-  --red-bright:    #d6294e;
-  --red-deep:      #7a1a3a;
+  --red:           #c50f1f;
+  --red-bright:    #b0101c;
+  --red-deep:      #7a0a14;
 
-  --text-primary:   #2a2520;
-  --text-secondary: #5a5448;
-  --text-tertiary:  #8a8278;
+  --prim1:        #1e1e1e;
+  --prim1-deep:   #4a4a4a;
+  --prim1-glow:   rgba(0, 0, 0, 0);
 
-  --frame:          rgba(100, 80, 60, 0.35);
-  --frame-soft:     rgba(100, 80, 60, 0.18);
-  --frame-inner:    rgba(100, 80, 60, 0.12);
+  --green:         #13a10e;
+  --amber:         #c19c00;
+
+  --text-primary:   #1e1e1e;
+  --text-secondary: #4a4a4a;
+  --text-tertiary:  #8a8a8a;
+
+  --frame:          rgba(0, 0, 0, 0.35);
+  --frame-soft:     rgba(0, 0, 0, 0.18);
+  --frame-inner:    rgba(0, 0, 0, 0.10);
   --frame-dark:     rgba(0, 0, 0, 0.08);
 }
 
-[data-theme="light"] body { background: var(--bg-base); background-image: none; }
-[data-theme="light"] body::before {
-  background: radial-gradient(ellipse at center, transparent 50%, rgba(0,0,0,0.08) 100%);
+/* Flat field: no scanlines, no vignette, no forge glow, no marquee. */
+[data-theme="dark"] body,
+[data-theme="light"] body {
+  background: var(--bg-base);
+  background-image: none;
 }
-[data-theme="light"] body::after { opacity: 0; }
+[data-theme="dark"] body::before,
+[data-theme="light"] body::before,
+[data-theme="dark"] body::after,
+[data-theme="light"] body::after {
+  display: none;
+}
+[data-theme="dark"] .prim1-ticker,
+[data-theme="light"] .prim1-ticker {
+  display: none;
+}
 
+/* Flat panels: the chamfer border stays, the glow and boot animation go. */
+[data-theme="dark"] .panel,
 [data-theme="light"] .panel {
-  background: var(--bg-panel);
-  box-shadow:
-    inset 0 0 0 1px var(--frame-inner),
-    0 1px 2px rgba(0, 0, 0, 0.06),
-    0 4px 12px rgba(0, 0, 0, 0.08);
+  filter: none;
+  animation: none;
 }
-
+[data-theme="dark"] .panel::before,
+[data-theme="light"] .panel::before {
+  border-color: var(--frame-inner);
+}
+[data-theme="dark"] .topbar h1,
+[data-theme="light"] .topbar h1,
+[data-theme="dark"] .terminal-card .card-head h2,
+[data-theme="light"] .terminal-card .card-head h2,
+[data-theme="dark"] .rooms-view .room-card .card-head h2,
+[data-theme="light"] .rooms-view .room-card .card-head h2 {
+  text-shadow: none;
+  filter: none;
+}
+[data-theme="dark"] .brand-logo,
+[data-theme="light"] .brand-logo,
+[data-theme="dark"] .brand-logo-frame,
+[data-theme="light"] .brand-logo-frame,
+[data-theme="dark"] .corner-button,
+[data-theme="light"] .corner-button,
+[data-theme="dark"] .corner-button:hover,
+[data-theme="light"] .corner-button:hover,
+[data-theme="dark"] .corner-button-glyph,
+[data-theme="light"] .corner-button-glyph {
+  filter: none;
+  text-shadow: none;
+}
+[data-theme="dark"] .corner-button-particles,
+[data-theme="light"] .corner-button-particles {
+  display: none;
+}
+[data-theme="dark"] .corner-menu,
+[data-theme="light"] .corner-menu {
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+[data-theme="light"] .corner-menu {
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+}
+[data-theme="dark"] .session-tab[aria-selected="true"],
+[data-theme="light"] .session-tab[aria-selected="true"] {
+  background: color-mix(in srgb, var(--prim1) 12%, transparent);
+}
 [data-theme="light"] .terminal-host,
 [data-theme="light"] .system-terminal {
-  box-shadow: inset 0 1px 4px rgba(0, 0, 0, 0.08);
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.08);
+}
+[data-theme="light"] ::-webkit-scrollbar-thumb { background: rgba(0, 0, 0, 0.22); }
+[data-theme="dark"] ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.22); }
+
+/* Corner button in the plain themes: a dark square with a white glyph — no
+   gradient, no pulse, readable on both fields. */
+[data-theme="dark"] .corner-button,
+[data-theme="light"] .corner-button,
+[data-theme="dark"] .corner-button:hover,
+[data-theme="light"] .corner-button:hover {
+  background: #1c1c1c;
+  border: 1.5px solid rgba(255, 255, 255, 0.55);
+  color: #ffffff;
+  animation: none;
+}
+[data-theme="dark"] .corner-button-glyph,
+[data-theme="light"] .corner-button-glyph {
+  color: #ffffff;
+  text-shadow: none;
 }
 
-[data-theme="light"] [data-action="start"]   { --btn-color: #3a6a28; }
-[data-theme="light"] [data-action="restart"] { --btn-color: #7a6020; }
-
-[data-theme="light"] ::-webkit-scrollbar-thumb { background: rgba(100, 80, 60, 0.20); }
+/* ── Themes page ── */
+.themes-view {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+}
+.theme-gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 1rem;
+}
+.theme-card {
+  display: grid;
+  grid-template-rows: auto auto 1fr auto;
+  gap: 0.5rem;
+  padding: 0.6rem;
+  text-align: left;
+  min-width: 0;
+  background: var(--bg-inset);
+  border: 1px solid var(--frame-soft);
+  border-radius: 0;
+  clip-path: none;
+  box-shadow: none;
+  text-shadow: none;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: border-color var(--duration-fast) var(--easing), background var(--duration-fast) var(--easing);
+}
+.theme-card:hover {
+  border-color: var(--prim1);
+  background: var(--bg-hover);
+  box-shadow: none;
+}
+.theme-card[aria-pressed="true"] {
+  border-color: var(--prim1);
+  box-shadow: inset 0 0 0 1px var(--prim1);
+}
+.theme-card-shot {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  object-position: top left;
+  background: #000;
+  border: 1px solid var(--frame-inner);
+}
+.theme-card-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.theme-card-name {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--prim1);
+}
+.theme-card-state {
+  display: none;
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--copper-hot);
+}
+.theme-card[aria-pressed="true"] .theme-card-state {
+  display: inline;
+}
+.theme-card-blurb {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
+.theme-card-use {
+  justify-self: start;
+  padding: 0.3rem 0.7rem;
+  border: 1px solid var(--frame);
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-primary);
+}
+.theme-card[aria-pressed="true"] .theme-card-use {
+  opacity: 0.45;
+}
+.theme-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+  max-width: 46rem;
+  margin-top: 0.4rem;
+  padding: 0.6rem 0.7rem;
+  border: 1px solid var(--frame-inner);
+  background: var(--bg-inset);
+  cursor: pointer;
+}
+.theme-option input[type="checkbox"] {
+  margin-top: 0.15rem;
+  accent-color: var(--prim1);
+}
+.theme-option-text {
+  display: grid;
+  gap: 0.2rem;
+}
+.theme-option-name {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--prim1);
+}
+.theme-option-hint {
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
 
 /* ══════════════════════════════════════
    RESPONSIVE

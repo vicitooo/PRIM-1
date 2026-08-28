@@ -49,6 +49,7 @@ import {
   retainRoomFeedWindow,
 } from "./room-feed";
 import "./styles.css";
+import { SgrColourFilter } from "./sgr-filter";
 import type {
   AddRoomMemberRequest,
   ChooseSessionWorkingDirectoryRequest,
@@ -292,6 +293,30 @@ app.innerHTML = `
       </article>
     </section>
 
+    <!-- Themes view (corner menu → Themes): one card per theme with a real screenshot. -->
+    <section class="themes-view" id="themes-view" hidden aria-label="Themes">
+      <article class="panel view-card">
+        <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
+        <div class="card-head view-head">
+          <div class="card-title">
+            <h2>Themes</h2>
+          </div>
+          <button type="button" class="ghost view-back" data-corner="themes">Back to sessions</button>
+        </div>
+        <div class="view-body">
+          <p class="view-hint">Pick the look. It applies immediately and is remembered. Dark and Light show harness output the way a normal terminal does; the two PRIM-1 themes are the original HUD look.</p>
+          <div class="theme-gallery" id="theme-gallery"></div>
+          <label class="theme-option" for="unicolor-toggle">
+            <input type="checkbox" id="unicolor-toggle" />
+            <span class="theme-option-text">
+              <span class="theme-option-name">Unicolor</span>
+              <span class="theme-option-hint">Render every harness in the theme's text colour: the harness's own colours are dropped; bold, italic and underline stay. Off, a harness paints with its own colours as in a normal terminal. Applies to new output.</span>
+            </span>
+          </label>
+        </div>
+      </article>
+    </section>
+
     <!-- Help view (corner menu → Help, F1). Every gesture and key the UI has. -->
     <section class="help-view" id="help-view" hidden aria-label="Help">
       <article class="panel view-card">
@@ -332,7 +357,7 @@ app.innerHTML = `
             <dl class="help-list">
               <dt>Rooms</dt><dd>Teams of sessions with a shared feed. <b>Post to feed</b> is a bulletin board: nobody is interrupted, the harnesses read it. <b>Send</b> delivers the text into one member's terminal as typed input — refused while that harness sits on a prompt or its state is unknown ("framing is blocked": type into its terminal instead).</dd>
               <dt>System log</dt><dd>The runtime's own messages in a bottom drawer. A red dot on the button means an error landed while the drawer was hidden; a failed close opens it.</dd>
-              <dt>Theme</dt><dd>Cycles the colour theme.</dd>
+              <dt>Themes</dt><dd>The theme gallery — one screenshot per theme; Dark and Light are plain terminal looks, the two PRIM-1 themes are the HUD look. <b>Unicolor</b> (off by default) drops the harnesses' own colours so everything renders in the theme's text colour.</dd>
               <dt>Fullscreen</dt><dd>Same as F11.</dd>
               <dt>Refresh state</dt><dd>Re-reads sessions and rooms from the supervisor.</dd>
               <dt>Settings</dt><dd>Which harnesses sit in the + menu; the runtime paths.</dd>
@@ -391,11 +416,10 @@ app.innerHTML = `
       <span class="corner-action-state" data-corner-log-state>off</span>
     </button>
     <div class="corner-menu-sep" role="separator"></div>
-    <label class="corner-action corner-action-row" for="theme-toggle">
-      <span class="corner-action-glyph" aria-hidden="true">&#9673;</span>
-      <span class="corner-action-label">Theme</span>
-      <button type="button" class="theme-toggle" id="theme-toggle" aria-label="Toggle theme" title="Toggle theme"></button>
-    </label>
+    <button type="button" class="corner-action" data-corner="themes" role="menuitem">
+      <span class="corner-action-glyph" aria-hidden="true">&#9680;</span>
+      <span class="corner-action-label" data-corner-view-label="themes">Themes</span>
+    </button>
     <button type="button" class="corner-action" data-corner="fullscreen" role="menuitem">
       <span class="corner-action-glyph" aria-hidden="true">&#9974;</span>
       <span class="corner-action-label">Fullscreen</span>
@@ -456,6 +480,24 @@ app.innerHTML = `
   </div>
 `;
 
+/** Unicolor (Themes page): drop the harnesses' own colours on the way into
+    xterm so everything renders in the theme's text colour. Off by default —
+    a normal terminal shows the harness's colours. */
+let unicolor = localStorage.getItem("prim1-unicolor") === "1";
+
+function setUnicolor(enabled: boolean): void {
+  if (unicolor === enabled) {
+    return;
+  }
+  unicolor = enabled;
+  localStorage.setItem("prim1-unicolor", enabled ? "1" : "0");
+  if (!enabled) {
+    for (const pane of paneMap.values()) {
+      pane.releaseColourFilter();
+    }
+  }
+}
+
 class SessionTerminal {
   readonly sessionId: string;
   alias: string;
@@ -470,6 +512,7 @@ class SessionTerminal {
   private readonly initialBannerLabel: HTMLElement;
   private readonly initialBannerElement: HTMLDivElement;
   private snapshot: SessionSnapshot | null = null;
+  private readonly colourFilter = new SgrColourFilter();
 
   constructor(sessionId: string, alias: string, label: string) {
     this.sessionId = sessionId;
@@ -483,29 +526,8 @@ class SessionTerminal {
       cursorBlink: true,
       fontFamily: '"JetBrains Mono", "Cascadia Code", Consolas, monospace',
       fontSize: 13,
-      theme: {
-        background: "#03060a",
-        foreground: "#ff2d8c",
-        cursor: "#5dbabe",
-        cursorAccent: "#03060a",
-        selectionBackground: "rgba(93, 186, 190, 0.22)",
-        black: "#03060a",
-        brightBlack: "#9a2858",
-        red: "#ff2d6f",
-        brightRed: "#ff5a8d",
-        green: "#00ff99",
-        brightGreen: "#5affb8",
-        yellow: "#d8e02a",
-        brightYellow: "#ecf055",
-        blue: "#00aaff",
-        brightBlue: "#5acdff",
-        magenta: "#ff2dd6",
-        brightMagenta: "#ff70e8",
-        cyan: "#5dbabe",
-        brightCyan: "#7dd0d4",
-        white: "#b8e8ff",
-        brightWhite: "#e0f7ff",
-      },
+      // New panes start in the active theme; applyTheme() keeps them in sync.
+      theme: TERMINAL_THEMES[currentThemeName()].session,
     });
     this.fitAddon = new FitAddon();
     this.terminal.loadAddon(this.fitAddon);
@@ -578,7 +600,15 @@ class SessionTerminal {
   }
 
   write(chunk: string): void {
-    this.initialBanner.forwardOutput(chunk);
+    this.initialBanner.forwardOutput(unicolor ? this.colourFilter.apply(chunk) : chunk);
+  }
+
+  /** Unicolor switched off mid-stream: hand any held partial sequence on. */
+  releaseColourFilter(): void {
+    const carried = this.colourFilter.flush();
+    if (carried) {
+      this.initialBanner.forwardOutput(carried);
+    }
   }
 
   fit(): void {
@@ -599,28 +629,22 @@ const systemTerminal = new Terminal({
   disableStdin: true,
   fontFamily: '"JetBrains Mono", "Cascadia Code", Consolas, monospace',
   fontSize: 12,
+  // The Dark system palette (TERMINAL_THEMES is declared further down, so the
+  // literal is repeated here); applyTheme() replaces it at startup.
   theme: {
-    background: "#03060a",
-    foreground: "#e0f7ff",
-    cursor: "#d8e02a",
-    cursorAccent: "#03060a",
-    selectionBackground: "rgba(216, 224, 42, 0.22)",
-    black: "#03060a",
-    brightBlack: "#2a3a55",
-    red: "#ff2d6f",
-    brightRed: "#ff5a8d",
-    green: "#00ff99",
-    brightGreen: "#5affb8",
-    yellow: "#d8e02a",
-    brightYellow: "#ecf055",
-    blue: "#00aaff",
-    brightBlue: "#5acdff",
-    magenta: "#ff2dd6",
-    brightMagenta: "#ff70e8",
-    cyan: "#5dbabe",
-    brightCyan: "#7dd0d4",
-    white: "#b8e8ff",
-    brightWhite: "#e0f7ff",
+    background: "#000000",
+    foreground: "#cccccc",
+    cursor: "#ffffff",
+    cursorAccent: "#000000",
+    selectionBackground: "rgba(255, 255, 255, 0.18)",
+    black: "#0c0c0c", brightBlack: "#767676",
+    red: "#c50f1f", brightRed: "#e74856",
+    green: "#13a10e", brightGreen: "#16c60c",
+    yellow: "#c19c00", brightYellow: "#f9f1a5",
+    blue: "#0037da", brightBlue: "#3b78ff",
+    magenta: "#881798", brightMagenta: "#b4009e",
+    cyan: "#3a96dd", brightCyan: "#61d6d6",
+    white: "#cccccc", brightWhite: "#f2f2f2",
   },
 });
 const systemFit = new FitAddon();
@@ -667,17 +691,21 @@ const tabMenu = must<HTMLDivElement>("#tab-menu");
 const zeroAttachChoices = must<HTMLDivElement>("#zero-attach-choices");
 const settingsView = must<HTMLElement>("#settings-view");
 const helpView = must<HTMLElement>("#help-view");
+const themesView = must<HTMLElement>("#themes-view");
+const themeGallery = must<HTMLDivElement>("#theme-gallery");
+const unicolorToggle = must<HTMLInputElement>("#unicolor-toggle");
 const quickAttachSettings = must<HTMLUListElement>("#quick-attach-settings");
 const settingsWorkspace = must<HTMLElement>("#settings-workspace");
 const settingsRuntimeDir = must<HTMLElement>("#settings-runtime-dir");
 const settingsAuditPath = must<HTMLElement>("#settings-audit-path");
 const settingsControlEndpoint = must<HTMLElement>("#settings-control-endpoint");
-type ShellView = "sessions" | "rooms" | "settings" | "help";
+type ShellView = "sessions" | "rooms" | "settings" | "help" | "themes";
 const VIEW_NAMES: Record<ShellView, string> = {
   sessions: "Sessions",
   rooms: "Rooms",
   settings: "Settings",
   help: "Help",
+  themes: "Themes",
 };
 let shellView: ShellView = "sessions";
 let cornerMenuOpen = false;
@@ -865,88 +893,180 @@ const TERMINAL_THEMES = {
       white: "#f0d4e8", brightWhite: "#ffeaf5",
     },
   },
-  light: {
+  /* A plain terminal: black field, white text, the Windows Terminal
+     "Campbell" ANSI palette — harness output looks exactly as it does in a
+     normal console. The default for anyone who never chose a theme. */
+  dark: {
     session: {
-      background: "#e8e4df",
-      foreground: "#2a2520",
-      cursor: "#8a5550",
-      cursorAccent: "#e8e4df",
-      selectionBackground: "rgba(138, 85, 80, 0.18)",
-      black: "#2a2520", brightBlack: "#6a6458",
-      red: "#7a3a32", brightRed: "#8a4a42",
-      green: "#3a6a28", brightGreen: "#4a7a38",
-      yellow: "#7a6020", brightYellow: "#8a7030",
-      blue: "#3a5a8a", brightBlue: "#4a6a9a",
-      magenta: "#6a4a70", brightMagenta: "#7a5a80",
-      cyan: "#2a5a5a", brightCyan: "#3a6a6a",
-      white: "#b5aea5", brightWhite: "#e8e4df",
+      background: "#000000",
+      foreground: "#f2f2f2",
+      cursor: "#ffffff",
+      cursorAccent: "#000000",
+      selectionBackground: "rgba(255, 255, 255, 0.22)",
+      black: "#0c0c0c", brightBlack: "#767676",
+      red: "#c50f1f", brightRed: "#e74856",
+      green: "#13a10e", brightGreen: "#16c60c",
+      yellow: "#c19c00", brightYellow: "#f9f1a5",
+      blue: "#0037da", brightBlue: "#3b78ff",
+      magenta: "#881798", brightMagenta: "#b4009e",
+      cyan: "#3a96dd", brightCyan: "#61d6d6",
+      white: "#cccccc", brightWhite: "#f2f2f2",
     },
     system: {
-      background: "#ddd9d4",
-      foreground: "#2a2520",
-      cursor: "#7a6048",
-      cursorAccent: "#ddd9d4",
-      selectionBackground: "rgba(122, 96, 72, 0.15)",
-      black: "#2a2520", brightBlack: "#6a6458",
-      red: "#7a3a32", brightRed: "#8a4a42",
-      green: "#3a6a28", brightGreen: "#4a7a38",
-      yellow: "#7a6020", brightYellow: "#8a7030",
-      blue: "#3a5a8a", brightBlue: "#4a6a9a",
-      magenta: "#6a4a70", brightMagenta: "#7a5a80",
-      cyan: "#2a5a5a", brightCyan: "#3a6a6a",
-      white: "#b5aea5", brightWhite: "#ddd9d4",
+      background: "#000000",
+      foreground: "#cccccc",
+      cursor: "#ffffff",
+      cursorAccent: "#000000",
+      selectionBackground: "rgba(255, 255, 255, 0.18)",
+      black: "#0c0c0c", brightBlack: "#767676",
+      red: "#c50f1f", brightRed: "#e74856",
+      green: "#13a10e", brightGreen: "#16c60c",
+      yellow: "#c19c00", brightYellow: "#f9f1a5",
+      blue: "#0037da", brightBlue: "#3b78ff",
+      magenta: "#881798", brightMagenta: "#b4009e",
+      cyan: "#3a96dd", brightCyan: "#61d6d6",
+      white: "#cccccc", brightWhite: "#f2f2f2",
+    },
+  },
+  /* The same idea on white: near-black text, a light ANSI palette. */
+  light: {
+    session: {
+      background: "#ffffff",
+      foreground: "#1e1e1e",
+      cursor: "#1e1e1e",
+      cursorAccent: "#ffffff",
+      selectionBackground: "rgba(0, 0, 0, 0.16)",
+      black: "#383a42", brightBlack: "#4f525d",
+      red: "#e45649", brightRed: "#df6c75",
+      green: "#50a14f", brightGreen: "#98c379",
+      yellow: "#c18401", brightYellow: "#e4c07a",
+      blue: "#0184bc", brightBlue: "#61afef",
+      magenta: "#a626a4", brightMagenta: "#c577dd",
+      cyan: "#0997b3", brightCyan: "#56b5c1",
+      white: "#fafafa", brightWhite: "#ffffff",
+    },
+    system: {
+      background: "#f6f6f6",
+      foreground: "#1e1e1e",
+      cursor: "#1e1e1e",
+      cursorAccent: "#f6f6f6",
+      selectionBackground: "rgba(0, 0, 0, 0.12)",
+      black: "#383a42", brightBlack: "#4f525d",
+      red: "#e45649", brightRed: "#df6c75",
+      green: "#50a14f", brightGreen: "#98c379",
+      yellow: "#c18401", brightYellow: "#e4c07a",
+      blue: "#0184bc", brightBlue: "#61afef",
+      magenta: "#a626a4", brightMagenta: "#c577dd",
+      cyan: "#0997b3", brightCyan: "#56b5c1",
+      white: "#fafafa", brightWhite: "#ffffff",
     },
   },
 } as const;
 
 type ThemeName = keyof typeof TERMINAL_THEMES;
 
-/** Themes the picker cycles through. `light` is intentionally excluded \u2014 kept
-    in TERMINAL_THEMES + styles.css for future repair but not user-exposed. */
-const THEME_CYCLE: ThemeName[] = ["prim1", "prim1-deep"];
-
-const THEME_LABELS: Record<ThemeName, { glyph: string; label: string }> = {
-  prim1:        { glyph: "\u25C7", label: "PRIM-1" },       // \u25C7 open diamond
-  "prim1-deep": { glyph: "\u25C6", label: "PRIM-1 DEEP" },  // \u25C6 filled diamond
-  light:            { glyph: "\u25C8", label: "LIGHT" },
+/** The Themes page lists these, in this order, each with a real screenshot of
+    the app in that theme (public/textures/themes/<name>.png). */
+const THEME_ORDER: ThemeName[] = ["dark", "light", "prim1", "prim1-deep"];
+const DEFAULT_THEME: ThemeName = "dark";
+const THEME_META: Record<ThemeName, { label: string; blurb: string }> = {
+  dark: {
+    label: "Dark",
+    blurb: "Black field, white text, standard terminal colours. Harness output looks exactly as in a normal console.",
+  },
+  light: {
+    label: "Light",
+    blurb: "White field, near-black text, a light terminal palette. Same plain chrome as Dark.",
+  },
+  prim1: {
+    label: "PRIM-1",
+    blurb: "The original HUD look: yellow frames, magenta text, scanlines and glow.",
+  },
+  "prim1-deep": {
+    label: "PRIM-1 Deep",
+    blurb: "The HUD look with everything in magenta, plus the dissolve effects.",
+  },
 };
 
-function applyTheme(name: ThemeName): void {
+/** `chosen` marks an explicit pick on the Themes page; only those survive as
+    a preference. Values written by the old cycle button were never a choice,
+    so a user who never picked lands on the default. */
+function applyTheme(name: ThemeName, chosen = false): void {
   document.documentElement.dataset.theme = name;
   localStorage.setItem("prim1-theme", name);
+  if (chosen) {
+    localStorage.setItem("prim1-theme-chosen", "1");
+  }
 
   const themes = TERMINAL_THEMES[name];
   for (const pane of paneMap.values()) {
     pane.terminal.options.theme = themes.session;
   }
   systemTerminal.options.theme = themes.system;
-
-  const toggleEl = document.getElementById("theme-toggle");
-  if (toggleEl) {
-    const meta = THEME_LABELS[name];
-    toggleEl.textContent = meta.glyph;
-    const nextIdx = (THEME_CYCLE.indexOf(name) + 1) % THEME_CYCLE.length;
-    const next = THEME_CYCLE[nextIdx] ?? THEME_CYCLE[0];
-    toggleEl.title = `${meta.label} \u2014 click for ${THEME_LABELS[next].label}`;
-    toggleEl.dataset.activeTheme = name;
-  }
+  markCurrentThemeCard(name);
 }
 
 function currentThemeName(): ThemeName {
   const stored = document.documentElement.dataset.theme;
   if (stored && stored in TERMINAL_THEMES) return stored as ThemeName;
-  return "prim1";
+  return DEFAULT_THEME;
 }
 
-function wireThemeToggle(): void {
-  const toggleEl = must<HTMLButtonElement>("#theme-toggle");
-  toggleEl.addEventListener("click", () => {
-    const current = currentThemeName();
-    const cycleIdx = THEME_CYCLE.indexOf(current);
-    // If currently on a non-cycled theme (e.g. legacy light), jump to first cycled theme
-    const nextIdx = cycleIdx === -1 ? 0 : (cycleIdx + 1) % THEME_CYCLE.length;
-    applyTheme(THEME_CYCLE[nextIdx]);
+/** Themes page: one card per theme — screenshot, name, blurb, Use. */
+function wireThemesPage(): void {
+  themeGallery.replaceChildren(
+    ...THEME_ORDER.map((name) => {
+      const meta = THEME_META[name];
+      const card = document.createElement("button");
+      card.type = "button";
+      card.className = "theme-card";
+      card.dataset.themePick = name;
+      card.setAttribute("aria-pressed", "false");
+      const shot = document.createElement("img");
+      shot.className = "theme-card-shot";
+      shot.src = `/textures/themes/${name}.png`;
+      shot.alt = `${meta.label} theme`;
+      shot.loading = "lazy";
+      const title = document.createElement("span");
+      title.className = "theme-card-title";
+      const label = document.createElement("span");
+      label.className = "theme-card-name";
+      label.textContent = meta.label;
+      const state = document.createElement("span");
+      state.className = "theme-card-state";
+      state.textContent = "current";
+      title.append(label, state);
+      const blurb = document.createElement("span");
+      blurb.className = "theme-card-blurb";
+      blurb.textContent = meta.blurb;
+      const use = document.createElement("span");
+      use.className = "theme-card-use";
+      use.textContent = "Use this theme";
+      card.append(shot, title, blurb, use);
+      return card;
+    }),
+  );
+  unicolorToggle.checked = unicolor;
+  unicolorToggle.addEventListener("change", () => {
+    setUnicolor(unicolorToggle.checked);
   });
+  themeGallery.addEventListener("click", (event) => {
+    if (!(event.target instanceof Element)) {
+      return;
+    }
+    const card = event.target.closest<HTMLButtonElement>("[data-theme-pick]");
+    const name = card?.dataset.themePick;
+    if (name && name in TERMINAL_THEMES) {
+      applyTheme(name as ThemeName, true);
+    }
+  });
+}
+
+function markCurrentThemeCard(name: ThemeName): void {
+  for (const card of themeGallery.querySelectorAll<HTMLButtonElement>("[data-theme-pick]")) {
+    const current = card.dataset.themePick === name;
+    card.setAttribute("aria-pressed", String(current));
+  }
 }
 
 /** Shell views + drawers. Only presentation: the room and system-log DOM and
@@ -959,6 +1079,7 @@ function setShellView(view: ShellView): void {
   roomsView.hidden = view !== "rooms";
   settingsView.hidden = view !== "settings";
   helpView.hidden = view !== "help";
+  themesView.hidden = view !== "themes";
   brandActiveTag.textContent = VIEW_NAMES[view];
   for (const label of cornerMenu.querySelectorAll<HTMLElement>("[data-corner-view-label]")) {
     const target = label.dataset.cornerViewLabel as ShellView;
@@ -1132,7 +1253,8 @@ function runCornerAction(kind: string): void {
   switch (kind) {
     case "rooms":
     case "settings":
-    case "help": {
+    case "help":
+    case "themes": {
       const view = kind as ShellView;
       setShellView(shellView === view ? "sessions" : view);
       setCornerMenuOpen(false);
@@ -1377,12 +1499,13 @@ function secondaryAnsiRgb(): string {
   return `${parseInt(m[1], 16)};${parseInt(m[2], 16)};${parseInt(m[3], 16)}`;
 }
 
-/** Load saved theme from localStorage, migrating legacy "dark" \u2192 "prim1" */
+/** The stored theme counts only if it was picked on the Themes page; values
+    left behind by the old cycle button fall back to the default. */
 function loadSavedTheme(): ThemeName {
   const raw = localStorage.getItem("prim1-theme");
-  if (raw === "dark" || raw === null) return "prim1";
-  if (raw in TERMINAL_THEMES) return raw as ThemeName;
-  return "prim1";
+  const chosen = localStorage.getItem("prim1-theme-chosen") === "1";
+  if (chosen && raw !== null && raw in TERMINAL_THEMES) return raw as ThemeName;
+  return DEFAULT_THEME;
 }
 
 applyTheme(loadSavedTheme());
@@ -1392,7 +1515,8 @@ wireRoomUi();
 wireControls();
 wireResize();
 wireTerminalShortcuts();
-wireThemeToggle();
+wireThemesPage();
+markCurrentThemeCard(currentThemeName());
 wireWindowControls();
 wireCornerButton();
 wireAttachMenu();
