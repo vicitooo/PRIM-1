@@ -190,6 +190,7 @@ app.innerHTML = `
             <input id="session-linux-working-directory" type="text" autocomplete="off" spellcheck="false" placeholder="Ubuntu home when blank" />
           </label>
           <p class="permission-warning" id="permission-warning" role="alert" hidden></p>
+          <p class="session-form-note session-profile-note" id="permission-note"></p>
           <p class="session-form-note" id="session-form-note"></p>
           <p class="session-form-error" id="session-form-error" role="alert" hidden></p>
           <div class="session-form-actions">
@@ -199,10 +200,12 @@ app.innerHTML = `
       </section>
 
       <section class="zero-session panel" id="zero-session" hidden>
-        <p class="card-kicker">Workspace ready</p>
-        <h2>No terminal sessions</h2>
-        <p>Create a harness session in <span id="zero-workspace">the selected workspace</span>.</p>
-        <button type="button" class="primary" id="zero-new-session" aria-haspopup="menu" aria-expanded="false">Attach a harness</button>
+        <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
+        <p class="card-kicker">No sessions</p>
+        <h2>Attach a harness</h2>
+        <p>Starts in <span id="zero-workspace">the selected workspace</span>.</p>
+        <div class="zero-attach-choices" id="zero-attach-choices"></div>
+        <button type="button" class="ghost" id="zero-new-session" data-attach="custom">Custom…</button>
       </section>
 
       <section class="workspace-grid" id="workspace-grid" aria-live="polite"></section>
@@ -221,8 +224,8 @@ app.innerHTML = `
             <select id="room-select" aria-label="Active room"></select>
             <button type="button" id="new-room">New</button>
             <button type="button" class="ghost" id="rename-room">Rename</button>
-            <button type="button" class="ghost" id="move-room-left" aria-label="Move room left">←</button>
-            <button type="button" class="ghost" id="move-room-right" aria-label="Move room right">→</button>
+            <button type="button" class="ghost" id="move-room-left" aria-label="Move room left" hidden>←</button>
+            <button type="button" class="ghost" id="move-room-right" aria-label="Move room right" hidden>→</button>
             <button type="button" class="ghost danger" id="delete-room">Delete</button>
           </div>
         </div>
@@ -256,6 +259,85 @@ app.innerHTML = `
             <button type="button" class="primary" id="room-send">Send</button>
           </div>
           <p id="room-status" class="room-status" aria-live="polite"></p>
+        </div>
+      </article>
+    </section>
+
+    <!-- Settings view (corner menu → Settings). Local preferences + runtime facts. -->
+    <section class="settings-view" id="settings-view" hidden aria-label="Settings">
+      <article class="panel view-card">
+        <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
+        <div class="card-head view-head">
+          <div class="card-title">
+            <h2>Settings</h2>
+          </div>
+          <button type="button" class="ghost view-back" data-corner="settings">Back to sessions</button>
+        </div>
+        <div class="view-body">
+          <section class="view-section">
+            <h3>Quick attach menu</h3>
+            <p class="view-hint">Which harnesses the <kbd>+</kbd> menu and the empty workspace offer, and in what order. Custom… is always there.</p>
+            <ul class="settings-list" id="quick-attach-settings"></ul>
+          </section>
+          <section class="view-section">
+            <h3>Runtime</h3>
+            <dl class="settings-facts">
+              <dt>Workspace</dt><dd class="mono" id="settings-workspace">—</dd>
+              <dt>Runtime dir</dt><dd class="mono" id="settings-runtime-dir">—</dd>
+              <dt>Audit log</dt><dd class="mono" id="settings-audit-path">—</dd>
+              <dt>Control endpoint</dt><dd class="mono" id="settings-control-endpoint">—</dd>
+            </dl>
+          </section>
+        </div>
+      </article>
+    </section>
+
+    <!-- Help view (corner menu → Help, F1). Every gesture and key the UI has. -->
+    <section class="help-view" id="help-view" hidden aria-label="Help">
+      <article class="panel view-card">
+        <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
+        <div class="card-head view-head">
+          <div class="card-title">
+            <h2>Help</h2>
+          </div>
+          <button type="button" class="ghost view-back" data-corner="help">Back to sessions</button>
+        </div>
+        <div class="view-body">
+          <section class="view-section">
+            <h3>Sessions</h3>
+            <dl class="help-list">
+              <dt><kbd>+</kbd></dt><dd>Pick a harness — the session is created and launched in one step. <b>Custom…</b> opens the full form (label, permission profile, working directory). Settings chooses which harnesses are listed.</dd>
+              <dt>Tab</dt><dd>Click to switch. <b>Drag</b> a tab to reorder. <b>Right-click</b> for Move left / Move right / Edit… / Close.</dd>
+              <dt>×</dt><dd>Closes the session the way you would by hand: leaves its room, stops the harness, deletes it — one confirmation. Terminal scrollback is discarded.</dd>
+              <dt>Pane strip</dt><dd>Launch / Restart / Stop / Edit for the open session; the dot in the tab is its state (copper = ready or idle, bronze = busy or starting, red = stalled or failed).</dd>
+              <dt>Normal / Unsafe</dt><dd>What the profile actually passes to the harness — Claude Code: <code>--permission-mode manual</code> vs <code>--dangerously-skip-permissions</code>. Codex: <code>--ask-for-approval on-request --sandbox workspace-write</code> vs <code>--dangerously-bypass-approvals-and-sandbox</code>. Grok Build: <code>--permission-mode default</code> vs <code>--permission-mode bypassPermissions</code>. Prime and Terminal: Normal only.</dd>
+            </dl>
+          </section>
+          <section class="view-section">
+            <h3>Keyboard</h3>
+            <dl class="help-list">
+              <dt><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>T</kbd></dt><dd>Attach a harness (opens the + menu)</dd>
+              <dt><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>W</kbd></dt><dd>Close the active session</dd>
+              <dt><kbd>Ctrl</kbd>+<kbd>Tab</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Tab</kbd></dt><dd>Next / previous tab</dd>
+              <dt><kbd>←</kbd> <kbd>→</kbd> <kbd>Home</kbd> <kbd>End</kbd></dt><dd>With a tab focused: select a tab</dd>
+              <dt><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd></dt><dd>With a tab focused: move it</dd>
+              <dt><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd> / <kbd>V</kbd></dt><dd>Copy the selection / paste into the focused terminal</dd>
+              <dt><kbd>F11</kbd></dt><dd>Fullscreen on / off — double-clicking the bar also leaves fullscreen</dd>
+              <dt><kbd>F1</kbd></dt><dd>This page</dd>
+              <dt><kbd>Esc</kbd></dt><dd>Closes any open menu</dd>
+            </dl>
+          </section>
+          <section class="view-section">
+            <h3>The ⇄ button — click for the menu, drag it anywhere</h3>
+            <dl class="help-list">
+              <dt>Rooms</dt><dd>Teams of sessions with a shared feed. <b>Post to feed</b> is a bulletin board: nobody is interrupted, the harnesses read it. <b>Send</b> delivers the text into one member's terminal as typed input — refused while that harness sits on a prompt or its state is unknown ("framing is blocked": type into its terminal instead).</dd>
+              <dt>System log</dt><dd>The runtime's own messages in a bottom drawer. A red dot on the button means an error landed while the drawer was hidden; a failed close opens it.</dd>
+              <dt>Theme</dt><dd>Cycles the colour theme.</dd>
+              <dt>Fullscreen</dt><dd>Same as F11.</dd>
+              <dt>Refresh state</dt><dd>Re-reads sessions and rooms from the supervisor.</dd>
+              <dt>Settings</dt><dd>Which harnesses sit in the + menu; the runtime paths.</dd>
+            </dl>
+          </section>
         </div>
       </article>
     </section>
@@ -301,7 +383,7 @@ app.innerHTML = `
   <div class="corner-menu" id="corner-menu" role="menu" hidden>
     <button type="button" class="corner-action" data-corner="rooms" role="menuitem">
       <span class="corner-action-glyph" aria-hidden="true">&#8644;</span>
-      <span class="corner-action-label" data-corner-rooms-label>Rooms</span>
+      <span class="corner-action-label" data-corner-view-label="rooms">Rooms</span>
     </button>
     <button type="button" class="corner-action" data-corner="log" role="menuitemcheckbox" aria-checked="false">
       <span class="corner-action-glyph" aria-hidden="true">&#8801;</span>
@@ -321,7 +403,17 @@ app.innerHTML = `
     </button>
     <button type="button" class="corner-action" data-control="refresh" role="menuitem">
       <span class="corner-action-glyph" aria-hidden="true">&#8635;</span>
-      <span class="corner-action-label">Refresh snapshot</span>
+      <span class="corner-action-label">Refresh state</span>
+    </button>
+    <div class="corner-menu-sep" role="separator"></div>
+    <button type="button" class="corner-action" data-corner="settings" role="menuitem">
+      <span class="corner-action-glyph" aria-hidden="true">&#9881;</span>
+      <span class="corner-action-label" data-corner-view-label="settings">Settings</span>
+    </button>
+    <button type="button" class="corner-action" data-corner="help" role="menuitem">
+      <span class="corner-action-glyph" aria-hidden="true">?</span>
+      <span class="corner-action-label" data-corner-view-label="help">Help</span>
+      <span class="corner-action-hint">F1</span>
     </button>
   </div>
 
@@ -558,6 +650,7 @@ const sessionLinuxDirectoryField = must<HTMLElement>("#session-linux-directory-f
 const sessionLinuxWorkingDirectory = must<HTMLInputElement>("#session-linux-working-directory");
 const browseSessionDirectory = must<HTMLButtonElement>("#browse-session-directory");
 const permissionWarning = must<HTMLElement>("#permission-warning");
+const permissionNote = must<HTMLElement>("#permission-note");
 const sessionFormNote = must<HTMLElement>("#session-form-note");
 const sessionFormError = must<HTMLElement>("#session-form-error");
 const saveSessionButton = must<HTMLButtonElement>("#save-session");
@@ -571,15 +664,88 @@ const attachMenu = must<HTMLDivElement>("#attach-menu");
 const attachChoices = must<HTMLDivElement>("#attach-choices");
 const attachMenuFoot = must<HTMLElement>("#attach-menu-foot");
 const tabMenu = must<HTMLDivElement>("#tab-menu");
-type ShellView = "sessions" | "rooms";
+const zeroAttachChoices = must<HTMLDivElement>("#zero-attach-choices");
+const settingsView = must<HTMLElement>("#settings-view");
+const helpView = must<HTMLElement>("#help-view");
+const quickAttachSettings = must<HTMLUListElement>("#quick-attach-settings");
+const settingsWorkspace = must<HTMLElement>("#settings-workspace");
+const settingsRuntimeDir = must<HTMLElement>("#settings-runtime-dir");
+const settingsAuditPath = must<HTMLElement>("#settings-audit-path");
+const settingsControlEndpoint = must<HTMLElement>("#settings-control-endpoint");
+type ShellView = "sessions" | "rooms" | "settings" | "help";
+const VIEW_NAMES: Record<ShellView, string> = {
+  sessions: "Sessions",
+  rooms: "Rooms",
+  settings: "Settings",
+  help: "Help",
+};
 let shellView: ShellView = "sessions";
 let cornerMenuOpen = false;
 let attachMenuOpen = false;
 let attachMenuAnchor: HTMLElement | null = null;
 let attachPending = false;
 let tabMenuSessionId: string | null = null;
+let suppressTabClickUntil = 0;
+
+/** The harnesses the "+" popover can offer, in tab-monogram order. */
+const ATTACH_DRIVERS: readonly DriverKind[] = [
+  "claude",
+  "codex",
+  "grok",
+  "prime",
+  "generic_terminal",
+];
+
+/** Settings → Quick attach menu: order of all five harnesses + the hidden ones.
+    Local preference (localStorage), validated on load; unknown entries dropped,
+    missing ones appended, so a stale value can never lose a harness. */
+interface QuickAttachPrefs {
+  order: DriverKind[];
+  hidden: DriverKind[];
+}
+const QUICK_ATTACH_KEY = "prim1-quick-attach";
+let quickAttachPrefs: QuickAttachPrefs = loadQuickAttachPrefs();
+
+function loadQuickAttachPrefs(): QuickAttachPrefs {
+  const isDriver = (value: unknown): value is DriverKind =>
+    typeof value === "string" && (ATTACH_DRIVERS as readonly string[]).includes(value);
+  let order: DriverKind[] = [];
+  let hidden: DriverKind[] = [];
+  try {
+    const raw = localStorage.getItem(QUICK_ATTACH_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as { order?: unknown; hidden?: unknown };
+      if (Array.isArray(parsed.order)) {
+        order = parsed.order.filter(isDriver);
+      }
+      if (Array.isArray(parsed.hidden)) {
+        hidden = parsed.hidden.filter(isDriver);
+      }
+    }
+  } catch {
+    /* corrupt or unavailable — defaults */
+  }
+  order = Array.from(new Set(order));
+  for (const driver of ATTACH_DRIVERS) {
+    if (!order.includes(driver)) {
+      order.push(driver);
+    }
+  }
+  return { order, hidden: Array.from(new Set(hidden)) };
+}
+
+function saveQuickAttachPrefs(): void {
+  try {
+    localStorage.setItem(QUICK_ATTACH_KEY, JSON.stringify(quickAttachPrefs));
+  } catch {
+    /* storage unavailable — the choice just won't persist */
+  }
+}
+
+function quickAttachDrivers(): DriverKind[] {
+  return quickAttachPrefs.order.filter((driver) => !quickAttachPrefs.hidden.includes(driver));
+}
 const zeroWorkspace = must<HTMLElement>("#zero-workspace");
-const zeroNewSession = must<HTMLButtonElement>("#zero-new-session");
 const roomSelect = must<HTMLSelectElement>("#room-select");
 const newRoomButton = must<HTMLButtonElement>("#new-room");
 const renameRoomButton = must<HTMLButtonElement>("#rename-room");
@@ -791,10 +957,15 @@ function setShellView(view: ShellView): void {
   shellView = view;
   appShell.dataset.view = view;
   roomsView.hidden = view !== "rooms";
-  brandActiveTag.textContent = view === "rooms" ? "Rooms" : "Sessions";
-  const label = cornerMenu.querySelector<HTMLElement>("[data-corner-rooms-label]");
-  if (label) {
-    label.textContent = view === "rooms" ? "Back to sessions" : "Rooms";
+  settingsView.hidden = view !== "settings";
+  helpView.hidden = view !== "help";
+  brandActiveTag.textContent = VIEW_NAMES[view];
+  for (const label of cornerMenu.querySelectorAll<HTMLElement>("[data-corner-view-label]")) {
+    const target = label.dataset.cornerViewLabel as ShellView;
+    label.textContent = view === target ? "Back to sessions" : VIEW_NAMES[target];
+  }
+  if (view === "settings") {
+    renderQuickAttachSettings();
   }
   requestAnimationFrame(() => {
     fitVisiblePanes();
@@ -935,6 +1106,12 @@ function wireCornerButton(): void {
   )) {
     button.addEventListener("click", () => runCornerAction("log"));
   }
+  // "Back to sessions" inside the Settings / Help views.
+  for (const button of document.querySelectorAll<HTMLButtonElement>(
+    ".view-back[data-corner]",
+  )) {
+    button.addEventListener("click", () => runCornerAction(button.dataset.corner ?? ""));
+  }
 
   document.addEventListener("click", (event) => {
     if (!cornerMenuOpen || !(event.target instanceof Node)) {
@@ -954,9 +1131,13 @@ function wireCornerButton(): void {
 function runCornerAction(kind: string): void {
   switch (kind) {
     case "rooms":
-      setShellView(shellView === "rooms" ? "sessions" : "rooms");
+    case "settings":
+    case "help": {
+      const view = kind as ShellView;
+      setShellView(shellView === view ? "sessions" : view);
       setCornerMenuOpen(false);
       break;
+    }
     case "log":
       setLogDrawer(appShell.dataset.log !== "open");
       break;
@@ -1021,6 +1202,9 @@ function wireWindowControls(): void {
         win.isFullscreen(),
       ]);
       appShell.dataset.maximized = String(maximized);
+      if (appShell.dataset.fullscreen !== String(fullscreen)) {
+        scheduleTerminalRefit();
+      }
       appShell.dataset.fullscreen = String(fullscreen);
       const maxButton = document.querySelector<HTMLButtonElement>('[data-window="maximize"]');
       if (maxButton) {
@@ -1099,6 +1283,19 @@ async function toggleFullscreen(): Promise<void> {
     return;
   }
   await settleWindow();
+  scheduleTerminalRefit();
+}
+
+/** xterm sizes its canvas from a layout the fullscreen swap has not finished —
+    the text garbled until the next tab switch. Refit a few times while the
+    transition settles. */
+function scheduleTerminalRefit(): void {
+  for (const delay of [60, 250, 700]) {
+    setTimeout(() => {
+      fitVisiblePanes();
+      systemFit.fit();
+    }, delay);
+  }
 }
 
 /** After leaving fullscreen the window can come back with a degenerate rect
@@ -1284,6 +1481,10 @@ function applySnapshot(snapshot: RuntimeSnapshot, preferredSessionId?: string): 
   controlEndpoint.textContent = snapshot.control_plane?.endpoint ?? "starting...";
   auditPath.textContent = snapshot.audit_log_path;
   runtimePath.textContent = snapshot.runtime_dir;
+  settingsWorkspace.textContent = snapshot.workspace_preference || "—";
+  settingsRuntimeDir.textContent = snapshot.runtime_dir;
+  settingsAuditPath.textContent = snapshot.audit_log_path;
+  settingsControlEndpoint.textContent = snapshot.control_plane?.endpoint ?? "starting...";
 
   for (const session of snapshot.sessions) {
     if (acceptedSessions.has(session.session_id)) {
@@ -1926,6 +2127,9 @@ function renderSessionTabs(sessions: SessionSnapshot[]): void {
     );
     tab.append(label, detail, badges);
     tab.addEventListener("click", () => {
+      if (performance.now() < suppressTabClickUntil) {
+        return; // the pointerup that ended a drag
+      }
       if (shellView !== "sessions") {
         setShellView("sessions");
       }
@@ -1934,6 +2138,7 @@ function renderSessionTabs(sessions: SessionSnapshot[]): void {
     tab.addEventListener("keydown", (event) =>
       handleFocusedTabKeydown(event, sessionId),
     );
+    wireTabDrag(tab, shell, sessionId);
 
     shell.append(
       tab,
@@ -1946,6 +2151,104 @@ function renderSessionTabs(sessions: SessionSnapshot[]): void {
     fragment.appendChild(shell);
   }
   sessionTabs.replaceChildren(fragment);
+}
+
+/** Drag a tab to reorder: pointer-based, 6 px threshold, the drop slot comes
+    from the other tabs' midpoints, and the drop calls the same move_session
+    command as the right-click menu. A press without movement is still a click. */
+function wireTabDrag(
+  tab: HTMLButtonElement,
+  shell: HTMLElement,
+  sessionId: string,
+): void {
+  let drag: {
+    pointerId: number;
+    startX: number;
+    startY: number;
+    active: boolean;
+    slot: number;
+  } | null = null;
+
+  tab.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) {
+      return;
+    }
+    drag = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      active: false,
+      slot: -1,
+    };
+  });
+  tab.addEventListener("pointermove", (event) => {
+    if (!drag || event.pointerId !== drag.pointerId) {
+      return;
+    }
+    if (!drag.active) {
+      if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) < 6) {
+        return;
+      }
+      drag.active = true;
+      tab.setPointerCapture(event.pointerId);
+      shell.dataset.dragging = "true";
+      sessionTabs.dataset.dragging = "true";
+      closeTabMenu();
+    }
+    drag.slot = markTabDropSlot(sessionId, event.clientX);
+  });
+  const finish = (event: PointerEvent): void => {
+    if (!drag || event.pointerId !== drag.pointerId) {
+      return;
+    }
+    const { active, slot } = drag;
+    drag = null;
+    if (!active) {
+      return;
+    }
+    delete shell.dataset.dragging;
+    delete sessionTabs.dataset.dragging;
+    clearTabDropSlot();
+    try {
+      tab.releasePointerCapture(event.pointerId);
+    } catch {
+      /* already released */
+    }
+    suppressTabClickUntil = performance.now() + 400;
+    if (event.type === "pointerup" && slot >= 0) {
+      void moveSessionToIndex(sessionId, slot);
+    }
+  };
+  tab.addEventListener("pointerup", finish);
+  tab.addEventListener("pointercancel", finish);
+}
+
+/** The slot among the other tabs the pointer is over (= the dragged tab's final
+    index); marks the drop line on the neighbour it would land before / after. */
+function markTabDropSlot(draggedId: string, clientX: number): number {
+  const others = Array.from(
+    sessionTabs.querySelectorAll<HTMLElement>("[data-session-tab-shell]"),
+  ).filter((shell) => shell.dataset.sessionTabShell !== draggedId);
+  let slot = 0;
+  for (const shell of others) {
+    const rect = shell.getBoundingClientRect();
+    if (clientX > rect.left + rect.width / 2) {
+      slot += 1;
+    }
+    delete shell.dataset.drop;
+  }
+  if (slot < others.length) {
+    others[slot].dataset.drop = "before";
+  } else if (others.length > 0) {
+    others[others.length - 1].dataset.drop = "after";
+  }
+  return slot;
+}
+
+function clearTabDropSlot(): void {
+  for (const shell of sessionTabs.querySelectorAll<HTMLElement>("[data-drop]")) {
+    delete shell.dataset.drop;
+  }
 }
 
 function updateSessionTab(session: SessionSnapshot): void {
@@ -2200,22 +2503,21 @@ function updateZeroSessionState(): void {
     sessionFormMode !== null,
   );
   zeroSession.hidden = !visible;
-  workspaceGrid.hidden = tabState.order.length === 0;
-  zeroWorkspace.textContent = workspacePreference || "the selected workspace";
+  // The form owns the whole area while it is open — never a form over a live terminal.
+  const gridHidden = tabState.order.length === 0 || sessionFormMode !== null;
+  if (workspaceGrid.hidden && !gridHidden) {
+    requestAnimationFrame(fitVisiblePanes);
+  }
+  workspaceGrid.hidden = gridHidden;
+  zeroWorkspace.textContent = workspacePreference || "the workspace you choose under Custom…";
   if (visible && !zeroStateWasVisible) {
-    requestAnimationFrame(() => zeroNewSession.focus());
+    renderAttachChoices();
+    requestAnimationFrame(() => {
+      zeroAttachChoices.querySelector<HTMLButtonElement>("button")?.focus();
+    });
   }
   zeroStateWasVisible = visible;
 }
-
-/** The harnesses the "+" popover offers, in tab-monogram order. */
-const ATTACH_DRIVERS: readonly DriverKind[] = [
-  "claude",
-  "codex",
-  "grok",
-  "prime",
-  "generic_terminal",
-];
 
 function wireAttachMenu(): void {
   attachMenu.addEventListener("click", (event) => {
@@ -2253,34 +2555,103 @@ function wireAttachMenu(): void {
   });
 }
 
-/** Rows are built on first open: DRIVER_TAGS is declared further down the module,
-    after the wiring calls run, so rendering at wire time would hit the TDZ. */
-function ensureAttachChoices(): void {
-  if (attachChoices.childElementCount > 0) {
-    return;
+/** The "+" popover and the empty-workspace panel show the same rows: the
+    harnesses Settings left enabled, in the chosen order. Rendered at open /
+    show time (DRIVER_TAGS is declared after the wiring calls run). */
+function renderAttachChoices(): void {
+  const drivers = quickAttachDrivers();
+  attachChoices.replaceChildren(...drivers.map(attachChoiceButton));
+  zeroAttachChoices.replaceChildren(...drivers.map(attachChoiceButton));
+}
+
+function attachChoiceButton(driver: DriverKind): HTMLButtonElement {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "corner-action attach-choice";
+  button.dataset.attach = driver;
+  button.setAttribute("role", "menuitem");
+  const tag = document.createElement("span");
+  tag.className = "attach-tag";
+  tag.setAttribute("aria-hidden", "true");
+  tag.textContent = driverTag(driver);
+  const label = document.createElement("span");
+  label.className = "corner-action-label";
+  label.textContent = driverLabel(driver);
+  button.append(tag, label);
+  if (driver === "prime") {
+    const hint = document.createElement("span");
+    hint.className = "corner-action-hint";
+    hint.textContent = "Ubuntu home";
+    button.append(hint);
   }
-  for (const driver of ATTACH_DRIVERS) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "corner-action attach-choice";
-    button.dataset.attach = driver;
-    button.setAttribute("role", "menuitem");
-    const tag = document.createElement("span");
-    tag.className = "attach-tag";
-    tag.setAttribute("aria-hidden", "true");
-    tag.textContent = driverTag(driver);
-    const label = document.createElement("span");
-    label.className = "corner-action-label";
-    label.textContent = driverLabel(driver);
-    button.append(tag, label);
-    if (driver === "prime") {
-      const hint = document.createElement("span");
-      hint.className = "corner-action-hint";
-      hint.textContent = "Ubuntu home";
-      button.append(hint);
+  return button;
+}
+
+/** Settings → Quick attach menu: one row per harness — on/off + ↑ ↓ order. */
+function renderQuickAttachSettings(): void {
+  quickAttachSettings.replaceChildren(
+    ...quickAttachPrefs.order.map((driver, index) => {
+      const row = document.createElement("li");
+      row.className = "settings-row";
+      const label = document.createElement("label");
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.checked = !quickAttachPrefs.hidden.includes(driver);
+      box.addEventListener("change", () => {
+        quickAttachPrefs.hidden = box.checked
+          ? quickAttachPrefs.hidden.filter((hidden) => hidden !== driver)
+          : [...quickAttachPrefs.hidden, driver];
+        saveQuickAttachPrefs();
+        renderAttachChoices();
+      });
+      const tag = document.createElement("span");
+      tag.className = "attach-tag";
+      tag.setAttribute("aria-hidden", "true");
+      tag.textContent = driverTag(driver);
+      const name = document.createElement("span");
+      name.className = "settings-row-label";
+      name.textContent = driverLabel(driver);
+      label.append(box, tag, name);
+      row.append(
+        label,
+        quickAttachMoveButton(driver, -1, index === 0),
+        quickAttachMoveButton(driver, 1, index === quickAttachPrefs.order.length - 1),
+      );
+      return row;
+    }),
+  );
+}
+
+function quickAttachMoveButton(
+  driver: DriverKind,
+  delta: -1 | 1,
+  disabled: boolean,
+): HTMLButtonElement {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "ghost settings-row-move";
+  button.textContent = delta < 0 ? "↑" : "↓";
+  const label = (delta < 0 ? "Move " : "Move ") + driverLabel(driver) + (delta < 0 ? " up" : " down");
+  button.title = label;
+  button.setAttribute("aria-label", label);
+  button.disabled = disabled;
+  button.addEventListener("click", () => {
+    const order = [...quickAttachPrefs.order];
+    const from = order.indexOf(driver);
+    const to = from + delta;
+    if (from < 0 || to < 0 || to >= order.length) {
+      return;
     }
-    attachChoices.append(button);
-  }
+    [order[from], order[to]] = [order[to], order[from]];
+    quickAttachPrefs = { ...quickAttachPrefs, order };
+    saveQuickAttachPrefs();
+    renderAttachChoices();
+    renderQuickAttachSettings();
+    quickAttachSettings
+      .querySelectorAll<HTMLButtonElement>(".settings-row-move")[to * 2 + (delta < 0 ? 0 : 1)]
+      ?.focus();
+  });
+  return button;
 }
 
 function toggleAttachMenu(anchor: HTMLElement, focusFirst = false): void {
@@ -2298,22 +2669,18 @@ function toggleAttachMenu(anchor: HTMLElement, focusFirst = false): void {
 function setAttachMenuOpen(open: boolean): void {
   attachMenuOpen = open;
   if (open) {
-    ensureAttachChoices();
+    renderAttachChoices();
     setCornerMenuOpen(false);
-    attachMenuFoot.textContent = workspacePreference
-      ? "in " + workspacePreference
-      : "No workspace yet — the form asks for one.";
+    closeTabMenu();
+    attachMenuFoot.textContent = quickAttachDrivers().length === 0
+      ? "All harnesses are hidden — enable them in Settings."
+      : workspacePreference
+        ? "in " + workspacePreference
+        : "No workspace yet — the form asks for one.";
     attachMenuFoot.title = workspacePreference;
   }
   attachMenu.hidden = !open;
-  newSessionButton.setAttribute(
-    "aria-expanded",
-    String(open && attachMenuAnchor === newSessionButton),
-  );
-  zeroNewSession.setAttribute(
-    "aria-expanded",
-    String(open && attachMenuAnchor === zeroNewSession),
-  );
+  newSessionButton.setAttribute("aria-expanded", String(open));
   if (open) {
     placeAttachMenu();
   } else {
@@ -2331,11 +2698,7 @@ function placeAttachMenu(): void {
   if (top + menu.height > window.innerHeight - margin) {
     top = Math.max(margin, anchor.top - menu.height - gap);
   }
-  // Hangs from the "+"'s left edge in the bar; centred under the zero-state button.
-  let left = anchorEl === newSessionButton
-    ? anchor.left
-    : anchor.left + anchor.width / 2 - menu.width / 2;
-  left = Math.min(left, window.innerWidth - margin - menu.width);
+  let left = Math.min(anchor.left, window.innerWidth - margin - menu.width);
   left = Math.max(margin, left);
   attachMenu.style.top = `${Math.round(top)}px`;
   attachMenu.style.left = `${Math.round(left)}px`;
@@ -2391,7 +2754,7 @@ async function quickAttach(driver: DriverKind): Promise<void> {
     setSessionFormError(
       "Session "
         + shortSessionId(created.session_id)
-        + " was created, but inventory refresh failed. Do not create a duplicate; use Refresh snapshot. "
+        + " was created, but inventory refresh failed. Do not create a duplicate; use Refresh state. "
         + String(error),
     );
     return;
@@ -2403,7 +2766,9 @@ async function quickAttach(driver: DriverKind): Promise<void> {
 function setAttachPending(pending: boolean): void {
   attachPending = pending;
   newSessionButton.disabled = pending;
-  zeroNewSession.disabled = pending;
+  for (const button of zeroSession.querySelectorAll<HTMLButtonElement>("[data-attach]")) {
+    button.disabled = pending;
+  }
   if (pending) {
     newSessionButton.dataset.busy = "true";
   } else {
@@ -2517,7 +2882,7 @@ async function selectSessionDriver(): Promise<void> {
 }
 
 function syncSessionForm(): void {
-  zeroWorkspace.textContent = workspacePreference || "the selected workspace";
+  zeroWorkspace.textContent = workspacePreference || "the workspace you choose under Custom…";
   if (!sessionFormMode) {
     sessionEditor.hidden = true;
     updateZeroSessionState();
@@ -2592,7 +2957,30 @@ function syncPermissionControls(): void {
   const warning = unsafePermissionWarning(driver, normalized);
   permissionWarning.hidden = warning === null;
   permissionWarning.textContent = warning ?? "";
+  const flags = PROFILE_FLAGS[driver];
+  permissionNote.textContent = flags.unsafe
+    ? "Normal passes " + flags.normal + " · Unsafe passes " + flags.unsafe + "."
+    : driverLabel(driver) + " runs with " + flags.normal + "; Unsafe is not available.";
 }
+
+/** What each driver actually passes per profile (crates/driver-*); the form
+    note and the Help page quote this table. */
+const PROFILE_FLAGS: Record<DriverKind, { normal: string; unsafe: string | null }> = {
+  claude: {
+    normal: "--permission-mode manual",
+    unsafe: "--dangerously-skip-permissions",
+  },
+  codex: {
+    normal: "--ask-for-approval on-request --sandbox workspace-write",
+    unsafe: "--dangerously-bypass-approvals-and-sandbox",
+  },
+  grok: {
+    normal: "--permission-mode default",
+    unsafe: "--permission-mode bypassPermissions",
+  },
+  prime: { normal: "no permission flags", unsafe: null },
+  generic_terminal: { normal: "no permission flags", unsafe: null },
+};
 
 function setSessionFormError(message: string | null): void {
   sessionFormError.hidden = message === null;
@@ -2648,7 +3036,7 @@ async function submitSessionForm(): Promise<void> {
       setSessionFormError(
         "Session "
           + shortSessionId(created.session_id)
-          + " was created, but inventory refresh failed. Do not create a duplicate; use Refresh snapshot. "
+          + " was created, but inventory refresh failed. Do not create a duplicate; use Refresh state. "
           + String(error),
       );
       syncSessionForm();
@@ -2785,8 +3173,16 @@ async function moveSession(
   delta: -1 | 1,
 ): Promise<void> {
   const nextOrder = movedSessionOrder(tabState.order, sessionId, delta);
-  const newIndex = nextOrder.indexOf(sessionId);
-  if (newIndex === tabState.order.indexOf(sessionId)) {
+  await moveSessionToIndex(sessionId, nextOrder.indexOf(sessionId));
+  sessionTabs
+    .querySelector<HTMLButtonElement>(
+      '[data-session-tab="' + sessionId + '"]',
+    )
+    ?.focus();
+}
+
+async function moveSessionToIndex(sessionId: string, newIndex: number): Promise<void> {
+  if (newIndex < 0 || newIndex === tabState.order.indexOf(sessionId)) {
     return;
   }
   try {
@@ -2797,11 +3193,6 @@ async function moveSession(
       } satisfies MoveSessionRequest,
     });
     applySnapshot(snapshot, sessionId);
-    sessionTabs
-      .querySelector<HTMLButtonElement>(
-        '[data-session-tab="' + sessionId + '"]',
-      )
-      ?.focus();
   } catch (error) {
     writeSystem(
       "error",
@@ -3167,8 +3558,14 @@ function wireSessionUi(): void {
   newSessionButton.addEventListener("click", () => {
     toggleAttachMenu(newSessionButton);
   });
-  zeroNewSession.addEventListener("click", () => {
-    toggleAttachMenu(zeroNewSession);
+  zeroSession.addEventListener("click", (event) => {
+    if (!(event.target instanceof Element)) {
+      return;
+    }
+    const action = event.target.closest<HTMLButtonElement>("[data-attach]");
+    if (action) {
+      void runAttachAction(action.dataset.attach ?? "");
+    }
   });
   must<HTMLButtonElement>("#cancel-session-form").addEventListener(
     "click",
@@ -3275,7 +3672,7 @@ function wireControls(): void {
       switch (button.dataset.control) {
         case "refresh": {
           await refreshSnapshot();
-          writeSystem("info", "snapshot refreshed");
+          writeSystem("info", "state refreshed");
           break;
         }
       }
@@ -3312,6 +3709,11 @@ function wireTerminalShortcuts(): void {
   window.addEventListener(
     "keydown",
     (event) => {
+      if (event.key === "F1") {
+        event.preventDefault();
+        runCornerAction("help");
+        return;
+      }
       if (event.key !== "F11") {
         return;
       }
