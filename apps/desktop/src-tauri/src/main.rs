@@ -8,6 +8,16 @@ use std::sync::OnceLock;
 static WRAPPER_JOB: OnceLock<pty_host::ProcessJob> = OnceLock::new();
 
 fn main() {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--prim1-room")) {
+        let args: Vec<std::ffi::OsString> = std::env::args_os().skip(2).collect();
+        match pane_mcp::run_room_cli(&args) {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("PRIM-1 room CLI failed: {error:#}");
+                std::process::exit(2);
+            }
+        }
+    }
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--prim1-pane-mcp")) {
         if std::env::args_os().count() != 2 {
             eprintln!("pane MCP mode accepts no additional arguments");

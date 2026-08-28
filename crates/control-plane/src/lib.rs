@@ -1,5 +1,5 @@
 use anyhow::Context;
-use shared_types::{SidebandRequest, SidebandResponse};
+use shared_types::{SidebandPreamble, SidebandRequest, SidebandResponse};
 
 #[cfg(windows)]
 pub const DEFAULT_ENDPOINT: &str = r"\\.\pipe\prim1";
@@ -23,6 +23,17 @@ pub fn decode_response(raw: &str) -> anyhow::Result<SidebandResponse> {
 
 pub fn encode_response(response: &SidebandResponse) -> anyhow::Result<String> {
     serde_json::to_string(response).context("failed to encode sideband response")
+}
+
+/// The optional first frame of a connection. A request frame is never a
+/// preamble (it has `kind` and no `secret`), and a preamble is never a request,
+/// so the server can tell them apart without any mode negotiation.
+pub fn encode_preamble(preamble: &SidebandPreamble) -> anyhow::Result<String> {
+    serde_json::to_string(preamble).context("failed to encode sideband preamble")
+}
+
+pub fn decode_preamble(raw: &str) -> Option<SidebandPreamble> {
+    serde_json::from_str(strip_utf8_bom(raw)).ok()
 }
 
 fn strip_utf8_bom(raw: &str) -> &str {
@@ -92,6 +103,32 @@ mod tests {
     #[test]
     fn decode_response_rejects_legacy_snapshot_projection() {
         assert!(decode_response(r#"{"ok":true,"message":"pong","snapshot":null}"#).is_err());
+    }
+
+    #[test]
+    fn preamble_and_request_frames_are_disjoint() {
+        let preamble = SidebandPreamble {
+            secret: "0123456789abcdef".into(),
+        };
+        let encoded = encode_preamble(&preamble).unwrap();
+        assert_eq!(decode_preamble(&encoded), Some(preamble));
+        assert!(
+            decode_request(&encoded).is_err(),
+            "a preamble is not a request"
+        );
+        let request = encode_request(&SidebandRequest::RoomPost {
+            content: "hello".into(),
+        })
+        .unwrap();
+        assert!(
+            decode_preamble(&request).is_none(),
+            "a request is not a preamble"
+        );
+        assert!(decode_preamble(r#"{"secret":"s","kind":"ping"}"#).is_none());
+        assert!(decode_preamble("{not json}").is_none());
+        // The secret never rides inside a request: the request codec still
+        // rejects any caller-supplied authority field.
+        assert!(decode_request(r#"{"kind":"room_post","content":"x","secret":"s"}"#).is_err());
     }
 
     #[test]

@@ -281,6 +281,18 @@ pub struct RoomFeedPage {
     pub gap: Option<RoomFeedGap>,
     pub events: Vec<RoomFeedEvent>,
     pub has_more: bool,
+    /// Current members with their labels, so a reader can address a session
+    /// by name and map feed sender ids to names. Empty only on legacy pages.
+    #[serde(default)]
+    pub members: Vec<RoomMember>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RoomMember {
+    pub session_id: SessionId,
+    pub label: String,
+    pub driver: DriverKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -386,6 +398,16 @@ pub struct DeliverRoomMessageRequest {
     pub room_id: RoomId,
     pub recipients: RoomRecipientSelection,
     pub content: String,
+}
+
+/// Deliver the canonical room brief into one member's terminal (the same
+/// path as the operator's Send). The supervisor does this on join and on the
+/// run's first idle; the UI's "Brief now" retries it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BriefRoomMemberRequest {
+    pub room_id: RoomId,
+    pub session_id: SessionId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -759,6 +781,14 @@ pub enum SidebandRequest {
     RoomPost {
         content: String,
     },
+    /// Deliver into one member's terminal (or every other member with
+    /// `"all"`) exactly like the operator's Send: same gate, same framing,
+    /// same receipts. `recipient` is a member session id, a member label, or
+    /// `"all"`; the sender is always the calling pane.
+    RoomDeliver {
+        recipient: String,
+        content: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -768,6 +798,18 @@ pub enum SidebandResponsePayload {
     WaitQuietTimeout { last_output_age_ms: u64 },
     RoomFeed { page: RoomFeedPage },
     RoomPost { result: RoomPostResult },
+    RoomDelivery { result: RoomDeliveryResult },
+}
+
+/// Optional first line of a sideband connection: the per-run pane secret the
+/// supervisor minted into the pane's environment (`PRIM1_PANE_SECRET`). It
+/// identifies callers the kernel cannot attribute to a pane Job (harnesses
+/// whose tool processes run outside it). It is proof of *own* identity only —
+/// never authority over another pane, a room, or a sender.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SidebandPreamble {
+    pub secret: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1092,6 +1134,54 @@ mod tests {
         ] {
             assert!(serde_json::from_value::<SidebandRequest>(request).is_err());
         }
+    }
+
+    #[test]
+    fn room_deliver_and_preamble_carry_no_room_or_sender_authority() {
+        let room_id = RoomId::new_v4();
+        let ok = serde_json::from_value::<SidebandRequest>(json!({
+            "kind": "room_deliver",
+            "recipient": "all",
+            "content": "wake up",
+        }))
+        .unwrap();
+        assert_eq!(
+            ok,
+            SidebandRequest::RoomDeliver {
+                recipient: "all".into(),
+                content: "wake up".into(),
+            }
+        );
+        for request in [
+            json!({ "kind": "room_deliver", "recipient": "all", "content": "x", "room_id": room_id }),
+            json!({ "kind": "room_deliver", "recipient": "all", "content": "x", "sender": "operator" }),
+            json!({ "kind": "room_deliver", "recipient": "all", "content": "x", "secret": "s" }),
+            json!({ "kind": "room_deliver", "content": "x" }),
+        ] {
+            assert!(serde_json::from_value::<SidebandRequest>(request).is_err());
+        }
+
+        let preamble =
+            serde_json::from_value::<SidebandPreamble>(json!({ "secret": "abc" })).unwrap();
+        assert_eq!(preamble.secret, "abc");
+        for preamble in [
+            json!({ "secret": "abc", "session_id": SessionId::new_v4() }),
+            json!({ "secret": "abc", "kind": "ping" }),
+            json!({ "kind": "ping" }),
+        ] {
+            assert!(serde_json::from_value::<SidebandPreamble>(preamble).is_err());
+        }
+        // A legacy page without members still decodes.
+        let page = serde_json::from_value::<RoomFeedPage>(json!({
+            "schema_version": ROOM_EVENT_SCHEMA_VERSION,
+            "room_id": room_id,
+            "cursor": { "epoch": Uuid::new_v4(), "sequence": 0 },
+            "gap": null,
+            "events": [],
+            "has_more": false,
+        }))
+        .unwrap();
+        assert!(page.members.is_empty());
     }
 
     #[test]

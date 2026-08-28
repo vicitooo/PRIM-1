@@ -124,6 +124,7 @@ function Start-ControlPlanePipeResponder {
   $readyPath = "$CapturePath.ready"
   $readyTempPath = "$readyPath.tmp"
   Remove-Item -LiteralPath $CapturePath -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath "$CapturePath.preamble" -Force -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $readyPath -Force -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $readyTempPath -Force -ErrorAction SilentlyContinue
   $originalServerPid = [Environment]::GetEnvironmentVariable("PRIM1_CONTROL_PLANE_SERVER_PID", "Process")
@@ -166,6 +167,15 @@ function Start-ControlPlanePipeResponder {
       $raw = $reader.ReadLine()
       if ($null -eq $raw) {
         throw "Named-pipe client disconnected before sending a request."
+      }
+      # A pane-secret preamble is its own first line; the request follows it.
+      # Mirror the supervisor: read both before answering.
+      if ($raw -match '^\s*\{\s*"secret"\s*:' -and $raw -notmatch '"kind"') {
+        [System.IO.File]::WriteAllText("$CapturePath.preamble", $raw, [System.Text.UTF8Encoding]::new($false))
+        $raw = $reader.ReadLine()
+        if ($null -eq $raw) {
+          throw "Named-pipe client disconnected after its preamble without a request."
+        }
       }
       [System.IO.File]::WriteAllText($CapturePath, $raw, [System.Text.UTF8Encoding]::new($false))
       if ($DelayMs -gt 0) {

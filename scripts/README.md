@@ -43,16 +43,21 @@ model completion. Timeout responses exit `124`; ordinary failures exit `1`.
 `-PassThruJson` and `-OutRequestIdFile` preserve the minimal response and request
 correlation without exposing a runtime snapshot.
 
-`room_read` and `room_post` derive the room, membership, and sender from the
-kernel-bound caller. They accept no `RoomId`, sender, peer target, recipient, or
-delivery authority. A room post writes no PTY; a newly joined pane reads only
-its join event and later traffic, with explicit gaps after eviction/restart.
+`room_read`, `room_post`, and `room_deliver` derive the room, membership, and
+sender from the calling pane — kernel Job membership, or the per-run pane
+secret (`PRIM1_PANE_SECRET`, sent as the connection's first line) when the
+shell runs outside the Job. They accept no `RoomId`, sender, or peer authority;
+`room_deliver -Recipient` names a member of the caller's own room (label,
+session id, or `all`) and is gated like the operator's Send. A room post writes
+no PTY; a newly joined pane reads only its join event and later traffic, with
+explicit gaps after eviction/restart. The same requests are available without
+PowerShell through `"$env:PRIM1_CLI" --prim1-room ping|read|post|deliver …`.
 
-The helper never reads `control-plane.json`, `PRIM1_PANE_CREDENTIALS`, or a
-bearer token. It does not implement list, lifecycle, recipient delivery,
-arbitrary routing, signals, or session/room-definition management.
+The helper never reads `control-plane.json` or `PRIM1_PANE_CREDENTIALS`. It
+does not implement list, lifecycle, arbitrary routing, signals, or
+session/room-definition management.
 
-`-ContentFile` for `input` or `room_post` is decoded as strict UTF-8 and
+`-ContentFile` for `input`, `room_post`, or `room_deliver` is decoded as strict UTF-8 and
 preserves source line endings and trailing whitespace. `wait_quiet` accepts `QuietSec` 1–60 and `TimeoutSec`
 1–300, with `QuietSec` no greater than `TimeoutSec`; the supervisor enforces the
 same bounds.

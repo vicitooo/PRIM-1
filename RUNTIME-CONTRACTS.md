@@ -103,8 +103,9 @@ recipient to have a compatible live run at whole-message preflight. A dormant
 zero- or one-member room remains visible until explicitly deleted. Every room
 member can read an addressed message from the shared feed even when only one
 member was selected for PTY delivery. The operator is not a room member, so
-**Send All** means every member in the pinned revision; pane sideband callers
-can read/post only their current room and cannot request delivery.
+**Send All** means every member in the pinned revision; a pane's `room_deliver`
+`all` means every *other* member. Pane sideband callers read, post, and deliver
+only within their current room, always as themselves.
 
 ## 5. Current typed surfaces
 
@@ -306,15 +307,20 @@ Restart flow:
 
 Current pane authority is deliberately narrower than operator room authority:
 
-- the supervisor derives the caller from live process-job membership and run generation
+- the supervisor derives the caller from live process-job membership and run
+  generation, or — only when the client process is in no pane Job — from the
+  per-run pane secret (`PRIM1_PANE_SECRET`) presented as the connection preamble
 - the pane-local sideband action set is fixed to self `ping`, `wait_quiet`,
-  `send_input`, `send_key`, membership-derived `room_read`, and feed-only
-  `room_post`
-- pane callers cannot supply `RoomId`, sender, peer, recipient, delivery,
-  inventory, membership, or lifecycle authority
+  `send_input`, `send_key`, membership-derived `room_read`, feed-only
+  `room_post`, and `room_deliver` (recipient = member label / session id /
+  `all` = every other member; the sender is always the caller)
+- pane callers cannot supply `RoomId`, sender, peer, inventory, membership, or
+  lifecycle authority; a presented secret is proof of the caller's own pane only
 - Claude Code and Codex receive a session-scoped `prim1_pane` stdio MCP child
-  exposing only `ping`, `room_read`, and `room_post`; the MCP layer contributes
-  no authority and every call is re-authorized through the named pipe
+  exposing `ping`, `room_read`, `room_post`, `room_deliver`; every other
+  non-Prime pane has the same surface through `PRIM1_CLI --prim1-room …`; the
+  MCP/CLI layer contributes no authority and every call is re-authorized
+  through the named pipe
 - Claude's three fully qualified pane-MCP tool names are allowed only for that
   process; no wildcard or persistent user/workspace permission is installed,
   and all non-pane tools retain the selected harness permission policy

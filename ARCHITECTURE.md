@@ -202,42 +202,57 @@ The current Windows surface is deliberately limited to:
 - `send_input` to the calling pane
 - `send_key` to the calling pane
 - `room_read` for the calling pane's current authorized room and join floor
+  (the page lists the members with labels and drivers)
 - feed-only `room_post` with sender derived from that caller
+- `room_deliver`: the operator's Send with the calling pane as sender — same
+  preflight/readiness gate, same framing, same receipts; recipient is a member
+  label, a member session id, or `all` (every other member), never the caller
 
-A named-pipe connection provides transport, not authority. On Windows the
-supervisor obtains and pins the kernel-reported client process, requires it to
-belong to exactly one live PTY job, binds the derived pane identity to that run
-generation, and revalidates both affiliation and generation at mutation time.
-There is no bearer token, credential file, caller-supplied identity, peer target,
-or disk-mailbox fallback. Room requests accept no caller-supplied `RoomId`,
-sender, peer, or recipient. Operator lifecycle, membership, and recipient
-delivery remain direct in-process Tauri commands.
+A named-pipe connection provides transport, not authority. Identity has two
+proofs, in order. First, the kernel: on Windows the supervisor obtains and pins
+the kernel-reported client process, requires it to belong to exactly one live
+PTY job, binds the derived pane identity to that run generation, and
+revalidates affiliation and generation at mutation time. Second, when the
+client process belongs to no pane Job, the per-run pane secret: the supervisor
+mints 256 random bits per run into the pane environment as `PRIM1_PANE_SECRET`,
+the client sends it as the connection's first line (`{"secret":…}`), and the
+supervisor maps it to exactly the run it minted it for. The secret proves the
+caller's *own* pane only — it is not authority over another pane, a room, a
+sender, or a recipient, requests still carry none of those, a kernel-attributed
+caller is never overridden by a presented secret, and the secret never enters
+audit, diagnostics, events, or snapshots. A stale secret (previous run) is
+refused like any stranger. Operator lifecycle and membership remain direct
+in-process Tauri commands.
 
-Prime sessions are intentionally excluded from this native sideband. Their
-Linux descendants cannot be authenticated through the Windows Job membership
-proof used by the named pipe, and no bearer or proxy fallback is introduced.
+Prime sessions are still excluded: their WSL launch forwards no environment, so
+neither proof reaches a Linux descendant yet.
 
-Room reads/posts use the same kernel-bound caller proof, derive current
-`RoomId` membership and sender `SessionId` under the supervisor locks, and are
-revoked immediately when the run or membership changes. Prime remains excluded.
+Room reads/posts/deliveries use whichever proof identified the caller, derive
+current `RoomId` membership and sender `SessionId` under the supervisor locks,
+and are revoked immediately when the run or membership changes.
 
 ### 6.1 Model-facing bridge
 
 Claude Code and Codex receive a session-scoped stdio MCP child named
 `prim1_pane`. The child is the signed/packaged PRIM-1 executable in an early
 no-UI mode, configured so the harness creates it inside the same pane Job. Its
-only tools are `ping`, membership-derived `room_read`, and feed-only
-`room_post`. The MCP
-request carries neither caller nor room authority; the helper verifies the
-desktop named-pipe server PID and creation time, and the supervisor derives the
-exact caller/run from the kernel again on every request.
+tools are `ping`, membership-derived `room_read`, feed-only `room_post`, and
+`room_deliver`. The MCP request carries neither caller nor room authority; the
+helper verifies the desktop named-pipe server PID and creation time, and the
+supervisor identifies the caller again on every request.
 
-This bridge is deliberately driver-scoped. Grok Build 1.0.0 supports
-session-scoped plugins only through its non-interactive agent host, while its
-TUI has no equivalent flag and its shell-tool subprocesses are empirically not
-members of the pane Job. Redirecting `GROK_HOME` would redirect Grok's sessions
-and logs into PRIM runtime storage. PRIM therefore leaves Grok, Prime, and
-Generic Terminal unchanged rather than adding a bearer, ancestry check,
+The same executable is the universal seam for every other harness:
+`<prim1 exe> --prim1-room ping|read|post|deliver …` (path in `PRIM1_CLI`) sends
+the identical requests and prints the supervisor's JSON response; a harness
+that can run a shell command can therefore take part without any per-harness
+code. Grok Build 1.0.0 still gets no MCP child (its TUI has no session-scoped
+plugin flag and redirecting `GROK_HOME` would redirect Grok's own storage), and
+its shell-tool subprocesses are not members of the pane Job — which is exactly
+what the pane secret is for. On join and on a run's first idle the supervisor
+delivers the canonical brief (`crates/supervisor/src/room_brief.txt`) into the
+member's terminal, naming the room, the members, and the path this harness has.
+The historical rationale for leaving Grok, Prime, and Generic Terminal without
+a bearer, ancestry check,
 global plugin, workspace mutation, or history-redirection fallback.
 
 ### 6.2 Transport choice

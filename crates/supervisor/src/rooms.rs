@@ -240,6 +240,8 @@ impl RoomRuntime {
             gap,
             events,
             has_more,
+            // Filled by the supervisor, which owns session labels.
+            members: Vec::new(),
         })
     }
 }

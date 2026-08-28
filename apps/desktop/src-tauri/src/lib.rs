@@ -15,12 +15,12 @@ use std::{
 };
 
 use shared_types::{
-    AddRoomMemberRequest, ChooseSessionWorkingDirectoryRequest, CreateRoomRequest,
-    CreateSessionRequest, DeleteRoomRequest, DeleteSessionRequest, DeliverRoomMessageRequest,
-    MoveRoomRequest, MoveSessionRequest, OperatorRouteMessageRequest, PostRoomMessageRequest,
-    ReadRoomFeedRequest, RemoveRoomMemberRequest, RenameRoomRequest, RenameSessionRequest,
-    RestartSessionRequest, RoomDeliveryResult, RoomFeedPage, RoomPostResult, RoomSnapshot,
-    RunEventIdentity, RuntimeSnapshot, SendInputRequest, SessionId, SessionSnapshot,
+    AddRoomMemberRequest, BriefRoomMemberRequest, ChooseSessionWorkingDirectoryRequest,
+    CreateRoomRequest, CreateSessionRequest, DeleteRoomRequest, DeleteSessionRequest,
+    DeliverRoomMessageRequest, MoveRoomRequest, MoveSessionRequest, OperatorRouteMessageRequest,
+    PostRoomMessageRequest, ReadRoomFeedRequest, RemoveRoomMemberRequest, RenameRoomRequest,
+    RenameSessionRequest, RestartSessionRequest, RoomDeliveryResult, RoomFeedPage, RoomPostResult,
+    RoomSnapshot, RunEventIdentity, RuntimeSnapshot, SendInputRequest, SessionId, SessionSnapshot,
     SetSessionLinuxWorkingDirectoryRequest, SetSessionPermissionRequest, StartSessionRequest,
     StopSessionRequest,
 };
@@ -911,6 +911,28 @@ fn post_room_message(
 }
 
 #[tauri::command]
+async fn brief_room_member(
+    state: State<'_, DesktopState>,
+    request: BriefRoomMemberRequest,
+) -> Result<RoomDeliveryResult, String> {
+    let supervisor = state.supervisor.clone();
+    let diagnostics = state.diagnostics.clone();
+    match tauri::async_runtime::spawn_blocking(move || supervisor.brief_room_member(request)).await
+    {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(error)) => {
+            diagnostics.log("error", "brief_room_member_failed", error.to_string());
+            Err(error.to_string())
+        }
+        Err(error) => {
+            let message = format!("room brief worker failed: {error}");
+            diagnostics.log("error", "brief_room_member_failed", &message);
+            Err(message)
+        }
+    }
+}
+
+#[tauri::command]
 async fn deliver_room_message(
     state: State<'_, DesktopState>,
     request: DeliverRoomMessageRequest,
@@ -1310,6 +1332,7 @@ fn init_supervisor(
         working_root: agent_working_root,
         runtime_dir,
         pane_mcp_executable: Some(pane_mcp_executable),
+        room_brief_on_join: true,
         heartbeat_interval: None,
         auto_restart_on_stall_sessions: None,
         auto_restart_stall_threshold: None,
@@ -1622,6 +1645,7 @@ pub fn run(startup: StartupConfig) {
             read_room_feed,
             post_room_message,
             deliver_room_message,
+            brief_room_member,
             send_input,
             route_message,
             resize_session,

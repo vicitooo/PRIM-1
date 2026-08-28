@@ -58,8 +58,9 @@ Current script-level coverage:
   - checks the `TIMED OUT: <message>` banner in both normal and `-Quiet` modes
 
 - `tests/control-plane-room.ps1`
-  - validates tokenless `room_read` / `room_post` request shapes against a real named pipe
-  - proves the script carries no caller-supplied `RoomId`, sender, peer, or recipient authority
+  - validates `room_read` / `room_post` / `room_deliver` request shapes against a real named pipe
+  - proves the script carries no caller-supplied `RoomId`, sender, or peer authority, and that `room_deliver` carries exactly kind, recipient, content
+  - proves the pane-secret preamble is the connection's first line when `PRIM1_PANE_SECRET` is set, and never rides inside a request
   - checks paired cursor validation and strict UTF-8 Unicode, embedded CRLF, and trailing-newline fidelity for feed posts
 
 - `tests/run-all-regression.ps1`

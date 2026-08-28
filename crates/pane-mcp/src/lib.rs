@@ -1,9 +1,9 @@
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use shared_types::{RoomFeedCursor, SidebandRequest, SidebandResponse};
+use shared_types::{RoomFeedCursor, SidebandPreamble, SidebandRequest, SidebandResponse};
 
 const MCP_FRAME_MAX_BYTES: usize = control_plane::MAX_FRAME_BYTES;
 const SERVER_NAME: &str = "prim1-pane";
@@ -109,7 +109,7 @@ impl<C: SidebandClient> McpServer<C> {
             "protocolVersion": negotiated_version,
             "capabilities": { "tools": { "listChanged": false } },
             "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION },
-            "instructions": "PRIM-1 pane-local tools. room_post appends only to the current room feed; room_read reads that feed from an optional cursor. Neither tool delivers a prompt to another harness."
+            "instructions": "PRIM-1 room tools for this pane. room_read reads the current room feed (members with labels included; pass the last cursor back). room_post appends to the feed without prompting anyone. room_deliver types your text into one member's terminal as a prompt (recipient = member label, session id, or 'all' for every other member) — it wakes them; the feed stays the record."
         }))
     }
 
@@ -181,6 +181,13 @@ impl<C: SidebandClient> McpServer<C> {
                     content: arguments.content,
                 }
             }
+            "room_deliver" => {
+                let arguments = decode_tool_arguments::<RoomDeliverArguments>(arguments)?;
+                SidebandRequest::RoomDeliver {
+                    recipient: arguments.recipient,
+                    content: arguments.content,
+                }
+            }
             _ => return Err(RpcFailure::new(-32602, "unknown PRIM-1 pane tool")),
         };
 
@@ -235,6 +242,13 @@ struct RoomReadArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RoomPostArguments {
+    content: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoomDeliverArguments {
+    recipient: String,
     content: String,
 }
 
@@ -308,7 +322,168 @@ fn tool_definitions() -> Vec<Value> {
             },
             "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false }
         }),
+        json!({
+            "name": "room_deliver",
+            "title": "Deliver into a room member's terminal",
+            "description": "Type one message from this pane into a room member's terminal as a prompt — the same path the human operator's Send uses, with the same readiness gate: it is refused while the member sits on a prompt or its state is unknown. recipient is a member label, a member session id, or 'all' (every other member). Use it to wake a member that must act on your output; keep the record in the feed with room_post.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "recipient": { "type": "string", "minLength": 1 },
+                    "content": { "type": "string", "minLength": 1 }
+                },
+                "required": ["recipient", "content"],
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false }
+        }),
     ]
+}
+
+/// `<prim1 exe> --prim1-room <ping|read|post|deliver> …` — the universal seam
+/// for harnesses without an MCP client: same requests as the MCP tools, JSON
+/// response on stdout, exit 0 when the supervisor said ok, 1 when it refused
+/// or the transport failed, 2 on a usage error.
+pub const ROOM_CLI_USAGE: &str = "usage: --prim1-room ping
+       --prim1-room read [--cursor '{\"epoch\":\"<uuid>\",\"sequence\":<n>}' | --epoch <uuid> --sequence <n>]
+       --prim1-room post <text…> | post --file <path> | post -   (text from stdin)
+       --prim1-room deliver <recipient> <text…> | deliver <recipient> --file <path> | deliver <recipient> -
+  recipient: a member label, a member session id, or all
+  prints the supervisor's JSON response; exit 0 ok, 1 refused/transport, 2 usage";
+
+pub fn run_room_cli(args: &[std::ffi::OsString]) -> Result<i32> {
+    let args: Vec<String> = args
+        .iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect();
+    let request = match parse_room_cli(&args) {
+        Ok(request) => request,
+        Err(usage) => {
+            eprintln!("{usage}\n{ROOM_CLI_USAGE}");
+            return Ok(2);
+        }
+    };
+    #[cfg(windows)]
+    attach_parent_console_if_detached();
+    let mut client = match EnvironmentSidebandClient::from_environment() {
+        Ok(client) => client,
+        Err(error) => {
+            print_cli_failure(format!(
+                "this shell is not inside a PRIM-1 pane (environment incomplete): {error:#}"
+            ))?;
+            return Ok(1);
+        }
+    };
+    match client.send(request) {
+        Ok(response) => {
+            println!("{}", serde_json::to_string(&response)?);
+            Ok(if response.ok { 0 } else { 1 })
+        }
+        Err(error) => {
+            print_cli_failure(format!("PRIM-1 pane sideband transport failed: {error:#}"))?;
+            Ok(1)
+        }
+    }
+}
+
+fn print_cli_failure(message: String) -> Result<()> {
+    let response = SidebandResponse {
+        ok: false,
+        message,
+        timed_out: false,
+        payload: None,
+        request_id: None,
+    };
+    println!("{}", serde_json::to_string(&response)?);
+    Ok(())
+}
+
+fn parse_room_cli(args: &[String]) -> std::result::Result<SidebandRequest, String> {
+    let (command, rest) = args
+        .split_first()
+        .ok_or_else(|| "missing command".to_string())?;
+    match command.as_str() {
+        "ping" => {
+            if !rest.is_empty() {
+                return Err("ping takes no arguments".into());
+            }
+            Ok(SidebandRequest::Ping {})
+        }
+        "read" => Ok(SidebandRequest::RoomRead {
+            cursor: parse_cursor_arguments(rest)?,
+        }),
+        "post" => Ok(SidebandRequest::RoomPost {
+            content: cli_content(rest)?,
+        }),
+        "deliver" => {
+            let (recipient, rest) = rest
+                .split_first()
+                .ok_or_else(|| "deliver needs a recipient".to_string())?;
+            if recipient.starts_with("--") {
+                return Err("deliver needs a recipient before the text".into());
+            }
+            Ok(SidebandRequest::RoomDeliver {
+                recipient: recipient.clone(),
+                content: cli_content(rest)?,
+            })
+        }
+        other => Err(format!("unknown command '{other}'")),
+    }
+}
+
+fn parse_cursor_arguments(rest: &[String]) -> std::result::Result<Option<RoomFeedCursor>, String> {
+    match rest {
+        [] => Ok(None),
+        [flag, json] if flag == "--cursor" => serde_json::from_str::<RoomFeedCursor>(json)
+            .map(Some)
+            .map_err(|error| format!("--cursor must be {{\"epoch\",\"sequence\"}} JSON: {error}")),
+        [epoch_flag, epoch, sequence_flag, sequence]
+            if epoch_flag == "--epoch" && sequence_flag == "--sequence" =>
+        {
+            let epoch = epoch
+                .parse()
+                .map_err(|_| "--epoch must be a UUID".to_string())?;
+            let sequence = sequence
+                .parse()
+                .map_err(|_| "--sequence must be a non-negative integer".to_string())?;
+            Ok(Some(RoomFeedCursor { epoch, sequence }))
+        }
+        _ => Err("read accepts either --cursor <json> or --epoch <uuid> --sequence <n>".into()),
+    }
+}
+
+fn cli_content(rest: &[String]) -> std::result::Result<String, String> {
+    match rest {
+        [] => Err("missing text (or --file <path>, or - for stdin)".into()),
+        [dash] if dash == "-" => {
+            let mut content = String::new();
+            std::io::stdin()
+                .read_to_string(&mut content)
+                .map_err(|error| format!("failed to read stdin: {error}"))?;
+            Ok(content.trim_start_matches('\u{feff}').to_string())
+        }
+        [flag, path] if flag == "--file" => std::fs::read_to_string(path)
+            .map(|content| content.trim_start_matches('\u{feff}').to_string())
+            .map_err(|error| format!("failed to read {path}: {error}")),
+        words => Ok(words.join(" ")),
+    }
+}
+
+/// A GUI-subsystem executable has no console; when a person runs the CLI from
+/// a terminal with nothing redirected, borrow the parent's console so the JSON
+/// is visible. Never touches handles a parent already set (pipes stay pipes).
+#[cfg(windows)]
+fn attach_parent_console_if_detached() {
+    use windows_sys::Win32::{
+        Foundation::INVALID_HANDLE_VALUE,
+        System::Console::{ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_OUTPUT_HANDLE},
+    };
+    let stdout = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    if stdout.is_null() || stdout == INVALID_HANDLE_VALUE {
+        unsafe {
+            AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
 }
 
 pub fn run_stdio() -> Result<()> {
@@ -432,6 +607,9 @@ struct EnvironmentSidebandClient {
     endpoint: String,
     expected_server_pid: u32,
     expected_server_creation_time: u64,
+    /// `PRIM1_PANE_SECRET` when the pane environment carries one: sent as the
+    /// connection preamble so a caller outside the pane's Job is still known.
+    pane_secret: Option<String>,
 }
 
 #[cfg(windows)]
@@ -463,6 +641,10 @@ impl EnvironmentSidebandClient {
                 "PRIM1_CONTROL_PLANE_SERVER_STARTED_FILETIME must be a positive decimal FILETIME"
             );
         }
+        let pane_secret = match std::env::var("PRIM1_PANE_SECRET") {
+            Ok(value) if !value.trim().is_empty() => Some(value),
+            _ => None,
+        };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -472,6 +654,7 @@ impl EnvironmentSidebandClient {
             endpoint,
             expected_server_pid,
             expected_server_creation_time,
+            pane_secret,
         })
     }
 
@@ -479,6 +662,7 @@ impl EnvironmentSidebandClient {
         endpoint: String,
         expected_server_pid: u32,
         expected_server_creation_time: u64,
+        pane_secret: Option<String>,
         request: SidebandRequest,
     ) -> Result<SidebandResponse> {
         use std::{os::windows::io::AsRawHandle, time::Duration};
@@ -528,14 +712,22 @@ impl EnvironmentSidebandClient {
             );
         }
 
-        let mut encoded = control_plane::encode_request(&request)?;
-        encoded.push('\n');
-        if encoded.len() > control_plane::MAX_FRAME_BYTES {
+        let mut request_line = control_plane::encode_request(&request)?;
+        request_line.push('\n');
+        if request_line.len() > control_plane::MAX_FRAME_BYTES {
             bail!(
                 "encoded sideband request exceeds {}-byte frame limit",
                 control_plane::MAX_FRAME_BYTES
             );
         }
+        let mut encoded = String::new();
+        if let Some(secret) = pane_secret {
+            encoded.push_str(&control_plane::encode_preamble(&SidebandPreamble {
+                secret,
+            })?);
+            encoded.push('\n');
+        }
+        encoded.push_str(&request_line);
         timeout(Duration::from_secs(5), async {
             client.write_all(encoded.as_bytes()).await?;
             client.flush().await
@@ -589,6 +781,7 @@ impl SidebandClient for EnvironmentSidebandClient {
             self.endpoint.clone(),
             self.expected_server_pid,
             self.expected_server_creation_time,
+            self.pane_secret.clone(),
             request,
         ))
     }
@@ -703,7 +896,7 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(names, ["ping", "room_read", "room_post"]);
+        assert_eq!(names, ["ping", "room_read", "room_post", "room_deliver"]);
     }
 
     #[test]
@@ -756,6 +949,7 @@ mod tests {
                     events: Vec::new(),
                     gap: None,
                     has_more: false,
+                    members: Vec::new(),
                 },
             }))),
             Ok(ok_response(None)),
@@ -791,6 +985,107 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn maps_room_deliver_with_recipient_and_content_only() {
+        let mut server = McpServer::new(RecordingClient::with_responses([Ok(ok_response(None))]));
+        initialize(&mut server);
+        let delivered = server
+            .handle(json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": { "name": "room_deliver", "arguments": { "recipient": "Codex", "content": "wake up" } }
+            }))
+            .unwrap();
+        assert_eq!(delivered["result"]["isError"], false);
+        assert_eq!(
+            server.sideband.requests,
+            [SidebandRequest::RoomDeliver {
+                recipient: "Codex".into(),
+                content: "wake up".into(),
+            }]
+        );
+        for arguments in [
+            json!({ "recipient": "Codex", "content": "x", "room_id": shared_types::RoomId::new_v4() }),
+            json!({ "content": "x" }),
+        ] {
+            let response = server
+                .handle(json!({
+                    "jsonrpc": "2.0",
+                    "id": 8,
+                    "method": "tools/call",
+                    "params": { "name": "room_deliver", "arguments": arguments }
+                }))
+                .unwrap();
+            assert_eq!(response["error"]["code"], -32602);
+        }
+        assert_eq!(server.sideband.requests.len(), 1);
+    }
+
+    #[test]
+    fn room_cli_parses_every_form_and_rejects_the_rest() {
+        let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            parse_room_cli(&args(&["ping"])).unwrap(),
+            SidebandRequest::Ping {}
+        );
+        assert_eq!(
+            parse_room_cli(&args(&["read"])).unwrap(),
+            SidebandRequest::RoomRead { cursor: None }
+        );
+        let epoch = uuid::Uuid::new_v4();
+        let cursor = RoomFeedCursor { epoch, sequence: 9 };
+        assert_eq!(
+            parse_room_cli(&args(&[
+                "read",
+                "--cursor",
+                &serde_json::to_string(&cursor).unwrap()
+            ]))
+            .unwrap(),
+            SidebandRequest::RoomRead {
+                cursor: Some(cursor)
+            }
+        );
+        assert_eq!(
+            parse_room_cli(&args(&[
+                "read",
+                "--epoch",
+                &epoch.to_string(),
+                "--sequence",
+                "9"
+            ]))
+            .unwrap(),
+            SidebandRequest::RoomRead {
+                cursor: Some(cursor)
+            }
+        );
+        assert_eq!(
+            parse_room_cli(&args(&["post", "hello", "from", "grok"])).unwrap(),
+            SidebandRequest::RoomPost {
+                content: "hello from grok".into()
+            }
+        );
+        assert_eq!(
+            parse_room_cli(&args(&["deliver", "all", "wake", "up"])).unwrap(),
+            SidebandRequest::RoomDeliver {
+                recipient: "all".into(),
+                content: "wake up".into()
+            }
+        );
+        for bad in [
+            vec!["ping", "extra"],
+            vec!["read", "--cursor"],
+            vec!["read", "--epoch", "not-a-uuid", "--sequence", "1"],
+            vec!["post"],
+            vec!["deliver"],
+            vec!["deliver", "--file", "x"],
+            vec!["shout", "x"],
+            vec![],
+        ] {
+            assert!(parse_room_cli(&args(&bad)).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
@@ -1052,6 +1347,7 @@ mod tests {
             endpoint,
             expected_server_pid: server_process.pid(),
             expected_server_creation_time: server_process.creation_time_filetime(),
+            pane_secret: None,
         };
         assert_eq!(client.send(SidebandRequest::Ping {}).unwrap(), response);
         assert!(server.join().unwrap().unwrap() > 0);
@@ -1069,6 +1365,7 @@ mod tests {
                 .creation_time_filetime()
                 .checked_add(1)
                 .unwrap(),
+            pane_secret: None,
         };
         let error = client
             .send(SidebandRequest::Ping {})

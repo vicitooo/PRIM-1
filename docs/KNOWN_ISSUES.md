@@ -50,12 +50,16 @@ membership cannot identify Linux tasks. No bearer fallback exists; external
 operators use the desktop UI.
 
 Claude Code and Codex receive a PRIM-owned session-scoped stdio MCP child for
-model-facing `ping`, `room_read`, and `room_post`. Grok Build 1.0.0 does not:
-its normal TUI has no session-scoped plugin/config flag, `GROK_HOME` also owns
-session/log storage, and a real Grok shell-tool child failed the Job-bound pipe
-check. Grok remains usable through raw terminal input and explicit operator
-room delivery, but it cannot autonomously read/post the PRIM room feed in this
-release.
+model-facing `ping`, `room_read`, `room_post`, and `room_deliver`. Grok Build
+1.0.0 still gets no MCP child (its TUI has no session-scoped plugin/config flag
+and `GROK_HOME` also owns session/log storage), but since 2026-08-28 every
+non-Prime pane carries `PRIM1_PANE_SECRET` and `PRIM1_CLI`: a Grok shell tool
+runs `& "$env:PRIM1_CLI" --prim1-room ping|read|post|deliver …` and is
+identified by the per-run secret when its process is outside the pane Job.
+Grok therefore reads, posts, and delivers like any other member; only the
+tool-discovery step differs (the room brief tells it which path it has).
+Prime remains the open case: its WSL launch forwards no environment, so the
+CLI-through-interop line comes after the first live retest.
 
 ### Prime is raw-input-only in the current release
 

@@ -24,17 +24,17 @@ use pty_host::{
 };
 use serde::{Deserialize, Serialize};
 use shared_types::{
-    AddRoomMemberRequest, AlertSeverity, ControlKey, ControlPlaneSnapshot, ControlPlaneStatus,
-    CreateRoomRequest, DeleteRoomRequest, DeliverRoomMessageRequest, DriverKind, EnvVar,
-    HeartbeatSessionSummary, LaunchSpec, LifecycleState, LogLevel, MessageScope, MoveRoomRequest,
-    OperatorRouteMessageRequest, PostRoomMessageRequest, ROOM_EVENT_SCHEMA_VERSION,
-    ReadRoomFeedRequest, RemoveRoomMemberRequest, RenameRoomRequest, RoomDeliveryFailure,
-    RoomDeliveryResult, RoomDeliveryStatus, RoomFeedItem, RoomFeedPage, RoomId,
-    RoomMembershipAction, RoomMessageSender, RoomPostResult, RoomRecipientSelection, RoomSnapshot,
-    RouteDeliveryPhase, RunEventIdentity, RuntimeEvent, RuntimeSnapshot, SendInputRequest,
-    SessionDefinition, SessionExitReason, SessionGeneration, SessionId, SessionSnapshot,
-    SidebandRequest, SidebandResponse, SidebandResponsePayload, SupervisorAlertType,
-    WaitQuietRequest, WorkState, now_rfc3339,
+    AddRoomMemberRequest, AlertSeverity, BriefRoomMemberRequest, ControlKey, ControlPlaneSnapshot,
+    ControlPlaneStatus, CreateRoomRequest, DeleteRoomRequest, DeliverRoomMessageRequest,
+    DriverKind, EnvVar, HeartbeatSessionSummary, LaunchSpec, LifecycleState, LogLevel,
+    MessageScope, MoveRoomRequest, OperatorRouteMessageRequest, PostRoomMessageRequest,
+    ROOM_EVENT_SCHEMA_VERSION, ReadRoomFeedRequest, RemoveRoomMemberRequest, RenameRoomRequest,
+    RoomDeliveryFailure, RoomDeliveryResult, RoomDeliveryStatus, RoomFeedItem, RoomFeedPage,
+    RoomId, RoomMember, RoomMembershipAction, RoomMessageSender, RoomPostResult,
+    RoomRecipientSelection, RoomRevision, RoomSnapshot, RouteDeliveryPhase, RunEventIdentity,
+    RuntimeEvent, RuntimeSnapshot, SendInputRequest, SessionDefinition, SessionExitReason,
+    SessionGeneration, SessionId, SessionSnapshot, SidebandRequest, SidebandResponse,
+    SidebandResponsePayload, SupervisorAlertType, WaitQuietRequest, WorkState, now_rfc3339,
 };
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -96,12 +96,14 @@ const PANE_MCP_ENVIRONMENT_VARIABLES: &[&str] = &[
     "PRIM1_CONTROL_PLANE_ENDPOINT",
     "PRIM1_CONTROL_PLANE_SERVER_PID",
     "PRIM1_CONTROL_PLANE_SERVER_STARTED_FILETIME",
+    "PRIM1_PANE_SECRET",
 ];
 #[cfg(windows)]
 const PANE_MCP_CLAUDE_ALLOWED_TOOLS: &[&str] = &[
     "mcp__prim1_pane__ping",
     "mcp__prim1_pane__room_read",
     "mcp__prim1_pane__room_post",
+    "mcp__prim1_pane__room_deliver",
 ];
 
 #[cfg(windows)]
@@ -477,13 +479,117 @@ impl PaneProcess for WindowsPaneProcess {
     }
 }
 
+/// How a sideband caller proved which pane it is. The kernel path is primary;
+/// the secret path exists for harnesses whose tool processes leave the pane's
+/// Job (Grok) or have no Windows Job at all. Both bind to one live run.
+#[derive(Clone)]
+enum PaneCallerIdentity {
+    Job(Arc<dyn PaneProcess>),
+    Secret(String),
+}
+
 #[derive(Clone)]
 struct PaneCaller {
     session: String,
     session_id: Uuid,
     generation: SessionGeneration,
     run_id: Uuid,
-    process: Arc<dyn PaneProcess>,
+    identity: PaneCallerIdentity,
+}
+
+/// 256 bits from the OS RNG (two v4 UUIDs), hex. Minted per run, handed to
+/// the pane as `PRIM1_PANE_SECRET`, never logged or audited.
+fn mint_pane_secret() -> String {
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
+/// One resolved room delivery: the operator's Send and a pane's `room_deliver`
+/// build this, then share every step after it (preflight, receipts, writes).
+struct RoomDeliverySpec {
+    room_id: RoomId,
+    recipient_ids: Vec<SessionId>,
+    membership_revision: RoomRevision,
+    room_label: String,
+    sender: RoomMessageSender,
+    /// What the recipient's terminal shows after "message from".
+    sender_label: String,
+    content: String,
+}
+
+const ROOM_BRIEF_MAX_ATTEMPTS: u8 = 3;
+const ROOM_BRIEF_TEMPLATE: &str = include_str!("room_brief.txt");
+
+fn driver_display_name(driver: DriverKind) -> &'static str {
+    match driver {
+        DriverKind::Claude => "Claude Code",
+        DriverKind::Codex => "Codex",
+        DriverKind::Grok => "Grok Build",
+        DriverKind::Prime => "Prime (Ubuntu)",
+        DriverKind::GenericTerminal => "Terminal",
+    }
+}
+
+/// The canonical brief (`room_brief.txt`) filled in for one member. Terminal
+/// members get it as one line: raw single-line framing admits no newline.
+fn render_room_brief(
+    room_label: &str,
+    members: &[RoomMember],
+    you: &RoomMember,
+    cli: Option<&Path>,
+) -> String {
+    let others: Vec<String> = members
+        .iter()
+        .filter(|member| member.session_id != you.session_id)
+        .map(|member| format!("{} ({})", member.label, driver_display_name(member.driver)))
+        .collect();
+    let others = if others.is_empty() {
+        "nobody else yet".to_string()
+    } else {
+        others.join(", ")
+    };
+    let tools = match you.driver {
+        DriverKind::Claude | DriverKind::Codex => {
+            "the prim1_pane MCP server: ping, room_read, room_post, room_deliver.".to_string()
+        }
+        _ => {
+            let cli = cli
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "$env:PRIM1_CLI".to_string());
+            format!(
+                "the PRIM-1 CLI from your shell (it prints JSON): & \"{cli}\" --prim1-room ping | read [--cursor '<json>'] | post <text> | deliver <label|all> <text>. Below, ping / room_read / room_post / room_deliver mean these commands."
+            )
+        }
+    };
+    // The template is LF; a checkout that turned it into CRLF must not leak a
+    // carriage return into Grok's LF-only framing.
+    let mut text = ROOM_BRIEF_TEMPLATE
+        .replace("\r\n", "\n")
+        .replace("{tools}", &tools)
+        .replace("{members}", &others)
+        .replace("{your_label}", &you.label)
+        .replace("{room_label}", room_label);
+    if you.driver == DriverKind::GenericTerminal {
+        text = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · ");
+    } else {
+        text = text.trim_end().to_string();
+    }
+    text
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (l, r) in left.iter().zip(right) {
+        difference |= l ^ r;
+    }
+    difference == 0
 }
 
 #[derive(Debug)]
@@ -612,6 +718,9 @@ trait PtySpawner: Send + Sync {
 struct PreparedLaunch {
     spec: LaunchSpec,
     wsl_scope: Option<WslRunScope>,
+    /// The secret placed in this launch's environment; stored on the run so
+    /// the sideband can recognise the pane by it.
+    pane_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1351,6 +1460,10 @@ pub struct SupervisorConfig {
     pub heartbeat_interval: Option<Duration>,
     pub auto_restart_on_stall_sessions: Option<Vec<SessionId>>,
     pub auto_restart_stall_threshold: Option<Duration>,
+    /// Deliver the room brief into a member's terminal when it joins a room
+    /// and on its run's first idle. Off in unit tests (mock PTYs record every
+    /// byte); on in the desktop.
+    pub room_brief_on_join: bool,
 }
 
 struct AuditInner {
@@ -1458,6 +1571,12 @@ struct RunningSession {
     pty: Option<Arc<dyn PtySession>>,
     input_gate: Arc<RunInputGate>,
     last_resize: Option<(u16, u16)>,
+    /// Per-run identity proof handed to the pane as `PRIM1_PANE_SECRET`.
+    pane_secret: Option<String>,
+    /// Room-brief attempts still owed to this run (it started as a member, or
+    /// joined a room while not ready): each idle transition spends one until
+    /// a brief is written. Zero once delivered or exhausted.
+    brief_attempts_left: u8,
 }
 
 impl RunningSession {
@@ -1466,7 +1585,19 @@ impl RunningSession {
             pty,
             input_gate: Arc::new(RunInputGate::new()),
             last_resize: None,
+            pane_secret: None,
+            brief_attempts_left: 0,
         }
+    }
+
+    fn with_pane_secret(mut self, pane_secret: Option<String>) -> Self {
+        self.pane_secret = pane_secret;
+        self
+    }
+
+    fn with_brief_owed(mut self, owed: bool) -> Self {
+        self.brief_attempts_left = if owed { ROOM_BRIEF_MAX_ATTEMPTS } else { 0 };
+        self
     }
 
     fn close_input(&self) {
@@ -2532,6 +2663,7 @@ fn ensure_run_input_safety_locked(
 struct SupervisorInner {
     runtime_dir: PathBuf,
     pane_mcp_executable: Option<PathBuf>,
+    room_brief_on_join: bool,
     catalog: Mutex<SessionCatalogV1>,
     rooms: Mutex<RoomState>,
     audit: AuditLog,
@@ -3591,6 +3723,7 @@ impl SupervisorHandle {
             inner: Arc::new(SupervisorInner {
                 runtime_dir: config.runtime_dir,
                 pane_mcp_executable: config.pane_mcp_executable,
+                room_brief_on_join: config.room_brief_on_join,
                 catalog: Mutex::new(catalog),
                 rooms: Mutex::new(rooms),
                 audit,
@@ -4073,6 +4206,7 @@ impl SupervisorHandle {
                 self.emit_run_event(event);
             }
         }
+        self.deliver_pending_brief_if_due(session_id, armed_generation, armed_run_id);
     }
 
     fn note_stale_quiesce_drop(&self, session_id: SessionId, generation: SessionGeneration) {
@@ -5437,6 +5571,7 @@ impl SupervisorHandle {
         for feed_event in feed_events {
             self.emit(RuntimeEvent::RoomFeedEvent { feed_event });
         }
+        self.schedule_room_briefs(snapshot.room_id, &request.member_ids);
         Ok(snapshot)
     }
 
@@ -5587,6 +5722,7 @@ impl SupervisorHandle {
             timestamp: now_rfc3339(),
         });
         self.emit(RuntimeEvent::RoomFeedEvent { feed_event });
+        self.schedule_room_briefs(request.room_id, std::slice::from_ref(&request.session_id));
         Ok(snapshot)
     }
 
@@ -5693,11 +5829,14 @@ impl SupervisorHandle {
 
     pub fn read_room_feed(&self, request: ReadRoomFeedRequest) -> Result<RoomFeedPage> {
         self.ensure_active()?;
+        let slots = self.inner.slots.lock();
         let rooms = self.inner.rooms.lock();
-        rooms
+        let room = rooms
             .get(request.room_id)
-            .ok_or_else(|| anyhow!("unknown room id '{}'", request.room_id))?
-            .read(request.cursor, 0)
+            .ok_or_else(|| anyhow!("unknown room id '{}'", request.room_id))?;
+        let mut page = room.read(request.cursor, 0)?;
+        page.members = Self::room_members_locked(room, &slots);
+        Ok(page)
     }
 
     pub fn post_room_message(&self, request: PostRoomMessageRequest) -> Result<RoomPostResult> {
@@ -5744,6 +5883,30 @@ impl SupervisorHandle {
             )
         };
 
+        self.deliver_room_message_as(RoomDeliverySpec {
+            room_id: request.room_id,
+            recipient_ids,
+            membership_revision,
+            room_label,
+            sender: RoomMessageSender::Operator {},
+            sender_label: "operator".into(),
+            content: request.content,
+        })
+    }
+
+    /// Deliver into every terminal in `recipient_ids` as one logical message:
+    /// preflight all, append the message + pending receipts, then write each
+    /// and record its terminal receipt. Identical for the operator and a pane.
+    fn deliver_room_message_as(&self, spec: RoomDeliverySpec) -> Result<RoomDeliveryResult> {
+        let RoomDeliverySpec {
+            room_id,
+            recipient_ids,
+            membership_revision,
+            room_label,
+            sender,
+            sender_label,
+            content,
+        } = spec;
         self.refresh_session_liveness();
         let mut delivery_plan = Vec::with_capacity(recipient_ids.len());
         for recipient_id in &recipient_ids {
@@ -5762,12 +5925,12 @@ impl SupervisorHandle {
                             "Prime/WSL room delivery is not admitted; use its visible raw terminal input"
                         ));
                     }
-                    validate_message_framing(&request.content, behavior)?;
+                    validate_message_framing(&content, behavior)?;
                     let route = RouteMessageRequest {
-                        from: "operator".into(),
+                        from: sender_label.clone(),
                         to: room_label.clone(),
                         scope: MessageScope::Room,
-                        content: request.content.clone(),
+                        content: content.clone(),
                     };
                     Ok((target, behavior, routed_message_payload(&route, behavior)))
                 })
@@ -5796,13 +5959,12 @@ impl SupervisorHandle {
             let _room_event_publish = self.inner.room_event_publish.lock();
             let (message_event, pending_events) = {
                 let mut rooms = self.inner.rooms.lock();
-                let room = rooms.get_mut(request.room_id).ok_or_else(|| {
-                    anyhow!("room '{}' was deleted before delivery", request.room_id)
-                })?;
+                let room = rooms
+                    .get_mut(room_id)
+                    .ok_or_else(|| anyhow!("room '{room_id}' was deleted before delivery"))?;
                 if room.definition.membership_revision != membership_revision {
                     return Err(anyhow!(
-                        "room '{}' membership changed during delivery preflight; retry",
-                        request.room_id
+                        "room '{room_id}' membership changed during delivery preflight; retry"
                     ));
                 }
                 if room.in_flight_deliveries == usize::MAX {
@@ -5811,8 +5973,8 @@ impl SupervisorHandle {
                 room.ensure_sequence_capacity(1 + recipient_ids.len() * 2)?;
                 let message_event = room.append(RoomFeedItem::Message {
                     message_id,
-                    sender: RoomMessageSender::Operator {},
-                    content: request.content,
+                    sender,
+                    content,
                     recipient_ids: recipient_ids.clone(),
                     membership_revision,
                 })?;
@@ -5833,7 +5995,7 @@ impl SupervisorHandle {
             };
             let delivery_lease = RoomDeliveryLease {
                 inner: self.inner.clone(),
-                room_id: request.room_id,
+                room_id,
             };
             let message_cursor = message_event.cursor;
             #[cfg(test)]
@@ -5878,7 +6040,7 @@ impl SupervisorHandle {
                 let feed_event = {
                     let mut rooms = self.inner.rooms.lock();
                     let room = rooms
-                        .get_mut(request.room_id)
+                        .get_mut(room_id)
                         .expect("in-flight room cannot be deleted");
                     room.append(RoomFeedItem::Delivery {
                         message_id,
@@ -5897,7 +6059,7 @@ impl SupervisorHandle {
             }
         }
         Ok(RoomDeliveryResult {
-            room_id: request.room_id,
+            room_id,
             message_id,
             cursor: message_cursor,
             recipient_count: recipient_ids.len(),
@@ -6371,6 +6533,12 @@ impl SupervisorHandle {
         match spawn_result {
             Ok(pty) => {
                 let pty: Arc<dyn PtySession> = Arc::from(pty);
+                let brief_owed = self
+                    .inner
+                    .rooms
+                    .lock()
+                    .room_by_session
+                    .contains_key(&session_id);
                 let installation = {
                     let mut slots = self.inner.slots.lock();
                     match slots.get_by_id_mut(session_id) {
@@ -6409,7 +6577,11 @@ impl SupervisorHandle {
                             } else {
                                 slot.spawn_in_flight = None;
                                 slot.process_id = pty.process_id();
-                                slot.running = Some(RunningSession::new(Some(pty.clone())));
+                                slot.running = Some(
+                                    RunningSession::new(Some(pty.clone()))
+                                        .with_pane_secret(plan.pane_secret.clone())
+                                        .with_brief_owed(brief_owed),
+                                );
                                 let grok_interactive_ready = slot.definition.driver
                                     == DriverKind::Grok
                                     && slot.grok_startup.is_interactive_ready();
@@ -6603,6 +6775,9 @@ impl SupervisorHandle {
                     message: format!("Started {} session", snapshot.label),
                     timestamp: now_rfc3339(),
                 });
+                if snapshot.lifecycle_state == LifecycleState::Idle {
+                    self.deliver_pending_brief_if_due(session_id, expected, run_id);
+                }
                 self.emit_run_event(RuntimeEvent::SessionState {
                     identity,
                     session: snapshot.alias.clone(),
@@ -7890,6 +8065,13 @@ impl SupervisorHandle {
                         reason,
                         timestamp: now_rfc3339(),
                     });
+                    if state == LifecycleState::Idle {
+                        self.deliver_pending_brief_if_due(
+                            session_id,
+                            event_generation,
+                            event_run_id,
+                        );
+                    }
                 }
 
                 self.emit_run_event(RuntimeEvent::SessionOutput {
@@ -7989,8 +8171,51 @@ impl SupervisorHandle {
             session_id,
             generation,
             run_id,
-            process,
+            identity: PaneCallerIdentity::Job(process),
         })
+    }
+
+    /// Identify a caller by the per-run secret it presented. Exactly one live
+    /// run may hold it; anything else — empty, stale, another pane's — is
+    /// refused without naming what was presented.
+    fn resolve_pane_caller_by_secret(&self, secret: &str) -> Result<PaneCaller> {
+        if secret.is_empty() {
+            return Err(anyhow!("sideband caller presented an empty pane secret"));
+        }
+        let slots = self.inner.slots.lock();
+        let mut matches = Vec::new();
+        for (session_id, slot) in &slots.by_id {
+            let Some(live) = slot
+                .running
+                .as_ref()
+                .and_then(|running| running.pane_secret.as_deref())
+            else {
+                continue;
+            };
+            if !constant_time_eq(live.as_bytes(), secret.as_bytes()) {
+                continue;
+            }
+            let Some(run_id) = slot.run_id else {
+                continue;
+            };
+            matches.push((
+                slot.definition.alias.clone(),
+                *session_id,
+                slot.generation,
+                run_id,
+            ));
+        }
+        match matches.as_slice() {
+            [(session, session_id, generation, run_id)] => Ok(PaneCaller {
+                session: session.clone(),
+                session_id: *session_id,
+                generation: *generation,
+                run_id: *run_id,
+                identity: PaneCallerIdentity::Secret(secret.to_string()),
+            }),
+            [] => Err(anyhow!("sideband caller pane secret matches no live pane")),
+            _ => Err(anyhow!("sideband caller pane secret is ambiguous")),
+        }
     }
 
     fn validate_pane_caller_locked(caller: &PaneCaller, slots: &SessionRegistry) -> Result<()> {
@@ -8003,14 +8228,27 @@ impl SupervisorHandle {
         {
             return Err(anyhow!("sideband caller run is stale"));
         }
-        let (session, session_id, generation, run_id) =
-            Self::resolve_pane_process_locked(caller.process.as_ref(), slots)?;
-        if session != caller.session
-            || session_id != caller.session_id
-            || generation != caller.generation
-            || run_id != caller.run_id
-        {
-            return Err(anyhow!("sideband caller run is stale"));
+        match &caller.identity {
+            PaneCallerIdentity::Job(process) => {
+                let (session, session_id, generation, run_id) =
+                    Self::resolve_pane_process_locked(process.as_ref(), slots)?;
+                if session != caller.session
+                    || session_id != caller.session_id
+                    || generation != caller.generation
+                    || run_id != caller.run_id
+                {
+                    return Err(anyhow!("sideband caller run is stale"));
+                }
+            }
+            PaneCallerIdentity::Secret(secret) => {
+                let live = bound_slot
+                    .running
+                    .as_ref()
+                    .and_then(|running| running.pane_secret.as_deref());
+                if !live.is_some_and(|live| constant_time_eq(live.as_bytes(), secret.as_bytes())) {
+                    return Err(anyhow!("sideband caller run is stale"));
+                }
+            }
         }
         Ok(())
     }
@@ -8071,7 +8309,8 @@ impl SupervisorHandle {
                 let rooms = self.inner.rooms.lock();
                 Self::pane_room_binding_locked(caller, &slots, &rooms).map(|_| ())
             }
-            SidebandRequest::RoomPost { content } => {
+            SidebandRequest::RoomPost { content }
+            | SidebandRequest::RoomDeliver { content, .. } => {
                 let rooms = self.inner.rooms.lock();
                 Self::pane_room_binding_locked(caller, &slots, &rooms)?;
                 validate_message_body(content)
@@ -8087,10 +8326,295 @@ impl SupervisorHandle {
         let slots = self.inner.slots.lock();
         let rooms = self.inner.rooms.lock();
         let (room_id, floor) = Self::pane_room_binding_locked(caller, &slots, &rooms)?;
-        rooms
+        let room = rooms
             .get(room_id)
-            .expect("validated pane room disappeared while room state was locked")
-            .read(cursor, floor)
+            .expect("validated pane room disappeared while room state was locked");
+        let mut page = room.read(cursor, floor)?;
+        page.members = Self::room_members_locked(room, &slots);
+        Ok(page)
+    }
+
+    /// Deliver the canonical brief into one member's terminal — the operator's
+    /// Send with the brief as content. Runs on join, on the run's first idle,
+    /// and from the UI's "Brief now".
+    pub fn brief_room_member(&self, request: BriefRoomMemberRequest) -> Result<RoomDeliveryResult> {
+        self.ensure_active()?;
+        let spec = {
+            let slots = self.inner.slots.lock();
+            let rooms = self.inner.rooms.lock();
+            let room = rooms
+                .get(request.room_id)
+                .ok_or_else(|| anyhow!("unknown room id '{}'", request.room_id))?;
+            if !room.definition.member_ids.contains(&request.session_id) {
+                return Err(anyhow!(
+                    "session '{}' is not a member of room '{}'",
+                    request.session_id,
+                    request.room_id
+                ));
+            }
+            let members = Self::room_members_locked(room, &slots);
+            let you = members
+                .iter()
+                .find(|member| member.session_id == request.session_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("unknown session id '{}'", request.session_id))?;
+            let content = render_room_brief(
+                &room.definition.label,
+                &members,
+                &you,
+                self.inner.pane_mcp_executable.as_deref(),
+            );
+            RoomDeliverySpec {
+                room_id: request.room_id,
+                recipient_ids: vec![request.session_id],
+                membership_revision: room.definition.membership_revision,
+                room_label: room.definition.label.clone(),
+                sender: RoomMessageSender::Operator {},
+                sender_label: "operator".into(),
+                content,
+            }
+        };
+        let result = self.deliver_room_message_as(spec)?;
+        if result.failures.is_empty() {
+            let mut slots = self.inner.slots.lock();
+            if let Some(running) = slots
+                .get_by_id_mut(request.session_id)
+                .and_then(|slot| slot.running.as_mut())
+            {
+                running.brief_attempts_left = 0;
+            }
+        }
+        Ok(result)
+    }
+
+    /// On join: brief every running member now; a refusal (harness not ready)
+    /// leaves attempts for the idle hook. Members that are not running are
+    /// briefed when their run starts and first idles.
+    fn schedule_room_briefs(&self, room_id: RoomId, member_ids: &[SessionId]) {
+        if !self.inner.room_brief_on_join {
+            return;
+        }
+        for session_id in member_ids {
+            let running = {
+                let mut slots = self.inner.slots.lock();
+                match slots
+                    .get_by_id_mut(*session_id)
+                    .and_then(|slot| slot.running.as_mut())
+                {
+                    Some(running) => {
+                        running.brief_attempts_left = ROOM_BRIEF_MAX_ATTEMPTS;
+                        true
+                    }
+                    None => false,
+                }
+            };
+            if running {
+                self.spawn_room_brief(room_id, *session_id);
+            }
+        }
+    }
+
+    /// A run just went idle: if it still owes a brief, spend one attempt.
+    fn deliver_pending_brief_if_due(
+        &self,
+        session_id: SessionId,
+        generation: SessionGeneration,
+        run_id: Uuid,
+    ) {
+        if !self.inner.room_brief_on_join {
+            return;
+        }
+        let room_id = {
+            let mut slots = self.inner.slots.lock();
+            let Some(slot) = slots.get_by_id_mut(session_id) else {
+                return;
+            };
+            if slot.generation != generation
+                || slot.run_id != Some(run_id)
+                || slot.state != LifecycleState::Idle
+            {
+                return;
+            }
+            let room_id = self
+                .inner
+                .rooms
+                .lock()
+                .room_by_session
+                .get(&session_id)
+                .copied();
+            let Some(running) = slot.running.as_mut() else {
+                return;
+            };
+            if running.brief_attempts_left == 0 {
+                return;
+            }
+            let Some(room_id) = room_id else {
+                running.brief_attempts_left = 0;
+                return;
+            };
+            running.brief_attempts_left -= 1;
+            room_id
+        };
+        self.spawn_room_brief(room_id, session_id);
+    }
+
+    fn spawn_room_brief(&self, room_id: RoomId, session_id: SessionId) {
+        let handle = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("prim1-room-brief".into())
+            .spawn(move || {
+                let label = handle
+                    .inner
+                    .slots
+                    .lock()
+                    .get_by_id(session_id)
+                    .map(|slot| slot.definition.label.clone())
+                    .unwrap_or_else(|| session_id.to_string());
+                let outcome = handle.brief_room_member(BriefRoomMemberRequest {
+                    room_id,
+                    session_id,
+                });
+                let failure = match outcome {
+                    Ok(result) if result.failures.is_empty() => None,
+                    Ok(result) => result.failures.first().map(|failure| failure.error.clone()),
+                    Err(error) => Some(error.to_string()),
+                };
+                if let Some(reason) = failure {
+                    handle.emit(RuntimeEvent::SystemLog {
+                        level: LogLevel::Warn,
+                        message: format!(
+                            "Room brief for {label} not delivered: {reason} — it is retried when the harness idles; or use Brief now"
+                        ),
+                        timestamp: now_rfc3339(),
+                    });
+                }
+            });
+        if let Err(error) = spawned {
+            self.emit(RuntimeEvent::SystemLog {
+                level: LogLevel::Warn,
+                message: format!("Room brief thread could not start: {error}"),
+                timestamp: now_rfc3339(),
+            });
+        }
+    }
+
+    /// A pane's `room_deliver`: the operator's Send with the calling pane as
+    /// sender. Recipient is a member session id, a member label, or `all`
+    /// (every other member); never the caller itself.
+    fn deliver_room_message_from_pane(
+        &self,
+        caller: &PaneCaller,
+        recipient: &str,
+        content: String,
+    ) -> Result<RoomDeliveryResult> {
+        validate_message_body(&content)?;
+        let spec = {
+            let slots = self.inner.slots.lock();
+            let rooms = self.inner.rooms.lock();
+            let (room_id, _floor) = Self::pane_room_binding_locked(caller, &slots, &rooms)?;
+            let room = rooms
+                .get(room_id)
+                .expect("validated pane room disappeared while room state was locked");
+            if room.definition.member_ids.len() < 2 {
+                return Err(anyhow!(
+                    "room '{room_id}' is dormant; room delivery requires at least two members"
+                ));
+            }
+            let recipient_ids =
+                Self::resolve_pane_delivery_recipients(room, &slots, caller.session_id, recipient)?;
+            let sender_label = slots
+                .get_by_id(caller.session_id)
+                .map(|slot| slot.definition.label.clone())
+                .unwrap_or_else(|| caller.session.clone());
+            RoomDeliverySpec {
+                room_id,
+                recipient_ids,
+                membership_revision: room.definition.membership_revision,
+                room_label: room.definition.label.clone(),
+                sender: RoomMessageSender::Session {
+                    session_id: caller.session_id,
+                },
+                sender_label,
+                content,
+            }
+        };
+        self.deliver_room_message_as(spec)
+    }
+
+    fn resolve_pane_delivery_recipients(
+        room: &RoomRuntime,
+        slots: &SessionRegistry,
+        sender_id: SessionId,
+        recipient: &str,
+    ) -> Result<Vec<SessionId>> {
+        let wanted = recipient.trim();
+        if wanted.is_empty() {
+            return Err(anyhow!(
+                "room delivery needs a recipient: a member label, a session id, or 'all'"
+            ));
+        }
+        let others: Vec<SessionId> = room
+            .definition
+            .member_ids
+            .iter()
+            .copied()
+            .filter(|member| *member != sender_id)
+            .collect();
+        if wanted.eq_ignore_ascii_case("all") {
+            if others.is_empty() {
+                return Err(anyhow!("room has no other members to deliver to"));
+            }
+            return Ok(others);
+        }
+        if let Ok(session_id) = Uuid::parse_str(wanted) {
+            if session_id == sender_id {
+                return Err(anyhow!(
+                    "room delivery cannot target the calling pane itself"
+                ));
+            }
+            if !room.definition.member_ids.contains(&session_id) {
+                return Err(anyhow!(
+                    "session '{session_id}' is not a member of room '{}'",
+                    room.definition.room_id
+                ));
+            }
+            return Ok(vec![session_id]);
+        }
+        let mut by_label = Vec::new();
+        let mut member_labels = Vec::new();
+        for member in &others {
+            let Some(slot) = slots.get_by_id(*member) else {
+                continue;
+            };
+            member_labels.push(slot.definition.label.clone());
+            if slot.definition.label.trim().eq_ignore_ascii_case(wanted) {
+                by_label.push(*member);
+            }
+        }
+        match by_label.as_slice() {
+            [session_id] => Ok(vec![*session_id]),
+            [] => Err(anyhow!(
+                "no other room member is labelled '{wanted}'; members: {}",
+                member_labels.join(", ")
+            )),
+            _ => Err(anyhow!(
+                "'{wanted}' names more than one room member; use a session id"
+            )),
+        }
+    }
+
+    fn room_members_locked(room: &RoomRuntime, slots: &SessionRegistry) -> Vec<RoomMember> {
+        room.definition
+            .member_ids
+            .iter()
+            .filter_map(|session_id| {
+                slots.get_by_id(*session_id).map(|slot| RoomMember {
+                    session_id: *session_id,
+                    label: slot.definition.label.clone(),
+                    driver: slot.definition.driver,
+                })
+            })
+            .collect()
     }
 
     fn post_room_message_from_pane(
@@ -8305,6 +8829,9 @@ impl SupervisorHandle {
                     Err(error) => Self::rejected_sideband_response(error.to_string()),
                 }
             }
+            SidebandRequest::RoomDeliver { .. } => Self::rejected_sideband_response(
+                "room_deliver is dispatched on the blocking delivery path",
+            ),
         }
     }
 
@@ -8535,6 +9062,32 @@ impl SupervisorHandle {
                 .apply_authorized_sideband_request(caller, request)
                 .await;
         }
+        if let SidebandRequest::RoomDeliver { recipient, content } = request {
+            // Delivery writes PTYs with submit delays: keep it off the
+            // sideband's async thread, exactly as the desktop command does.
+            let handle = self.clone();
+            let caller = caller.clone();
+            return match tokio::task::spawn_blocking(move || {
+                handle.deliver_room_message_from_pane(&caller, &recipient, content)
+            })
+            .await
+            {
+                Ok(Ok(result)) => SidebandResponse {
+                    ok: true,
+                    message: format!(
+                        "room delivery written for {} of {} recipients",
+                        result.written_count, result.recipient_count
+                    ),
+                    timed_out: false,
+                    payload: Some(SidebandResponsePayload::RoomDelivery { result }),
+                    request_id: None,
+                },
+                Ok(Err(error)) => Self::rejected_sideband_response(error.to_string()),
+                Err(error) => Self::rejected_sideband_response(format!(
+                    "room delivery worker failed: {error}"
+                )),
+            };
+        }
 
         let request_id = Uuid::new_v4().to_string();
         let action = match &request {
@@ -8542,7 +9095,9 @@ impl SupervisorHandle {
             SidebandRequest::WaitQuiet { .. } => "wait_quiet",
             SidebandRequest::SendInput { .. } => "send_input",
             SidebandRequest::SendKey { .. } => "send_key",
-            SidebandRequest::RoomRead { .. } | SidebandRequest::RoomPost { .. } => {
+            SidebandRequest::RoomRead { .. }
+            | SidebandRequest::RoomPost { .. }
+            | SidebandRequest::RoomDeliver { .. } => {
                 unreachable!("room sideband requests return before dispatch metadata")
             }
         };
@@ -8575,7 +9130,9 @@ impl SupervisorHandle {
                 self.apply_authorized_sideband_request(caller, request)
                     .await
             }
-            SidebandRequest::RoomRead { .. } | SidebandRequest::RoomPost { .. } => {
+            SidebandRequest::RoomRead { .. }
+            | SidebandRequest::RoomPost { .. }
+            | SidebandRequest::RoomDeliver { .. } => {
                 unreachable!("room sideband requests return before PTY dispatch")
             }
         };
@@ -8779,12 +9336,19 @@ impl SupervisorHandle {
             (build_launch_spec(definition, &resolved)?, None)
         };
 
-        // Prime is intentionally excluded: native Windows Job membership is
-        // the pane-sideband authority, and WSL has no equivalent verified
-        // caller-identity bridge in this release.
+        // Prime is still excluded from the pane environment: its WSL launch
+        // forwards no environment (WSLENV is cleared) and the CLI path through
+        // Windows interop is a separate line after C1-C4.
+        let mut pane_secret = None;
         if definition.driver != DriverKind::Prime
             && let Some(status) = self.inner.control_plane.read().clone()
         {
+            let secret = mint_pane_secret();
+            spec.env.push(EnvVar {
+                key: "PRIM1_PANE_SECRET".into(),
+                value: secret.clone(),
+            });
+            pane_secret = Some(secret);
             spec.env.push(EnvVar {
                 key: "PRIM1_PANE_IDENTITY".into(),
                 value: definition.alias.clone(),
@@ -8809,16 +9373,31 @@ impl SupervisorHandle {
                     key: "PRIM1_CONTROL_PLANE_SERVER_STARTED_FILETIME".into(),
                     value: server.creation_time_filetime().to_string(),
                 });
-                if let (Some(executable), Some(client)) = (
-                    self.inner.pane_mcp_executable.as_deref(),
-                    PaneMcpClient::for_driver(definition.driver),
-                ) {
-                    augment_launch_spec_with_pane_mcp(&mut spec, client, executable)?;
+                if let Some(executable) = self.inner.pane_mcp_executable.as_deref() {
+                    // Every pane learns where the PRIM-1 executable is: the
+                    // universal seam (`--prim1-room …`) for harnesses without
+                    // an MCP client of their own.
+                    validate_pane_mcp_executable(executable)?;
+                    let cli = child_process_path(executable)
+                        .into_os_string()
+                        .into_string()
+                        .map_err(|_| anyhow!("PRIM-1 executable path is not valid Unicode"))?;
+                    spec.env.push(EnvVar {
+                        key: "PRIM1_CLI".into(),
+                        value: cli,
+                    });
+                    if let Some(client) = PaneMcpClient::for_driver(definition.driver) {
+                        augment_launch_spec_with_pane_mcp(&mut spec, client, executable)?;
+                    }
                 }
             }
         }
 
-        Ok(PreparedLaunch { spec, wsl_scope })
+        Ok(PreparedLaunch {
+            spec,
+            wsl_scope,
+            pane_secret,
+        })
     }
 
     fn deliver_prepared_payload(
@@ -9836,48 +10415,76 @@ fn pane_process_from_windows_pipe(
 #[cfg(windows)]
 async fn handle_windows_sideband_connection(
     handle: SupervisorHandle,
-    mut server: tokio::net::windows::named_pipe::NamedPipeServer,
+    server: tokio::net::windows::named_pipe::NamedPipeServer,
 ) -> Result<()> {
-    const ACCESS_DENIED: &str = "sideband access denied";
-    let caller = match pane_process_from_windows_pipe(&server)
+    // Kernel identity first. A caller the Job cannot attribute is not refused
+    // yet: it may open with the pane secret from its environment.
+    let job_caller = match pane_process_from_windows_pipe(&server)
         .and_then(|process| handle.resolve_pane_caller(process))
     {
-        Ok(caller) => caller,
+        Ok(caller) => Some(caller),
         Err(error) => {
-            eprintln!("rejected unaffiliated sideband client: {error:#}");
-            let response = SupervisorHandle::rejected_sideband_response(ACCESS_DENIED);
-            let payload = format!("{}\n", encode_response(&response)?);
-            write_sideband_response(
-                &mut server,
-                payload.as_bytes(),
-                SIDEBAND_RESPONSE_WRITE_TIMEOUT,
-            )
-            .await?;
-            return Ok(());
+            eprintln!(
+                "sideband client is outside every pane job; awaiting a pane secret: {error:#}"
+            );
+            None
         }
     };
 
-    handle_sideband_stream(handle, caller, server).await
+    handle_sideband_stream(handle, job_caller, server).await
 }
 
 async fn handle_sideband_stream<Stream>(
     handle: SupervisorHandle,
-    caller: PaneCaller,
+    job_caller: Option<PaneCaller>,
     stream: Stream,
 ) -> Result<()>
 where
     Stream: tokio::io::AsyncRead + AsyncWrite + Unpin,
 {
+    const ACCESS_DENIED: &str = "sideband access denied";
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
-    let frame = read_sideband_frame(
+    let first = read_sideband_frame(
         &mut reader,
         SIDEBAND_FRAME_MAX_BYTES,
         SIDEBAND_FRAME_READ_TIMEOUT,
     )
     .await?;
-    let request = decode_request(&frame).context("invalid sideband payload")?;
-    let response = handle.apply_sideband_request_async(&caller, request).await;
+    // An optional preamble line carries the pane secret; the request follows.
+    // Kernel identity always wins over a presented secret.
+    let (caller, frame) = match control_plane::decode_preamble(&first) {
+        Some(preamble) => {
+            let frame = read_sideband_frame(
+                &mut reader,
+                SIDEBAND_FRAME_MAX_BYTES,
+                SIDEBAND_FRAME_READ_TIMEOUT,
+            )
+            .await?;
+            let caller = match job_caller {
+                Some(caller) => Some(caller),
+                None => match handle.resolve_pane_caller_by_secret(&preamble.secret) {
+                    Ok(caller) => Some(caller),
+                    Err(error) => {
+                        eprintln!("rejected sideband client: {error:#}");
+                        None
+                    }
+                },
+            };
+            (caller, frame)
+        }
+        None => (job_caller, first),
+    };
+    let response = match caller {
+        Some(caller) => {
+            let request = decode_request(&frame).context("invalid sideband payload")?;
+            handle.apply_sideband_request_async(&caller, request).await
+        }
+        None => {
+            eprintln!("rejected unaffiliated sideband client");
+            SupervisorHandle::rejected_sideband_response(ACCESS_DENIED)
+        }
+    };
     let payload = format!("{}\n", encode_response(&response)?);
     write_sideband_response(
         &mut write_half,
@@ -10963,6 +11570,7 @@ mod tests {
 
     fn test_supervisor_config(root: &Path) -> SupervisorConfig {
         SupervisorConfig {
+            room_brief_on_join: false,
             working_root: root.join("work"),
             runtime_dir: root.join("runtime"),
             pane_mcp_executable: None,
@@ -11034,6 +11642,7 @@ mod tests {
         let working_root = root.join("work");
         fs::create_dir_all(&working_root).expect("create defaults test working root");
         let supervisor = SupervisorHandle::new(SupervisorConfig {
+            room_brief_on_join: false,
             working_root,
             runtime_dir: root.join("runtime"),
             pane_mcp_executable: None,
@@ -17002,7 +17611,9 @@ mod tests {
             let (mut client, server) = tokio::io::duplex(4096);
             let handle = supervisor.clone();
             let server_task =
-                tokio::spawn(async move { handle_sideband_stream(handle, caller, server).await });
+                tokio::spawn(
+                    async move { handle_sideband_stream(handle, Some(caller), server).await },
+                );
             client.write_all(b"{not json}\n").await.unwrap();
             client.flush().await.unwrap();
             tokio::time::timeout(Duration::from_secs(1), server_task)
@@ -17134,7 +17745,7 @@ mod tests {
                 let handle = supervisor.clone();
                 let request_caller = caller.clone();
                 let server_task = tokio::spawn(async move {
-                    handle_sideband_stream(handle, request_caller, server).await
+                    handle_sideband_stream(handle, Some(request_caller), server).await
                 });
                 let (read_half, mut write_half) = tokio::io::split(client);
                 let writer = tokio::spawn(async move {
@@ -17237,6 +17848,7 @@ mod tests {
         fs::write(&sentinel, b"not a legacy credential file").expect("write directory sentinel");
 
         let result = SupervisorHandle::new(SupervisorConfig {
+            room_brief_on_join: false,
             working_root,
             runtime_dir,
             pane_mcp_executable: None,
@@ -17279,6 +17891,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).expect("create Unix legacy credential symlink");
 
         let supervisor = SupervisorHandle::new(SupervisorConfig {
+            room_brief_on_join: false,
             working_root,
             runtime_dir,
             pane_mcp_executable: None,
@@ -17311,6 +17924,7 @@ mod tests {
         create_windows_junction(&runtime_junction, &junction_target);
 
         let result = SupervisorHandle::new(SupervisorConfig {
+            room_brief_on_join: false,
             working_root,
             runtime_dir: runtime_junction.clone(),
             pane_mcp_executable: None,
@@ -17354,6 +17968,7 @@ mod tests {
         create_windows_junction(&sideband_junction, &target);
 
         let supervisor = SupervisorHandle::new(SupervisorConfig {
+            room_brief_on_join: false,
             working_root,
             runtime_dir,
             pane_mcp_executable: None,
@@ -17598,8 +18213,19 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn unaffiliated_named_pipe_client_is_rejected_before_sending_a_frame() {
+    fn unaffiliated_named_pipe_client_is_refused_after_its_frame_and_admitted_by_the_pane_secret() {
+        use tokio::io::AsyncWriteExt as _;
+
         let supervisor = test_supervisor();
+        let (pty, _inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            pty,
+        );
+        let secret = mint_pane_secret();
+        set_test_pane_secret(&supervisor, "claude", &secret);
         let endpoint = windows_test_pipe_endpoint("unaffiliated");
         let status = supervisor
             .start_control_plane_at(Some(endpoint))
@@ -17610,22 +18236,516 @@ mod tests {
             .build()
             .expect("build pipe client runtime");
 
-        let response = runtime.block_on(async {
-            let client = tokio::net::windows::named_pipe::ClientOptions::new()
-                .open(&status.endpoint)
-                .expect("connect unaffiliated client");
-            let mut reader = BufReader::new(client);
-            let mut response_line = String::new();
-            tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut response_line))
-                .await
-                .expect("server waited for a request frame before rejecting caller")
-                .expect("read access-denied response");
-            decode_response(response_line.trim()).expect("decode access-denied response")
-        });
+        let exchange = |lines: Vec<String>| {
+            let endpoint = status.endpoint.clone();
+            runtime.block_on(async move {
+                let mut client = tokio::net::windows::named_pipe::ClientOptions::new()
+                    .open(&endpoint)
+                    .expect("connect unaffiliated client");
+                for line in lines {
+                    client
+                        .write_all(format!("{line}\n").as_bytes())
+                        .await
+                        .expect("write frame");
+                }
+                client.flush().await.expect("flush frames");
+                let mut reader = BufReader::new(client);
+                let mut response_line = String::new();
+                tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut response_line))
+                    .await
+                    .expect("server answered the frame")
+                    .expect("read response");
+                decode_response(response_line.trim()).expect("decode response")
+            })
+        };
+        let ping = encode_request(&SidebandRequest::Ping {}).unwrap();
 
-        assert!(!response.ok);
-        assert_eq!(response.message, "sideband access denied");
+        // No preamble: this test process is in no pane job → refused, after its frame.
+        let denied = exchange(vec![ping.clone()]);
+        assert!(!denied.ok);
+        assert_eq!(denied.message, "sideband access denied");
+
+        // A wrong secret is refused the same way.
+        let wrong = exchange(vec![
+            control_plane::encode_preamble(&shared_types::SidebandPreamble {
+                secret: "not-the-secret".into(),
+            })
+            .unwrap(),
+            ping.clone(),
+        ]);
+        assert!(!wrong.ok);
+        assert_eq!(wrong.message, "sideband access denied");
+
+        // The pane's own secret admits the same process as that pane.
+        let admitted = exchange(vec![
+            control_plane::encode_preamble(&shared_types::SidebandPreamble {
+                secret: secret.clone(),
+            })
+            .unwrap(),
+            ping,
+        ]);
+        assert!(admitted.ok, "{}", admitted.message);
+        assert_eq!(admitted.message, "pong");
+
+        let audit = fs::read_to_string(supervisor.audit_log_path()).unwrap();
+        assert!(
+            !audit.contains(&secret),
+            "the pane secret leaked into the audit log"
+        );
         supervisor.shutdown().expect("stop real control plane");
+    }
+
+    fn set_test_pane_secret(supervisor: &SupervisorHandle, name: &str, secret: &str) {
+        let session_id = test_session_id(supervisor, name);
+        let mut slots = supervisor.inner.slots.lock();
+        slots
+            .get_by_id_mut(session_id)
+            .expect("test session")
+            .running
+            .as_mut()
+            .expect("test session must be running")
+            .pane_secret = Some(secret.to_string());
+    }
+
+    fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !condition() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn secret_identity_binds_to_one_live_run_and_expires_with_it() {
+        let supervisor = test_supervisor();
+        let (claude_pty, _claude_inputs) = recording_pty_session(std::process::id());
+        let (codex_pty, _codex_inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            claude_pty,
+        );
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            codex_pty,
+        );
+        let claude = test_session_id(&supervisor, "claude");
+        let codex = test_session_id(&supervisor, "codex");
+        let claude_secret = mint_pane_secret();
+        let codex_secret = mint_pane_secret();
+        set_test_pane_secret(&supervisor, "claude", &claude_secret);
+        set_test_pane_secret(&supervisor, "codex", &codex_secret);
+
+        assert!(supervisor.resolve_pane_caller_by_secret("").is_err());
+        let unknown = supervisor
+            .resolve_pane_caller_by_secret("0000")
+            .err()
+            .expect("an unknown secret must not resolve");
+        assert!(
+            unknown.to_string().contains("matches no live pane"),
+            "{unknown}"
+        );
+        let caller = supervisor
+            .resolve_pane_caller_by_secret(&claude_secret)
+            .expect("the live secret resolves");
+        assert_eq!(caller.session_id, claude);
+        assert!(matches!(caller.identity, PaneCallerIdentity::Secret(_)));
+        assert_eq!(
+            supervisor
+                .resolve_pane_caller_by_secret(&codex_secret)
+                .unwrap()
+                .session_id,
+            codex
+        );
+
+        supervisor
+            .create_room(CreateRoomRequest {
+                label: Some("Secret room".into()),
+                member_ids: vec![claude, codex],
+            })
+            .unwrap();
+        let posted = supervisor.apply_sideband_request(
+            &caller,
+            SidebandRequest::RoomPost {
+                content: "posted via the pane secret".into(),
+            },
+        );
+        assert!(posted.ok, "{}", posted.message);
+        let read =
+            supervisor.apply_sideband_request(&caller, SidebandRequest::RoomRead { cursor: None });
+        let Some(SidebandResponsePayload::RoomFeed { page }) = read.payload else {
+            panic!("missing feed page")
+        };
+        assert!(page.events.iter().any(|event| matches!(
+            &event.item,
+            RoomFeedItem::Message { sender: RoomMessageSender::Session { session_id }, content, .. }
+                if *session_id == claude && content == "posted via the pane secret"
+        )));
+        assert_eq!(page.members.len(), 2);
+        assert!(page.members.iter().any(|member| member.session_id == claude
+            && member.driver == DriverKind::Claude
+            && member.label == "claude"));
+
+        // A new run mints a new secret: the old caller is stale.
+        set_test_pane_secret(&supervisor, "claude", &mint_pane_secret());
+        let stale = supervisor.apply_sideband_request(&caller, SidebandRequest::Ping {});
+        assert!(!stale.ok);
+        assert!(stale.message.contains("stale"), "{}", stale.message);
+        assert!(
+            supervisor
+                .resolve_pane_caller_by_secret(&claude_secret)
+                .is_err()
+        );
+
+        let audit = fs::read_to_string(supervisor.audit_log_path()).unwrap();
+        assert!(!audit.contains(&claude_secret));
+        assert!(!audit.contains(&codex_secret));
+    }
+
+    #[test]
+    fn sideband_stream_admits_a_preamble_secret_without_a_job_caller() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let supervisor = test_supervisor();
+        let (pty, _inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            pty,
+        );
+        let secret = mint_pane_secret();
+        set_test_pane_secret(&supervisor, "claude", &secret);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+        let exchange = |lines: Vec<String>| {
+            let handle = supervisor.clone();
+            runtime.block_on(async move {
+                let (mut client, server) = tokio::io::duplex(16 * 1024);
+                let server_task =
+                    tokio::spawn(async move { handle_sideband_stream(handle, None, server).await });
+                for line in lines {
+                    client
+                        .write_all(format!("{line}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+                client.flush().await.unwrap();
+                let mut reader = BufReader::new(client);
+                let mut response_line = String::new();
+                tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut response_line))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                server_task.await.unwrap().unwrap();
+                decode_response(response_line.trim()).unwrap()
+            })
+        };
+        let ping = encode_request(&SidebandRequest::Ping {}).unwrap();
+        let preamble = |secret: &str| {
+            control_plane::encode_preamble(&shared_types::SidebandPreamble {
+                secret: secret.into(),
+            })
+            .unwrap()
+        };
+
+        let denied = exchange(vec![ping.clone()]);
+        assert!(!denied.ok);
+        assert_eq!(denied.message, "sideband access denied");
+        let wrong = exchange(vec![preamble("wrong"), ping.clone()]);
+        assert!(!wrong.ok);
+        let admitted = exchange(vec![preamble(&secret), ping]);
+        assert!(admitted.ok, "{}", admitted.message);
+        assert_eq!(admitted.message, "pong");
+    }
+
+    #[test]
+    fn pane_room_deliver_wakes_members_with_the_pane_label_and_never_itself() {
+        let supervisor = test_supervisor();
+        // Liveness prunes runs whose OS pid is dead: the caller pane borrows this
+        // test process's pid; the recipient keeps no pid (never pruned).
+        let live_pid = std::process::id();
+        let (claude_pty, claude_inputs) = recording_pty_session(live_pid);
+        let (codex_pty, codex_inputs) = recording_pty_session(102);
+        install_mock_running_session_with_process_id_and_bracketed_paste_enabled(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            Some(live_pid),
+            claude_pty,
+        );
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            codex_pty,
+        );
+        let claude = test_session_id(&supervisor, "claude");
+        let codex = test_session_id(&supervisor, "codex");
+        let room = supervisor
+            .create_room(CreateRoomRequest {
+                label: Some("Wake room".into()),
+                member_ids: vec![claude, codex],
+            })
+            .unwrap();
+        let caller = supervisor
+            .resolve_pane_caller(TestPaneProcess::new(9001, [live_pid]))
+            .unwrap();
+
+        let delivered = supervisor.apply_sideband_request(
+            &caller,
+            SidebandRequest::RoomDeliver {
+                recipient: "codex".into(),
+                content: "wake up, I need your output".into(),
+            },
+        );
+        assert!(delivered.ok, "{}", delivered.message);
+        let Some(SidebandResponsePayload::RoomDelivery { result }) = delivered.payload else {
+            panic!("missing delivery payload")
+        };
+        assert_eq!(result.recipient_count, 1);
+        assert_eq!(result.written_count, 1);
+        assert!(result.failures.is_empty());
+        let framed = frame_message_payload(
+            "[Room message from claude]\nwake up, I need your output",
+            MessageFraming::BracketedPaste,
+        );
+        assert_eq!(codex_inputs.lock().as_slice(), &[framed, "\r".into()]);
+        assert!(
+            claude_inputs.lock().is_empty(),
+            "the sender's own terminal stays untouched"
+        );
+
+        let by_id = supervisor.apply_sideband_request(
+            &caller,
+            SidebandRequest::RoomDeliver {
+                recipient: codex.to_string(),
+                content: "by id".into(),
+            },
+        );
+        assert!(by_id.ok, "{}", by_id.message);
+        let to_self = supervisor.apply_sideband_request(
+            &caller,
+            SidebandRequest::RoomDeliver {
+                recipient: claude.to_string(),
+                content: "hello me".into(),
+            },
+        );
+        assert!(!to_self.ok);
+        assert!(
+            to_self.message.contains("calling pane itself"),
+            "{}",
+            to_self.message
+        );
+        let nobody = supervisor.apply_sideband_request(
+            &caller,
+            SidebandRequest::RoomDeliver {
+                recipient: "hermes".into(),
+                content: "anyone?".into(),
+            },
+        );
+        assert!(!nobody.ok);
+        assert!(
+            nobody.message.contains("no other room member is labelled"),
+            "{}",
+            nobody.message
+        );
+        let all = supervisor.apply_sideband_request(
+            &caller,
+            SidebandRequest::RoomDeliver {
+                recipient: "ALL".into(),
+                content: "everyone but me".into(),
+            },
+        );
+        assert!(all.ok, "{}", all.message);
+        let Some(SidebandResponsePayload::RoomDelivery { result: all_result }) = all.payload else {
+            panic!("missing all-delivery payload")
+        };
+        assert_eq!(all_result.recipient_count, 1, "all excludes the caller");
+        assert!(claude_inputs.lock().is_empty());
+        assert_eq!(codex_inputs.lock().len(), 6);
+
+        let page = supervisor
+            .read_room_feed(ReadRoomFeedRequest {
+                room_id: room.room_id,
+                cursor: None,
+            })
+            .unwrap();
+        assert!(page.events.iter().any(|event| matches!(
+            &event.item,
+            RoomFeedItem::Message { sender: RoomMessageSender::Session { session_id }, recipient_ids, content, .. }
+                if *session_id == claude && recipient_ids == &vec![codex] && content == "wake up, I need your output"
+        )));
+        assert_eq!(
+            page.events
+                .iter()
+                .filter(|event| matches!(
+                    event.item,
+                    RoomFeedItem::Delivery { status: RoomDeliveryStatus::Written, recipient_id, .. }
+                        if recipient_id == codex
+                ))
+                .count(),
+            3
+        );
+        assert_eq!(page.members.len(), 2);
+    }
+
+    #[test]
+    fn room_brief_is_delivered_on_join_and_retried_on_the_first_idle() {
+        let root = std::env::temp_dir().join(format!("prim1-brief-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("work")).unwrap();
+        let mut config = test_supervisor_config(&root);
+        config.room_brief_on_join = true;
+        let supervisor = SupervisorHandle::new(config).unwrap();
+        supervisor.set_executable_resolver_for_tests(Arc::new(TestExecutableResolver));
+        install_standard_test_sessions(&supervisor);
+        let (claude_pty, claude_inputs) = recording_pty_session(std::process::id());
+        let (codex_pty, codex_inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            claude_pty,
+        );
+        // Codex is not deliverable yet: its bracketed-paste mode is unknown.
+        install_mock_running_session_with_process_id_and_mode(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            None,
+            codex_pty,
+            BracketedPasteMode::Unknown,
+        );
+        let claude = test_session_id(&supervisor, "claude");
+        let codex = test_session_id(&supervisor, "codex");
+
+        supervisor
+            .create_room(CreateRoomRequest {
+                label: Some("Brief room".into()),
+                member_ids: vec![claude, codex],
+            })
+            .unwrap();
+
+        wait_until("the join brief to reach claude", || {
+            !claude_inputs.lock().is_empty()
+        });
+        let brief = claude_inputs.lock()[0].clone();
+        assert!(brief.contains("[Room message from operator]"), "{brief}");
+        assert!(brief.contains("PRIM-1 room \"Brief room\""), "{brief}");
+        assert!(brief.contains("Your label is \"claude\""), "{brief}");
+        assert!(brief.contains("codex (Codex)"), "{brief}");
+        assert!(brief.contains("prim1_pane MCP server"), "{brief}");
+        wait_until("claude's brief to be marked delivered", || {
+            let slots = supervisor.inner.slots.lock();
+            slots
+                .get_by_id(claude)
+                .and_then(|slot| slot.running.as_ref())
+                .map(|running| running.brief_attempts_left == 0)
+                .unwrap_or(false)
+        });
+        // Codex refused the immediate brief: nothing written, attempts kept.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(codex_inputs.lock().is_empty());
+        let (generation, run_id) = {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id(codex).unwrap();
+            assert_eq!(
+                slot.running.as_ref().unwrap().brief_attempts_left,
+                ROOM_BRIEF_MAX_ATTEMPTS
+            );
+            (slot.generation, slot.run_id.unwrap())
+        };
+
+        // Codex becomes ready and idles: the owed brief is delivered.
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id_mut(codex).unwrap();
+            set_test_bracketed_paste_mode(slot, run_id, BracketedPasteMode::Enabled);
+            slot.state = LifecycleState::Idle;
+        }
+        supervisor.deliver_pending_brief_if_due(codex, generation, run_id);
+        wait_until("the idle brief to reach codex", || {
+            !codex_inputs.lock().is_empty()
+        });
+        let codex_brief = codex_inputs.lock()[0].clone();
+        assert!(
+            codex_brief.contains("Your label is \"codex\""),
+            "{codex_brief}"
+        );
+        assert!(
+            codex_brief.contains("claude (Claude Code)"),
+            "{codex_brief}"
+        );
+        wait_until("codex's brief to be marked delivered", || {
+            let slots = supervisor.inner.slots.lock();
+            slots
+                .get_by_id(codex)
+                .and_then(|slot| slot.running.as_ref())
+                .map(|running| running.brief_attempts_left == 0)
+                .unwrap_or(false)
+        });
+        // Nothing left owed: another idle delivers nothing more.
+        supervisor.deliver_pending_brief_if_due(codex, generation, run_id);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(codex_inputs.lock().len(), 2);
+    }
+
+    #[test]
+    fn render_room_brief_is_one_line_for_terminals_and_names_the_tools_per_driver() {
+        let claude = RoomMember {
+            session_id: Uuid::new_v4(),
+            label: "CC".into(),
+            driver: DriverKind::Claude,
+        };
+        let grok = RoomMember {
+            session_id: Uuid::new_v4(),
+            label: "Grok".into(),
+            driver: DriverKind::Grok,
+        };
+        let terminal = RoomMember {
+            session_id: Uuid::new_v4(),
+            label: "Shell".into(),
+            driver: DriverKind::GenericTerminal,
+        };
+        let members = vec![claude.clone(), grok.clone(), terminal.clone()];
+        let cli = Path::new(r"C:\PRIM-1\prim1.exe");
+
+        let for_claude = render_room_brief("Team A", &members, &claude, Some(cli));
+        assert!(for_claude.contains("prim1_pane MCP server"));
+        assert!(for_claude.contains("Grok (Grok Build), Shell (Terminal)"));
+        assert!(
+            !for_claude.contains("CC (Claude Code)"),
+            "the member is not listed to itself"
+        );
+        assert!(for_claude.contains('\n'));
+
+        let for_grok = render_room_brief("Team A", &members, &grok, Some(cli));
+        assert!(for_grok.contains(r"C:\PRIM-1\prim1.exe"));
+        assert!(for_grok.contains("--prim1-room ping"));
+
+        let for_terminal = render_room_brief("Team A", &members, &terminal, None);
+        assert!(
+            !for_terminal.contains('\n'),
+            "terminal framing admits a single line"
+        );
+        assert!(for_terminal.contains("$env:PRIM1_CLI"));
+        assert!(
+            validate_message_framing(
+                &for_terminal,
+                routed_message_submit_behavior(DriverKind::GenericTerminal)
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_message_framing(&for_grok, routed_message_submit_behavior(DriverKind::Grok))
+                .is_ok()
+        );
     }
 
     #[cfg(windows)]
