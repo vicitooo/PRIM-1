@@ -1407,6 +1407,8 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
 .room-create-form {
   display: grid;
   grid-template-columns: minmax(180px, 0.7fr) minmax(300px, 1.3fr);
+  /* Row 3 is the room brief: it takes every pixel the form has left. */
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
   gap: 0.55rem;
   overflow: auto;
 }
@@ -1450,6 +1452,51 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
 
 .room-member-choice input {
   width: auto;
+}
+
+.room-brief-auto {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45rem;
+  cursor: pointer;
+}
+
+.room-create-form label.room-brief-auto > span {
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: normal;
+  text-transform: none;
+  line-height: 1.45;
+}
+
+.room-brief-auto input {
+  width: auto;
+  margin-top: 0.15rem;
+  accent-color: var(--prim1);
+}
+
+.room-brief-edit {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 0.3rem;
+  min-height: 0;
+}
+
+.room-brief-edit textarea {
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  min-height: 120px;
+  resize: none; /* the grid gives it the whole remaining height */
+}
+
+.room-brief-edit small {
+  color: var(--text-secondary);
+  font-size: 10px;
+  line-height: 1.4;
 }
 
 .room-form-actions {

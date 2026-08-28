@@ -194,6 +194,10 @@ export interface DeleteSessionRequest {
 export interface CreateRoomRequest {
   label?: string | null;
   member_ids: string[];
+  /** Deliver the room brief automatically on create / join / first idle. */
+  brief_on_join: boolean;
+  /** Edited brief for this room; null means the canonical brief. */
+  brief_template?: string | null;
 }
 
 export interface RenameRoomRequest {

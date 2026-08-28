@@ -519,6 +519,37 @@ struct RoomDeliverySpec {
 const ROOM_BRIEF_MAX_ATTEMPTS: u8 = 3;
 const ROOM_BRIEF_TEMPLATE: &str = include_str!("room_brief.txt");
 
+/// Cap for an operator-edited room brief — well under the smallest delivery
+/// ceiling (Grok minimal, 13 KiB) so per-member substitution never pushes a
+/// brief past what a member's framing can carry.
+const ROOM_BRIEF_TEMPLATE_MAX_BYTES: usize = 8 * 1024;
+
+/// The canonical room brief with its placeholders un-substituted — what the
+/// room-creation form offers for editing.
+pub fn default_room_brief_template() -> String {
+    ROOM_BRIEF_TEMPLATE.replace("\r\n", "\n")
+}
+
+/// An operator-edited brief: CRLF normalized, trimmed; empty means "use the
+/// canonical brief"; bounded by `ROOM_BRIEF_TEMPLATE_MAX_BYTES`.
+fn normalize_room_brief_template(template: Option<String>) -> Result<Option<String>> {
+    let Some(template) = template else {
+        return Ok(None);
+    };
+    let template = template.replace("\r\n", "\n");
+    let trimmed = template.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.len() > ROOM_BRIEF_TEMPLATE_MAX_BYTES {
+        return Err(anyhow!(
+            "the room brief is {} bytes; the maximum is {ROOM_BRIEF_TEMPLATE_MAX_BYTES} bytes",
+            trimmed.len()
+        ));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
 fn driver_display_name(driver: DriverKind) -> &'static str {
     match driver {
         DriverKind::Claude => "Claude Code",
@@ -529,13 +560,15 @@ fn driver_display_name(driver: DriverKind) -> &'static str {
     }
 }
 
-/// The canonical brief (`room_brief.txt`) filled in for one member. Terminal
-/// members get it as one line: raw single-line framing admits no newline.
+/// The room's brief — `room_brief.txt`, or the operator's edited template —
+/// filled in for one member. Terminal members get it as one line: raw
+/// single-line framing admits no newline.
 fn render_room_brief(
     room_label: &str,
     members: &[RoomMember],
     you: &RoomMember,
     cli: Option<&Path>,
+    template: Option<&str>,
 ) -> String {
     let others: Vec<String> = members
         .iter()
@@ -560,9 +593,10 @@ fn render_room_brief(
             )
         }
     };
-    // The template is LF; a checkout that turned it into CRLF must not leak a
-    // carriage return into Grok's LF-only framing.
-    let mut text = ROOM_BRIEF_TEMPLATE
+    // The template is LF; a checkout (or a pasted edit) carrying CRLF must
+    // not leak a carriage return into Grok's LF-only framing.
+    let mut text = template
+        .unwrap_or(ROOM_BRIEF_TEMPLATE)
         .replace("\r\n", "\n")
         .replace("{tools}", &tools)
         .replace("{members}", &others)
@@ -5487,8 +5521,9 @@ impl SupervisorHandle {
         Ok(())
     }
 
-    pub fn create_room(&self, request: CreateRoomRequest) -> Result<RoomSnapshot> {
+    pub fn create_room(&self, mut request: CreateRoomRequest) -> Result<RoomSnapshot> {
         self.ensure_active()?;
+        let brief_template = normalize_room_brief_template(request.brief_template.take())?;
         let mut unique_members = HashSet::new();
         if request.member_ids.len() < 2 {
             return Err(anyhow!("room creation requires at least two sessions"));
@@ -5538,6 +5573,8 @@ impl SupervisorHandle {
                 label,
                 member_ids: request.member_ids.clone(),
                 membership_revision: 1,
+                brief_on_join: request.brief_on_join,
+                brief_template,
             };
             let mut runtime = RoomRuntime::from_persisted(definition.clone());
             let mut feed_events = Vec::with_capacity(definition.member_ids.len());
@@ -6533,12 +6570,15 @@ impl SupervisorHandle {
         match spawn_result {
             Ok(pty) => {
                 let pty: Arc<dyn PtySession> = Arc::from(pty);
-                let brief_owed = self
-                    .inner
-                    .rooms
-                    .lock()
-                    .room_by_session
-                    .contains_key(&session_id);
+                let brief_owed = {
+                    let rooms = self.inner.rooms.lock();
+                    rooms
+                        .room_by_session
+                        .get(&session_id)
+                        .and_then(|room_id| rooms.get(*room_id))
+                        .map(|room| room.definition.brief_on_join)
+                        .unwrap_or(false)
+                };
                 let installation = {
                     let mut slots = self.inner.slots.lock();
                     match slots.get_by_id_mut(session_id) {
@@ -8363,6 +8403,7 @@ impl SupervisorHandle {
                 &members,
                 &you,
                 self.inner.pane_mcp_executable.as_deref(),
+                room.definition.brief_template.as_deref(),
             );
             RoomDeliverySpec {
                 room_id: request.room_id,
@@ -8392,6 +8433,16 @@ impl SupervisorHandle {
     /// briefed when their run starts and first idles.
     fn schedule_room_briefs(&self, room_id: RoomId, member_ids: &[SessionId]) {
         if !self.inner.room_brief_on_join {
+            return;
+        }
+        let room_briefs_automatically = self
+            .inner
+            .rooms
+            .lock()
+            .get(room_id)
+            .map(|room| room.definition.brief_on_join)
+            .unwrap_or(false);
+        if !room_briefs_automatically {
             return;
         }
         for session_id in member_ids {
@@ -8435,13 +8486,20 @@ impl SupervisorHandle {
             {
                 return;
             }
-            let room_id = self
-                .inner
-                .rooms
-                .lock()
-                .room_by_session
-                .get(&session_id)
-                .copied();
+            // The member's room — only if that room briefs automatically.
+            let room_id = {
+                let rooms = self.inner.rooms.lock();
+                rooms
+                    .room_by_session
+                    .get(&session_id)
+                    .copied()
+                    .filter(|room_id| {
+                        rooms
+                            .get(*room_id)
+                            .map(|room| room.definition.brief_on_join)
+                            .unwrap_or(false)
+                    })
+            };
             let Some(running) = slot.running.as_mut() else {
                 return;
             };
@@ -18363,6 +18421,8 @@ mod tests {
 
         supervisor
             .create_room(CreateRoomRequest {
+                brief_on_join: true,
+                brief_template: None,
                 label: Some("Secret room".into()),
                 member_ids: vec![claude, codex],
             })
@@ -18490,6 +18550,8 @@ mod tests {
         let codex = test_session_id(&supervisor, "codex");
         let room = supervisor
             .create_room(CreateRoomRequest {
+                brief_on_join: true,
+                brief_template: None,
                 label: Some("Wake room".into()),
                 member_ids: vec![claude, codex],
             })
@@ -18627,6 +18689,8 @@ mod tests {
 
         supervisor
             .create_room(CreateRoomRequest {
+                brief_on_join: true,
+                brief_template: None,
                 label: Some("Brief room".into()),
                 member_ids: vec![claude, codex],
             })
@@ -18697,6 +18761,212 @@ mod tests {
     }
 
     #[test]
+    fn a_room_created_with_auto_brief_off_briefs_nobody_but_brief_now_still_works() {
+        let root = std::env::temp_dir().join(format!("prim1-brief-off-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("work")).unwrap();
+        let mut config = test_supervisor_config(&root);
+        config.room_brief_on_join = true;
+        let supervisor = SupervisorHandle::new(config).unwrap();
+        supervisor.set_executable_resolver_for_tests(Arc::new(TestExecutableResolver));
+        install_standard_test_sessions(&supervisor);
+        let (claude_pty, claude_inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            claude_pty,
+        );
+        let claude = test_session_id(&supervisor, "claude");
+        let codex = test_session_id(&supervisor, "codex");
+
+        let room = supervisor
+            .create_room(CreateRoomRequest {
+                label: Some("Quiet room".into()),
+                member_ids: vec![claude, codex],
+                brief_on_join: false,
+                brief_template: None,
+            })
+            .unwrap();
+
+        // Nothing is typed on join, and nothing is owed for later.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(claude_inputs.lock().is_empty());
+        {
+            let slots = supervisor.inner.slots.lock();
+            let running = slots.get_by_id(claude).unwrap().running.as_ref().unwrap();
+            assert_eq!(running.brief_attempts_left, 0);
+        }
+
+        // Even a hand-set owed brief dies at the room's toggle on idle.
+        let (generation, run_id) = {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id_mut(claude).unwrap();
+            slot.state = LifecycleState::Idle;
+            slot.running.as_mut().unwrap().brief_attempts_left = ROOM_BRIEF_MAX_ATTEMPTS;
+            (slot.generation, slot.run_id.unwrap())
+        };
+        supervisor.deliver_pending_brief_if_due(claude, generation, run_id);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(claude_inputs.lock().is_empty());
+        assert_eq!(
+            supervisor
+                .inner
+                .slots
+                .lock()
+                .get_by_id(claude)
+                .unwrap()
+                .running
+                .as_ref()
+                .unwrap()
+                .brief_attempts_left,
+            0
+        );
+
+        // The operator's "Brief now" ignores the toggle.
+        let result = supervisor
+            .brief_room_member(BriefRoomMemberRequest {
+                room_id: room.room_id,
+                session_id: claude,
+            })
+            .unwrap();
+        assert!(result.failures.is_empty());
+        wait_until("the manual brief to reach claude", || {
+            !claude_inputs.lock().is_empty()
+        });
+        assert!(claude_inputs.lock()[0].contains("PRIM-1 room \"Quiet room\""));
+    }
+
+    #[test]
+    fn a_rooms_edited_brief_replaces_the_canonical_text_for_join_and_idle_briefs() {
+        let root = std::env::temp_dir().join(format!("prim1-brief-custom-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("work")).unwrap();
+        let mut config = test_supervisor_config(&root);
+        config.room_brief_on_join = true;
+        let supervisor = SupervisorHandle::new(config).unwrap();
+        supervisor.set_executable_resolver_for_tests(Arc::new(TestExecutableResolver));
+        install_standard_test_sessions(&supervisor);
+        let (claude_pty, claude_inputs) = recording_pty_session(std::process::id());
+        let (codex_pty, codex_inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            claude_pty,
+        );
+        install_mock_running_session_with_process_id_and_mode(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            None,
+            codex_pty,
+            BracketedPasteMode::Unknown,
+        );
+        let claude = test_session_id(&supervisor, "claude");
+        let codex = test_session_id(&supervisor, "codex");
+
+        supervisor
+            .create_room(CreateRoomRequest {
+                label: Some("Custom room".into()),
+                member_ids: vec![claude, codex],
+                brief_on_join: true,
+                brief_template: Some(
+                    "Mission for {your_label} in {room_label}: talk to {members} via {tools}\r\nSecond line."
+                        .into(),
+                ),
+            })
+            .unwrap();
+
+        wait_until("the custom join brief to reach claude", || {
+            !claude_inputs.lock().is_empty()
+        });
+        let brief = claude_inputs.lock()[0].clone();
+        assert!(brief.contains("Mission for claude in Custom room"), "{brief}");
+        assert!(brief.contains("codex (Codex)"), "{brief}");
+        assert!(brief.contains("prim1_pane MCP server"), "{brief}");
+        assert!(brief.contains("Second line."), "{brief}");
+        assert!(
+            !brief.contains("Do not reach the pipe by any other means"),
+            "{brief}"
+        );
+
+        // The owed idle brief uses the same edited text.
+        let (generation, run_id) = {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id(codex).unwrap();
+            (slot.generation, slot.run_id.unwrap())
+        };
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id_mut(codex).unwrap();
+            set_test_bracketed_paste_mode(slot, run_id, BracketedPasteMode::Enabled);
+            slot.state = LifecycleState::Idle;
+        }
+        supervisor.deliver_pending_brief_if_due(codex, generation, run_id);
+        wait_until("the custom idle brief to reach codex", || {
+            !codex_inputs.lock().is_empty()
+        });
+        let codex_brief = codex_inputs.lock()[0].clone();
+        assert!(
+            codex_brief.contains("Mission for codex in Custom room"),
+            "{codex_brief}"
+        );
+    }
+
+    #[test]
+    fn render_room_brief_substitutes_an_edited_template_and_one_lines_it_for_terminals() {
+        let claude = RoomMember {
+            session_id: Uuid::new_v4(),
+            label: "CC".into(),
+            driver: DriverKind::Claude,
+        };
+        let terminal = RoomMember {
+            session_id: Uuid::new_v4(),
+            label: "Shell".into(),
+            driver: DriverKind::GenericTerminal,
+        };
+        let members = vec![claude.clone(), terminal.clone()];
+        let template =
+            "Hello {your_label} of {room_label}.\r\nOthers: {members}.\r\nTools: {tools}";
+
+        let for_claude = render_room_brief("Edited", &members, &claude, None, Some(template));
+        assert!(for_claude.contains("Hello CC of Edited."), "{for_claude}");
+        assert!(
+            for_claude.contains("Others: Shell (Terminal)."),
+            "{for_claude}"
+        );
+        assert!(for_claude.contains("prim1_pane MCP server"), "{for_claude}");
+        assert!(!for_claude.contains('\r'), "{for_claude}");
+        assert!(!for_claude.contains("Do not reach the pipe"), "{for_claude}");
+
+        let for_terminal = render_room_brief("Edited", &members, &terminal, None, Some(template));
+        assert!(!for_terminal.contains('\n'), "{for_terminal}");
+        assert!(
+            for_terminal.contains("Hello Shell of Edited. · Others: CC (Claude Code)."),
+            "{for_terminal}"
+        );
+    }
+
+    #[test]
+    fn room_brief_template_normalization_trims_bounds_and_defaults() {
+        assert_eq!(normalize_room_brief_template(None).unwrap(), None);
+        assert_eq!(
+            normalize_room_brief_template(Some("  \r\n \n ".into())).unwrap(),
+            None
+        );
+        assert_eq!(
+            normalize_room_brief_template(Some("  keep\r\nboth lines \n".into())).unwrap(),
+            Some("keep\nboth lines".into())
+        );
+        let oversized = "x".repeat(ROOM_BRIEF_TEMPLATE_MAX_BYTES + 1);
+        let error = normalize_room_brief_template(Some(oversized)).unwrap_err();
+        assert!(error.to_string().contains("maximum is"), "{error}");
+        // A request that omits the new fields keeps the old behaviour.
+        let request: CreateRoomRequest = serde_json::from_str(r#"{"member_ids":[]}"#).unwrap();
+        assert!(request.brief_on_join);
+        assert!(request.brief_template.is_none());
+    }
+
+    #[test]
     fn render_room_brief_is_one_line_for_terminals_and_names_the_tools_per_driver() {
         let claude = RoomMember {
             session_id: Uuid::new_v4(),
@@ -18716,7 +18986,7 @@ mod tests {
         let members = vec![claude.clone(), grok.clone(), terminal.clone()];
         let cli = Path::new(r"C:\PRIM-1\prim1.exe");
 
-        let for_claude = render_room_brief("Team A", &members, &claude, Some(cli));
+        let for_claude = render_room_brief("Team A", &members, &claude, Some(cli), None);
         assert!(for_claude.contains("prim1_pane MCP server"));
         assert!(for_claude.contains("Grok (Grok Build), Shell (Terminal)"));
         assert!(
@@ -18725,11 +18995,11 @@ mod tests {
         );
         assert!(for_claude.contains('\n'));
 
-        let for_grok = render_room_brief("Team A", &members, &grok, Some(cli));
+        let for_grok = render_room_brief("Team A", &members, &grok, Some(cli), None);
         assert!(for_grok.contains(r"C:\PRIM-1\prim1.exe"));
         assert!(for_grok.contains("--prim1-room ping"));
 
-        let for_terminal = render_room_brief("Team A", &members, &terminal, None);
+        let for_terminal = render_room_brief("Team A", &members, &terminal, None, None);
         assert!(
             !for_terminal.contains('\n'),
             "terminal framing admits a single line"
@@ -21197,6 +21467,8 @@ mod tests {
         supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
         let first = supervisor
             .create_room(CreateRoomRequest {
+                brief_on_join: true,
+                brief_template: None,
                 label: Some("Twin".into()),
                 member_ids: vec![
                     test_session_id(&supervisor, "claude"),
@@ -21206,6 +21478,8 @@ mod tests {
             .unwrap();
         let second = supervisor
             .create_room(CreateRoomRequest {
+                brief_on_join: true,
+                brief_template: None,
                 label: Some("Twin".into()),
                 member_ids: vec![grok.session_id, terminal.session_id],
             })
@@ -21282,6 +21556,8 @@ mod tests {
 
         let error = supervisor
             .create_room(CreateRoomRequest {
+                brief_on_join: true,
+                brief_template: None,
                 label: Some("Must not exist".into()),
                 member_ids: vec![
                     test_session_id(&supervisor, "claude"),
@@ -21337,6 +21613,8 @@ mod tests {
         let supervisor = test_supervisor();
         let room = supervisor
             .create_room(CreateRoomRequest {
+                brief_on_join: true,
+                brief_template: None,
                 label: Some("Ordered feed".into()),
                 member_ids: vec![
                     test_session_id(&supervisor, "claude"),
@@ -21414,6 +21692,8 @@ mod tests {
         let claude = test_session_id(&supervisor, "claude");
         let room = supervisor
             .create_room(CreateRoomRequest {
+                brief_on_join: true,
+                brief_template: None,
                 label: None,
                 member_ids: vec![claude, test_session_id(&supervisor, "codex")],
             })
@@ -21462,6 +21742,8 @@ mod tests {
         );
         let room = supervisor
             .create_room(CreateRoomRequest {
+                brief_on_join: true,
+                brief_template: None,
                 label: Some("Feed only".into()),
                 member_ids: vec![
                     test_session_id(&supervisor, "claude"),
@@ -21556,6 +21838,8 @@ mod tests {
         );
         let first = supervisor
             .create_room(CreateRoomRequest {
+                brief_on_join: true,
+                brief_template: None,
                 label: Some("Twin".into()),
                 member_ids: vec![
                     test_session_id(&supervisor, "claude"),
@@ -21565,6 +21849,8 @@ mod tests {
             .unwrap();
         let second = supervisor
             .create_room(CreateRoomRequest {
+                brief_on_join: true,
+                brief_template: None,
                 label: Some("Twin".into()),
                 member_ids: vec![second_claude.session_id, second_codex.session_id],
             })
@@ -21623,6 +21909,8 @@ mod tests {
         );
         let room = supervisor
             .create_room(CreateRoomRequest {
+                brief_on_join: true,
+                brief_template: None,
                 label: Some("Unwind".into()),
                 member_ids: vec![
                     test_session_id(&supervisor, "claude"),
@@ -21675,6 +21963,8 @@ mod tests {
         );
         let room = supervisor
             .create_room(CreateRoomRequest {
+                brief_on_join: true,
+                brief_template: None,
                 label: Some("Exact room".into()),
                 member_ids: vec![
                     test_session_id(&supervisor, "claude"),
@@ -21746,6 +22036,8 @@ mod tests {
         );
         let room = supervisor
             .create_room(CreateRoomRequest {
+                brief_on_join: true,
+                brief_template: None,
                 label: Some("Grok exact".into()),
                 member_ids: vec![grok.session_id, test_session_id(&supervisor, "claude")],
             })
@@ -21811,6 +22103,8 @@ mod tests {
         );
         let room = supervisor
             .create_room(CreateRoomRequest {
+                brief_on_join: true,
+                brief_template: None,
                 label: Some("Mixed CR".into()),
                 member_ids: vec![test_session_id(&supervisor, "claude"), grok.session_id],
             })
@@ -21872,6 +22166,8 @@ mod tests {
         let claude = test_session_id(&supervisor, "claude");
         let room = supervisor
             .create_room(CreateRoomRequest {
+                brief_on_join: true,
+                brief_template: None,
                 label: Some("Revision pin".into()),
                 member_ids: vec![claude, test_session_id(&supervisor, "codex")],
             })
@@ -21930,6 +22226,8 @@ mod tests {
         );
         let room = supervisor
             .create_room(CreateRoomRequest {
+                brief_on_join: true,
+                brief_template: None,
                 label: Some("Atomic".into()),
                 member_ids: vec![
                     test_session_id(&supervisor, "claude"),
@@ -21994,6 +22292,8 @@ mod tests {
         );
         let room = supervisor
             .create_room(CreateRoomRequest {
+                brief_on_join: true,
+                brief_template: None,
                 label: Some("Partial".into()),
                 member_ids: vec![
                     test_session_id(&supervisor, "claude"),
@@ -22059,6 +22359,8 @@ mod tests {
         );
         let room = supervisor
             .create_room(CreateRoomRequest {
+                brief_on_join: true,
+                brief_template: None,
                 label: Some("In flight".into()),
                 member_ids: vec![
                     test_session_id(&supervisor, "claude"),
@@ -22119,6 +22421,8 @@ mod tests {
         let claude = test_session_id(&supervisor, "claude");
         let room = supervisor
             .create_room(CreateRoomRequest {
+                brief_on_join: true,
+                brief_template: None,
                 label: Some("Pane room".into()),
                 member_ids: vec![test_session_id(&supervisor, "codex"), grok.session_id],
             })

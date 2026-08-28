@@ -236,6 +236,15 @@ app.innerHTML = `
             <legend>Select at least two sessions</legend>
             <div id="room-member-choices" class="room-member-choices"></div>
           </fieldset>
+          <label class="room-brief-auto" for="room-brief-auto">
+            <input type="checkbox" id="room-brief-auto" checked />
+            <span>Brief members automatically — on create, on join, and when a member's run first idles, the room brief below is typed into their terminal. Off, nobody is messaged.</span>
+          </label>
+          <label class="room-brief-edit">
+            <span>Room brief</span>
+            <textarea id="room-brief-template" rows="8" maxlength="8192" spellcheck="false"></textarea>
+            <small>{room_label}, {members}, {your_label} and {tools} are filled in per member. Clear the box to use the standard brief.</small>
+          </label>
           <p id="room-create-error" class="session-form-error" role="alert" hidden></p>
           <div class="room-form-actions">
             <button type="submit" class="primary">Create room</button>
@@ -355,7 +364,7 @@ app.innerHTML = `
           <section class="view-section">
             <h3>The ⇄ button — click for the menu, drag it anywhere</h3>
             <dl class="help-list">
-              <dt>Rooms</dt><dd>Teams of sessions with a shared feed. <b>Post to feed</b> is a bulletin board: nobody is interrupted, the harnesses read it. <b>Send</b> delivers the text into one member's terminal as typed input — refused while that harness sits on a prompt or its state is unknown ("framing is blocked": type into its terminal instead).</dd>
+              <dt>Rooms</dt><dd>Teams of sessions with a shared feed. <b>Post to feed</b> is a bulletin board: nobody is interrupted, the harnesses read it. <b>Send</b> delivers the text into one member's terminal as typed input — refused while that harness sits on a prompt or its state is unknown ("framing is blocked": type into its terminal instead). Creating a room, you choose whether the room brief is typed to members automatically and can edit its text.</dd>
               <dt>System log</dt><dd>The runtime's own messages in a bottom drawer. A red dot on the button means an error landed while the drawer was hidden; a failed close opens it.</dd>
               <dt>Themes</dt><dd>The theme gallery — one screenshot per theme; Dark and Light are plain terminal looks, the two PRIM-1 themes are the HUD look. <b>Unicolor</b> (off by default) drops the harnesses' own colours so everything renders in the theme's text colour.</dd>
               <dt>Fullscreen</dt><dd>Same as F11.</dd>
@@ -785,6 +794,8 @@ const roomLabelInput = must<HTMLInputElement>("#room-label");
 const roomMemberChoices = must<HTMLDivElement>("#room-member-choices");
 const roomCreateError = must<HTMLElement>("#room-create-error");
 const cancelRoomCreate = must<HTMLButtonElement>("#cancel-room-create");
+const roomBriefAuto = must<HTMLInputElement>("#room-brief-auto");
+const roomBriefTemplate = must<HTMLTextAreaElement>("#room-brief-template");
 const roomEmpty = must<HTMLElement>("#room-empty");
 const roomContent = must<HTMLElement>("#room-content");
 const roomMembers = must<HTMLDivElement>("#room-members");
@@ -3419,11 +3430,34 @@ async function deleteSessionOnceClosed(sessionId: string): Promise<void> {
   }
 }
 
+/** The canonical room brief, fetched once — prefills the creation form. */
+let defaultRoomBrief: string | null = null;
+
+async function loadDefaultRoomBrief(): Promise<string> {
+  if (defaultRoomBrief === null) {
+    try {
+      defaultRoomBrief = await command<string>("default_room_brief");
+    } catch {
+      return "";
+    }
+  }
+  return defaultRoomBrief;
+}
+
 function openRoomCreateForm(): void {
   roomCreateForm.hidden = false;
   roomLabelInput.value = "";
   roomCreateError.hidden = true;
   roomCreateError.textContent = "";
+  roomBriefAuto.checked = true;
+  roomBriefTemplate.value = defaultRoomBrief ?? "";
+  if (defaultRoomBrief === null) {
+    void loadDefaultRoomBrief().then((text) => {
+      if (!roomCreateForm.hidden && roomBriefTemplate.value === "") {
+        roomBriefTemplate.value = text;
+      }
+    });
+  }
   roomMemberChoices.replaceChildren();
   for (const session of snapshotById.values()) {
     const occupied = roomSnapshots.some((room) => room.member_ids.includes(session.session_id));
@@ -3459,10 +3493,16 @@ async function createRoomFromForm(): Promise<void> {
   }
   const label = roomLabelInput.value.trim();
   try {
+    const briefText = roomBriefTemplate.value;
     const room = await command<RoomSnapshot>("create_room", {
       request: {
         label: label || null,
         member_ids: memberIds,
+        brief_on_join: roomBriefAuto.checked,
+        // Unchanged or cleared = the canonical brief, kept as null so future
+        // improvements to the default text reach this room too.
+        brief_template:
+          briefText.trim() === "" || briefText === defaultRoomBrief ? null : briefText,
       } satisfies CreateRoomRequest,
     });
     activeRoomId = room.room_id;
@@ -3653,6 +3693,7 @@ function setRoomStatus(message: string, level: "info" | "warn" | "error"): void 
 }
 
 function wireRoomUi(): void {
+  void loadDefaultRoomBrief();
   newRoomButton.addEventListener("click", openRoomCreateForm);
   cancelRoomCreate.addEventListener("click", closeRoomCreateForm);
   roomCreateForm.addEventListener("submit", (event) => {
