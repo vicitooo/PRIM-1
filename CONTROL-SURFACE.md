@@ -56,6 +56,7 @@ Visible terminal shortcuts:
 | `key` | `-Session`, `-Key` | `send_key` |
 | `room_read` | optional paired `-CursorEpoch`, `-CursorSequence` | `room_read` |
 | `room_post` | `-Content` or `-ContentFile` | `room_post` |
+| `room_deliver` | `-Recipient` (member label, session id, or `all`), `-Content` or `-ContentFile` | `room_deliver` |
 
 The endpoint comes from a nonblank `PRIM1_CONTROL_PLANE_ENDPOINT`. An explicit
 `-Endpoint` may be supplied only by isolated tests using a fake named-pipe
@@ -90,9 +91,13 @@ Behavior:
 - `input` writes raw text and does not press Enter
 - `Content` and `ContentFile` are mutually exclusive
 - `ContentFile` is strict UTF-8 (BOM optional); malformed UTF-8 fails closed, and CR/LF/trailing whitespace are preserved
-- `room_read` and `room_post` derive the exact room and sender from the
-  kernel-bound calling pane; they accept no `-Session`, `RoomId`, sender, peer,
-  recipient, or delivery authority
+- `room_read`, `room_post`, and `room_deliver` derive the exact room and sender
+  from the calling pane (kernel Job, or the pane secret when the shell runs
+  outside the Job); they accept no `-Session`, `RoomId`, sender, or peer
+  authority — `room_deliver`'s `-Recipient` names a member of the caller's own
+  room and is gated exactly like the operator's Send
+- when `PRIM1_PANE_SECRET` is set in the shell, the script sends it as the
+  connection's first line; the supervisor still prefers kernel identity
 - a newly added member reads only its join event and later room traffic; an
   evicted or restarted feed returns an explicit cursor gap
 - `room_post` changes only the bounded room feed and writes no PTY

@@ -19,8 +19,9 @@ A local multi-agent runtime for terminal-first AI tools. PRIM-1 hosts CLI agents
 - **Direct launch** — drivers launch qualified executables without `cmd.exe`, `.cmd` shims, renderer arguments, or source-checkout access. Labels and metacharacters are never interpreted as shell syntax.
 - **Explicit rooms** — a separate atomic catalog stores ordered `RoomId` definitions, labels, membership, and membership revisions. Room content stays in a bounded 512-event / 16 MiB in-memory feed with explicit cursor gaps; it is never restored after process restart.
 - **Deliberate room traffic** — **Post** appends to the shared feed without prompting a harness. **Send** targets one member or explicitly all members through the existing exact-run framing path, with whole-recipient preflight and truthful per-recipient pending/written/failed receipts. Generic Terminal receives the operator's validated printable single-line command without an injected text prefix; provenance remains visible in PRIM's feed, route receipts, and audit. Prime remains raw-terminal-only.
-- **Pane-local sideband** — an authorized supervised pane gets a narrow named-pipe surface for `ping`, `wait_quiet`, raw `input`, PTY `key`, and membership-derived room `read` / `post`. The pane cannot supply a `RoomId`, sender, peer target, lifecycle action, or recipient delivery.
-- **Model-facing room tools, fail-closed by driver** — Claude Code and Codex receive a PRIM-owned `prim1_pane` stdio MCP child exposing only `ping`, `room_read`, and feed-only `room_post`; caller, run, room, and sender still come from kernel Job membership. Grok Build 1.0.0 offers no privacy-safe session-scoped plugin seam for its TUI and its shell tools are not Job-affiliated, so Grok receives no model-facing sideband tool rather than a bearer or redirected-history workaround.
+- **Pane-local sideband** — an authorized supervised pane gets a narrow named-pipe surface for `ping`, `wait_quiet`, raw `input`, PTY `key`, membership-derived room `read` / `post`, and `room_deliver` (the operator's Send with the calling pane as sender: same gate, same framing, same receipts; recipient = member label, session id, or `all` = every other member). The pane cannot supply a `RoomId`, sender, peer target, or lifecycle action.
+- **Two proofs of pane identity** — kernel Job membership first; when the calling process is outside every pane Job (Grok's tool processes, anything without a Job), the per-run `PRIM1_PANE_SECRET` from the pane's own environment, sent as the connection's first line. The secret identifies its own run only, rotates on every start/restart, and never appears in audit or diagnostics.
+- **Every harness can speak** — Claude Code and Codex receive a PRIM-owned `prim1_pane` stdio MCP child (`ping`, `room_read`, `room_post`, `room_deliver`); every other non-Prime pane uses the same executable as a CLI (`"$env:PRIM1_CLI" --prim1-room …`, JSON on stdout) or `scripts/control-plane.ps1`. The supervisor delivers the canonical room brief (`crates/supervisor/src/room_brief.txt`) into a member's terminal on join and on its run's first idle; `room_read` pages list the members with labels.
 - **Append-only metadata audit** at `<runtime-dir>/audit/YYYY-MM-DD.jsonl` for lifecycle, authorization, dispatch, delivery, session-definition, and room receipts. Terminal output is not persisted; routed and room-message content is stored as `[content omitted]`.
 
 ## Prerequisites
@@ -165,12 +166,12 @@ to use the runtime-directory resolver, including roots containing spaces.
 PRIM-1 runs locally. The pane sideband carries no bearer token and no master or
 per-pane credential file is an operator backdoor. Native pane authority must be
 derived by the supervisor from the named-pipe caller and bound to the live PTY
-process job and generation at mutation time. Prime/WSL sessions deliberately do
-not receive the native sideband or routed-message surface because no verified
-Windows-job-to-Linux-task caller identity bridge exists. Use raw input through
-the desktop UI for Prime. Grok's TUI likewise receives no model-facing pane
-tool until its client exposes a session-scoped plugin/config boundary that does
-not redirect Grok-owned sessions or logs; operator room sends remain available.
+process job and generation at mutation time, or — for a caller outside every
+pane Job — from the per-run pane secret it presents. Prime/WSL sessions still
+do not receive the sideband or routed-message surface: their launch forwards no
+environment, so neither the Job proof nor the secret reaches them yet. Use raw
+input through the desktop UI for Prime. Grok's TUI receives no MCP child but
+reaches the same surface through the CLI (`PRIM1_CLI`) with the pane secret.
 
 Treat the app-local runtime directory as private machine-local state. The repo-local `.runtime/` directory remains gitignored for test environments and developer scratch files; it is no longer the product runtime default.
 

@@ -1,6 +1,6 @@
 param(
   [Parameter(Mandatory = $true)]
-  [ValidateSet("ping", "wait_quiet", "input", "key", "room_read", "room_post")]
+  [ValidateSet("ping", "wait_quiet", "input", "key", "room_read", "room_post", "room_deliver")]
   [string]$Action,
 
   [string]$Session,
@@ -8,6 +8,7 @@ param(
   [string]$Key,
   [string]$Content,
   [string]$ContentFile,
+  [string]$Recipient,
   [int]$QuietSec,
   [int]$TimeoutSec,
   [string]$CursorEpoch,
@@ -223,15 +224,21 @@ function Write-AtomicText {
   Move-Item -LiteralPath $tmpPath -Destination $Path -Force
 }
 
-if ($Action -in @("input", "room_post")) {
+if ($Action -in @("input", "room_post", "room_deliver")) {
   $Content = Resolve-InputContent -InlineContent $Content -ContentFilePath $ContentFile
 } elseif ($ContentFile) {
-  throw "-ContentFile is only supported for -Action input or room_post"
+  throw "-ContentFile is only supported for -Action input, room_post or room_deliver"
 }
 
-if ($Action -in @("room_read", "room_post")) {
+if ($Action -in @("room_read", "room_post", "room_deliver")) {
   if ($Session) { throw "$Action derives room membership from the calling pane; -Session is not accepted" }
   if ($Key) { throw "$Action does not accept -Key" }
+}
+if ($Action -ne "room_deliver" -and $Recipient) {
+  throw "-Recipient is supported only for -Action room_deliver"
+}
+if ($Action -eq "room_deliver" -and [string]::IsNullOrWhiteSpace($Recipient)) {
+  throw "room_deliver requires -Recipient (a member label, a session id, or all)"
 }
 if ($Action -eq "room_read" -and -not [string]::IsNullOrEmpty($Content)) {
   throw "room_read does not accept -Content"
@@ -311,6 +318,15 @@ $payload = switch ($Action) {
       content = $Content
     }
   }
+  "room_deliver" {
+    if ([string]::IsNullOrWhiteSpace($Recipient)) { throw "room_deliver requires -Recipient (a member label, a session id, or all)" }
+    if ([string]::IsNullOrEmpty($Content)) { throw "room_deliver requires -Content or -ContentFile" }
+    [ordered]@{
+      kind = "room_deliver"
+      recipient = $Recipient
+      content = $Content
+    }
+  }
 }
 
 $json = $payload | ConvertTo-Json -Depth 4 -Compress
@@ -329,6 +345,12 @@ try {
     $writer.AutoFlush = $true
     $reader = [System.IO.StreamReader]::new($pipe)
 
+    # The pane secret (PRIM1_PANE_SECRET) opens the connection when this shell
+    # runs outside the pane's Windows Job; the supervisor still prefers the Job.
+    $paneSecret = [Environment]::GetEnvironmentVariable("PRIM1_PANE_SECRET", "Process")
+    if (-not [string]::IsNullOrWhiteSpace($paneSecret)) {
+      $writer.WriteLine(([ordered]@{ secret = $paneSecret } | ConvertTo-Json -Compress))
+    }
     $writer.WriteLine($json)
     $readTask = $reader.ReadLineAsync()
     if (-not $readTask.Wait($pipeReadTimeoutSec * 1000)) {

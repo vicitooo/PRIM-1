@@ -45,6 +45,36 @@ function Invoke-CapturedRoomRequest {
   }
 }
 
+function Invoke-CapturedRoomRequestWithPreamble {
+  param(
+    [string]$Prefix,
+    [string[]]$Arguments,
+    [string]$ResponseMessage
+  )
+  $runtime = New-ControlPlaneTestRuntime -Prefix $Prefix
+  $response = @{ ok = $true; message = $ResponseMessage } | ConvertTo-Json -Compress
+  $responder = Start-ControlPlanePipeResponder -PipeName $runtime.PipeName -CapturePath $runtime.CapturePath -ResponseJson $response
+  try {
+    $result = Invoke-ControlPlane -Arguments (@(
+      "-File", $controlPlaneScript,
+      "-Endpoint", $runtime.Endpoint,
+      "-Quiet"
+    ) + $Arguments)
+    Assert-True ($result.ExitCode -eq 0) "Room request failed: $($result.Output)"
+    Wait-ControlPlanePipeResponder -Responder $responder
+    $strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+    $preamblePath = "$($runtime.CapturePath).preamble"
+    $preamble = if (Test-Path -LiteralPath $preamblePath) { [System.IO.File]::ReadAllText($preamblePath, $strictUtf8) | ConvertFrom-Json } else { $null }
+    return [pscustomobject]@{
+      Preamble = $preamble
+      Request = ([System.IO.File]::ReadAllText($runtime.CapturePath, $strictUtf8) | ConvertFrom-Json)
+    }
+  } finally {
+    Remove-ControlPlanePipeResponder -Responder $responder
+    Remove-Item -LiteralPath $runtime.Root -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}
+
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $controlPlaneScript = Join-Path $repoRoot "scripts\control-plane.ps1"
 
@@ -88,6 +118,57 @@ $invalid = Invoke-ControlPlane -Arguments @(
 )
 Assert-True ($invalid.ExitCode -ne 0) "Pane room post with renderer-selected session must fail."
 Assert-True ($invalid.Output -like "*derives room membership from the calling pane*") "Expected derived-membership guard."
+
+$deliver = Invoke-CapturedRoomRequest -Prefix "prim1-room-deliver" -Arguments @(
+  "-Action", "room_deliver",
+  "-Recipient", "Codex",
+  "-Content", "wake up"
+) -ResponseMessage "room delivery written for 1 of 1 recipients"
+Assert-True ($deliver.kind -ceq "room_deliver") "Expected room_deliver request."
+Assert-True ($deliver.recipient -ceq "Codex") "Recipient must pass through unchanged."
+Assert-True ($deliver.content -ceq "wake up") "Delivery content must pass through unchanged."
+Assert-True (-not ($deliver.PSObject.Properties.Name -contains "room_id")) "room_deliver must not carry RoomId authority."
+Assert-True (-not ($deliver.PSObject.Properties.Name -contains "sender")) "room_deliver must not carry sender authority."
+Assert-True (@($deliver.PSObject.Properties.Name).Count -eq 3) "room_deliver carries exactly kind, recipient, content."
+
+$noRecipient = Invoke-ControlPlane -Arguments @(
+  "-File", $controlPlaneScript,
+  "-Action", "room_deliver",
+  "-Content", "must fail",
+  "-Endpoint", "\.\pipe\unused",
+  "-Quiet"
+)
+Assert-True ($noRecipient.ExitCode -ne 0) "room_deliver without -Recipient must fail."
+Assert-True ($noRecipient.Output -like "*requires -Recipient*") "Expected the recipient guard. Output: $($noRecipient.Output)"
+
+$strayRecipient = Invoke-ControlPlane -Arguments @(
+  "-File", $controlPlaneScript,
+  "-Action", "room_post",
+  "-Recipient", "Codex",
+  "-Content", "must fail",
+  "-Endpoint", "\.\pipe\unused",
+  "-Quiet"
+)
+Assert-True ($strayRecipient.ExitCode -ne 0) "room_post with -Recipient must fail."
+Assert-True ($strayRecipient.Output -like "*-Recipient is supported only for -Action room_deliver*") "Expected the stray-recipient guard. Output: $($strayRecipient.Output)"
+
+# With PRIM1_PANE_SECRET in the environment the connection opens with the
+# secret preamble as its first line; the request follows on the second.
+$secret = "secret-" + [guid]::NewGuid().ToString("N")
+[Environment]::SetEnvironmentVariable("PRIM1_PANE_SECRET", $secret, "Process")
+try {
+  $withSecret = Invoke-CapturedRoomRequestWithPreamble -Prefix "prim1-room-preamble" -Arguments @(
+    "-Action", "room_post",
+    "-Content", "with secret"
+  ) -ResponseMessage "room message posted"
+} finally {
+  [Environment]::SetEnvironmentVariable("PRIM1_PANE_SECRET", $null, "Process")
+}
+Assert-True ($null -ne $withSecret.Preamble) "With PRIM1_PANE_SECRET set, the first line must be the preamble."
+Assert-True ($withSecret.Preamble.secret -ceq $secret) "The preamble carries the exact pane secret."
+Assert-True (@($withSecret.Preamble.PSObject.Properties.Name).Count -eq 1) "The preamble carries the secret and nothing else."
+Assert-True ($withSecret.Request.kind -ceq "room_post") "The request follows the preamble unchanged."
+Assert-True (-not ($withSecret.Request.PSObject.Properties.Name -contains "secret")) "The secret never rides inside the request."
 
 Write-Host "control-plane room tests passed"
 exit 0
