@@ -49,6 +49,7 @@ import {
   retainRoomFeedWindow,
 } from "./room-feed";
 import "./styles.css";
+import { SgrColourFilter } from "./sgr-filter";
 import type {
   AddRoomMemberRequest,
   ChooseSessionWorkingDirectoryRequest,
@@ -305,6 +306,13 @@ app.innerHTML = `
         <div class="view-body">
           <p class="view-hint">Pick the look. It applies immediately and is remembered. Dark and Light show harness output the way a normal terminal does; the two PRIM-1 themes are the original HUD look.</p>
           <div class="theme-gallery" id="theme-gallery"></div>
+          <label class="theme-option" for="unicolor-toggle">
+            <input type="checkbox" id="unicolor-toggle" />
+            <span class="theme-option-text">
+              <span class="theme-option-name">Unicolor</span>
+              <span class="theme-option-hint">Render every harness in the theme's text colour: the harness's own colours are dropped; bold, italic and underline stay. Off, a harness paints with its own colours as in a normal terminal. Applies to new output.</span>
+            </span>
+          </label>
         </div>
       </article>
     </section>
@@ -349,7 +357,7 @@ app.innerHTML = `
             <dl class="help-list">
               <dt>Rooms</dt><dd>Teams of sessions with a shared feed. <b>Post to feed</b> is a bulletin board: nobody is interrupted, the harnesses read it. <b>Send</b> delivers the text into one member's terminal as typed input — refused while that harness sits on a prompt or its state is unknown ("framing is blocked": type into its terminal instead).</dd>
               <dt>System log</dt><dd>The runtime's own messages in a bottom drawer. A red dot on the button means an error landed while the drawer was hidden; a failed close opens it.</dd>
-              <dt>Themes</dt><dd>The theme gallery — one screenshot per theme; Dark and Light are plain terminal looks, the two PRIM-1 themes are the HUD look.</dd>
+              <dt>Themes</dt><dd>The theme gallery — one screenshot per theme; Dark and Light are plain terminal looks, the two PRIM-1 themes are the HUD look. <b>Unicolor</b> (off by default) drops the harnesses' own colours so everything renders in the theme's text colour.</dd>
               <dt>Fullscreen</dt><dd>Same as F11.</dd>
               <dt>Refresh state</dt><dd>Re-reads sessions and rooms from the supervisor.</dd>
               <dt>Settings</dt><dd>Which harnesses sit in the + menu; the runtime paths.</dd>
@@ -472,6 +480,24 @@ app.innerHTML = `
   </div>
 `;
 
+/** Unicolor (Themes page): drop the harnesses' own colours on the way into
+    xterm so everything renders in the theme's text colour. Off by default —
+    a normal terminal shows the harness's colours. */
+let unicolor = localStorage.getItem("prim1-unicolor") === "1";
+
+function setUnicolor(enabled: boolean): void {
+  if (unicolor === enabled) {
+    return;
+  }
+  unicolor = enabled;
+  localStorage.setItem("prim1-unicolor", enabled ? "1" : "0");
+  if (!enabled) {
+    for (const pane of paneMap.values()) {
+      pane.releaseColourFilter();
+    }
+  }
+}
+
 class SessionTerminal {
   readonly sessionId: string;
   alias: string;
@@ -486,6 +512,7 @@ class SessionTerminal {
   private readonly initialBannerLabel: HTMLElement;
   private readonly initialBannerElement: HTMLDivElement;
   private snapshot: SessionSnapshot | null = null;
+  private readonly colourFilter = new SgrColourFilter();
 
   constructor(sessionId: string, alias: string, label: string) {
     this.sessionId = sessionId;
@@ -594,7 +621,15 @@ class SessionTerminal {
   }
 
   write(chunk: string): void {
-    this.initialBanner.forwardOutput(chunk);
+    this.initialBanner.forwardOutput(unicolor ? this.colourFilter.apply(chunk) : chunk);
+  }
+
+  /** Unicolor switched off mid-stream: hand any held partial sequence on. */
+  releaseColourFilter(): void {
+    const carried = this.colourFilter.flush();
+    if (carried) {
+      this.initialBanner.forwardOutput(carried);
+    }
   }
 
   fit(): void {
@@ -685,6 +720,7 @@ const settingsView = must<HTMLElement>("#settings-view");
 const helpView = must<HTMLElement>("#help-view");
 const themesView = must<HTMLElement>("#themes-view");
 const themeGallery = must<HTMLDivElement>("#theme-gallery");
+const unicolorToggle = must<HTMLInputElement>("#unicolor-toggle");
 const quickAttachSettings = must<HTMLUListElement>("#quick-attach-settings");
 const settingsWorkspace = must<HTMLElement>("#settings-workspace");
 const settingsRuntimeDir = must<HTMLElement>("#settings-runtime-dir");
@@ -1037,6 +1073,10 @@ function wireThemesPage(): void {
       return card;
     }),
   );
+  unicolorToggle.checked = unicolor;
+  unicolorToggle.addEventListener("change", () => {
+    setUnicolor(unicolorToggle.checked);
+  });
   themeGallery.addEventListener("click", (event) => {
     if (!(event.target instanceof Element)) {
       return;

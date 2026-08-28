@@ -2175,6 +2175,37 @@ textarea:focus-visible {
 .theme-card[aria-pressed="true"] .theme-card-use {
   opacity: 0.45;
 }
+.theme-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+  max-width: 46rem;
+  margin-top: 0.4rem;
+  padding: 0.6rem 0.7rem;
+  border: 1px solid var(--frame-inner);
+  background: var(--bg-inset);
+  cursor: pointer;
+}
+.theme-option input[type="checkbox"] {
+  margin-top: 0.15rem;
+  accent-color: var(--prim1);
+}
+.theme-option-text {
+  display: grid;
+  gap: 0.2rem;
+}
+.theme-option-name {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--prim1);
+}
+.theme-option-hint {
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
 
 /* ══════════════════════════════════════
    RESPONSIVE
