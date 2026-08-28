@@ -18837,6 +18837,78 @@ mod tests {
     }
 
     #[test]
+    fn a_relaunched_member_of_a_persisted_room_is_briefed_on_first_idle() {
+        let root = std::env::temp_dir().join(format!("prim1-brief-restart-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("work")).unwrap();
+
+        // Life 1: create the room (auto-brief on, edited template), then stop.
+        {
+            let mut config = test_supervisor_config(&root);
+            config.room_brief_on_join = true;
+            let supervisor = SupervisorHandle::new(config).unwrap();
+            supervisor.set_executable_resolver_for_tests(Arc::new(TestExecutableResolver));
+            install_standard_test_sessions(&supervisor);
+            let claude = test_session_id(&supervisor, "claude");
+            let codex = test_session_id(&supervisor, "codex");
+            supervisor
+                .create_room(CreateRoomRequest {
+                    label: Some("Persisted room".into()),
+                    member_ids: vec![claude, codex],
+                    brief_on_join: true,
+                    brief_template: Some("Persisted mission for {your_label}.".into()),
+                })
+                .unwrap();
+            supervisor.shutdown().unwrap();
+        }
+
+        // Life 2: the app restart — catalogs reloaded from disk, member relaunched.
+        let mut config = test_supervisor_config(&root);
+        config.room_brief_on_join = true;
+        let supervisor = SupervisorHandle::new(config).unwrap();
+        supervisor.set_executable_resolver_for_tests(Arc::new(TestExecutableResolver));
+        let claude = test_session_id(&supervisor, "claude");
+        let (pty, inputs) = recording_pty_session(std::process::id());
+        supervisor.set_pty_spawner_for_tests(Arc::new(OutputThenReturnPtySpawner {
+            outputs: Vec::new(),
+            session: Mutex::new(Some(pty)),
+        }));
+        start_test_session(&supervisor, "claude").unwrap();
+
+        // The relaunched member owes the brief...
+        let (generation, run_id, attempts) = {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id(claude).unwrap();
+            let running = slot.running.as_ref().unwrap();
+            (
+                slot.generation,
+                slot.run_id.unwrap(),
+                running.brief_attempts_left,
+            )
+        };
+        assert_eq!(
+            attempts, ROOM_BRIEF_MAX_ATTEMPTS,
+            "a member of a persisted auto-brief room must owe the brief at relaunch"
+        );
+
+        // ...and receives the room's edited brief on the run's first idle.
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id_mut(claude).unwrap();
+            set_test_bracketed_paste_mode(slot, run_id, BracketedPasteMode::Enabled);
+            slot.state = LifecycleState::Idle;
+        }
+        supervisor.deliver_pending_brief_if_due(claude, generation, run_id);
+        wait_until("the restart brief to reach claude", || {
+            !inputs.lock().is_empty()
+        });
+        assert!(
+            inputs.lock()[0].contains("Persisted mission for claude."),
+            "{}",
+            inputs.lock()[0]
+        );
+    }
+
+    #[test]
     fn a_rooms_edited_brief_replaces_the_canonical_text_for_join_and_idle_briefs() {
         let root = std::env::temp_dir().join(format!("prim1-brief-custom-{}", Uuid::new_v4()));
         fs::create_dir_all(root.join("work")).unwrap();

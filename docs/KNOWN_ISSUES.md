@@ -37,6 +37,34 @@ long-lived installations should manage that history through Grok's own tools.
 
 ## Behavioral notes the wrapper does not yet abstract
 
+### Grok startup detection is measured, and Grok's paint changes server-side
+
+2026-08-28 late: with an unchanged grok.exe (1.0.5, Aug 20), Grok's startup
+paint changed under it — splash text became "Signing in… starting your
+session.", the ❯ composer glyph became ">", and the whole startup collapsed
+into one repaint frame with the `minimal · /help` statusline written outside
+any cursor hide/show cycle. The tracker's old two-ordered-frames measure wedged
+every run in `Starting` (brief refused, deliveries refused, operator typing
+refused). Re-measured the same night: the statusline is now the ready signal,
+evaluated on completed frames AND on the settled screen at chunk end; the new
+splash phrasing is recognized; the fullscreen path keeps its ordered measure.
+If Grok's UI changes again, the failure mode is the same fail-closed wedge —
+compare a raw ConPTY capture against `StartupTracker`'s predicates (fixture:
+`crates/driver-grok/src/fixtures/grok-startup-minimal-single-frame-v105.json`).
+
+### Room brief on relaunch: one unexplained live miss (open)
+
+2026-08-28 ~23:56: after an app restart, the three relaunched members of a
+persisted auto-brief room received no brief — no delivery events, no refusal
+warnings, which implies `brief_attempts_left` was 0 (brief never owed). The
+exact shape passes as a unit test
+(`a_relaunched_member_of_a_persisted_room_is_briefed_on_first_idle`), so the
+defect is live-environment-specific and could not be isolated without killing a
+working overnight run. If it recurs: check the audit for the absence of both
+delivery events AND "Room brief … not delivered" warnings after the members'
+first idle; that signature means owed-at-start never armed, not a refused
+delivery.
+
 These are documented runtime behaviors that callers should know. Each is on the roadmap to be hidden behind a wrapper abstraction; until then, callers compensate.
 
 ### Pane sideband requires an empirically verified native-caller boundary

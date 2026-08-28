@@ -6,7 +6,11 @@ use terminal_viewport::CONTROL_MAX_CHARS as TERMINAL_CONTROL_MAX_CHARS;
 use terminal_viewport::TerminalViewport;
 use uuid::Uuid;
 
-// Measured against Grok Build 1.0.0 (3cd0d0cbce). Unknown future text stays
+// Measured against Grok Build 1.0.0 (3cd0d0cbce); re-measured against 1.0.5
+// (2026-08-28: minimal mode paints ONE completed frame — welcome box +
+// "minimal · /help" statusline + ">" composer; the ❯ glyph and the separate
+// "Starting session..." splash frame are gone, and the splash text is now
+// "Signing in… starting your session."). Unknown future text stays
 // fail-closed in lifecycle Starting rather than being inferred ready.
 pub const LAUNCHER_MENU_DETAIL: &str = "launcher_menu";
 pub const SESSION_STARTING_DETAIL: &str = "session_starting";
@@ -96,6 +100,20 @@ impl StartupTracker {
                 }
             }
         }
+        // Grok 1.0.5 minimal is scrollback-native: after the one early frame,
+        // the "minimal · /help" statusline lands with the cursor visible —
+        // outside any hide/show cycle. Evaluate the settled screen at chunk
+        // end too (only until Complete; a string split across chunks simply
+        // completes on the next chunk).
+        if self.phase != StartupPhase::Complete && !self.frame_active {
+            let observed = self.evaluate_screen(bracketed_paste_enabled);
+            if observed == StartupProgress::InteractiveReady {
+                return observed;
+            }
+            if observed == StartupProgress::StartingObserved && progress == StartupProgress::None {
+                progress = observed;
+            }
+        }
         progress
     }
 
@@ -115,29 +133,42 @@ impl StartupTracker {
             self.frame_invalid = false;
             return StartupProgress::None;
         }
+        self.evaluate_screen(bracketed_paste_enabled)
+    }
 
+    /// The measured readiness predicates against the current settled screen —
+    /// shared by completed hide/show frames and chunk-end evaluation.
+    fn evaluate_screen(&mut self, bracketed_paste_enabled: bool) -> StartupProgress {
         let Some(screen) = self.viewport.trusted_screen() else {
             return StartupProgress::None;
         };
         let normalized = screen.text().replace('\u{2026}', "...");
         let lower = normalized.to_ascii_lowercase();
-        let has_starting = lower.contains("starting session...");
+        let has_starting = lower.contains("starting session...")
+            || lower.contains("starting your session");
         let has_launcher = lower.contains("new worktree") || lower.contains("resume session");
         let has_fullscreen_interactive_composer =
             normalized.contains('❯') && lower.contains("shift+tab") && lower.contains("ctrl+x");
-        let has_minimal_interactive_composer =
-            normalized.contains('❯') && normalized.contains(MINIMAL_MODE_READY_MARKER);
+        let has_minimal_interactive_composer = normalized.contains(MINIMAL_MODE_READY_MARKER);
 
         match self.phase {
+            StartupPhase::AwaitingStarting | StartupPhase::StartingObserved
+                if bracketed_paste_enabled
+                    && !has_launcher
+                    && has_minimal_interactive_composer =>
+            {
+                self.phase = StartupPhase::Complete;
+                StartupProgress::InteractiveReady
+            }
             StartupPhase::AwaitingStarting if has_starting => {
                 self.phase = StartupPhase::StartingObserved;
                 StartupProgress::StartingObserved
             }
             StartupPhase::StartingObserved
                 if bracketed_paste_enabled
+                    && !has_starting
                     && !has_launcher
-                    && (has_minimal_interactive_composer
-                        || (!has_starting && has_fullscreen_interactive_composer)) =>
+                    && has_fullscreen_interactive_composer =>
             {
                 self.phase = StartupPhase::Complete;
                 StartupProgress::InteractiveReady
@@ -210,7 +241,7 @@ pub fn classify_work_state(chunk: &str) -> Option<(WorkState, Option<String>)> {
     {
         return Some((WorkState::Blocked, Some(LAUNCHER_MENU_DETAIL.into())));
     }
-    if lower.contains("starting session...") {
+    if lower.contains("starting session...") || lower.contains("starting your session") {
         return Some((WorkState::Blocked, Some(SESSION_STARTING_DETAIL.into())));
     }
 
@@ -422,6 +453,11 @@ mod tests {
             Some((WorkState::Blocked, Some(SESSION_STARTING_DETAIL.into())))
         );
         assert_eq!(
+            classify_work_state("Signing in… starting your session."),
+            Some((WorkState::Blocked, Some(SESSION_STARTING_DETAIL.into()))),
+            "the 1.0.5 splash phrasing is still a blocked startup"
+        );
+        assert_eq!(
             classify_work_state("Help improve Grok [Opt out] [Opt in]"),
             None,
             "the measured banner is optional non-modal chrome; production receipts prove Grok accepts and answers routed input while it remains visible"
@@ -538,13 +574,30 @@ mod tests {
     }
 
     #[test]
-    fn startup_tracker_rejects_minimal_chrome_before_start_or_without_its_exact_marker() {
-        let mut premature = StartupTracker::default();
+    fn startup_tracker_admits_the_minimal_statusline_without_a_prior_starting_frame() {
+        // Grok 1.0.5 paints no separate starting frame: the statusline frame
+        // is the whole measured startup, glyph or no glyph.
+        let mut tracker = StartupTracker::default();
         assert_eq!(
-            premature.observe_output(&minimal_ready_repaint()),
-            StartupProgress::None
+            tracker.observe_output(&minimal_ready_repaint()),
+            StartupProgress::InteractiveReady
         );
 
+        let mut glyphless = StartupTracker::default();
+        assert_eq!(
+            glyphless.observe_output(concat!(
+                "\x1b[?25l",
+                "\x1b[15;1Hminimal · /help",
+                "\x1b[16;1H>",
+                "\x1b[16;3H\x1b[?25h",
+            )),
+            StartupProgress::InteractiveReady,
+            "1.0.5 replaced the ❯ composer glyph with '>'"
+        );
+    }
+
+    #[test]
+    fn startup_tracker_rejects_minimal_chrome_without_its_exact_marker() {
         let mut incomplete = StartupTracker::default();
         assert_eq!(
             incomplete.observe_output(&starting_repaint()),
@@ -553,6 +606,36 @@ mod tests {
         assert_eq!(
             incomplete.observe_output("\x1b[?25l\x1b[15;1H/help\x1b[16;1H❯\x1b[?25h"),
             StartupProgress::None
+        );
+    }
+
+    #[test]
+    fn startup_tracker_observes_the_v105_splash_phrasing_as_starting() {
+        let mut tracker = StartupTracker::default();
+        assert_eq!(
+            tracker.observe_output(&repaint("Signing in… starting your session.")),
+            StartupProgress::StartingObserved
+        );
+    }
+
+    #[test]
+    fn startup_tracker_admits_the_exact_v105_single_frame_minimal_stream() {
+        let stream: String = serde_json::from_str(include_str!(
+            "fixtures/grok-startup-minimal-single-frame-v105.json"
+        ))
+        .expect("v1.0.5 minimal startup fixture should remain valid JSON");
+        let mut tracker = StartupTracker::default();
+        tracker.resize(120, 30);
+
+        assert_eq!(
+            tracker.observe_output(&stream),
+            StartupProgress::InteractiveReady,
+            "the exact wedge-night stream must reach the measured interactive repaint"
+        );
+        assert_eq!(
+            tracker.observe_output(&stream),
+            StartupProgress::None,
+            "an admitted run must not re-enter startup"
         );
     }
 
