@@ -336,12 +336,26 @@ pub struct OperatorRouteMessageRequest {
     pub content: String,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CreateRoomRequest {
     #[serde(default)]
     pub label: Option<String>,
     pub member_ids: Vec<SessionId>,
+    /// Deliver the room brief into every member's terminal automatically —
+    /// on creation, when a member joins, and on a run's first idle. Off, no
+    /// member is messaged; the operator can still brief one by hand.
+    #[serde(default = "default_true")]
+    pub brief_on_join: bool,
+    /// Operator-edited brief for this room; `None` means the canonical brief.
+    /// `{room_label}`, `{members}`, `{your_label}` and `{tools}` are filled
+    /// in per member.
+    #[serde(default)]
+    pub brief_template: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

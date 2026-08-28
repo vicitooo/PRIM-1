@@ -18,6 +18,10 @@ const ROOM_FEED_MAX_BYTES: usize = 16 * 1024 * 1024;
 const ROOM_FEED_PAGE_MAX_EVENTS: usize = 64;
 const ROOM_FEED_PAGE_MAX_BYTES: usize = 2 * 1024 * 1024;
 
+fn default_brief_on_join() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PersistedRoomV1 {
@@ -25,6 +29,14 @@ pub(crate) struct PersistedRoomV1 {
     pub(crate) label: String,
     pub(crate) member_ids: Vec<SessionId>,
     pub(crate) membership_revision: RoomRevision,
+    /// Whether the room brief is typed into members' terminals automatically
+    /// (on create, join, and a run's first idle). Catalogs written before
+    /// this field existed always briefed, so absent means true.
+    #[serde(default = "default_brief_on_join")]
+    pub(crate) brief_on_join: bool,
+    /// Operator-edited brief template; `None` means the canonical brief.
+    #[serde(default)]
+    pub(crate) brief_template: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -385,7 +397,24 @@ mod tests {
             label: label.into(),
             member_ids: members,
             membership_revision: 1,
+            brief_on_join: true,
+            brief_template: None,
         }
+    }
+
+    #[test]
+    fn persisted_room_defaults_brief_fields_when_absent() {
+        let json = format!(
+            r#"{{"room_id":"{}","label":"old","member_ids":[],"membership_revision":1}}"#,
+            Uuid::new_v4()
+        );
+        let room: PersistedRoomV1 = serde_json::from_str(&json).unwrap();
+        assert!(room.brief_on_join);
+        assert!(room.brief_template.is_none());
+
+        let back = serde_json::to_string(&room).unwrap();
+        let reparsed: PersistedRoomV1 = serde_json::from_str(&back).unwrap();
+        assert_eq!(room, reparsed);
     }
 
     fn message(index: usize, content: String) -> RoomFeedItem {

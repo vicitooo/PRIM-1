@@ -25,7 +25,8 @@ use shared_types::{
     StopSessionRequest,
 };
 use supervisor::{
-    RendererEventProjector, SupervisorConfig, SupervisorHandle, validate_runtime_storage_paths,
+    RendererEventProjector, SupervisorConfig, SupervisorHandle, default_room_brief_template,
+    validate_runtime_storage_paths,
 };
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
@@ -801,6 +802,11 @@ fn delete_session(
             );
             error.to_string()
         })
+}
+
+#[tauri::command]
+fn default_room_brief() -> String {
+    default_room_brief_template()
 }
 
 #[tauri::command]
@@ -1637,6 +1643,7 @@ pub fn run(startup: StartupConfig) {
             move_session,
             delete_session,
             create_room,
+            default_room_brief,
             rename_room,
             move_room,
             add_room_member,
