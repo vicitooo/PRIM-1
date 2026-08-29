@@ -9744,6 +9744,21 @@ impl SupervisorHandle {
         // Prime is still excluded from the pane environment: its WSL launch
         // forwards no environment (WSLENV is cleared) and the CLI path through
         // Windows interop is a separate line after C1-C4.
+        if definition.driver != DriverKind::Prime {
+            // Panes must behave identically from any launcher. An icon launch
+            // carries no TERM, and harnesses fall back to ASCII glyph sets
+            // (grok painted ">" for its composer, defeating glyph-anchored
+            // detection); a shell launch may instead leak NO_COLOR (stripped
+            // in pty-host). Pin the terminal identity.
+            spec.env.push(EnvVar {
+                key: "TERM".into(),
+                value: "xterm-256color".into(),
+            });
+            spec.env.push(EnvVar {
+                key: "COLORTERM".into(),
+                value: "truecolor".into(),
+            });
+        }
         let mut pane_secret = None;
         if definition.driver != DriverKind::Prime
             && let Some(status) = self.inner.control_plane.read().clone()

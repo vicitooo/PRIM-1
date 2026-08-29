@@ -82,13 +82,19 @@ impl Utf8StreamDecoder {
 }
 
 const LEGACY_PANE_CREDENTIAL_ENV: &str = "PRIM1_PANE_CREDENTIALS";
-const INHERITED_CONTROL_ENV: [&str; 6] = [
+const INHERITED_CONTROL_ENV: [&str; 9] = [
     LEGACY_PANE_CREDENTIAL_ENV,
     "PRIM1_CONTROL_PLANE_ENDPOINT",
     "PRIM1_CONTROL_PLANE_TRANSPORT",
     "PRIM1_PANE_IDENTITY",
     "PRIM1_CONTROL_PLANE_SERVER_PID",
     "PRIM1_CONTROL_PLANE_SERVER_STARTED_FILETIME",
+    // Launcher leakage: an app started from an agent's tool shell carries
+    // these and every harness honours them (monochrome panes, child-session
+    // markers). Panes must render identically from any launcher.
+    "NO_COLOR",
+    "CLAUDECODE",
+    "CLAUDE_CODE_CHILD_SESSION",
 ];
 
 fn apply_launch_environment(command: &mut CommandBuilder, env: &[EnvVar]) -> Result<()> {
