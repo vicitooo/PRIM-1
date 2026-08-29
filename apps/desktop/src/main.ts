@@ -77,6 +77,7 @@ import type {
   SetSessionLinuxWorkingDirectoryRequest,
   SetSessionPermissionRequest,
   SessionSnapshot,
+  StartSessionRequest,
 } from "./types";
 
 type SessionFormMode =
@@ -290,6 +291,16 @@ app.innerHTML = `
             <ul class="settings-list" id="quick-attach-settings"></ul>
           </section>
           <section class="view-section">
+            <h3>Startup</h3>
+            <label class="theme-option" for="auto-resume-toggle">
+              <input type="checkbox" id="auto-resume-toggle" />
+              <span class="theme-option-text">
+                <span class="theme-option-name">Continue where I left off</span>
+                <span class="theme-option-hint">On open, relaunch every session that was running when PRIM-1 last closed — each harness resumes its previous conversation. Launch always resumes when a conversation is stored; right-click a tab for Start fresh session.</span>
+              </span>
+            </label>
+          </section>
+          <section class="view-section">
             <h3>Runtime</h3>
             <dl class="settings-facts">
               <dt>Workspace</dt><dd class="mono" id="settings-workspace">—</dd>
@@ -343,6 +354,7 @@ app.innerHTML = `
               <dt><kbd>+</kbd></dt><dd>Pick a harness — the session is created and launched in one step. <b>Custom…</b> opens the full form (label, permission profile, working directory). Settings chooses which harnesses are listed.</dd>
               <dt>Tab</dt><dd>Click to switch. <b>Drag</b> a tab to reorder. <b>Right-click</b> for Move left / Move right / Edit… / Close.</dd>
               <dt>×</dt><dd>Closes the session the way you would by hand: leaves its room, stops the harness, deletes it — one confirmation. Terminal scrollback is discarded.</dd>
+              <dt>Launch</dt><dd>Resumes the session's previous conversation when one is stored (Claude, Codex, Grok). Right-click the tab → <b>Start fresh session</b> for a clean one.</dd>
               <dt>Pane strip</dt><dd>Launch / Restart / Stop / Edit for the open session; the dot in the tab is its state (copper = ready or idle, bronze = busy or starting, red = stalled or failed).</dd>
               <dt>Normal / Unsafe</dt><dd>What the profile actually passes to the harness — Claude Code: <code>--permission-mode manual</code> vs <code>--dangerously-skip-permissions</code>. Codex: <code>--ask-for-approval on-request --sandbox workspace-write</code> vs <code>--dangerously-bypass-approvals-and-sandbox</code>. Grok Build: <code>--permission-mode default</code> vs <code>--permission-mode bypassPermissions</code>. Prime and Terminal: Normal only.</dd>
             </dl>
@@ -369,7 +381,7 @@ app.innerHTML = `
               <dt>Themes</dt><dd>The theme gallery — one screenshot per theme; Dark and Light are plain terminal looks, the two PRIM-1 themes are the HUD look. <b>Unicolor</b> (off by default) drops the harnesses' own colours so everything renders in the theme's text colour.</dd>
               <dt>Fullscreen</dt><dd>Same as F11.</dd>
               <dt>Refresh state</dt><dd>Re-reads sessions and rooms from the supervisor.</dd>
-              <dt>Settings</dt><dd>Which harnesses sit in the + menu; the runtime paths.</dd>
+              <dt>Settings</dt><dd>Which harnesses sit in the + menu; the runtime paths; whether PRIM-1 continues where you left off on open.</dd>
             </dl>
           </section>
         </div>
@@ -479,6 +491,10 @@ app.innerHTML = `
     <button type="button" class="corner-action" data-tab-menu="edit" role="menuitem">
       <span class="corner-action-glyph" aria-hidden="true">&#9998;</span>
       <span class="corner-action-label">Edit…</span>
+    </button>
+    <button type="button" class="corner-action" data-tab-menu="fresh" role="menuitem">
+      <span class="corner-action-glyph" aria-hidden="true">&#8635;</span>
+      <span class="corner-action-label">Start fresh session</span>
     </button>
     <div class="corner-menu-sep" role="separator"></div>
     <button type="button" class="corner-action" data-tab-menu="close" role="menuitem">
@@ -704,6 +720,11 @@ const themesView = must<HTMLElement>("#themes-view");
 const themeGallery = must<HTMLDivElement>("#theme-gallery");
 const unicolorToggle = must<HTMLInputElement>("#unicolor-toggle");
 const quickAttachSettings = must<HTMLUListElement>("#quick-attach-settings");
+const autoResumeToggle = must<HTMLInputElement>("#auto-resume-toggle");
+autoResumeToggle.checked = localStorage.getItem("prim1-auto-resume") !== "0";
+autoResumeToggle.addEventListener("change", () => {
+  localStorage.setItem("prim1-auto-resume", autoResumeToggle.checked ? "1" : "0");
+});
 const settingsWorkspace = must<HTMLElement>("#settings-workspace");
 const settingsRuntimeDir = must<HTMLElement>("#settings-runtime-dir");
 const settingsAuditPath = must<HTMLElement>("#settings-audit-path");
@@ -1584,6 +1605,64 @@ async function initializeUi(): Promise<void> {
 async function bootstrap(): Promise<void> {
   await refreshSnapshot();
   writeSystem("info", "UI attached to supervisor.");
+  maybeResumeWorkspace();
+}
+
+/** "Continue where I left off" (Settings, on by default): on app open,
+    relaunch every session that had a live run when the app last went down.
+    Each launch resumes the harness's stored conversation. */
+const AUTO_RESUME_KEY = "prim1-auto-resume";
+let workspaceResumeAttempted = false;
+
+function maybeResumeWorkspace(): void {
+  if (workspaceResumeAttempted) {
+    return;
+  }
+  workspaceResumeAttempted = true;
+  if (localStorage.getItem(AUTO_RESUME_KEY) === "0") {
+    return;
+  }
+  const targets = [...snapshotById.values()].filter(
+    (session) => session.was_running_at_shutdown && !session.running,
+  );
+  if (targets.length === 0) {
+    return;
+  }
+  writeSystem(
+    "info",
+    `Continuing where you left off: launching ${targets.map((s) => s.label).join(", ")}.`,
+  );
+  for (const session of targets) {
+    void command<SessionSnapshot>("start_session", {
+      request: { session_id: session.session_id } satisfies StartSessionRequest,
+    }).catch((error) =>
+      writeSystem("error", `Auto-launch ${session.label} failed: ${String(error)}`),
+    );
+  }
+  window.setTimeout(() => {
+    void refreshSnapshot(tabState.activeId ?? undefined).catch(() => {});
+  }, 1800);
+}
+
+/** Tab menu → Start fresh session: a NEW harness conversation, abandoning the
+    stored one. Only for a stopped session — a running one is its own truth. */
+async function startFreshSession(sessionId: string): Promise<void> {
+  const session = snapshotById.get(sessionId);
+  if (session?.running) {
+    writeSystem(
+      "warn",
+      "Stop the session first — Start fresh session begins a new conversation.",
+    );
+    return;
+  }
+  try {
+    await command<SessionSnapshot>("start_session", {
+      request: { session_id: sessionId, fresh: true } satisfies StartSessionRequest,
+    });
+    await refreshSnapshot(sessionId);
+  } catch (error) {
+    writeSystem("error", `Start fresh failed: ${String(error)}`);
+  }
 }
 
 async function refreshSnapshot(preferredSessionId?: string): Promise<RuntimeSnapshot> {
@@ -2453,6 +2532,9 @@ function wireTabMenu(): void {
         break;
       case "edit":
         openEditSessionForm(sessionId);
+        break;
+      case "fresh":
+        void startFreshSession(sessionId);
         break;
       case "close":
         void deleteSession(sessionId);
@@ -3767,6 +3849,9 @@ function wireSessionUi(): void {
       }
       case "edit":
         openEditSessionForm(sessionId);
+        break;
+      case "fresh":
+        void startFreshSession(sessionId);
         break;
       case "close":
         void deleteSession(sessionId);

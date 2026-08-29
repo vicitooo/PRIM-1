@@ -616,7 +616,7 @@ fn start_session(
     );
     state
         .supervisor
-        .start_session_by_id(request.session_id)
+        .start_session_by_id_with_mode(request.session_id, request.fresh)
         .map_err(|error| {
             let detail = format!("{error:#}");
             state.diagnostics.log(

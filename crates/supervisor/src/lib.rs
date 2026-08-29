@@ -24,6 +24,7 @@ use pty_host::{
 };
 use serde::{Deserialize, Serialize};
 use shared_types::{
+    HarnessLaunchSession,
     AddRoomMemberRequest, AlertSeverity, BriefRoomMemberRequest, ControlKey, ControlPlaneSnapshot,
     ControlPlaneStatus, CreateRoomRequest, DeleteRoomRequest, DeliverRoomMessageRequest,
     DriverKind, EnvVar, HeartbeatSessionSummary, LaunchSpec, LifecycleState, LogLevel,
@@ -755,6 +756,10 @@ struct PreparedLaunch {
     /// The secret placed in this launch's environment; stored on the run so
     /// the sideband can recognise the pane by it.
     pane_secret: Option<String>,
+    /// The harness conversation id this run pins (fresh mint) or resumes.
+    /// None for drivers whose id is captured after spawn (Codex) or that have
+    /// no conversation identity (terminal, Prime).
+    harness_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2078,6 +2083,12 @@ struct SessionSlot {
     stall_state_entered_at: Option<Instant>,
     stall_state_entered_timestamp: Option<String>,
     stall_detector: Option<StallDetector>,
+    /// Harness-side conversation id of the newest run — what Launch resumes.
+    /// Minted for Claude/Grok, captured from the rollout for Codex.
+    harness_session_id: Option<String>,
+    /// The session had a live run when the app last went down; drives the
+    /// UI's "continue where I left off" relaunch on open.
+    running_at_shutdown: bool,
 }
 
 impl SessionSlot {
@@ -2097,6 +2108,8 @@ impl SessionSlot {
             running: self.running.is_some(),
             last_activity_at: self.last_activity_at.clone(),
             last_error: self.last_error.clone(),
+            resume_available: self.harness_session_id.is_some(),
+            was_running_at_shutdown: self.running_at_shutdown,
         }
     }
 
@@ -2130,6 +2143,10 @@ struct PersistedSessionV1 {
     driver: DriverKind,
     working_directory: QualifiedWorkingDirectory,
     permission_profile: shared_types::PermissionProfile,
+    #[serde(default)]
+    harness_session_id: Option<String>,
+    #[serde(default)]
+    running_at_shutdown: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2190,6 +2207,8 @@ impl SessionRegistry {
             };
             let mut slot = closed_session_slot(definition);
             slot.qualified_working_directory = Some(persisted.working_directory.clone());
+            slot.harness_session_id = persisted.harness_session_id.clone();
+            slot.running_at_shutdown = persisted.running_at_shutdown;
             registry.insert(slot)?;
         }
         Ok(registry)
@@ -2585,6 +2604,8 @@ fn closed_session_slot(definition: SessionDefinition) -> SessionSlot {
         stall_state_entered_at: None,
         stall_state_entered_timestamp: None,
         stall_detector: None,
+        harness_session_id: None,
+        running_at_shutdown: false,
     }
 }
 
@@ -3289,6 +3310,101 @@ fn persist_session_catalog(runtime_dir: &Path, catalog: &SessionCatalogV1) -> Re
         "session catalog",
         catalog,
     )
+}
+
+/// The newest Codex rollout whose recorded cwd matches `working_dir` and
+/// whose file was written at/after `started` (small clock slack). Scans only
+/// the two lexicographically newest day directories.
+fn newest_codex_rollout_for_cwd(
+    sessions_root: &Path,
+    working_dir: &str,
+    started: std::time::SystemTime,
+) -> Option<String> {
+    fn normalize(path: &str) -> String {
+        path.replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    }
+    fn sorted_dirs_desc(root: &Path) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return Vec::new();
+        };
+        let mut dirs: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect();
+        dirs.sort();
+        dirs.reverse();
+        dirs
+    }
+
+    let wanted = normalize(working_dir);
+    let floor = started
+        .checked_sub(Duration::from_secs(5))
+        .unwrap_or(started);
+    let mut day_dirs = Vec::new();
+    'years: for year in sorted_dirs_desc(sessions_root) {
+        for month in sorted_dirs_desc(&year) {
+            for day in sorted_dirs_desc(&month) {
+                day_dirs.push(day);
+                if day_dirs.len() >= 2 {
+                    break 'years;
+                }
+            }
+        }
+    }
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+    for day in day_dirs {
+        let Ok(entries) = std::fs::read_dir(&day) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+            if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
+                continue;
+            }
+            let Ok(metadata) = path.metadata() else {
+                continue;
+            };
+            let Ok(modified) = metadata.modified() else {
+                continue;
+            };
+            if modified < floor {
+                continue;
+            }
+            if best.as_ref().is_some_and(|(at, _)| *at >= modified) {
+                continue;
+            }
+            let Ok(file) = fs::File::open(&path) else {
+                continue;
+            };
+            let mut first_line = String::new();
+            use std::io::BufRead as _;
+            if StdBufReader::new(file).read_line(&mut first_line).is_err() {
+                continue;
+            }
+            let Ok(meta) = serde_json::from_str::<serde_json::Value>(&first_line) else {
+                continue;
+            };
+            let payload = &meta["payload"];
+            let Some(cwd) = payload["cwd"].as_str() else {
+                continue;
+            };
+            if normalize(cwd) != wanted {
+                continue;
+            }
+            let Some(id) = payload["id"]
+                .as_str()
+                .or_else(|| payload["session_id"].as_str())
+            else {
+                continue;
+            };
+            best = Some((modified, id.to_string()));
+        }
+    }
+    best.map(|(_, id)| id)
 }
 
 fn persist_room_catalog(runtime_dir: &Path, catalog: &RoomCatalogV1) -> Result<()> {
@@ -4654,6 +4770,16 @@ impl SupervisorHandle {
     }
 
     pub fn start_session_by_id(&self, session_id: SessionId) -> Result<SessionSnapshot> {
+        self.start_session_by_id_with_mode(session_id, false)
+    }
+
+    /// `fresh = true` starts a NEW harness conversation; default Launch
+    /// resumes the stored one when the driver supports it.
+    pub fn start_session_by_id_with_mode(
+        &self,
+        session_id: SessionId,
+        fresh: bool,
+    ) -> Result<SessionSnapshot> {
         self.ensure_active()?;
         self.refresh_session_liveness();
         let (initial_generation, definition, qualified_directory) = {
@@ -4698,7 +4824,7 @@ impl SupervisorHandle {
             definition.driver,
             &qualified_directory,
         )?;
-        let plan = self.prepare_launch_spec_for_spawn(&definition, &qualified_directory)?;
+        let plan = self.prepare_launch_spec_for_spawn(&definition, &qualified_directory, fresh)?;
         let expected = {
             let mut slots = self.inner.slots.lock();
             self.ensure_active()?;
@@ -4763,7 +4889,15 @@ impl SupervisorHandle {
         }
         let (_, expected) =
             self.declare_stop_operation(session_id, None, StopIntentKind::Operator)?;
-        self.stop_session_at(session_id, expected)
+        let snapshot = self.stop_session_at(session_id, expected)?;
+        {
+            let mut slots = self.inner.slots.lock();
+            if let Some(slot) = slots.get_by_id_mut(session_id) {
+                slot.running_at_shutdown = false;
+            }
+        }
+        self.persist_slot_harness_state(session_id);
+        Ok(snapshot)
     }
 
     pub fn restart_session_by_id(&self, session_id: SessionId) -> Result<SessionSnapshot> {
@@ -5059,6 +5193,102 @@ impl SupervisorHandle {
         persist_room_catalog(&self.inner.runtime_dir, candidate)
     }
 
+    /// Persist the slot's harness conversation id and running-at-shutdown
+    /// flag into the session catalog. A failure downgrades to a warning: the
+    /// run itself is unaffected, only workspace restore fidelity suffers.
+    fn persist_slot_harness_state(&self, session_id: SessionId) {
+        let state = {
+            let slots = self.inner.slots.lock();
+            slots
+                .get_by_id(session_id)
+                .map(|slot| (slot.harness_session_id.clone(), slot.running_at_shutdown))
+        };
+        let Some((harness_session_id, running_at_shutdown)) = state else {
+            return;
+        };
+        let mut catalog = self.inner.catalog.lock();
+        let mut candidate = catalog.clone();
+        let Some(row) = candidate
+            .sessions
+            .iter_mut()
+            .find(|session| session.session_id == session_id)
+        else {
+            return;
+        };
+        if row.harness_session_id == harness_session_id
+            && row.running_at_shutdown == running_at_shutdown
+        {
+            return;
+        }
+        row.harness_session_id = harness_session_id;
+        row.running_at_shutdown = running_at_shutdown;
+        if let Err(error) = self.persist_catalog_candidate(&candidate) {
+            self.emit(RuntimeEvent::SystemLog {
+                level: LogLevel::Warn,
+                message: format!("Session resume state could not be persisted: {error}"),
+                timestamp: now_rfc3339(),
+            });
+            return;
+        }
+        *catalog = candidate;
+    }
+
+    /// Codex offers no launch-time id flag: after spawn, watch its rollout
+    /// directory for the new session file (matched by cwd and start time) and
+    /// persist that id for the next resume.
+    fn spawn_codex_session_capture(&self, session_id: SessionId, working_dir: String) {
+        let handle = self.clone();
+        let started = std::time::SystemTime::now();
+        let spawned = std::thread::Builder::new()
+            .name("prim1-codex-session-capture".into())
+            .spawn(move || {
+                let Some(profile) = std::env::var_os("USERPROFILE") else {
+                    return;
+                };
+                let sessions = PathBuf::from(profile).join(".codex").join("sessions");
+                for _ in 0..24 {
+                    std::thread::sleep(Duration::from_secs(1));
+                    let Some(found) =
+                        newest_codex_rollout_for_cwd(&sessions, &working_dir, started)
+                    else {
+                        continue;
+                    };
+                    let changed = {
+                        let mut slots = handle.inner.slots.lock();
+                        match slots.get_by_id_mut(session_id) {
+                            Some(slot)
+                                if slot.harness_session_id.as_deref()
+                                    != Some(found.as_str()) =>
+                            {
+                                slot.harness_session_id = Some(found.clone());
+                                true
+                            }
+                            Some(_) => false,
+                            None => return,
+                        }
+                    };
+                    if changed {
+                        handle.persist_slot_harness_state(session_id);
+                        handle.emit(RuntimeEvent::SystemLog {
+                            level: LogLevel::Info,
+                            message: format!(
+                                "Captured Codex conversation {found} for resume"
+                            ),
+                            timestamp: now_rfc3339(),
+                        });
+                    }
+                    return;
+                }
+            });
+        if let Err(error) = spawned {
+            self.emit(RuntimeEvent::SystemLog {
+                level: LogLevel::Warn,
+                message: format!("Codex session capture thread could not start: {error}"),
+                timestamp: now_rfc3339(),
+            });
+        }
+    }
+
     fn ensure_wsl_reconciled(&self) -> Result<()> {
         if self.inner.wsl_reconciliation_error.lock().is_none() {
             return Ok(());
@@ -5205,6 +5435,8 @@ impl SupervisorHandle {
                 driver: request.driver,
                 working_directory: qualified_directory,
                 permission_profile: request.permission_profile,
+                harness_session_id: None,
+                running_at_shutdown: false,
             });
             self.persist_catalog_candidate(&candidate)?;
             slots.insert_prevalidated(slot);
@@ -5575,6 +5807,7 @@ impl SupervisorHandle {
                 membership_revision: 1,
                 brief_on_join: request.brief_on_join,
                 brief_template,
+                briefed_member_ids: Some(Vec::new()),
             };
             let mut runtime = RoomRuntime::from_persisted(definition.clone());
             let mut feed_events = Vec::with_capacity(definition.member_ids.len());
@@ -5798,6 +6031,7 @@ impl SupervisorHandle {
                 .member_ids
                 .retain(|session_id| *session_id != request.session_id);
             persisted.membership_revision = revision;
+            persisted.clear_member_briefed(request.session_id);
             self.persist_room_catalog_candidate(&candidate)?;
             let room = rooms
                 .get_mut(request.room_id)
@@ -6576,7 +6810,10 @@ impl SupervisorHandle {
                         .room_by_session
                         .get(&session_id)
                         .and_then(|room_id| rooms.get(*room_id))
-                        .map(|room| room.definition.brief_on_join)
+                        .map(|room| {
+                            room.definition.brief_on_join
+                                && !room.definition.member_briefed(session_id)
+                        })
                         .unwrap_or(false)
                 };
                 let installation = {
@@ -6622,6 +6859,8 @@ impl SupervisorHandle {
                                         .with_pane_secret(plan.pane_secret.clone())
                                         .with_brief_owed(brief_owed),
                                 );
+                                slot.harness_session_id = plan.harness_session_id.clone();
+                                slot.running_at_shutdown = true;
                                 let grok_interactive_ready = slot.definition.driver
                                     == DriverKind::Grok
                                     && slot.grok_startup.is_interactive_ready();
@@ -6815,6 +7054,10 @@ impl SupervisorHandle {
                     message: format!("Started {} session", snapshot.label),
                     timestamp: now_rfc3339(),
                 });
+                self.persist_slot_harness_state(session_id);
+                if snapshot.driver == DriverKind::Codex && plan.harness_session_id.is_none() {
+                    self.spawn_codex_session_capture(session_id, snapshot.working_dir.clone());
+                }
                 if snapshot.lifecycle_state == LifecycleState::Idle {
                     self.deliver_pending_brief_if_due(session_id, expected, run_id);
                 }
@@ -6956,7 +7199,7 @@ impl SupervisorHandle {
             definition.driver,
             &qualified_directory,
         )?;
-        let plan = self.prepare_launch_spec_for_spawn(&definition, &qualified_directory)?;
+        let plan = self.prepare_launch_spec_for_spawn(&definition, &qualified_directory, false)?;
         let (_, expected_stop) = self.declare_stop_operation(
             session_id,
             Some((expected_generation, expected_run_id)),
@@ -8417,15 +8660,53 @@ impl SupervisorHandle {
         };
         let result = self.deliver_room_message_as(spec)?;
         if result.failures.is_empty() {
-            let mut slots = self.inner.slots.lock();
-            if let Some(running) = slots
-                .get_by_id_mut(request.session_id)
-                .and_then(|slot| slot.running.as_mut())
             {
-                running.brief_attempts_left = 0;
+                let mut slots = self.inner.slots.lock();
+                if let Some(running) = slots
+                    .get_by_id_mut(request.session_id)
+                    .and_then(|slot| slot.running.as_mut())
+                {
+                    running.brief_attempts_left = 0;
+                }
             }
+            self.mark_room_member_briefed(request.room_id, request.session_id);
         }
         Ok(result)
+    }
+
+    /// A delivered brief is recorded per membership: the member is never
+    /// automatically briefed again unless removed and re-added. A persistence
+    /// failure downgrades to a warning — the delivery itself succeeded.
+    fn mark_room_member_briefed(&self, room_id: RoomId, session_id: SessionId) {
+        let mut rooms = self.inner.rooms.lock();
+        let Some(room) = rooms.get(room_id) else {
+            return;
+        };
+        if room.definition.member_briefed(session_id) {
+            return;
+        }
+        let mut candidate = rooms.catalog.clone();
+        if let Some(persisted) = candidate
+            .rooms
+            .iter_mut()
+            .find(|room| room.room_id == room_id)
+        {
+            persisted.mark_member_briefed(session_id);
+        }
+        if let Err(error) = self.persist_room_catalog_candidate(&candidate) {
+            self.emit(RuntimeEvent::SystemLog {
+                level: LogLevel::Warn,
+                message: format!(
+                    "Room brief delivered but the briefed mark could not be persisted: {error}"
+                ),
+                timestamp: now_rfc3339(),
+            });
+            return;
+        }
+        if let Some(room) = rooms.get_mut(room_id) {
+            room.definition.mark_member_briefed(session_id);
+        }
+        rooms.catalog = candidate;
     }
 
     /// On join: brief every running member now; a refusal (harness not ready)
@@ -8435,17 +8716,26 @@ impl SupervisorHandle {
         if !self.inner.room_brief_on_join {
             return;
         }
-        let room_briefs_automatically = self
-            .inner
-            .rooms
-            .lock()
-            .get(room_id)
-            .map(|room| room.definition.brief_on_join)
-            .unwrap_or(false);
-        if !room_briefs_automatically {
-            return;
-        }
+        let briefed: HashSet<SessionId> = {
+            let rooms = self.inner.rooms.lock();
+            let Some(room) = rooms.get(room_id) else {
+                return;
+            };
+            if !room.definition.brief_on_join {
+                return;
+            }
+            room.definition
+                .briefed_member_ids
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .copied()
+                .collect()
+        };
         for session_id in member_ids {
+            if briefed.contains(session_id) {
+                continue;
+            }
             let running = {
                 let mut slots = self.inner.slots.lock();
                 match slots
@@ -8486,7 +8776,8 @@ impl SupervisorHandle {
             {
                 return;
             }
-            // The member's room — only if that room briefs automatically.
+            // The member's room — only if it briefs automatically and this
+            // member has never received the brief (once per membership).
             let room_id = {
                 let rooms = self.inner.rooms.lock();
                 rooms
@@ -8496,7 +8787,10 @@ impl SupervisorHandle {
                     .filter(|room_id| {
                         rooms
                             .get(*room_id)
-                            .map(|room| room.definition.brief_on_join)
+                            .map(|room| {
+                                room.definition.brief_on_join
+                                    && !room.definition.member_briefed(session_id)
+                            })
                             .unwrap_or(false)
                     })
             };
@@ -9359,8 +9653,10 @@ impl SupervisorHandle {
         &self,
         definition: &SessionDefinition,
         qualified_directory: &QualifiedWorkingDirectory,
+        fresh: bool,
     ) -> Result<PreparedLaunch> {
         validate_driver_working_directory_pair(definition.driver, qualified_directory)?;
+        let harness_session = self.resolve_harness_launch_session(definition, fresh);
         let (mut spec, wsl_scope) = if definition.driver == DriverKind::Prime {
             self.ensure_wsl_reconciled()?;
             let (expected_device, expected_inode) =
@@ -9391,7 +9687,7 @@ impl SupervisorHandle {
                 .executable_resolver
                 .read()
                 .resolve(definition.driver)?;
-            (build_launch_spec(definition, &resolved)?, None)
+            (build_launch_spec(definition, &resolved, &harness_session)?, None)
         };
 
         // Prime is still excluded from the pane environment: its WSL launch
@@ -9455,7 +9751,45 @@ impl SupervisorHandle {
             spec,
             wsl_scope,
             pane_secret,
+            harness_session_id: match &harness_session {
+                HarnessLaunchSession::New { session_id }
+                | HarnessLaunchSession::Resume { session_id } => Some(session_id.clone()),
+                HarnessLaunchSession::Fresh => None,
+            },
         })
+    }
+
+    /// Launch = resume the stored conversation by default; `fresh` starts a
+    /// new one. Claude and Grok pin a minted id when nothing is stored so the
+    /// NEXT launch can resume; Codex's id is captured from its rollout after
+    /// spawn; terminals and Prime have no conversation identity.
+    fn resolve_harness_launch_session(
+        &self,
+        definition: &SessionDefinition,
+        fresh: bool,
+    ) -> HarnessLaunchSession {
+        let stored = if fresh {
+            None
+        } else {
+            self.inner
+                .slots
+                .lock()
+                .get_by_id(definition.session_id)
+                .and_then(|slot| slot.harness_session_id.clone())
+        };
+        match definition.driver {
+            DriverKind::Claude | DriverKind::Grok => match stored {
+                Some(session_id) => HarnessLaunchSession::Resume { session_id },
+                None => HarnessLaunchSession::New {
+                    session_id: Uuid::new_v4().to_string(),
+                },
+            },
+            DriverKind::Codex => match stored {
+                Some(session_id) => HarnessLaunchSession::Resume { session_id },
+                None => HarnessLaunchSession::Fresh,
+            },
+            DriverKind::Prime | DriverKind::GenericTerminal => HarnessLaunchSession::Fresh,
+        }
     }
 
     fn deliver_prepared_payload(
@@ -9649,13 +9983,19 @@ fn prepare_control_plane_thread(
 fn build_launch_spec(
     definition: &SessionDefinition,
     resolved: &ResolvedLaunchProgram,
+    harness_session: &HarnessLaunchSession,
 ) -> Result<LaunchSpec> {
     match definition.driver {
-        DriverKind::Claude => driver_claude::launch_spec(definition, &resolved.program),
-        DriverKind::Codex => {
-            driver_codex::launch_spec(definition, &resolved.program, &resolved.prefix_args)
+        DriverKind::Claude => {
+            driver_claude::launch_spec(definition, &resolved.program, harness_session)
         }
-        DriverKind::Grok => driver_grok::launch_spec(definition, &resolved.program),
+        DriverKind::Codex => driver_codex::launch_spec(
+            definition,
+            &resolved.program,
+            &resolved.prefix_args,
+            harness_session,
+        ),
+        DriverKind::Grok => driver_grok::launch_spec(definition, &resolved.program, harness_session),
         DriverKind::Prime => {
             return Err(anyhow!(
                 "Prime launch specifications require a qualified WSL scope"
@@ -18836,6 +19176,234 @@ mod tests {
         assert!(claude_inputs.lock()[0].contains("PRIM-1 room \"Quiet room\""));
     }
 
+    struct ArgRecordingPtySpawner {
+        args: Arc<Mutex<Vec<Vec<String>>>>,
+        sessions: Mutex<Vec<Box<dyn PtySessionTrait>>>,
+    }
+
+    impl PtySpawner for ArgRecordingPtySpawner {
+        fn spawn(
+            &self,
+            plan: &PreparedLaunch,
+            _handler: PtyEventHandler,
+        ) -> Result<Box<dyn PtySessionTrait>> {
+            self.args.lock().push(plan.spec.args.clone());
+            self.sessions
+                .lock()
+                .pop()
+                .ok_or_else(|| anyhow!("capturing spawner exhausted"))
+        }
+    }
+
+    #[test]
+    fn launch_mints_persists_and_resumes_the_harness_conversation_id() {
+        let root = std::env::temp_dir().join(format!("prim1-resume-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("work")).unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let first_id;
+        {
+            let supervisor = SupervisorHandle::new(test_supervisor_config(&root)).unwrap();
+            supervisor.set_executable_resolver_for_tests(Arc::new(TestExecutableResolver));
+            install_standard_test_sessions(&supervisor);
+            let claude = test_session_id(&supervisor, "claude");
+            let (pty, _inputs) = recording_pty_session(std::process::id());
+            supervisor.set_pty_spawner_for_tests(Arc::new(ArgRecordingPtySpawner {
+                args: Arc::clone(&captured),
+                sessions: Mutex::new(vec![pty]),
+            }));
+            start_test_session(&supervisor, "claude").unwrap();
+            let args = captured.lock().last().unwrap().clone();
+            let position = args
+                .iter()
+                .position(|arg| arg == "--session-id")
+                .expect("a fresh Claude launch pins --session-id");
+            first_id = args[position + 1].clone();
+            {
+                let slots = supervisor.inner.slots.lock();
+                let slot = slots.get_by_id(claude).unwrap();
+                assert_eq!(slot.harness_session_id.as_deref(), Some(first_id.as_str()));
+                assert!(slot.running_at_shutdown);
+                assert!(slot.snapshot().resume_available);
+            }
+            supervisor.stop_session_by_id(claude).unwrap();
+            assert!(
+                !supervisor
+                    .inner
+                    .slots
+                    .lock()
+                    .get_by_id(claude)
+                    .unwrap()
+                    .running_at_shutdown,
+                "an operator stop clears the workspace-relaunch flag"
+            );
+            supervisor.shutdown().unwrap();
+        }
+
+        // Restart: the id reloads; Launch resumes it; fresh mints anew.
+        let supervisor = SupervisorHandle::new(test_supervisor_config(&root)).unwrap();
+        supervisor.set_executable_resolver_for_tests(Arc::new(TestExecutableResolver));
+        let claude = test_session_id(&supervisor, "claude");
+        assert_eq!(
+            supervisor
+                .inner
+                .slots
+                .lock()
+                .get_by_id(claude)
+                .unwrap()
+                .harness_session_id
+                .as_deref(),
+            Some(first_id.as_str()),
+            "the conversation id survives the app restart"
+        );
+        let (pty, _inputs) = recording_pty_session(std::process::id());
+        let (second_pty, _second_inputs) = recording_pty_session(std::process::id());
+        supervisor.set_pty_spawner_for_tests(Arc::new(ArgRecordingPtySpawner {
+            args: Arc::clone(&captured),
+            sessions: Mutex::new(vec![second_pty, pty]),
+        }));
+        start_test_session(&supervisor, "claude").unwrap();
+        let resume_args = captured.lock().last().unwrap().clone();
+        assert!(
+            resume_args
+                .iter()
+                .any(|arg| *arg == format!("--resume={first_id}")),
+            "{resume_args:?}"
+        );
+        supervisor.stop_session_by_id(claude).unwrap();
+        supervisor
+            .start_session_by_id_with_mode(claude, true)
+            .unwrap();
+        let fresh_args = captured.lock().last().unwrap().clone();
+        let position = fresh_args
+            .iter()
+            .position(|arg| arg == "--session-id")
+            .expect("a fresh relaunch mints a new id");
+        assert_ne!(fresh_args[position + 1], first_id);
+    }
+
+    #[test]
+    fn the_brief_is_owed_once_per_membership_across_restarts() {
+        let root = std::env::temp_dir().join(format!("prim1-brief-restart-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("work")).unwrap();
+
+        // Life 1: claude is running and receives the brief at room creation;
+        // codex is not running and is never briefed.
+        {
+            let mut config = test_supervisor_config(&root);
+            config.room_brief_on_join = true;
+            let supervisor = SupervisorHandle::new(config).unwrap();
+            supervisor.set_executable_resolver_for_tests(Arc::new(TestExecutableResolver));
+            install_standard_test_sessions(&supervisor);
+            let (claude_pty, claude_inputs) = recording_pty_session(std::process::id());
+            install_mock_running_session_with_bracketed_paste_enabled(
+                &supervisor,
+                "claude",
+                DriverKind::Claude,
+                claude_pty,
+            );
+            let claude = test_session_id(&supervisor, "claude");
+            let scout = create_test_session(
+                &supervisor,
+                "scout",
+                DriverKind::Claude,
+                shared_types::PermissionProfile::Normal,
+            )
+            .session_id;
+            let room = supervisor
+                .create_room(CreateRoomRequest {
+                    label: Some("Persisted room".into()),
+                    member_ids: vec![claude, scout],
+                    brief_on_join: true,
+                    brief_template: Some("Persisted mission for {your_label}.".into()),
+                })
+                .unwrap();
+            wait_until("the join brief to reach claude", || {
+                !claude_inputs.lock().is_empty()
+            });
+            wait_until("claude's briefed mark to persist", || {
+                supervisor
+                    .inner
+                    .rooms
+                    .lock()
+                    .get(room.room_id)
+                    .map(|r| r.definition.member_briefed(claude))
+                    .unwrap_or(false)
+            });
+            supervisor.shutdown().unwrap();
+        }
+
+        // Life 2: the app restart. The briefed member relaunches QUIET; the
+        // never-briefed member owes the brief and receives it on first idle.
+        let mut config = test_supervisor_config(&root);
+        config.room_brief_on_join = true;
+        let supervisor = SupervisorHandle::new(config).unwrap();
+        supervisor.set_executable_resolver_for_tests(Arc::new(TestExecutableResolver));
+        let claude = test_session_id(&supervisor, "claude");
+        let scout = test_session_id(&supervisor, "scout");
+
+        let (claude_pty, claude_inputs) = recording_pty_session(std::process::id());
+        supervisor.set_pty_spawner_for_tests(Arc::new(OutputThenReturnPtySpawner {
+            outputs: Vec::new(),
+            session: Mutex::new(Some(claude_pty)),
+        }));
+        start_test_session(&supervisor, "claude").unwrap();
+        {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id(claude).unwrap();
+            assert_eq!(
+                slot.running.as_ref().unwrap().brief_attempts_left,
+                0,
+                "a briefed member owes nothing at relaunch"
+            );
+        }
+        let (claude_generation, claude_run) = {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id_mut(claude).unwrap();
+            let run_id = slot.run_id.unwrap();
+            set_test_bracketed_paste_mode(slot, run_id, BracketedPasteMode::Enabled);
+            slot.state = LifecycleState::Idle;
+            (slot.generation, run_id)
+        };
+        supervisor.deliver_pending_brief_if_due(claude, claude_generation, claude_run);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            claude_inputs.lock().is_empty(),
+            "no re-brief for an already-briefed member"
+        );
+
+        let (scout_pty, scout_inputs) = recording_pty_session(std::process::id());
+        supervisor.set_pty_spawner_for_tests(Arc::new(OutputThenReturnPtySpawner {
+            outputs: Vec::new(),
+            session: Mutex::new(Some(scout_pty)),
+        }));
+        start_test_session(&supervisor, "scout").unwrap();
+        let (scout_generation, scout_run) = {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id(scout).unwrap();
+            assert_eq!(
+                slot.running.as_ref().unwrap().brief_attempts_left,
+                ROOM_BRIEF_MAX_ATTEMPTS,
+                "a never-briefed member owes the brief at launch"
+            );
+            (slot.generation, slot.run_id.unwrap())
+        };
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id_mut(scout).unwrap();
+            set_test_bracketed_paste_mode(slot, scout_run, BracketedPasteMode::Enabled);
+            slot.state = LifecycleState::Idle;
+        }
+        supervisor.deliver_pending_brief_if_due(scout, scout_generation, scout_run);
+        wait_until("the owed brief to reach scout", || {
+            !scout_inputs.lock().is_empty()
+        });
+        assert!(
+            scout_inputs.lock()[0].contains("Persisted mission for scout."),
+            "{}",
+            scout_inputs.lock()[0]
+        );
+    }
+
     #[test]
     fn a_rooms_edited_brief_replaces_the_canonical_text_for_join_and_idle_briefs() {
         let root = std::env::temp_dir().join(format!("prim1-brief-custom-{}", Uuid::new_v4()));
@@ -21100,6 +21668,8 @@ mod tests {
             persisted.keys().cloned().collect::<BTreeSet<_>>(),
             BTreeSet::from([
                 "driver".to_string(),
+                "harness_session_id".to_string(),
+                "running_at_shutdown".to_string(),
                 "label".to_string(),
                 "permission_profile".to_string(),
                 "session_id".to_string(),

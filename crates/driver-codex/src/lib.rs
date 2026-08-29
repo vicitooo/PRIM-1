@@ -1,6 +1,9 @@
 use std::path::Path;
 
-use shared_types::{LaunchSpec, LaunchSpecError, PermissionProfile, SessionDefinition, WorkState};
+use shared_types::{
+    HarnessLaunchSession, LaunchSpec, LaunchSpecError, PermissionProfile, SessionDefinition,
+    WorkState,
+};
 use terminal_viewport::{TerminalViewport, TrustedScreen};
 
 const WORK_STATE_CONTEXT_MAX_BYTES: usize = 16 * 1024;
@@ -356,10 +359,17 @@ pub fn launch_spec(
     definition: &SessionDefinition,
     program: &str,
     prefix_args: &[String],
+    harness_session: &HarnessLaunchSession,
 ) -> Result<LaunchSpec, LaunchSpecError> {
     validate_direct_program(program)?;
 
     let mut args = prefix_args.to_vec();
+    // Codex cannot pin an id at launch (it is captured from the rollout after
+    // spawn); resuming is the `resume` subcommand, which accepts the same
+    // safety, alt-screen and cwd flags as a fresh launch.
+    if let HarnessLaunchSession::Resume { session_id } = harness_session {
+        args.extend(["resume".into(), session_id.clone()]);
+    }
     match definition.permission_profile {
         PermissionProfile::Normal => {
             args.extend([
@@ -513,7 +523,7 @@ mod tests {
     #[test]
     fn normal_native_launch_is_direct_and_omits_unsafe_mode() {
         let definition = definition(PermissionProfile::Normal);
-        let spec = launch_spec(&definition, CODEX_EXECUTABLE, &[]).unwrap();
+        let spec = launch_spec(&definition, CODEX_EXECUTABLE, &[], &HarnessLaunchSession::Fresh).unwrap();
 
         assert_eq!(spec.program, CODEX_EXECUTABLE);
         assert_eq!(
@@ -544,7 +554,7 @@ mod tests {
     fn unsafe_node_launch_preserves_prefix_and_adds_exactly_the_bypass_flag() {
         let definition = definition(PermissionProfile::Unsafe);
         let prefix_args = vec![CODEX_JS.to_string()];
-        let spec = launch_spec(&definition, NODE_EXECUTABLE, &prefix_args).unwrap();
+        let spec = launch_spec(&definition, NODE_EXECUTABLE, &prefix_args, &HarnessLaunchSession::Fresh).unwrap();
 
         assert_eq!(spec.program, NODE_EXECUTABLE);
         assert_eq!(
@@ -572,11 +582,11 @@ mod tests {
     fn relative_and_shell_mediated_programs_are_rejected() {
         let definition = definition(PermissionProfile::Normal);
         assert!(matches!(
-            launch_spec(&definition, "codex", &[]),
+            launch_spec(&definition, "codex", &[], &HarnessLaunchSession::Fresh),
             Err(LaunchSpecError::ProgramNotQualified { .. })
         ));
         assert!(matches!(
-            launch_spec(&definition, SHELL_SHIM, &[]),
+            launch_spec(&definition, SHELL_SHIM, &[], &HarnessLaunchSession::Fresh),
             Err(LaunchSpecError::ShellMediatedProgram { .. })
         ));
     }

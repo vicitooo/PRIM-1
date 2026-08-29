@@ -37,6 +37,43 @@ long-lived installations should manage that history through Grok's own tools.
 
 ## Behavioral notes the wrapper does not yet abstract
 
+### Grok startup detection is measured, and Grok's paint changes server-side
+
+2026-08-28 late: with an unchanged grok.exe (1.0.5, Aug 20), Grok's startup
+paint changed under it — splash text became "Signing in… starting your
+session.", the ❯ composer glyph became ">", and the whole startup collapsed
+into one repaint frame with the `minimal · /help` statusline written outside
+any cursor hide/show cycle. The tracker's old two-ordered-frames measure wedged
+every run in `Starting` (brief refused, deliveries refused, operator typing
+refused). Re-measured the same night: the statusline is now the ready signal,
+evaluated on completed frames AND on the settled screen at chunk end; the new
+splash phrasing is recognized; the fullscreen path keeps its ordered measure.
+If Grok's UI changes again, the failure mode is the same fail-closed wedge —
+compare a raw ConPTY capture against `StartupTracker`'s predicates (fixture:
+`crates/driver-grok/src/fixtures/grok-startup-minimal-single-frame-v105.json`).
+
+2026-08-29 addendum — a RESUMED grok (`--resume=<id>`) replays its transcript
+scrollback-style: no clear, no cursor hide/show frames, so the viewport
+projection never becomes trusted and the old tracker wedged in `Starting` with
+a fully interactive pane. Third measured acceptance path: the raw-stream
+`minimal · /help` statusline (bracketed paste on, no launcher text,
+chunk-spanning tail). Two grok-side oddities observed once each and not yet
+explained: (a) the day's first resumed grok exited silently ~30 s after
+"session loaded" (no log line, no crash artifact); (b) one subsequent launch
+hung BEFORE grok's logging initialised (zero unified.jsonl lines, ~5 s CPU) —
+remedy: taskkill the grok.exe, Stop the pane, Launch again. Watch for
+recurrence; grok's own `active_sessions.json` can also hold a stale dead-pid
+entry, which did NOT block resumes in testing.
+
+### Room briefs are owed once per membership (2026-08-29; retires the relaunch-miss issue)
+
+The brief is delivered once per MEMBERSHIP (`briefed_member_ids` in the room
+catalog): delivery marks, removal clears, re-adding re-briefs, relaunches are
+quiet, manual Brief now is unconditional. The 2026-08-28 "owed brief missed on
+relaunch" observation is retired by this contract change — per-run re-briefing
+was the wrong behaviour (it re-briefed a finished team on the next morning's
+open); the one unexplained non-delivery was never reproduced under test.
+
 These are documented runtime behaviors that callers should know. Each is on the roadmap to be hidden behind a wrapper abstraction; until then, callers compensate.
 
 ### Pane sideband requires an empirically verified native-caller boundary

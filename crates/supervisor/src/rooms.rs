@@ -37,6 +37,33 @@ pub(crate) struct PersistedRoomV1 {
     /// Operator-edited brief template; `None` means the canonical brief.
     #[serde(default)]
     pub(crate) brief_template: Option<String>,
+    /// Members that have received the room brief. The brief is owed once per
+    /// MEMBERSHIP, never once per run: re-launching a briefed member is quiet.
+    /// Absent in a catalog written before this field existed = every current
+    /// member counts as briefed (upgrading never surprise-briefs a room).
+    #[serde(default)]
+    pub(crate) briefed_member_ids: Option<Vec<SessionId>>,
+}
+
+impl PersistedRoomV1 {
+    pub(crate) fn member_briefed(&self, session_id: SessionId) -> bool {
+        self.briefed_member_ids
+            .as_deref()
+            .is_some_and(|ids| ids.contains(&session_id))
+    }
+
+    pub(crate) fn mark_member_briefed(&mut self, session_id: SessionId) {
+        let ids = self.briefed_member_ids.get_or_insert_with(Vec::new);
+        if !ids.contains(&session_id) {
+            ids.push(session_id);
+        }
+    }
+
+    pub(crate) fn clear_member_briefed(&mut self, session_id: SessionId) {
+        if let Some(ids) = self.briefed_member_ids.as_mut() {
+            ids.retain(|id| *id != session_id);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -267,9 +294,17 @@ pub(crate) struct RoomState {
 
 impl RoomState {
     pub(crate) fn from_catalog(
-        catalog: RoomCatalogV1,
+        mut catalog: RoomCatalogV1,
         known_sessions: &HashSet<SessionId>,
     ) -> Result<Self> {
+        // Grandfather rooms persisted before the briefed list existed: their
+        // members were briefed under the old per-run contract, so treat every
+        // current member as briefed rather than re-briefing on upgrade.
+        for room in &mut catalog.rooms {
+            if room.briefed_member_ids.is_none() {
+                room.briefed_member_ids = Some(room.member_ids.clone());
+            }
+        }
         if catalog.schema_version != ROOM_CATALOG_SCHEMA_VERSION {
             return Err(anyhow!(
                 "unsupported room catalog schema version {} (expected {})",
@@ -399,7 +434,34 @@ mod tests {
             membership_revision: 1,
             brief_on_join: true,
             brief_template: None,
+            briefed_member_ids: Some(Vec::new()),
         }
+    }
+
+    #[test]
+    fn briefed_members_grandfather_and_track() {
+        let member = Uuid::new_v4();
+        let mut room = definition(Uuid::new_v4(), "b", vec![member]);
+        room.briefed_member_ids = None;
+        let catalog = RoomCatalogV1 {
+            schema_version: ROOM_CATALOG_SCHEMA_VERSION,
+            rooms: vec![room],
+        };
+        let known = std::iter::once(member).collect();
+        let state = RoomState::from_catalog(catalog, &known).unwrap();
+        let loaded = state.by_id.values().next().unwrap();
+        assert!(
+            loaded.definition.member_briefed(member),
+            "a legacy catalog's members are grandfathered as briefed"
+        );
+
+        let mut fresh = definition(Uuid::new_v4(), "c", vec![member]);
+        assert!(!fresh.member_briefed(member));
+        fresh.mark_member_briefed(member);
+        fresh.mark_member_briefed(member);
+        assert_eq!(fresh.briefed_member_ids.as_deref().unwrap().len(), 1);
+        fresh.clear_member_briefed(member);
+        assert!(!fresh.member_briefed(member));
     }
 
     #[test]
@@ -411,6 +473,7 @@ mod tests {
         let room: PersistedRoomV1 = serde_json::from_str(&json).unwrap();
         assert!(room.brief_on_join);
         assert!(room.brief_template.is_none());
+        assert!(room.briefed_member_ids.is_none());
 
         let back = serde_json::to_string(&room).unwrap();
         let reparsed: PersistedRoomV1 = serde_json::from_str(&back).unwrap();

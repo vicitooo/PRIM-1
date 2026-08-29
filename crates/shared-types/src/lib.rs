@@ -150,6 +150,16 @@ impl std::fmt::Display for LaunchSpecError {
 
 impl std::error::Error for LaunchSpecError {}
 
+/// How a launch relates to the harness-side conversation: pin a fresh id
+/// where the CLI accepts one, resume a stored conversation, or neither
+/// (drivers without either capability).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HarnessLaunchSession {
+    Fresh,
+    New { session_id: String },
+    Resume { session_id: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SessionDefinition {
@@ -176,6 +186,11 @@ pub struct SessionSnapshot {
     pub run_event_sequence: u64,
     pub process_id: Option<u32>,
     pub running: bool,
+    /// A harness conversation id is stored: the next Launch resumes it.
+    pub resume_available: bool,
+    /// The session had a live run when the app last went down; the UI's
+    /// "continue where I left off" relaunches these on open.
+    pub was_running_at_shutdown: bool,
     pub last_activity_at: Option<String>,
     pub last_error: Option<String>,
 }
@@ -470,6 +485,10 @@ pub struct SendInputRequest {
 #[serde(deny_unknown_fields)]
 pub struct StartSessionRequest {
     pub session_id: SessionId,
+    /// Start a NEW harness conversation instead of resuming the stored one.
+    /// Default false: Launch continues where the session left off.
+    #[serde(default)]
+    pub fresh: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -1,6 +1,9 @@
 use std::path::Path;
 
-use shared_types::{LaunchSpec, LaunchSpecError, PermissionProfile, SessionDefinition, WorkState};
+use shared_types::{
+    HarnessLaunchSession, LaunchSpec, LaunchSpecError, PermissionProfile, SessionDefinition,
+    WorkState,
+};
 
 pub fn classify_work_state(chunk: &str) -> Option<(WorkState, Option<String>)> {
     let normalized = strip_ansi_and_controls(chunk).replace('\u{2026}', "...");
@@ -93,10 +96,24 @@ fn strip_ansi_and_controls(input: &str) -> String {
 pub fn launch_spec(
     definition: &SessionDefinition,
     executable: &str,
+    harness_session: &HarnessLaunchSession,
 ) -> Result<LaunchSpec, LaunchSpecError> {
     validate_direct_program(executable)?;
 
     let mut args = vec!["-n".into(), definition.alias.clone()];
+    match harness_session {
+        // `--session-id` pins a fresh conversation's id so a later launch can
+        // `--resume` it; Claude keeps the id stable across plain resumes.
+        HarnessLaunchSession::New { session_id } => {
+            args.extend(["--session-id".into(), session_id.clone()]);
+        }
+        // Fused `=` form: the flag takes an optional value, and a separated
+        // token must never be able to fall through as a prompt.
+        HarnessLaunchSession::Resume { session_id } => {
+            args.push(format!("--resume={session_id}"));
+        }
+        HarnessLaunchSession::Fresh => {}
+    }
     match definition.permission_profile {
         PermissionProfile::Normal => {
             args.extend(["--permission-mode".into(), "manual".into()]);
@@ -180,7 +197,7 @@ mod tests {
     #[test]
     fn normal_launch_is_direct_and_omits_unsafe_and_wrapper_arguments() {
         let definition = definition(PermissionProfile::Normal);
-        let spec = launch_spec(&definition, CLAUDE_EXECUTABLE).unwrap();
+        let spec = launch_spec(&definition, CLAUDE_EXECUTABLE, &HarnessLaunchSession::Fresh).unwrap();
 
         assert_eq!(spec.program, CLAUDE_EXECUTABLE);
         assert_eq!(
@@ -207,7 +224,7 @@ mod tests {
     #[test]
     fn unsafe_launch_adds_exactly_the_claude_unsafe_flag() {
         let definition = definition(PermissionProfile::Unsafe);
-        let spec = launch_spec(&definition, CLAUDE_EXECUTABLE).unwrap();
+        let spec = launch_spec(&definition, CLAUDE_EXECUTABLE, &HarnessLaunchSession::Fresh).unwrap();
 
         assert_eq!(
             spec.args,
@@ -223,11 +240,11 @@ mod tests {
     fn relative_and_shell_mediated_programs_are_rejected() {
         let definition = definition(PermissionProfile::Normal);
         assert!(matches!(
-            launch_spec(&definition, "claude"),
+            launch_spec(&definition, "claude", &HarnessLaunchSession::Fresh),
             Err(LaunchSpecError::ProgramNotQualified { .. })
         ));
         assert!(matches!(
-            launch_spec(&definition, SHELL_SHIM),
+            launch_spec(&definition, SHELL_SHIM, &HarnessLaunchSession::Fresh),
             Err(LaunchSpecError::ShellMediatedProgram { .. })
         ));
     }
