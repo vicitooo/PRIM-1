@@ -537,7 +537,6 @@ class SessionTerminal {
   private readonly initialBannerLabel: HTMLElement;
   private readonly initialBannerElement: HTMLDivElement;
   private snapshot: SessionSnapshot | null = null;
-  private lockedCols: number | null = null;
   private readonly colourFilter = new SgrColourFilter();
 
   constructor(sessionId: string, alias: string, label: string) {
@@ -622,9 +621,6 @@ class SessionTerminal {
     this.activityEl.dataset.running = String(snapshot.running);
 
     this.initialBanner.observeRunning(snapshot.running);
-    if (!snapshot.running) {
-      this.lockedCols = null;
-    }
     this.hookInput();
   }
 
@@ -654,23 +650,14 @@ class SessionTerminal {
 
   /** Every pane keeps the same grid, visible or not, so a background PTY
       (sized from the persisted pane size at spawn) never writes into a
-      default-width grid. A running Grok's columns stay pinned: it pads its
-      pinned-region lines to the full width, and a width reflow scatters
-      them — width changes apply at its next run. */
+      default-width grid. Grok runs its fullscreen TUI, which fully repaints
+      on resize like the other harnesses — no per-driver pinning needed. */
   applyGrid(cols: number, rows: number): void {
-    if (this.snapshot?.driver === "grok") {
-      if (this.snapshot.running) {
-        this.lockedCols = this.lockedCols ?? cols;
-      } else {
-        this.lockedCols = null;
-      }
-    }
-    const targetCols = this.lockedCols ?? cols;
-    if (this.terminal.cols !== targetCols || this.terminal.rows !== rows) {
-      this.terminal.resize(targetCols, rows);
+    if (this.terminal.cols !== cols || this.terminal.rows !== rows) {
+      this.terminal.resize(cols, rows);
     }
     if (this.snapshot?.running) {
-      void resizeSession(this.sessionId, targetCols, rows);
+      void resizeSession(this.sessionId, cols, rows);
     }
   }
 

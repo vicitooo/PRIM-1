@@ -10498,9 +10498,13 @@ fn routed_message_submit_behavior(driver: DriverKind) -> SubmitBehavior {
             framing: MessageFraming::BracketedPaste,
             submit_delay: BRACKETED_PASTE_SUBMIT_DELAY,
         },
+        // Grok panes run the fullscreen TUI (2026-08-29): its composer takes
+        // standard bracketed paste with embedded LF and a CR submit — measured
+        // live (grok-fs receipts). The GrokMinimal framing below remains for
+        // the minimal mode's measured contract, no longer driver-mapped.
         DriverKind::Grok => SubmitBehavior {
             sequence: "\r",
-            framing: MessageFraming::GrokMinimal,
+            framing: MessageFraming::BracketedPaste,
             submit_delay: BRACKETED_PASTE_SUBMIT_DELAY,
         },
         DriverKind::GenericTerminal => SubmitBehavior {
@@ -12898,7 +12902,13 @@ mod tests {
     #[test]
     fn grok_minimal_frame_preserves_lf_blank_and_trailing_lines_in_one_buffer() {
         let content = "  alpha\n\n\tbeta 👩‍💻  \n";
-        let behavior = routed_message_submit_behavior(DriverKind::Grok);
+        // The minimal framing contract, tested directly: Grok panes ship
+        // the fullscreen TUI now and map to BracketedPaste.
+        let behavior = SubmitBehavior {
+            sequence: "\r",
+            framing: MessageFraming::GrokMinimal,
+            submit_delay: BRACKETED_PASTE_SUBMIT_DELAY,
+        };
         validate_message_body(content).unwrap();
         validate_message_framing(content, behavior).unwrap();
 
@@ -12916,7 +12926,13 @@ mod tests {
 
     #[test]
     fn grok_minimal_framing_rejects_cr_and_unmeasured_size_or_line_count() {
-        let behavior = routed_message_submit_behavior(DriverKind::Grok);
+        // The minimal framing contract, tested directly: Grok panes ship the
+        // fullscreen TUI now and map to BracketedPaste.
+        let behavior = SubmitBehavior {
+            sequence: "\r",
+            framing: MessageFraming::GrokMinimal,
+            submit_delay: BRACKETED_PASTE_SUBMIT_DELAY,
+        };
         assert_eq!(
             validate_message_framing("first\r\nsecond", behavior)
                 .unwrap_err()
@@ -13390,7 +13406,9 @@ mod tests {
 
     #[test]
     fn grok_delivery_rejects_unmeasured_large_body_before_every_side_effect() {
-        let content = "x".repeat(MESSAGE_BODY_MAX_BYTES);
+        // Fullscreen Grok takes the standard bracketed-paste contract: the
+        // general body cap governs, not the minimal 13 KiB envelope.
+        let content = "x".repeat(MESSAGE_BODY_MAX_BYTES + 1);
         let supervisor = test_supervisor();
         let events = capture_runtime_events(&supervisor);
         let (pty, inputs) = recording_pty_session(std::process::id());
@@ -13408,7 +13426,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("measured maximum is 13312 bytes"),
+                .contains("maximum is 1048576 bytes"),
             "{error:#}"
         );
         assert_eq!(slots_mutation_probe(&supervisor), before);
@@ -13554,7 +13572,7 @@ mod tests {
             routed_message_submit_behavior(DriverKind::Grok),
             SubmitBehavior {
                 sequence: "\r",
-                framing: MessageFraming::GrokMinimal,
+                framing: MessageFraming::BracketedPaste,
                 submit_delay: BRACKETED_PASTE_SUBMIT_DELAY,
             }
         );
@@ -14146,9 +14164,7 @@ mod tests {
             &[
                 "raw input remains available".to_string(),
                 format!(
-                    "{BRACKETED_PASTE_START}[Direct message from operator]{BRACKETED_PASTE_END}\
-                     {GROK_MINIMAL_LINE_BREAK}\
-                     {BRACKETED_PASTE_START}accepted after readiness{BRACKETED_PASTE_END}"
+                    "{BRACKETED_PASTE_START}[Direct message from operator]\naccepted after readiness{BRACKETED_PASTE_END}"
                 ),
                 "\r".to_string(),
             ],
@@ -21803,7 +21819,7 @@ mod tests {
         assert_eq!(
             specs[0].args[0..5],
             [
-                "--minimal",
+                "--fullscreen",
                 "--permission-mode",
                 "bypassPermissions",
                 "--cwd",
@@ -22698,7 +22714,7 @@ mod tests {
         assert_eq!(
             grok_inputs.lock().as_slice(),
             &[
-                frame_message_payload(&payload, MessageFraming::GrokMinimal),
+                frame_message_payload(&payload, MessageFraming::BracketedPaste),
                 "\r".into(),
             ]
         );
@@ -22715,16 +22731,19 @@ mod tests {
     }
 
     #[test]
-    fn mixed_room_cr_rejection_is_atomic_when_grok_is_a_recipient() {
+    fn mixed_room_framing_rejection_is_atomic_when_a_terminal_is_a_recipient() {
+        // Fullscreen Grok admits CR like the other paste drivers; the strict
+        // recipient proving delivery atomicity is now a generic terminal,
+        // whose raw single-line framing rejects control characters.
         let supervisor = test_supervisor();
-        let grok = create_test_session(
+        let shell = create_test_session(
             &supervisor,
-            "grok",
-            DriverKind::Grok,
+            "shell",
+            DriverKind::GenericTerminal,
             shared_types::PermissionProfile::Normal,
         );
         let (claude_pty, claude_inputs) = recording_pty_session(std::process::id());
-        let (grok_pty, grok_inputs) = recording_pty_session(std::process::id());
+        let (shell_pty, grok_inputs) = recording_pty_session(std::process::id());
         install_mock_running_session_with_bracketed_paste_enabled(
             &supervisor,
             "claude",
@@ -22733,10 +22752,10 @@ mod tests {
         );
         install_mock_running_session_by_id_with_mode(
             &supervisor,
-            grok.session_id,
-            DriverKind::Grok,
+            shell.session_id,
+            DriverKind::GenericTerminal,
             None,
-            grok_pty,
+            shell_pty,
             BracketedPasteMode::Enabled,
         );
         let room = supervisor
@@ -22744,7 +22763,7 @@ mod tests {
                 brief_on_join: true,
                 brief_template: None,
                 label: Some("Mixed CR".into()),
-                member_ids: vec![test_session_id(&supervisor, "claude"), grok.session_id],
+                member_ids: vec![test_session_id(&supervisor, "claude"), shell.session_id],
             })
             .unwrap();
         let before = supervisor
@@ -22767,7 +22786,8 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("carriage returns are not admitted")
+                .contains("printable single-line message bodies"),
+            "{error:#}"
         );
         assert!(claude_inputs.lock().is_empty());
         assert!(grok_inputs.lock().is_empty());
