@@ -71,6 +71,15 @@ Shift+Tab/Ctrl+x footer is the signature; the launcher screen shows it too
 and stays excluded by its own guard). Fixture: the captured no-TERM startup.
 Verified: two Explorer-launched cycles, repaint completed in ~1 s each.
 
+2026-08-29 delivery addendum — large deliveries pasted but did not submit on
+Codex/Grok (an 8.4 KiB Send: all three recipients `written`, CR included, only
+Claude Code acted). Measured: a TUI still ingesting a large paste swallows a
+CR arriving at the fixed 1 s delay and submits cleanly once the echo settles
+(reproduced in a raw ConPTY with the exact payload). The submit now waits for
+a 400 ms quiet window on the pane's output after the payload (bounded at
+10 s), replacing the fixed-delay-only contract. Small messages are unchanged;
+the fixed delay remains the floor.
+
 ### Grok startup detection is measured, and Grok's paint changes server-side
 
 2026-08-28 late: with an unchanged grok.exe (1.0.5, Aug 20), Grok's startup

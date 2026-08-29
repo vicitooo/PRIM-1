@@ -7499,6 +7499,31 @@ impl SupervisorHandle {
             submit_behavior.submit_delay,
             framed_content.len(),
         ));
+        // The submit must land only after the pane's echo settles: a TUI still
+        // ingesting a large paste swallows the CR (measured 2026-08-29 — an
+        // 8.5 KiB paste into Codex drops a CR at the fixed 1 s delay and
+        // submits cleanly once the echo has settled). Wait for a quiet window
+        // on the pane's output, bounded so a busy spinner cannot stall the
+        // delivery forever.
+        const ECHO_SETTLE_QUIET: Duration = Duration::from_millis(400);
+        const ECHO_SETTLE_CAP: Duration = Duration::from_secs(10);
+        let settle_started = Instant::now();
+        loop {
+            let last_output = {
+                let slots = self.inner.slots.lock();
+                slots
+                    .get_by_id(target.session_id)
+                    .and_then(|slot| slot.last_real_output_at)
+            };
+            let settled = match last_output {
+                Some(at) => at.elapsed() >= ECHO_SETTLE_QUIET,
+                None => true,
+            };
+            if settled || settle_started.elapsed() >= ECHO_SETTLE_CAP {
+                break;
+            }
+            thread::sleep(Duration::from_millis(120));
+        }
 
         let slots = self.inner.slots.lock();
         if let Err(error) = Self::validate_run_input_target_locked(
