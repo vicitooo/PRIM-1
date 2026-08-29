@@ -60,6 +60,17 @@ starting splash or the launcher menu is visible. Grok repaints that burst on
 every activity, so a lost first frame self-heals. Verified over two open
 cycles: readiness in ~12 s each.
 
+2026-08-29 final addendum — the remaining launcher split: an icon-launched app
+carries no TERM, and grok paints ASCII fallbacks (">" for the composer glyph)
+— every glyph-anchored predicate was dead on icon launches while shell
+launches (TERM set) passed. Two fixes: the pane environment is now pinned
+(TERM=xterm-256color, COLORTERM=truecolor pushed; NO_COLOR / CLAUDECODE /
+CLAUDE_CODE_CHILD_SESSION stripped in pty-host — panes render identically
+from any launcher), and the fullscreen predicates are glyph-free (the
+Shift+Tab/Ctrl+x footer is the signature; the launcher screen shows it too
+and stays excluded by its own guard). Fixture: the captured no-TERM startup.
+Verified: two Explorer-launched cycles, repaint completed in ~1 s each.
+
 ### Grok startup detection is measured, and Grok's paint changes server-side
 
 2026-08-28 late: with an unchanged grok.exe (1.0.5, Aug 20), Grok's startup
