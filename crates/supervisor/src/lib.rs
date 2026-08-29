@@ -10594,8 +10594,27 @@ fn routed_message_payload(request: &RouteMessageRequest, behavior: SubmitBehavio
 
 fn routed_message_submit_behavior(driver: DriverKind) -> SubmitBehavior {
     match driver {
-        DriverKind::Claude | DriverKind::Codex | DriverKind::Prime => SubmitBehavior {
+        DriverKind::Claude | DriverKind::Prime => SubmitBehavior {
             sequence: "\r",
+            framing: MessageFraming::BracketedPaste,
+            submit_delay: BRACKETED_PASTE_SUBMIT_DELAY,
+        },
+        // Codex under ConPTY never receives Event::Paste — the payload arrives
+        // as thousands of key events feeding a paste-burst heuristic
+        // (codex tui paste_burst.rs: 8 ms char interval, 60 ms idle close,
+        // 120 ms enter-suppression window, each handled char re-arming both),
+        // and an Enter that drains mid-burst is consumed as a pasted newline,
+        // never queued. No output signal reports the drain (the pasted-content
+        // chip renders before the queue empties), so the fix is ordering, not
+        // timing: Right Arrow queues BEHIND the payload and, as a
+        // non-character key, flushes the burst synchronously
+        // (flush_before_modified_input) — the CR after it always submits, and
+        // both keys are no-ops at the end of an already-flushed composer.
+        // Source-verified via the codex:work peer + A/B measured 2026-08-29
+        // (8.5 KiB paste: CR-only swallowed at 1-3 s, arrow-fenced submits
+        // at 1 s; boundary without the fence scaled with paste size).
+        DriverKind::Codex => SubmitBehavior {
+            sequence: "\x1b[C\r",
             framing: MessageFraming::BracketedPaste,
             submit_delay: BRACKETED_PASTE_SUBMIT_DELAY,
         },
@@ -12988,7 +13007,12 @@ mod tests {
     #[test]
     fn claude_and_codex_message_frame_is_content_faithful_before_observed_submit() {
         let content = "  alpha\r\n\tbeta 👩‍💻  ";
-        for driver in [DriverKind::Claude, DriverKind::Codex] {
+        for (driver, expected_sequence) in [
+            (DriverKind::Claude, "\r"),
+            // The Right-Arrow fence flushes Codex's paste burst before the CR
+            // (see routed_message_submit_behavior).
+            (DriverKind::Codex, "\x1b[C\r"),
+        ] {
             let behavior = routed_message_submit_behavior(driver);
             validate_message_body(content).unwrap();
             validate_message_framing(content, behavior).unwrap();
@@ -12996,7 +13020,7 @@ mod tests {
                 frame_message_payload(content, behavior.framing),
                 format!("{BRACKETED_PASTE_START}{content}{BRACKETED_PASTE_END}")
             );
-            assert_eq!(behavior.sequence, "\r");
+            assert_eq!(behavior.sequence, expected_sequence);
         }
     }
 
@@ -13164,7 +13188,7 @@ mod tests {
                 inputs.lock().as_slice(),
                 &[
                     format!("{BRACKETED_PASTE_START}{expected_payload}{BRACKETED_PASTE_END}"),
-                    "\r".to_string(),
+                    routed_message_submit_behavior(driver).sequence.to_string(),
                 ],
                 "{name} delivery did not preserve the paste/submit boundary"
             );
@@ -13299,7 +13323,7 @@ mod tests {
                 format!(
                     "{BRACKETED_PASTE_START}[Direct message from operator]\nsubmit after completed paste{BRACKETED_PASTE_END}"
                 ),
-                "\r".to_string(),
+                "\x1b[C\r".to_string(),
             ],
             "a terminal may legitimately disable paste mode after consuming the completed frame"
         );
@@ -13501,7 +13525,11 @@ mod tests {
                 &written[BRACKETED_PASTE_START.len()..written.len() - BRACKETED_PASTE_END.len()],
                 expected_payload
             );
-            assert_eq!(inputs[1], "\r");
+            assert_eq!(
+                inputs[1],
+                routed_message_submit_behavior(driver).sequence,
+                "{name} submit write"
+            );
         }
     }
 
@@ -13569,7 +13597,7 @@ mod tests {
                     inputs.lock().as_slice(),
                     &[
                         format!("{BRACKETED_PASTE_START}{expected_payload}{BRACKETED_PASTE_END}"),
-                        "\r".to_string(),
+                        routed_message_submit_behavior(driver).sequence.to_string(),
                     ],
                     "{driver:?} route of {size} source bytes did not preserve the paste/submit boundary"
                 );
@@ -13668,7 +13696,16 @@ mod tests {
             routed_message_submit_behavior(DriverKind::Claude),
             bracketed
         );
-        assert_eq!(routed_message_submit_behavior(DriverKind::Codex), bracketed);
+        // Codex carries the Right-Arrow fence ahead of the CR: it flushes the
+        // paste-burst heuristic ConPTY leaves live long after the chip
+        // renders (see routed_message_submit_behavior).
+        assert_eq!(
+            routed_message_submit_behavior(DriverKind::Codex),
+            SubmitBehavior {
+                sequence: "\x1b[C\r",
+                ..bracketed
+            }
+        );
         assert_eq!(
             routed_message_submit_behavior(DriverKind::Grok),
             SubmitBehavior {
@@ -19087,7 +19124,7 @@ mod tests {
             "[Room message from claude]\nwake up, I need your output",
             MessageFraming::BracketedPaste,
         );
-        assert_eq!(codex_inputs.lock().as_slice(), &[framed, "\r".into()]);
+        assert_eq!(codex_inputs.lock().as_slice(), &[framed, "\x1b[C\r".into()]);
         assert!(
             claude_inputs.lock().is_empty(),
             "the sender's own terminal stays untouched"
@@ -22772,8 +22809,8 @@ mod tests {
         assert!(result.failures.is_empty());
         let payload = format!("[Room message from operator]\n{content}");
         let framed = frame_message_payload(&payload, MessageFraming::BracketedPaste);
-        for inputs in [claude_inputs, codex_inputs] {
-            assert_eq!(inputs.lock().as_slice(), &[framed.clone(), "\r".into()]);
+        for (inputs, submit) in [(claude_inputs, "\r"), (codex_inputs, "\x1b[C\r")] {
+            assert_eq!(inputs.lock().as_slice(), &[framed.clone(), submit.into()]);
         }
         let page = supervisor
             .read_room_feed(ReadRoomFeedRequest {
