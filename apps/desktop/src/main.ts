@@ -537,6 +537,7 @@ class SessionTerminal {
   private readonly initialBannerLabel: HTMLElement;
   private readonly initialBannerElement: HTMLDivElement;
   private snapshot: SessionSnapshot | null = null;
+  private lockedCols: number | null = null;
   private readonly colourFilter = new SgrColourFilter();
 
   constructor(sessionId: string, alias: string, label: string) {
@@ -551,6 +552,11 @@ class SessionTerminal {
       cursorBlink: true,
       fontFamily: '"JetBrains Mono", "Cascadia Code", Consolas, monospace',
       fontSize: 13,
+      // The pane is fed by ConPTY, which re-emits a re-wrapped repaint of its
+      // own buffer on every resize. Without declaring the backend, xterm ALSO
+      // reflows its buffer — the double transformation tears positioned
+      // painters (Grok's pinned prompt region scattered on every resize).
+      windowsPty: { backend: "conpty" },
       // New panes start in the active theme; applyTheme() keeps them in sync.
       theme: TERMINAL_THEMES[currentThemeName()].session,
     });
@@ -616,10 +622,8 @@ class SessionTerminal {
     this.activityEl.dataset.running = String(snapshot.running);
 
     this.initialBanner.observeRunning(snapshot.running);
-
-    if (isPaneVisible(this.sessionId)) {
-      this.fitAddon.fit();
-      void resizeSession(this.sessionId, this.terminal.cols, this.terminal.rows);
+    if (!snapshot.running) {
+      this.lockedCols = null;
     }
     this.hookInput();
   }
@@ -636,12 +640,38 @@ class SessionTerminal {
     }
   }
 
-  fit(): void {
+  /** Measure the pane area — only a visible host can be measured. */
+  measure(): { cols: number; rows: number } | null {
     if (!isPaneVisible(this.sessionId)) {
-      return;
+      return null;
     }
-    this.fitAddon.fit();
-    void resizeSession(this.sessionId, this.terminal.cols, this.terminal.rows);
+    const proposed = this.fitAddon.proposeDimensions();
+    if (!proposed || !Number.isFinite(proposed.cols) || !Number.isFinite(proposed.rows)) {
+      return null;
+    }
+    return { cols: Math.max(2, proposed.cols), rows: Math.max(1, proposed.rows) };
+  }
+
+  /** Every pane keeps the same grid, visible or not, so a background PTY
+      (sized from the persisted pane size at spawn) never writes into a
+      default-width grid. A running Grok's columns stay pinned: it pads its
+      pinned-region lines to the full width, and a width reflow scatters
+      them — width changes apply at its next run. */
+  applyGrid(cols: number, rows: number): void {
+    if (this.snapshot?.driver === "grok") {
+      if (this.snapshot.running) {
+        this.lockedCols = this.lockedCols ?? cols;
+      } else {
+        this.lockedCols = null;
+      }
+    }
+    const targetCols = this.lockedCols ?? cols;
+    if (this.terminal.cols !== targetCols || this.terminal.rows !== rows) {
+      this.terminal.resize(targetCols, rows);
+    }
+    if (this.snapshot?.running) {
+      void resizeSession(this.sessionId, targetCols, rows);
+    }
   }
 
   dispose(): void {
@@ -1705,6 +1735,7 @@ function applySnapshot(snapshot: RuntimeSnapshot, preferredSessionId?: string): 
       paneMap.get(session.session_id)?.applySnapshot(session);
     }
   }
+  fitVisiblePanes();
   completeInitialRunEventReconciliation(runtimeEventContext);
 }
 
@@ -2068,6 +2099,7 @@ function applyCommandSessionSnapshot(snapshot: SessionSnapshot): void {
 
 function applySessionSnapshotToUi(snapshot: SessionSnapshot): void {
   paneMap.get(snapshot.session_id)?.applySnapshot(snapshot);
+  fitVisiblePanes();
   const card = document.querySelector<HTMLElement>(
     '[data-session-card="' + snapshot.session_id + '"]',
   );
@@ -2676,7 +2708,7 @@ function setActiveSession(
   if (activeId) {
     requestAnimationFrame(() => {
       const pane = paneMap.get(activeId);
-      pane?.fit();
+      fitVisiblePanes();
       if (focusTerminal) {
         pane?.terminal.focus();
       }
@@ -3931,23 +3963,33 @@ function wireControls(): void {
 }
 
 function wireResize(): void {
-  const observer = new ResizeObserver(() => {
-    fitVisiblePanes();
-    systemFit.fit();
-  });
-
+  // Both observers fire per frame during a window drag; every fit reflows
+  // xterm AND resizes ConPTY, which re-emits its whole re-wrapped screen each
+  // time. One settle-fit per drag is the contract ConPTY behaves under.
+  let settle: number | undefined;
+  const refit = () => {
+    if (settle !== undefined) {
+      window.clearTimeout(settle);
+    }
+    settle = window.setTimeout(() => {
+      settle = undefined;
+      fitVisiblePanes();
+      systemFit.fit();
+    }, 120);
+  };
+  const observer = new ResizeObserver(refit);
   observer.observe(document.body);
-  window.addEventListener("resize", () => {
-    fitVisiblePanes();
-    systemFit.fit();
-  });
+  window.addEventListener("resize", refit);
 }
 
 function fitVisiblePanes(): void {
+  const active = tabState.activeId ? paneMap.get(tabState.activeId) : undefined;
+  const measured = active?.measure() ?? null;
+  if (!measured) {
+    return;
+  }
   for (const pane of paneMap.values()) {
-    if (isPaneVisible(pane.sessionId)) {
-      pane.fit();
-    }
+    pane.applyGrid(measured.cols, measured.rows);
   }
 }
 

@@ -52,6 +52,21 @@ If Grok's UI changes again, the failure mode is the same fail-closed wedge —
 compare a raw ConPTY capture against `StartupTracker`'s predicates (fixture:
 `crates/driver-grok/src/fixtures/grok-startup-minimal-single-frame-v105.json`).
 
+2026-08-29 second addendum — Grok's pane scattering had TWO renderer-side
+roots, found by capturing the raw ConPTY resize flow: (a) only the VISIBLE
+pane's xterm grid was ever sized, so a background pane's PTY (spawned at the
+persisted real size) wrote into a default-width grid — a resumed replay was
+pre-wrapped garbage before the tab was ever opened, and the reveal-refit
+reflowed it into scatter (broken at full screen with zero resizes); (b) grok
+pads its pinned-region lines with hard spaces to the full terminal width, so
+ANY later width change makes xterm reflow those lines into scatter. Fixes:
+one measured grid propagated to every pane, hidden included; a running Grok's
+columns stay pinned for the life of the run (width changes apply at its next
+run; rows track freely); `windowsPty: conpty` declared; resize refits
+debounced to one per settle. Capture harness: `grok_resize_capture.py`
+pattern — grok repaints only `CUP + ED(J) + width-padded statusline` on
+resize.
+
 2026-08-29 addendum — a RESUMED grok (`--resume=<id>`) replays its transcript
 scrollback-style: no clear, no cursor hide/show frames, so the viewport
 projection never becomes trusted and the old tracker wedged in `Starting` with
