@@ -122,20 +122,38 @@ impl StartupTracker {
                 progress = observed;
             }
         }
-        // A RESUMED session replays its transcript scrollback-style — no
-        // clear, no hide/show frame — so the viewport projection may never
-        // become trusted at all. The statusline in the raw stream, with paste
-        // enabled and no launcher-menu text in the same window, is the
-        // measured interactive signal (measured 2026-08-29 against a 1.0.5
-        // --resume replay).
+        // The screen projection is loseable — a resumed replay paints with
+        // no frames, a resize can invalidate the one startup frame, and
+        // unknown controls can taint the projection — while the raw stream
+        // is not. Two raw signals admit startup (measured 2026-08-29,
+        // grok 1.0.5):
+        //   minimal:    the "minimal · /help" statusline;
+        //   fullscreen: the composer+footer burst (❯ + Shift+Tab + Ctrl+x),
+        //               repainted on every activity, so even a lost first
+        //               frame self-heals on the next burst.
+        // Paste-awareness comes from the tracked mode OR the 2004h enable
+        // observed in the same window.
         if self.phase != StartupPhase::Complete {
             let mut window =
                 String::with_capacity(self.raw_tail.len() + chunk.len());
             window.push_str(&self.raw_tail);
             window.push_str(chunk);
-            if bracketed_paste_enabled
-                && window.contains(MINIMAL_MODE_READY_MARKER)
-                && !window.to_ascii_lowercase().contains("new worktree")
+            let window_lower = window.to_ascii_lowercase();
+            let paste_observed =
+                bracketed_paste_enabled || window.contains("\x1b[?2004h");
+            let launcher_visible = window_lower.contains("new worktree");
+            // A window still showing the starting splash defers: input is not
+            // accepted yet. The next composer burst after startup admits.
+            let starting_visible = window_lower.contains("starting session")
+                || window_lower.contains("starting your session");
+            let minimal_ready = window.contains(MINIMAL_MODE_READY_MARKER);
+            let fullscreen_ready = window.contains('❯')
+                && window_lower.contains("shift+tab")
+                && window_lower.contains("ctrl+x");
+            if paste_observed
+                && !launcher_visible
+                && !starting_visible
+                && (minimal_ready || fullscreen_ready)
             {
                 self.phase = StartupPhase::Complete;
                 return StartupProgress::InteractiveReady;
@@ -143,7 +161,7 @@ impl StartupTracker {
             let tail: String = window
                 .chars()
                 .rev()
-                .take(64)
+                .take(1024)
                 .collect::<Vec<_>>()
                 .into_iter()
                 .rev()
@@ -708,6 +726,52 @@ mod tests {
         let mut unpasted = StartupTracker::default();
         assert_eq!(
             unpasted.observe_output_with_mode("minimal \u{b7} /help\r\n> ", false),
+            StartupProgress::None
+        );
+    }
+
+    #[test]
+    fn startup_tracker_admits_a_fullscreen_burst_raw_after_a_lost_frame() {
+        // The one startup frame is invalidated by a resize mid-frame; grok
+        // sits silent, then a later activity burst repaints composer+footer
+        // cursor-shown — the raw window must admit it.
+        let mut tracker = StartupTracker::default();
+        tracker.observe_output_with_mode("\x1b[?2004h\x1b[?25l welcome box ", true);
+        tracker.resize(150, 40); // invalidates the active frame
+        assert_eq!(
+            tracker.observe_output_with_mode("more paint\x1b[?25h", true),
+            StartupProgress::None,
+            "the invalidated frame must not admit"
+        );
+        assert_eq!(
+            tracker.observe_output_with_mode("❯ ", true),
+            StartupProgress::None,
+            "half a burst is not a composer"
+        );
+        assert_eq!(
+            tracker.observe_output_with_mode("  Shift+Tab:mode  Ctrl+x:shortcuts", true),
+            StartupProgress::InteractiveReady,
+            "the composer+footer burst admits raw, split across chunks"
+        );
+
+        // Paste-awareness from the window itself, before the tracked mode
+        // flips.
+        let mut same_chunk = StartupTracker::default();
+        assert_eq!(
+            same_chunk.observe_output_with_mode(
+                "\x1b[?2004h❯  Shift+Tab:mode  Ctrl+x:shortcuts",
+                false,
+            ),
+            StartupProgress::InteractiveReady
+        );
+
+        // The launcher menu never admits through the raw path.
+        let mut launcher = StartupTracker::default();
+        assert_eq!(
+            launcher.observe_output_with_mode(
+                "New worktree  Resume session  ❯  Shift+Tab  Ctrl+x",
+                true,
+            ),
             StartupProgress::None
         );
     }

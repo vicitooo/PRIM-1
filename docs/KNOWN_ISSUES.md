@@ -50,6 +50,16 @@ GrokMinimal framing (ESC-CR line breaks, measured 13 KiB / 256-line envelope)
 remains in the codebase, tested directly, for a potential minimal-mode return.
 The minimal-mode notes below are historical.
 
+2026-08-29 late addendum — the fullscreen startup frame is ONE-SHOT and was
+still loseable live (a resize invalidation or projection taint wedged a
+resumed pane in `Starting` while the work-state classifier read the same
+output fine — Victor's second Send refusal). The tracker now ALSO admits from
+the raw stream: the composer+footer burst (❯ + Shift+Tab + Ctrl+x) in a 1 KiB
+rolling window, paste-aware from the window itself, deferring while a
+starting splash or the launcher menu is visible. Grok repaints that burst on
+every activity, so a lost first frame self-heals. Verified over two open
+cycles: readiness in ~12 s each.
+
 ### Grok startup detection is measured, and Grok's paint changes server-side
 
 2026-08-28 late: with an unchanged grok.exe (1.0.5, Aug 20), Grok's startup
