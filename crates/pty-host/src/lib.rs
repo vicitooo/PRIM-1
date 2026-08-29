@@ -270,11 +270,23 @@ pub struct ConcretePtySession {
 
 impl ConcretePtySession {
     pub fn spawn(spec: &LaunchSpec, handler: PtyEventHandler) -> anyhow::Result<Self> {
+        Self::spawn_with_size(spec, None, handler)
+    }
+
+    /// Spawn at the pane's real size when known: a harness that paints (or
+    /// replays) before the UI's first fit-resize otherwise wraps for the
+    /// 120x40 default and reflows into scatter.
+    pub fn spawn_with_size(
+        spec: &LaunchSpec,
+        size: Option<(u16, u16)>,
+        handler: PtyEventHandler,
+    ) -> anyhow::Result<Self> {
+        let (cols, rows) = size.unwrap_or((120, 40));
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
-                rows: 40,
-                cols: 120,
+                rows,
+                cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })

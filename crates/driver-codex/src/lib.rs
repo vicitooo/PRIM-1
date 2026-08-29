@@ -246,13 +246,20 @@ fn classify_normalized_work_state(normalized: &str) -> Option<(WorkState, Option
         return Some((WorkState::Blocked, Some("plan_mode_prompt".into())));
     }
 
+    // Numeric status codes require their HTTP phrasing: a bare "401"/"403"
+    // matches any digit run (token counts, offsets, sequence numbers — a
+    // resumed replay carried 131 of them and latched a false auth block).
     if lower.contains("access token could not be refreshed")
         || lower.contains("refresh token")
         || lower.contains("auth refresh")
         || lower.contains("please log out")
         || lower.contains("signed in to another account")
-        || lower.contains("401")
-        || lower.contains("403")
+        || lower.contains("401 unauthorized")
+        || lower.contains("error 401")
+        || lower.contains("http 401")
+        || lower.contains("403 forbidden")
+        || lower.contains("error 403")
+        || lower.contains("http 403")
     {
         return Some((WorkState::Blocked, Some("auth_refresh".into())));
     }
@@ -260,7 +267,11 @@ fn classify_normalized_work_state(normalized: &str) -> Option<(WorkState, Option
     if lower.contains("hit your usage") {
         return Some((WorkState::Blocked, Some("usage_limit".into())));
     }
-    if lower.contains("rate limit") || lower.contains("429") {
+    if lower.contains("rate limit")
+        || lower.contains("429 too many")
+        || lower.contains("error 429")
+        || lower.contains("http 429")
+    {
         return Some((WorkState::Blocked, Some("rate_limit".into())));
     }
     if lower.contains("stream disconnected")
@@ -647,6 +658,19 @@ mod tests {
             classify_work_state("You've hit your usage limit.").unwrap(),
             (WorkState::Blocked, Some("usage_limit".into()))
         );
+        assert_eq!(
+            classify_work_state("HTTP 401 Unauthorized").unwrap(),
+            (WorkState::Blocked, Some("auth_refresh".into()))
+        );
+        assert_eq!(
+            classify_work_state("server said 429 Too Many Requests").unwrap(),
+            (WorkState::Blocked, Some("rate_limit".into()))
+        );
+        // Digit runs in ordinary output are NOT status codes: the resumed
+        // replay that latched a false auth block carried lines like these.
+        assert_eq!(classify_work_state("sequence\": 4013,"), None);
+        assert_eq!(classify_work_state("read 403 lines from index.html"), None);
+        assert_eq!(classify_work_state("commit 8f403abc integrated (470742d)"), None);
         for available_usage in [
             "You have 1 usage limit reset available. Run /usage to use one.",
             "Heads up, you have less than 10% of your weekly limit left. Run /status for details.",

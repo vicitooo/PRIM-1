@@ -134,6 +134,20 @@ content; use audit events for lifecycle, authorization, membership, dispatch,
 and delivery receipts only. A receipt proves that the supervisor wrote to a
 pane, not that the model understood or completed the request.
 
+### driver-codex classifier: numeric triggers were substring bombs (fixed 2026-08-29)
+
+Bare `"401"`, `"403"`, `"429"` substrings classified ANY digit run as an
+auth/rate blocker — a resumed replay carried 131 such runs and latched
+`blocked (auth_refresh)`, refusing room deliveries to a perfectly healthy
+Codex (and feeding the repeated-blocked → `error_loop` escalation seen
+2026-08-28). Numeric codes now require their HTTP phrasing ("401
+unauthorized", "http 403", "429 too many", …); sentence triggers unchanged.
+Related and still open: the tracker clears a blocker only via a TRUSTED
+clean-prompt screen, which a scrollback-style resume replay may never
+produce — a false phrase-level latch during replay would still stick.
+Watchlist: the day's FIRST resumed run of a harness has died silently ~30 s
+in twice (Grok 10:34, Codex 12:09, both 2026-08-29); relaunch recovered both.
+
 ## Roadmap items tracked publicly
 
 The following are not bugs but in-progress structural improvements. They affect what consumers can rely on:

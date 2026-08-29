@@ -760,6 +760,9 @@ struct PreparedLaunch {
     /// None for drivers whose id is captured after spawn (Codex) or that have
     /// no conversation identity (terminal, Prime).
     harness_session_id: Option<String>,
+    /// The pane's last known terminal size — the PTY spawns at it so early
+    /// paint (a resumed replay especially) wraps for the real width.
+    pty_size: Option<(u16, u16)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -807,7 +810,7 @@ impl PtySpawner for ConcretePtySpawner {
         plan: &PreparedLaunch,
         handler: PtyEventHandler,
     ) -> Result<Box<dyn PtySession>> {
-        let session = ConcretePtySession::spawn(&plan.spec, handler)?;
+        let session = ConcretePtySession::spawn_with_size(&plan.spec, plan.pty_size, handler)?;
         let Some(scope) = plan.wsl_scope.clone() else {
             return Ok(Box::new(session));
         };
@@ -2089,6 +2092,9 @@ struct SessionSlot {
     /// The session had a live run when the app last went down; drives the
     /// UI's "continue where I left off" relaunch on open.
     running_at_shutdown: bool,
+    /// Last terminal size the UI fitted this pane to; the next run's PTY
+    /// spawns at it.
+    last_pty_size: Option<(u16, u16)>,
 }
 
 impl SessionSlot {
@@ -2147,6 +2153,10 @@ struct PersistedSessionV1 {
     harness_session_id: Option<String>,
     #[serde(default)]
     running_at_shutdown: bool,
+    #[serde(default)]
+    last_pty_cols: Option<u16>,
+    #[serde(default)]
+    last_pty_rows: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2209,6 +2219,10 @@ impl SessionRegistry {
             slot.qualified_working_directory = Some(persisted.working_directory.clone());
             slot.harness_session_id = persisted.harness_session_id.clone();
             slot.running_at_shutdown = persisted.running_at_shutdown;
+            slot.last_pty_size = persisted
+                .last_pty_cols
+                .zip(persisted.last_pty_rows)
+                .filter(|(cols, rows)| *cols > 0 && *rows > 0);
             registry.insert(slot)?;
         }
         Ok(registry)
@@ -2606,6 +2620,7 @@ fn closed_session_slot(definition: SessionDefinition) -> SessionSlot {
         stall_detector: None,
         harness_session_id: None,
         running_at_shutdown: false,
+        last_pty_size: None,
     }
 }
 
@@ -5199,13 +5214,19 @@ impl SupervisorHandle {
     fn persist_slot_harness_state(&self, session_id: SessionId) {
         let state = {
             let slots = self.inner.slots.lock();
-            slots
-                .get_by_id(session_id)
-                .map(|slot| (slot.harness_session_id.clone(), slot.running_at_shutdown))
+            slots.get_by_id(session_id).map(|slot| {
+                (
+                    slot.harness_session_id.clone(),
+                    slot.running_at_shutdown,
+                    slot.last_pty_size,
+                )
+            })
         };
-        let Some((harness_session_id, running_at_shutdown)) = state else {
+        let Some((harness_session_id, running_at_shutdown, last_pty_size)) = state else {
             return;
         };
+        let (last_pty_cols, last_pty_rows) =
+            (last_pty_size.map(|s| s.0), last_pty_size.map(|s| s.1));
         let mut catalog = self.inner.catalog.lock();
         let mut candidate = catalog.clone();
         let Some(row) = candidate
@@ -5217,11 +5238,15 @@ impl SupervisorHandle {
         };
         if row.harness_session_id == harness_session_id
             && row.running_at_shutdown == running_at_shutdown
+            && row.last_pty_cols == last_pty_cols
+            && row.last_pty_rows == last_pty_rows
         {
             return;
         }
         row.harness_session_id = harness_session_id;
         row.running_at_shutdown = running_at_shutdown;
+        row.last_pty_cols = last_pty_cols;
+        row.last_pty_rows = last_pty_rows;
         if let Err(error) = self.persist_catalog_candidate(&candidate) {
             self.emit(RuntimeEvent::SystemLog {
                 level: LogLevel::Warn,
@@ -5437,6 +5462,8 @@ impl SupervisorHandle {
                 permission_profile: request.permission_profile,
                 harness_session_id: None,
                 running_at_shutdown: false,
+                last_pty_cols: None,
+                last_pty_rows: None,
             });
             self.persist_catalog_candidate(&candidate)?;
             slots.insert_prevalidated(slot);
@@ -6861,6 +6888,18 @@ impl SupervisorHandle {
                                 );
                                 slot.harness_session_id = plan.harness_session_id.clone();
                                 slot.running_at_shutdown = true;
+                                if let Some((cols, rows)) = plan.pty_size {
+                                    if let Some(running) = slot.running.as_mut() {
+                                        running.last_resize = Some((cols, rows));
+                                    }
+                                    match slot.definition.driver {
+                                        DriverKind::Codex => {
+                                            slot.codex_work_state.resize(cols, rows)
+                                        }
+                                        DriverKind::Grok => slot.grok_startup.resize(cols, rows),
+                                        _ => {}
+                                    }
+                                }
                                 let grok_interactive_ready = slot.definition.driver
                                     == DriverKind::Grok
                                     && slot.grok_startup.is_interactive_ready();
@@ -7715,10 +7754,16 @@ impl SupervisorHandle {
             .ok_or_else(|| anyhow!("session '{session_id}' transport is not available"))?
             .resize(cols, rows)?;
         running.last_resize = Some((cols, rows));
+        let size_changed = slot.last_pty_size != Some((cols, rows));
+        slot.last_pty_size = Some((cols, rows));
         match slot.definition.driver {
             DriverKind::Codex => slot.codex_work_state.resize(cols, rows),
             DriverKind::Grok => slot.grok_startup.resize(cols, rows),
             _ => {}
+        }
+        drop(slots);
+        if size_changed {
+            self.persist_slot_harness_state(session_id);
         }
         Ok(())
     }
@@ -9657,6 +9702,12 @@ impl SupervisorHandle {
     ) -> Result<PreparedLaunch> {
         validate_driver_working_directory_pair(definition.driver, qualified_directory)?;
         let harness_session = self.resolve_harness_launch_session(definition, fresh);
+        let pty_size = self
+            .inner
+            .slots
+            .lock()
+            .get_by_id(definition.session_id)
+            .and_then(|slot| slot.last_pty_size);
         let (mut spec, wsl_scope) = if definition.driver == DriverKind::Prime {
             self.ensure_wsl_reconciled()?;
             let (expected_device, expected_inode) =
@@ -9756,6 +9807,7 @@ impl SupervisorHandle {
                 | HarnessLaunchSession::Resume { session_id } => Some(session_id.clone()),
                 HarnessLaunchSession::Fresh => None,
             },
+            pty_size,
         })
     }
 
@@ -19225,6 +19277,9 @@ mod tests {
                 assert!(slot.running_at_shutdown);
                 assert!(slot.snapshot().resume_available);
             }
+            supervisor
+                .resize_session_by_id(claude, 190, 45)
+                .expect("resize the running session");
             supervisor.stop_session_by_id(claude).unwrap();
             assert!(
                 !supervisor
@@ -19254,6 +19309,17 @@ mod tests {
                 .as_deref(),
             Some(first_id.as_str()),
             "the conversation id survives the app restart"
+        );
+        assert_eq!(
+            supervisor
+                .inner
+                .slots
+                .lock()
+                .get_by_id(claude)
+                .unwrap()
+                .last_pty_size,
+            Some((190, 45)),
+            "the pane size survives the app restart and seeds the next spawn"
         );
         let (pty, _inputs) = recording_pty_session(std::process::id());
         let (second_pty, _second_inputs) = recording_pty_session(std::process::id());
@@ -21670,6 +21736,8 @@ mod tests {
                 "driver".to_string(),
                 "harness_session_id".to_string(),
                 "running_at_shutdown".to_string(),
+                "last_pty_cols".to_string(),
+                "last_pty_rows".to_string(),
                 "label".to_string(),
                 "permission_profile".to_string(),
                 "session_id".to_string(),
