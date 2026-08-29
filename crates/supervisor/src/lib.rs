@@ -2764,6 +2764,11 @@ struct SupervisorInner {
     auto_restart_history: Mutex<HashMap<SessionId, AutoRestartHistory>>,
     #[cfg(test)]
     fail_next_catalog_write: AtomicBool,
+    /// Delivery timing override (settle_quiet, settle_cap, verify_window,
+    /// attempts): None = production constants. Test builds default to zeros /
+    /// one attempt so mock deliveries keep the historical instant
+    /// single-submit shape unless a test opts in.
+    delivery_timing_tuning: Mutex<Option<(Duration, Duration, Duration, usize)>>,
     #[cfg(test)]
     fail_next_room_catalog_write: AtomicBool,
     #[cfg(test)]
@@ -3921,6 +3926,16 @@ impl SupervisorHandle {
                 auto_restart_history: Mutex::new(HashMap::new()),
                 #[cfg(test)]
                 fail_next_catalog_write: AtomicBool::new(false),
+                delivery_timing_tuning: Mutex::new({
+                    #[cfg(test)]
+                    {
+                        Some((Duration::ZERO, Duration::ZERO, Duration::ZERO, 1))
+                    }
+                    #[cfg(not(test))]
+                    {
+                        None
+                    }
+                }),
                 #[cfg(test)]
                 fail_next_room_catalog_write: AtomicBool::new(false),
                 #[cfg(test)]
@@ -7507,6 +7522,18 @@ impl SupervisorHandle {
         // delivery forever.
         const ECHO_SETTLE_QUIET: Duration = Duration::from_millis(400);
         const ECHO_SETTLE_CAP: Duration = Duration::from_secs(10);
+        const SUBMIT_VERIFY_WINDOW: Duration = Duration::from_millis(3000);
+        const SUBMIT_ATTEMPTS: usize = 3;
+        let (settle_quiet, settle_cap, verify_window, attempts) = self
+            .inner
+            .delivery_timing_tuning
+            .lock()
+            .unwrap_or((
+                ECHO_SETTLE_QUIET,
+                ECHO_SETTLE_CAP,
+                SUBMIT_VERIFY_WINDOW,
+                SUBMIT_ATTEMPTS,
+            ));
         let settle_started = Instant::now();
         loop {
             let last_output = {
@@ -7516,10 +7543,13 @@ impl SupervisorHandle {
                     .and_then(|slot| slot.last_real_output_at)
             };
             let settled = match last_output {
-                Some(at) => at.elapsed() >= ECHO_SETTLE_QUIET,
+                Some(at) => at.elapsed() >= settle_quiet,
                 None => true,
             };
-            if settled || settle_started.elapsed() >= ECHO_SETTLE_CAP {
+            if settled || settle_started.elapsed() >= settle_cap {
+                break;
+            }
+            if settle_quiet.is_zero() {
                 break;
             }
             thread::sleep(Duration::from_millis(120));
@@ -7536,9 +7566,40 @@ impl SupervisorHandle {
         }
         drop(slots);
 
-        Self::write_full_pty_input(target.pty.as_ref(), submit_behavior.sequence)
-            .map(|submit_bytes| content_bytes + submit_bytes)
-            .map_err(|error| Self::delivery_error_after_progress(error, content_bytes))
+        // Submit, then VERIFY the pane accepted it: a TUI can hold a large
+        // paste behind an enter-guard (Codex collapses one into a
+        // "[Pasted Content N chars]" chip and ignores Enter for a while), so
+        // a submit that produces no response output within the window is
+        // retried. An extra Enter into an already-submitted, empty composer
+        // is a no-op on every measured harness.
+        let mut written = content_bytes;
+        for attempt in 0..attempts {
+            let submitted_at = Instant::now();
+            written += Self::write_full_pty_input(target.pty.as_ref(), submit_behavior.sequence)
+                .map_err(|error| Self::delivery_error_after_progress(error, written))?;
+            if attempt + 1 == attempts {
+                break;
+            }
+            let mut accepted = false;
+            while submitted_at.elapsed() < verify_window {
+                thread::sleep(Duration::from_millis(150));
+                let advanced = {
+                    let slots = self.inner.slots.lock();
+                    slots
+                        .get_by_id(target.session_id)
+                        .and_then(|slot| slot.last_real_output_at)
+                        .is_some_and(|at| at >= submitted_at)
+                };
+                if advanced {
+                    accepted = true;
+                    break;
+                }
+            }
+            if accepted {
+                break;
+            }
+        }
+        Ok(written)
     }
 
     fn send_input_with_bytes(&self, request: SendInputRequest) -> Result<(SessionSnapshot, usize)> {
@@ -19282,6 +19343,36 @@ mod tests {
             !claude_inputs.lock().is_empty()
         });
         assert!(claude_inputs.lock()[0].contains("PRIM-1 room \"Quiet room\""));
+    }
+
+    fn set_submit_verify_tuning(supervisor: &SupervisorHandle, window: Duration, attempts: usize) {
+        *supervisor.inner.delivery_timing_tuning.lock() =
+            Some((Duration::ZERO, Duration::ZERO, window, attempts));
+    }
+
+    #[test]
+    fn a_swallowed_submit_is_retried_until_the_pane_responds_or_attempts_end() {
+        let supervisor = test_supervisor();
+        set_submit_verify_tuning(&supervisor, Duration::from_millis(120), 3);
+        let (pty, inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            pty,
+        );
+        route_operator_to_test_session(&supervisor, "claude", "big feedback body")
+            .expect("delivery should succeed");
+        let written = inputs.lock().clone();
+        assert_eq!(
+            written.iter().filter(|input| input.as_str() == "\r").count(),
+            3,
+            "a pane that never responds gets every submit attempt: {written:?}"
+        );
+        assert!(
+            written[0].contains("big feedback body"),
+            "payload precedes the submits"
+        );
     }
 
     struct ArgRecordingPtySpawner {

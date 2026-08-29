@@ -80,6 +80,18 @@ a 400 ms quiet window on the pane's output after the payload (bounded at
 10 s), replacing the fixed-delay-only contract. Small messages are unchanged;
 the fixed delay remains the floor.
 
+Second half of the same defect (same day, Victor's retry): Codex collapses a
+large paste into a "[Pasted Content N chars]" chip and ignores Enter for a
+guard window even after the echo settles — its chip renders instantly, so the
+settle wait alone does not clear the guard. The submit is now
+verify-and-retry: after each Enter the supervisor watches the pane for
+response output (3 s window); a pane that has not started responding gets the
+Enter again, three attempts total. An extra Enter into an already-submitted
+empty composer is a no-op on every measured harness. Test builds default the
+settle/verify timings to zero so mock deliveries keep their historical shape;
+`a_swallowed_submit_is_retried_until_the_pane_responds_or_attempts_end` pins
+the retry contract.
+
 ### Grok startup detection is measured, and Grok's paint changes server-side
 
 2026-08-28 late: with an unchanged grok.exe (1.0.5, Aug 20), Grok's startup
