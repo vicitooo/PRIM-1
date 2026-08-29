@@ -537,6 +537,7 @@ class SessionTerminal {
   private readonly initialBannerLabel: HTMLElement;
   private readonly initialBannerElement: HTMLDivElement;
   private snapshot: SessionSnapshot | null = null;
+  private pendingRepaintResync = false;
   private readonly colourFilter = new SgrColourFilter();
 
   constructor(sessionId: string, alias: string, label: string) {
@@ -657,8 +658,24 @@ class SessionTerminal {
       this.terminal.resize(cols, rows);
     }
     if (this.snapshot?.running) {
+      if (this.pendingRepaintResync && rows > 1) {
+        // The pane discarded a headless buffered stream; a same-size PTY
+        // resize is a no-op, so wiggle rows to force ConPTY and the harness
+        // to repaint the full screen at the real grid.
+        this.pendingRepaintResync = false;
+        void resizeSession(this.sessionId, cols, rows - 1).then(() =>
+          resizeSession(this.sessionId, cols, rows),
+        );
+        return;
+      }
       void resizeSession(this.sessionId, cols, rows);
     }
+  }
+
+  /** Called when buffered output for this pane was discarded as unusable:
+      the next applyGrid with a live session forces a full harness repaint. */
+  requestFullRepaintResync(): void {
+    this.pendingRepaintResync = true;
   }
 
   dispose(): void {
@@ -2125,7 +2142,7 @@ function syncPaneInventory(
     }
     const entry = pendingOutput.get(buffered);
     pendingOutput.delete(buffered);
-    if (entry && (entry.chunks.length > 0 || entry.dropped > 0)) {
+    if (entry && (entry.chunks.length > 0 || entry.shed > 0)) {
       writeSystem(
         "info",
         "pendingOutput dropped for removed session "
@@ -2133,8 +2150,8 @@ function syncPaneInventory(
           + " ("
           + entry.chunks.length
           + " queued + "
-          + entry.dropped
-          + " previously shed)",
+          + entry.shed
+          + " overflow sheds)",
       );
     }
   }
@@ -2198,22 +2215,33 @@ function syncPaneInventory(
     if (!pending) {
       continue;
     }
+    pendingOutput.delete(session.session_id);
+    if (pending.shed > 0) {
+      // The buffered stream lost its head to the byte cap. A TUI paint
+      // stream's tail painted onto a blank grid is scatter, not content —
+      // discard it and force the harness to repaint the whole screen once
+      // the real grid has been applied.
+      pane.requestFullRepaintResync();
+      writeSystem(
+        "warn",
+        "session_output resync: "
+          + session.label
+          + " overflowed the pending buffer; discarded "
+          + pending.chunks.length
+          + " tail chunks and scheduled a full repaint",
+      );
+      continue;
+    }
     for (const chunk of pending.chunks) {
       pane.write(chunk);
     }
-    pendingOutput.delete(session.session_id);
-    if (pending.chunks.length > 0 || pending.dropped > 0) {
-      const suffix =
-        pending.dropped > 0
-          ? " (" + pending.dropped + " older chunks dropped due to cap)"
-          : "";
+    if (pending.chunks.length > 0) {
       writeSystem(
         "info",
         "session_output flushed: "
           + pending.chunks.length
           + " chunks into "
-          + session.label
-          + suffix,
+          + session.label,
       );
     }
   }

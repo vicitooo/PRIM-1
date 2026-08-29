@@ -13,7 +13,15 @@
 
 import type { RuntimeEvent, SessionSnapshot } from "./types";
 
-export const MAX_PENDING_CHUNKS_PER_SESSION = 256;
+/** Pane bytes buffered while the pane is not attached yet (the boot window
+    between event subscription and terminal construction). Byte-bounded, not
+    chunk-bounded: a fullscreen TUI's resume replay is a differential paint
+    stream, and shedding its OLDEST chunks deletes the full-repaint head — the
+    surviving tail then paints sparse fragments onto a blank grid (the Grok
+    scatter, 2026-08-29). Overflow therefore sheds the ENTIRE buffer and marks
+    the stream for a full-repaint resync after attach; a corrupt tail is never
+    written. */
+export const MAX_PENDING_BYTES_PER_SESSION = 16 * 1024 * 1024;
 export const MAX_BOOTSTRAP_RUN_EVENTS = 512;
 // Retains exact retired lineages across invoke/event-channel reordering. Any
 // lossy eviction is surfaced to the operator by flushRunEventGateWarnings.
@@ -22,7 +30,11 @@ const SESSION_CATALOG_EVENT_SCHEMA_VERSION = 1;
 
 export interface PendingBuffer {
   chunks: string[];
-  dropped: number;
+  bytes: number;
+  /** Times the entire buffer was shed on byte-cap overflow. Non-zero means
+      the accumulated stream is missing its head: the flush must discard it
+      and force a full repaint instead of writing a corrupt tail. */
+  shed: number;
 }
 
 export interface RunEventGateState {
@@ -598,7 +610,7 @@ export function handleRuntimeEvent(
 
       let entry = ctx.pendingOutput.get(sessionId);
       if (!entry) {
-        entry = { chunks: [], dropped: 0 };
+        entry = { chunks: [], bytes: 0, shed: 0 };
         ctx.pendingOutput.set(sessionId, entry);
         ctx.writeSystem(
           "warn",
@@ -607,15 +619,17 @@ export function handleRuntimeEvent(
       }
 
       entry.chunks.push(event.chunk);
-      if (entry.chunks.length > MAX_PENDING_CHUNKS_PER_SESSION) {
-        entry.chunks.shift();
-        entry.dropped += 1;
-        if (entry.dropped === 1 || entry.dropped % 64 === 0) {
-          ctx.writeSystem(
-            "warn",
-            `session_output buffer pressure: ${event.session} shed ${entry.dropped} oldest chunks`,
-          );
-        }
+      entry.bytes += event.chunk.length;
+      if (entry.bytes > MAX_PENDING_BYTES_PER_SESSION) {
+        // Never keep a headless tail of a TUI paint stream: shed everything
+        // and let the attach-time flush trigger a full-repaint resync.
+        entry.chunks = [];
+        entry.bytes = 0;
+        entry.shed += 1;
+        ctx.writeSystem(
+          "warn",
+          `session_output buffer overflow: ${event.session} shed the entire buffered stream (${entry.shed}×); full repaint scheduled on attach`,
+        );
       }
       break;
     }

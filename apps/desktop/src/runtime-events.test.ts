@@ -12,6 +12,7 @@ import {
   flushRunEventGateWarnings,
   forgetRunEventSession,
   handleRuntimeEvent,
+  MAX_PENDING_BYTES_PER_SESSION,
   MAX_RETIRED_RUN_CURSORS_PER_SESSION,
   reconcileSessionSnapshot,
   registerRuntimeEventsBeforeBootstrap,
@@ -1397,5 +1398,58 @@ describe("route status truth", () => {
       "error",
       "route route-12 PTY write failed for codex after 17 bytes were accepted by the PTY; content may be partial and model receipt is unconfirmed: pipe closed",
     );
+  });
+});
+
+describe("pending pane-output buffer", () => {
+  it("buffers unattached pane bytes without shedding below the byte cap", () => {
+    const ctx = makeContext();
+    reconcileSessionSnapshot(
+      sessionSnapshot({ run_event_sequence: 3 }),
+      ctx.snapshotById,
+      ctx.runEventGate,
+    );
+    handleRuntimeEvent(sessionOutput(1, "\x1b[2J\x1b[H full repaint"), ctx);
+    handleRuntimeEvent(sessionOutput(2, "diff one"), ctx);
+    handleRuntimeEvent(sessionOutput(3, "diff two"), ctx);
+
+    const entry = [...ctx.pendingOutput.values()][0];
+    expect(entry.chunks).toEqual([
+      "\x1b[2J\x1b[H full repaint",
+      "diff one",
+      "diff two",
+    ]);
+    expect(entry.bytes).toBe(
+      "\x1b[2J\x1b[H full repaint".length + "diff one".length + "diff two".length,
+    );
+    expect(entry.shed).toBe(0);
+  });
+
+  it("sheds the ENTIRE buffer on byte-cap overflow — a TUI stream must never survive as a headless tail", () => {
+    const ctx = makeContext();
+    reconcileSessionSnapshot(
+      sessionSnapshot({ run_event_sequence: 3 }),
+      ctx.snapshotById,
+      ctx.runEventGate,
+    );
+    handleRuntimeEvent(sessionOutput(1, "the full-repaint head"), ctx);
+    handleRuntimeEvent(
+      sessionOutput(2, "x".repeat(MAX_PENDING_BYTES_PER_SESSION)),
+      ctx,
+    );
+
+    const entry = [...ctx.pendingOutput.values()][0];
+    expect(entry.chunks).toEqual([]);
+    expect(entry.bytes).toBe(0);
+    expect(entry.shed).toBe(1);
+    expect(ctx.writeSystem).toHaveBeenCalledWith(
+      "warn",
+      expect.stringContaining("shed the entire buffered stream"),
+    );
+
+    handleRuntimeEvent(sessionOutput(3, "fresh tail after shed"), ctx);
+    const after = [...ctx.pendingOutput.values()][0];
+    expect(after.chunks).toEqual(["fresh tail after shed"]);
+    expect(after.shed).toBe(1);
   });
 });
