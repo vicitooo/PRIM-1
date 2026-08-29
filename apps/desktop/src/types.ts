@@ -51,6 +51,10 @@ export interface SessionSnapshot {
   run_event_sequence: number;
   process_id: number | null;
   running: boolean;
+  /** A harness conversation id is stored: the next Launch resumes it. */
+  resume_available: boolean;
+  /** Had a live run when the app last went down (workspace restore target). */
+  was_running_at_shutdown: boolean;
   last_activity_at: string | null;
   last_error: string | null;
 }
@@ -146,6 +150,8 @@ export interface HeartbeatSessionSummary {
 
 export interface StartSessionRequest {
   session_id: string;
+  /** Start a NEW harness conversation instead of resuming the stored one. */
+  fresh?: boolean;
 }
 
 export interface StopSessionRequest {

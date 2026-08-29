@@ -50,6 +50,8 @@ function session(
     run_event_sequence: 0,
     process_id: null,
     running: false,
+    resume_available: false,
+    was_running_at_shutdown: false,
     last_activity_at: null,
     last_error: null,
     ...overrides,

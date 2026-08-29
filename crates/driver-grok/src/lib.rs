@@ -1,6 +1,9 @@
 use std::path::Path;
 
-use shared_types::{LaunchSpec, LaunchSpecError, PermissionProfile, SessionDefinition, WorkState};
+use shared_types::{
+    HarnessLaunchSession, LaunchSpec, LaunchSpecError, PermissionProfile, SessionDefinition,
+    WorkState,
+};
 #[cfg(test)]
 use terminal_viewport::CONTROL_MAX_CHARS as TERMINAL_CONTROL_MAX_CHARS;
 use terminal_viewport::TerminalViewport;
@@ -40,6 +43,9 @@ pub struct StartupTracker {
     viewport: TerminalViewport,
     frame_active: bool,
     frame_invalid: bool,
+    /// Tail of recently observed raw output, so the minimal statusline is
+    /// recognised even when it spans a chunk boundary.
+    raw_tail: String,
 }
 
 impl Default for StartupTracker {
@@ -49,6 +55,7 @@ impl Default for StartupTracker {
             viewport: TerminalViewport::default(),
             frame_active: false,
             frame_invalid: false,
+            raw_tail: String::new(),
         }
     }
 }
@@ -59,6 +66,7 @@ impl StartupTracker {
         self.viewport.begin_run();
         self.frame_active = false;
         self.frame_invalid = false;
+        self.raw_tail.clear();
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
@@ -113,6 +121,34 @@ impl StartupTracker {
             if observed == StartupProgress::StartingObserved && progress == StartupProgress::None {
                 progress = observed;
             }
+        }
+        // A RESUMED session replays its transcript scrollback-style — no
+        // clear, no hide/show frame — so the viewport projection may never
+        // become trusted at all. The statusline in the raw stream, with paste
+        // enabled and no launcher-menu text in the same window, is the
+        // measured interactive signal (measured 2026-08-29 against a 1.0.5
+        // --resume replay).
+        if self.phase != StartupPhase::Complete {
+            let mut window =
+                String::with_capacity(self.raw_tail.len() + chunk.len());
+            window.push_str(&self.raw_tail);
+            window.push_str(chunk);
+            if bracketed_paste_enabled
+                && window.contains(MINIMAL_MODE_READY_MARKER)
+                && !window.to_ascii_lowercase().contains("new worktree")
+            {
+                self.phase = StartupPhase::Complete;
+                return StartupProgress::InteractiveReady;
+            }
+            let tail: String = window
+                .chars()
+                .rev()
+                .take(64)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            self.raw_tail = tail;
         }
         progress
     }
@@ -181,8 +217,24 @@ impl StartupTracker {
 pub fn launch_spec(
     definition: &SessionDefinition,
     executable: &str,
+    harness_session: &HarnessLaunchSession,
 ) -> Result<LaunchSpec, LaunchSpecError> {
-    launch_spec_with_session_id(definition, executable, Uuid::new_v4())
+    match harness_session {
+        HarnessLaunchSession::New { session_id } => {
+            launch_spec_with_session_arg(definition, executable, SessionArg::New(session_id))
+        }
+        HarnessLaunchSession::Resume { session_id } => {
+            launch_spec_with_session_arg(definition, executable, SessionArg::Resume(session_id))
+        }
+        HarnessLaunchSession::Fresh => {
+            launch_spec_with_session_id(definition, executable, Uuid::new_v4())
+        }
+    }
+}
+
+enum SessionArg<'a> {
+    New(&'a str),
+    Resume(&'a str),
 }
 
 fn launch_spec_with_session_id(
@@ -190,21 +242,38 @@ fn launch_spec_with_session_id(
     executable: &str,
     session_id: Uuid,
 ) -> Result<LaunchSpec, LaunchSpecError> {
+    let session_id = session_id.to_string();
+    launch_spec_with_session_arg(definition, executable, SessionArg::New(&session_id))
+}
+
+fn launch_spec_with_session_arg(
+    definition: &SessionDefinition,
+    executable: &str,
+    session: SessionArg<'_>,
+) -> Result<LaunchSpec, LaunchSpecError> {
     validate_direct_program(executable)?;
 
     let permission_mode = match definition.permission_profile {
         PermissionProfile::Normal => "default",
         PermissionProfile::Unsafe => "bypassPermissions",
     };
-    let args = vec![
+    let mut args: Vec<String> = vec![
         "--minimal".into(),
         "--permission-mode".into(),
         permission_mode.into(),
         "--cwd".into(),
         definition.working_dir.clone(),
-        "--session-id".into(),
-        session_id.to_string(),
     ];
+    match session {
+        SessionArg::New(session_id) => {
+            args.extend(["--session-id".into(), session_id.to_string()]);
+        }
+        // Fused `=` form: grok's --resume takes an optional value and a
+        // separated token would be parsed as the prompt positional.
+        SessionArg::Resume(session_id) => {
+            args.push(format!("--resume={session_id}"));
+        }
+    }
 
     Ok(LaunchSpec {
         program: executable.to_string(),
@@ -397,8 +466,8 @@ mod tests {
     #[test]
     fn each_launch_gets_one_fresh_grok_session_id_without_a_bootstrap_prompt() {
         let definition = definition(PermissionProfile::Normal);
-        let first = launch_spec(&definition, GROK_EXECUTABLE).unwrap();
-        let second = launch_spec(&definition, GROK_EXECUTABLE).unwrap();
+        let first = launch_spec(&definition, GROK_EXECUTABLE, &HarnessLaunchSession::Fresh).unwrap();
+        let second = launch_spec(&definition, GROK_EXECUTABLE, &HarnessLaunchSession::Fresh).unwrap();
 
         let session_id = |spec: &LaunchSpec| {
             let positions = spec
@@ -419,11 +488,11 @@ mod tests {
     fn relative_and_shell_mediated_programs_are_rejected() {
         let definition = definition(PermissionProfile::Normal);
         assert!(matches!(
-            launch_spec(&definition, "grok"),
+            launch_spec(&definition, "grok", &HarnessLaunchSession::Fresh),
             Err(LaunchSpecError::ProgramNotQualified { .. })
         ));
         assert!(matches!(
-            launch_spec(&definition, SHELL_SHIM),
+            launch_spec(&definition, SHELL_SHIM, &HarnessLaunchSession::Fresh),
             Err(LaunchSpecError::ShellMediatedProgram { .. })
         ));
     }
@@ -605,6 +674,44 @@ mod tests {
         );
         assert_eq!(
             incomplete.observe_output("\x1b[?25l\x1b[15;1H/help\x1b[16;1H❯\x1b[?25h"),
+            StartupProgress::None
+        );
+    }
+
+    #[test]
+    fn startup_tracker_admits_a_resumed_replay_without_frames_or_clears() {
+        // A --resume replay: transcript lines appended cursor-shown, no 2J,
+        // no cursor hide/show, statusline at the end — split mid-marker
+        // across two chunks.
+        let mut tracker = StartupTracker::default();
+        assert_eq!(
+            tracker.observe_output_with_mode(
+                "\x1b[?2004hyesterday's transcript line one\r\nline two\r\nminimal \u{b7} /he",
+                true,
+            ),
+            StartupProgress::None,
+            "the split marker must not admit early"
+        );
+        assert_eq!(
+            tracker.observe_output_with_mode("lp\r\n> \r\n", true),
+            StartupProgress::InteractiveReady,
+            "the raw statusline completes a frameless resumed replay"
+        );
+
+        // The launcher menu never admits through the raw path.
+        let mut launcher = StartupTracker::default();
+        assert_eq!(
+            launcher.observe_output_with_mode(
+                "New worktree  Resume session  minimal \u{b7} /help",
+                true,
+            ),
+            StartupProgress::None
+        );
+
+        // Without bracketed paste the raw path stays closed.
+        let mut unpasted = StartupTracker::default();
+        assert_eq!(
+            unpasted.observe_output_with_mode("minimal \u{b7} /help\r\n> ", false),
             StartupProgress::None
         );
     }

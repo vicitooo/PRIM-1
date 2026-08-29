@@ -52,18 +52,27 @@ If Grok's UI changes again, the failure mode is the same fail-closed wedge —
 compare a raw ConPTY capture against `StartupTracker`'s predicates (fixture:
 `crates/driver-grok/src/fixtures/grok-startup-minimal-single-frame-v105.json`).
 
-### Room brief on relaunch: one unexplained live miss (open)
+2026-08-29 addendum — a RESUMED grok (`--resume=<id>`) replays its transcript
+scrollback-style: no clear, no cursor hide/show frames, so the viewport
+projection never becomes trusted and the old tracker wedged in `Starting` with
+a fully interactive pane. Third measured acceptance path: the raw-stream
+`minimal · /help` statusline (bracketed paste on, no launcher text,
+chunk-spanning tail). Two grok-side oddities observed once each and not yet
+explained: (a) the day's first resumed grok exited silently ~30 s after
+"session loaded" (no log line, no crash artifact); (b) one subsequent launch
+hung BEFORE grok's logging initialised (zero unified.jsonl lines, ~5 s CPU) —
+remedy: taskkill the grok.exe, Stop the pane, Launch again. Watch for
+recurrence; grok's own `active_sessions.json` can also hold a stale dead-pid
+entry, which did NOT block resumes in testing.
 
-2026-08-28 ~23:56: after an app restart, the three relaunched members of a
-persisted auto-brief room received no brief — no delivery events, no refusal
-warnings, which implies `brief_attempts_left` was 0 (brief never owed). The
-exact shape passes as a unit test
-(`a_relaunched_member_of_a_persisted_room_is_briefed_on_first_idle`), so the
-defect is live-environment-specific and could not be isolated without killing a
-working overnight run. If it recurs: check the audit for the absence of both
-delivery events AND "Room brief … not delivered" warnings after the members'
-first idle; that signature means owed-at-start never armed, not a refused
-delivery.
+### Room briefs are owed once per membership (2026-08-29; retires the relaunch-miss issue)
+
+The brief is delivered once per MEMBERSHIP (`briefed_member_ids` in the room
+catalog): delivery marks, removal clears, re-adding re-briefs, relaunches are
+quiet, manual Brief now is unconditional. The 2026-08-28 "owed brief missed on
+relaunch" observation is retired by this contract change — per-run re-briefing
+was the wrong behaviour (it re-briefed a finished team on the next morning's
+open); the one unexplained non-delivery was never reproduced under test.
 
 These are documented runtime behaviors that callers should know. Each is on the roadmap to be hidden behind a wrapper abstraction; until then, callers compensate.
 
