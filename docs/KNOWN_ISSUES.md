@@ -37,6 +37,19 @@ long-lived installations should manage that history through Grok's own tools.
 
 ## Behavioral notes the wrapper does not yet abstract
 
+### Grok panes run the fullscreen TUI (2026-08-29 evening)
+
+Grok panes launch `--fullscreen`: the pane renders exactly what a normal
+terminal shows (message cards with timestamps, collapsed hook chips, the
+bordered composer). Measured live: alt-screen + bracketed paste at startup,
+composer frame with no splash (the tracker admits the composer from either
+phase), bracketed-paste delivery with embedded LF + CR submit answered by the
+model, full repaint on resize (no column pinning needed). Grok deliveries use
+the standard BracketedPaste framing and the general 1 MiB body cap; the
+GrokMinimal framing (ESC-CR line breaks, measured 13 KiB / 256-line envelope)
+remains in the codebase, tested directly, for a potential minimal-mode return.
+The minimal-mode notes below are historical.
+
 ### Grok startup detection is measured, and Grok's paint changes server-side
 
 2026-08-28 late: with an unchanged grok.exe (1.0.5, Aug 20), Grok's startup

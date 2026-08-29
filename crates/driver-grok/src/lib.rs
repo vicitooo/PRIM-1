@@ -191,7 +191,8 @@ impl StartupTracker {
             StartupPhase::AwaitingStarting | StartupPhase::StartingObserved
                 if bracketed_paste_enabled
                     && !has_launcher
-                    && has_minimal_interactive_composer =>
+                    && (has_minimal_interactive_composer
+                        || (!has_starting && has_fullscreen_interactive_composer)) =>
             {
                 self.phase = StartupPhase::Complete;
                 StartupProgress::InteractiveReady
@@ -199,15 +200,6 @@ impl StartupTracker {
             StartupPhase::AwaitingStarting if has_starting => {
                 self.phase = StartupPhase::StartingObserved;
                 StartupProgress::StartingObserved
-            }
-            StartupPhase::StartingObserved
-                if bracketed_paste_enabled
-                    && !has_starting
-                    && !has_launcher
-                    && has_fullscreen_interactive_composer =>
-            {
-                self.phase = StartupPhase::Complete;
-                StartupProgress::InteractiveReady
             }
             _ => StartupProgress::None,
         }
@@ -258,7 +250,7 @@ fn launch_spec_with_session_arg(
         PermissionProfile::Unsafe => "bypassPermissions",
     };
     let mut args: Vec<String> = vec![
-        "--minimal".into(),
+        "--fullscreen".into(),
         "--permission-mode".into(),
         permission_mode.into(),
         "--cwd".into(),
@@ -430,7 +422,7 @@ mod tests {
         assert_eq!(
             spec.args,
             vec![
-                "--minimal",
+                "--fullscreen",
                 "--permission-mode",
                 "default",
                 "--cwd",
@@ -459,7 +451,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             spec.args[0..3],
-            ["--minimal", "--permission-mode", "bypassPermissions"]
+            ["--fullscreen", "--permission-mode", "bypassPermissions"]
         );
     }
 
@@ -588,13 +580,17 @@ mod tests {
     }
 
     #[test]
-    fn startup_tracker_requires_ordered_completed_repaints() {
-        let mut tracker = StartupTracker::default();
+    fn startup_tracker_admits_the_composer_with_or_without_a_prior_starting_frame() {
+        // Measured 2026-08-29: fullscreen 1.0.5 paints no splash frame — the
+        // composer frame is the whole startup, exactly like minimal.
+        let mut direct = StartupTracker::default();
         assert_eq!(
-            tracker.observe_output(&ready_repaint(true)),
-            StartupProgress::None,
-            "an interactive-looking pre-start screen must not admit"
+            direct.observe_output(&ready_repaint(true)),
+            StartupProgress::InteractiveReady,
+            "the fullscreen composer is the measured ready signal"
         );
+
+        let mut tracker = StartupTracker::default();
         assert_eq!(
             tracker.observe_output(&starting_repaint()),
             StartupProgress::StartingObserved
@@ -722,6 +718,22 @@ mod tests {
         assert_eq!(
             tracker.observe_output(&repaint("Signing in… starting your session.")),
             StartupProgress::StartingObserved
+        );
+    }
+
+    #[test]
+    fn startup_tracker_admits_the_exact_v105_fullscreen_startup_stream() {
+        let stream: String = serde_json::from_str(include_str!(
+            "fixtures/grok-startup-fullscreen-v105.json"
+        ))
+        .expect("v1.0.5 fullscreen startup fixture should remain valid JSON");
+        let mut tracker = StartupTracker::default();
+        tracker.resize(197, 56);
+
+        assert_eq!(
+            tracker.observe_output(&stream),
+            StartupProgress::InteractiveReady,
+            "the measured fullscreen startup must reach the interactive repaint"
         );
     }
 
