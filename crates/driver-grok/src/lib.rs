@@ -147,9 +147,8 @@ impl StartupTracker {
             let starting_visible = window_lower.contains("starting session")
                 || window_lower.contains("starting your session");
             let minimal_ready = window.contains(MINIMAL_MODE_READY_MARKER);
-            let fullscreen_ready = window.contains('❯')
-                && window_lower.contains("shift+tab")
-                && window_lower.contains("ctrl+x");
+            let fullscreen_ready =
+                window_lower.contains("shift+tab") && window_lower.contains("ctrl+x");
             if paste_observed
                 && !launcher_visible
                 && !starting_visible
@@ -201,8 +200,11 @@ impl StartupTracker {
         let has_starting = lower.contains("starting session...")
             || lower.contains("starting your session");
         let has_launcher = lower.contains("new worktree") || lower.contains("resume session");
+        // Glyph-free: without TERM in its env grok paints ">" instead of the
+        // composer glyph. The footer chrome is the grok-unique signature; the
+        // launcher screen also shows it and stays excluded by has_launcher.
         let has_fullscreen_interactive_composer =
-            normalized.contains('❯') && lower.contains("shift+tab") && lower.contains("ctrl+x");
+            lower.contains("shift+tab") && lower.contains("ctrl+x");
         let has_minimal_interactive_composer = normalized.contains(MINIMAL_MODE_READY_MARKER);
 
         match self.phase {
@@ -782,6 +784,25 @@ mod tests {
         assert_eq!(
             tracker.observe_output(&repaint("Signing in… starting your session.")),
             StartupProgress::StartingObserved
+        );
+    }
+
+    #[test]
+    fn startup_tracker_admits_the_exact_v105_fullscreen_noterm_startup_stream() {
+        // The icon-launch shape: no TERM in the env, grok paints ASCII
+        // fallbacks — no composer glyph anywhere in the stream.
+        let stream: String = serde_json::from_str(include_str!(
+            "fixtures/grok-startup-fullscreen-noterm-v105.json"
+        ))
+        .expect("no-TERM fullscreen startup fixture should remain valid JSON");
+        assert!(!stream.contains('❯'), "the fixture must be glyph-free");
+        let mut tracker = StartupTracker::default();
+        tracker.resize(197, 56);
+
+        assert_eq!(
+            tracker.observe_output(&stream),
+            StartupProgress::InteractiveReady,
+            "a glyph-free fullscreen startup must reach the interactive repaint"
         );
     }
 
