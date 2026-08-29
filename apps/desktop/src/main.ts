@@ -510,6 +510,32 @@ app.innerHTML = `
     a normal terminal shows the harness's colours. */
 let unicolor = localStorage.getItem("prim1-unicolor") === "1";
 
+/** Diagnostic byte tap (localStorage `prim1-byte-tap` = "1"): ring-buffers the
+    exact chunks each pane writes into its terminal, so a paint corruption can
+    be replayed byte-for-byte. Off unless explicitly armed; ~4 MiB cap/pane. */
+const paneByteTapEnabled = localStorage.getItem("prim1-byte-tap") === "1";
+interface PaneTapEntry {
+  chunk: string;
+  cols: number;
+  rows: number;
+}
+const paneTapRings = new Map<string, { entries: PaneTapEntry[]; bytes: number }>();
+const PANE_TAP_MAX_BYTES = 4 * 1024 * 1024;
+
+function recordPaneTap(sessionId: string, chunk: string, cols: number, rows: number): void {
+  let ring = paneTapRings.get(sessionId);
+  if (!ring) {
+    ring = { entries: [], bytes: 0 };
+    paneTapRings.set(sessionId, ring);
+    (window as unknown as { __paneTap?: unknown }).__paneTap = paneTapRings;
+  }
+  ring.entries.push({ chunk, cols, rows });
+  ring.bytes += chunk.length;
+  while (ring.bytes > PANE_TAP_MAX_BYTES && ring.entries.length > 1) {
+    ring.bytes -= ring.entries.shift()!.chunk.length;
+  }
+}
+
 function setUnicolor(enabled: boolean): void {
   if (unicolor === enabled) {
     return;
@@ -548,7 +574,16 @@ class SessionTerminal {
     this.stateEl = must<HTMLSpanElement>(`[data-session-state="${sessionId}"]`);
     this.activityEl = must<HTMLSpanElement>(`[data-session-activity="${sessionId}"]`);
     this.terminal = new Terminal({
-      convertEol: true,
+      // NEVER convertEol on a ConPTY-fed pane. A bare LF in a VT stream means
+      // "down one row, SAME column", and the real ConPTY emits them (with CUF
+      // and ECH — the legacy winpty dialect doesn't, which is why offline
+      // captures couldn't reproduce). Rewriting LF to CR+LF throws the cursor
+      // to column 0, the next run of text paints at the left edge, and
+      // ConPTY's later diffs — addressed to where IT put the text — repaint
+      // columns 5+ and can never heal columns 0-4: the Grok left-strip
+      // ghosts (2026-08-30, tap-replayed byte-for-byte: convertEol true →
+      // 8 ghost rows, false → 0).
+      convertEol: false,
       cursorBlink: true,
       fontFamily: '"JetBrains Mono", "Cascadia Code", Consolas, monospace',
       fontSize: 13,
@@ -626,6 +661,9 @@ class SessionTerminal {
   }
 
   write(chunk: string): void {
+    if (paneByteTapEnabled) {
+      recordPaneTap(this.sessionId, chunk, this.terminal.cols, this.terminal.rows);
+    }
     this.initialBanner.forwardOutput(unicolor ? this.colourFilter.apply(chunk) : chunk);
   }
 
@@ -655,7 +693,16 @@ class SessionTerminal {
       on resize like the other harnesses — no per-driver pinning needed. */
   applyGrid(cols: number, rows: number): void {
     if (this.terminal.cols !== cols || this.terminal.rows !== rows) {
+      const before = `${this.terminal.cols}×${this.terminal.rows}`;
       this.terminal.resize(cols, rows);
+      if (this.snapshot?.running) {
+        // Mid-run size changes are when paint-divergence bugs surface; keep
+        // a receipt of what resized and when.
+        writeSystem(
+          "info",
+          `pane grid resized ${before} → ${cols}×${rows} (${this.label})`,
+        );
+      }
     }
     if (this.snapshot?.running) {
       if (this.pendingRepaintResync && rows > 1) {
