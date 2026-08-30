@@ -167,6 +167,8 @@ export interface CreateSessionRequest {
   driver: DriverKind;
   permission_profile: PermissionProfile;
   linux_working_directory?: string | null;
+  /** Born already a member of this room ("+" inside a room). */
+  room_id?: string | null;
 }
 
 export interface RenameSessionRequest {

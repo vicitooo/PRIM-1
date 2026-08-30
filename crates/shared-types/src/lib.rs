@@ -513,6 +513,10 @@ pub struct CreateSessionRequest {
     pub permission_profile: PermissionProfile,
     #[serde(default)]
     pub linux_working_directory: Option<String>,
+    /// Born already a member of this room ("+" inside a room). An unknown or
+    /// full room fails the request before any session is created.
+    #[serde(default)]
+    pub room_id: Option<RoomId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -886,6 +890,8 @@ mod tests {
             run_event_sequence: 4,
             process_id: Some(1234),
             running: true,
+            resume_available: false,
+            was_running_at_shutdown: false,
             last_activity_at: Some("2026-08-10T00:00:00Z".into()),
             last_error: None,
         }

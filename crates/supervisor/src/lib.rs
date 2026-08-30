@@ -5418,6 +5418,19 @@ impl SupervisorHandle {
                 request.driver
             ));
         }
+        if let Some(room_id) = request.room_id {
+            // Fail before any side effect when the target room cannot take the
+            // newborn: a bad room id must create nothing.
+            let rooms = self.inner.rooms.lock();
+            let room = rooms
+                .get(room_id)
+                .ok_or_else(|| anyhow!("unknown room id '{room_id}'"))?;
+            if room.definition.member_ids.len() >= ROOM_MEMBER_MAX_COUNT {
+                return Err(anyhow!(
+                    "room '{room_id}' has reached the {ROOM_MEMBER_MAX_COUNT} member limit"
+                ));
+            }
+        }
 
         let workspace_preference = self.inner.catalog.lock().workspace_preference.clone();
         let qualified_directory = if request.driver == DriverKind::Prime {
@@ -5494,6 +5507,21 @@ impl SupervisorHandle {
             session: snapshot.clone(),
             timestamp: now_rfc3339(),
         });
+        if let Some(room_id) = request.room_id {
+            // Pre-validated above; a failure here (the room was deleted or
+            // filled meanwhile) leaves an honest lobby session, never a
+            // rollback of the created definition.
+            self.add_room_member(AddRoomMemberRequest {
+                room_id,
+                session_id: snapshot.session_id,
+            })
+            .map_err(|error| {
+                anyhow!(
+                    "session '{}' was created in the lobby, but joining the room failed: {error}",
+                    snapshot.label
+                )
+            })?;
+        }
         Ok(snapshot)
     }
 
@@ -12157,6 +12185,7 @@ mod tests {
         );
         supervisor
             .create_session(shared_types::CreateSessionRequest {
+                room_id: None,
                 label: Some("claude".into()),
                 driver: DriverKind::Claude,
                 permission_profile: shared_types::PermissionProfile::Normal,
@@ -12165,6 +12194,7 @@ mod tests {
             .expect("create Claude test session");
         supervisor
             .create_session(shared_types::CreateSessionRequest {
+                room_id: None,
                 label: Some("codex".into()),
                 driver: DriverKind::Codex,
                 permission_profile: shared_types::PermissionProfile::Normal,
@@ -12181,6 +12211,7 @@ mod tests {
     ) -> SessionSnapshot {
         supervisor
             .create_session(shared_types::CreateSessionRequest {
+                room_id: None,
                 label: Some(label.into()),
                 driver,
                 permission_profile,
@@ -21959,6 +21990,7 @@ mod tests {
 
         let session = supervisor
             .create_session(shared_types::CreateSessionRequest {
+                room_id: None,
                 label: None,
                 driver: DriverKind::Grok,
                 permission_profile: shared_types::PermissionProfile::Normal,
@@ -22218,6 +22250,7 @@ mod tests {
 
         let error = supervisor
             .create_session(shared_types::CreateSessionRequest {
+                room_id: None,
                 label: Some("Must reselect".into()),
                 driver: DriverKind::Claude,
                 permission_profile: shared_types::PermissionProfile::Normal,
@@ -22700,6 +22733,67 @@ mod tests {
             refused.message
         );
         assert!(claude_inputs.lock().is_empty());
+    }
+
+    #[test]
+    fn create_session_into_a_room_joins_on_birth_and_unknown_rooms_create_nothing() {
+        let supervisor = test_supervisor();
+        let room = supervisor
+            .create_room(CreateRoomRequest {
+                brief_on_join: false,
+                brief_template: None,
+                label: Some("Nest".into()),
+                member_ids: Vec::new(),
+            })
+            .unwrap();
+
+        let created = supervisor
+            .create_session(shared_types::CreateSessionRequest {
+                room_id: Some(room.room_id),
+                label: Some("hatchling".into()),
+                driver: DriverKind::Claude,
+                permission_profile: shared_types::PermissionProfile::Normal,
+                linux_working_directory: None,
+            })
+            .unwrap();
+        let page = supervisor
+            .read_room_feed(ReadRoomFeedRequest {
+                room_id: room.room_id,
+                cursor: None,
+            })
+            .unwrap();
+        assert!(
+            page.members
+                .iter()
+                .any(|member| member.session_id == created.session_id),
+            "the newborn is a member of its birth room"
+        );
+        assert!(page.events.iter().any(|event| matches!(
+            &event.item,
+            RoomFeedItem::Membership {
+                action: RoomMembershipAction::Joined,
+                session_id,
+                ..
+            } if *session_id == created.session_id
+        )));
+
+        let sessions_before = supervisor.snapshot().sessions.len();
+        let error = supervisor
+            .create_session(shared_types::CreateSessionRequest {
+                room_id: Some(Uuid::new_v4()),
+                label: Some("orphan".into()),
+                driver: DriverKind::Claude,
+                permission_profile: shared_types::PermissionProfile::Normal,
+                linux_working_directory: None,
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown room id"), "got: {error}");
+        assert_eq!(
+            supervisor.snapshot().sessions.len(),
+            sessions_before,
+            "an unknown room creates no session at all"
+        );
     }
 
     #[test]
@@ -24459,6 +24553,7 @@ mod tests {
 
         let created = supervisor
             .create_session(shared_types::CreateSessionRequest {
+                room_id: None,
                 label: Some("Prime & echo pwned".into()),
                 driver: DriverKind::Prime,
                 permission_profile: shared_types::PermissionProfile::Normal,
@@ -24530,6 +24625,7 @@ mod tests {
         assert!(
             supervisor
                 .create_session(shared_types::CreateSessionRequest {
+                    room_id: None,
                     label: None,
                     driver: DriverKind::Prime,
                     permission_profile: shared_types::PermissionProfile::Unsafe,
@@ -24540,6 +24636,7 @@ mod tests {
         assert!(
             supervisor
                 .create_session(shared_types::CreateSessionRequest {
+                    room_id: None,
                     label: None,
                     driver: DriverKind::Claude,
                     permission_profile: shared_types::PermissionProfile::Normal,
@@ -24564,6 +24661,7 @@ mod tests {
 
         let prime = supervisor
             .create_session(shared_types::CreateSessionRequest {
+                room_id: None,
                 label: Some("Route denied".into()),
                 driver: DriverKind::Prime,
                 permission_profile: shared_types::PermissionProfile::Normal,
@@ -24598,6 +24696,7 @@ mod tests {
         let before = slots_mutation_probe(&supervisor);
         let error = supervisor
             .create_session(shared_types::CreateSessionRequest {
+                room_id: None,
                 label: Some("Prime qualified".into()),
                 driver: DriverKind::Prime,
                 permission_profile: shared_types::PermissionProfile::Normal,
@@ -24610,6 +24709,7 @@ mod tests {
         control.fail_reconciliation.store(false, Ordering::Release);
         let session = supervisor
             .create_session(shared_types::CreateSessionRequest {
+                room_id: None,
                 label: Some("Prime qualified".into()),
                 driver: DriverKind::Prime,
                 permission_profile: shared_types::PermissionProfile::Normal,
@@ -24673,6 +24773,7 @@ mod tests {
         supervisor.set_wsl_control_for_tests(control.clone());
         let session = supervisor
             .create_session(shared_types::CreateSessionRequest {
+                room_id: None,
                 label: Some("Prime concurrent start".into()),
                 driver: DriverKind::Prime,
                 permission_profile: shared_types::PermissionProfile::Normal,
@@ -24933,6 +25034,7 @@ mod tests {
         let home = control.default_working_directory().unwrap();
         let session = supervisor
             .create_session(shared_types::CreateSessionRequest {
+                room_id: None,
                 label: Some("Prime missing scope".into()),
                 driver: DriverKind::Prime,
                 permission_profile: shared_types::PermissionProfile::Normal,
@@ -24983,6 +25085,7 @@ mod tests {
 
         let session = supervisor
             .create_session(shared_types::CreateSessionRequest {
+                room_id: None,
                 label: Some("Prime integration".into()),
                 driver: DriverKind::Prime,
                 permission_profile: shared_types::PermissionProfile::Normal,
