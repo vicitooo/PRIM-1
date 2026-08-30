@@ -2954,3 +2954,10 @@ textarea:focus-visible {
   clip-path: none;
   font-size: 9px;
 }
+
+.room-member-choices-empty {
+  margin: 0;
+  padding: 0.4rem 0.2rem;
+  color: var(--text-secondary);
+  font-size: 11px;
+}

@@ -2268,9 +2268,20 @@ function buildMemberChip(sessionId: string): HTMLElement {
 
 function renderRoomUi(): void {
   const selected = activeRoom();
-  roomPanelTitle.textContent = selected ? selected.label : "Rooms";
-  roomEmpty.hidden = selected !== null || !roomCreateForm.hidden;
-  roomContent.hidden = selected === null || !roomCreateForm.hidden;
+  const creating = !roomCreateForm.hidden;
+  // While the create form is open the panel is about the room being born —
+  // never the standing room. Its title must not lie, and rename/delete
+  // (which target the standing room) have no business being reachable.
+  roomPanelTitle.textContent = creating
+    ? "Creating new room"
+    : selected
+      ? selected.label
+      : "Rooms";
+  newRoomButton.hidden = creating;
+  renameRoomButton.hidden = creating;
+  deleteRoomButton.hidden = creating;
+  roomEmpty.hidden = selected !== null || creating;
+  roomContent.hidden = selected === null || creating;
   const roomIndex = selected
     ? roomSnapshots.findIndex((room) => room.room_id === selected.room_id)
     : -1;
@@ -3932,18 +3943,31 @@ function openRoomCreateForm(): void {
     });
   }
   roomMemberChoices.replaceChildren();
-  for (const session of snapshotById.values()) {
-    const occupied = roomSnapshots.some((room) => room.member_ids.includes(session.session_id));
-    const label = document.createElement("label");
-    label.className = "room-member-choice";
-    const checkbox = document.createElement("input");
-    checkbox.type = "checkbox";
-    checkbox.value = session.session_id;
-    checkbox.disabled = occupied;
-    const text = document.createElement("span");
-    text.textContent = `${session.label} · ${driverLabel(session.driver)} · ${shortSessionId(session.session_id)}${occupied ? " · already in a room" : ""}`;
-    label.append(checkbox, text);
-    roomMemberChoices.append(label);
+  // Only sessions that can actually join: membership is exclusive, so a
+  // harness already in a room is not a choice here (Victor, 2026-08-30).
+  const available = [...snapshotById.values()].filter(
+    (session) => sessionRoomIdPure(roomSnapshots, session.session_id) === null,
+  );
+  if (available.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "room-member-choices-empty";
+    empty.textContent =
+      "No available sessions — the lobby is empty and every harness is already "
+      + 'in a room. An empty room is fine: create it, and "+" spawns members '
+      + "straight into it.";
+    roomMemberChoices.append(empty);
+  } else {
+    for (const session of available) {
+      const label = document.createElement("label");
+      label.className = "room-member-choice";
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.value = session.session_id;
+      const text = document.createElement("span");
+      text.textContent = `${session.label} · ${driverLabel(session.driver)} · ${shortSessionId(session.session_id)}`;
+      label.append(checkbox, text);
+      roomMemberChoices.append(label);
+    }
   }
   renderRoomUi();
   roomLabelInput.focus();
