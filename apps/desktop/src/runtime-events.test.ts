@@ -735,18 +735,24 @@ describe("run-event provenance gate", () => {
     expect(ctx.snapshotById.get(SESSION_A)?.run_event_sequence).toBe(3);
   });
 
-  it("allows only session_state to establish a higher-generation run", () => {
+  it("adopts a higher-generation run from content, and its late state still lands", () => {
+    // Contract change 2026-08-30: a newer run's output arriving before its
+    // `starting` state is ADOPTED, never swallowed — the pty reader can win
+    // the emit race against the spawner, and what it carries is a resumed
+    // harness's transcript replay (the head of the conversation on screen).
     const ctx = makeContext();
     ctx.writeToPane.mockReturnValue(true);
     ctx.snapshotById.set(SESSION_A, sessionSnapshot());
 
     handleRuntimeEvent(
-      sessionOutput(1, "future output", {
+      sessionOutput(2, "future output", {
         run_id: RUN_B,
         generation: 8,
       }),
       ctx,
     );
+    expect(ctx.writeToPane).toHaveBeenCalledWith(SESSION_A, "future output");
+
     handleRuntimeEvent(
       {
         event: "session_state",
@@ -758,15 +764,26 @@ describe("run-event provenance gate", () => {
       },
       ctx,
     );
-
-    expect(ctx.writeToPane).not.toHaveBeenCalled();
     expect(ctx.snapshotById.get(SESSION_A)).toMatchObject({
       lifecycle_state: "starting",
       generation: 8,
       run_id: RUN_B,
-      run_event_sequence: 1,
     });
-    expect(ctx.applyPaneSnapshot).toHaveBeenCalledOnce();
+
+    // A bare session_exit from a yet-unseen even-newer run still waits for
+    // its state: exits carry no renderable content to lose.
+    handleRuntimeEvent(
+      {
+        event: "session_exit",
+        identity: runIdentity(1, { run_id: RUN_C, generation: 9 }),
+        session: "codex",
+        exit_code: 0,
+        reason: "clean_exit",
+        timestamp: "2026-08-10T00:00:02Z",
+      } as unknown as RuntimeEvent,
+      ctx,
+    );
+    expect(ctx.snapshotById.get(SESSION_A)?.generation).toBe(8);
   });
 
   it("rejects a snapshot that would move the current run cursor backward", () => {
@@ -1451,5 +1468,103 @@ describe("pending pane-output buffer", () => {
     const after = [...ctx.pendingOutput.values()][0];
     expect(after.chunks).toEqual(["fresh tail after shed"]);
     expect(after.shed).toBe(1);
+  });
+});
+
+describe("newer-run content adoption (resume replay must never be swallowed)", () => {
+  it("adopts a newer generation from output arriving before its starting state", () => {
+    const ctx = makeContext();
+    // Boot snapshot: not running, generation 0, no run — the catalog shape.
+    ctx.snapshotById.set(
+      SESSION_A,
+      sessionSnapshot({
+        generation: 0,
+        run_id: null,
+        run_event_sequence: 0,
+        running: false,
+        lifecycle_state: "closed",
+      }),
+    );
+    ctx.writeToPane.mockReturnValue(true);
+
+    // The resume replay wins the emit race: output first, state second.
+    handleRuntimeEvent(
+      sessionOutput(2, "REPLAYED TRANSCRIPT", { generation: 1, run_id: RUN_B }),
+      ctx,
+    );
+    expect(ctx.writeToPane).toHaveBeenCalledWith(SESSION_A, "REPLAYED TRANSCRIPT");
+    expect(
+      ctx.writeSystem.mock.calls.some(
+        (call: unknown[]) => String(call[1]).includes("adopted from terminal output"),
+      ),
+    ).toBe(true);
+
+    // The late starting state still lands and advances lifecycle.
+    handleRuntimeEvent(
+      {
+        event: "session_state",
+        identity: runIdentity(1, { generation: 1, run_id: RUN_B }),
+        session: "codex",
+        state: "starting",
+        reason: "launch requested",
+        timestamp: "2026-08-10T00:00:01Z",
+      } as RuntimeEvent,
+      ctx,
+    );
+    expect(ctx.snapshotById.get(SESSION_A)?.lifecycle_state).toBe("starting");
+
+    // Later output of the adopted run flows normally.
+    handleRuntimeEvent(
+      sessionOutput(3, "MORE", { generation: 1, run_id: RUN_B }),
+      ctx,
+    );
+    expect(ctx.writeToPane).toHaveBeenCalledWith(SESSION_A, "MORE");
+  });
+
+  it("still rejects stale output from an older generation after adoption", () => {
+    const ctx = makeContext();
+    ctx.snapshotById.set(
+      SESSION_A,
+      sessionSnapshot({
+        generation: 0,
+        run_id: null,
+        run_event_sequence: 0,
+        running: false,
+        lifecycle_state: "closed",
+      }),
+    );
+    ctx.writeToPane.mockReturnValue(true);
+    handleRuntimeEvent(
+      sessionOutput(2, "NEW RUN", { generation: 2, run_id: RUN_C }),
+      ctx,
+    );
+    ctx.writeToPane.mockClear();
+
+    // A straggler from a lower generation with no retired cursor: dropped.
+    handleRuntimeEvent(
+      sessionOutput(9, "STALE", { generation: 1, run_id: RUN_B }),
+      ctx,
+    );
+    expect(ctx.writeToPane).not.toHaveBeenCalledWith(SESSION_A, "STALE");
+  });
+});
+
+describe("ui_output_gap heal", () => {
+  it("forces a repaint resync for the shed session", () => {
+    const ctx = makeContext();
+    const requestRepaintResync = vi.fn();
+    ctx.requestRepaintResync = requestRepaintResync;
+
+    handleRuntimeEvent(
+      {
+        event: "ui_output_gap",
+        identity: runIdentity(5),
+        session: "codex",
+        dropped_events: 3,
+        timestamp: "2026-08-10T00:00:00Z",
+      } as RuntimeEvent,
+      ctx,
+    );
+    expect(requestRepaintResync).toHaveBeenCalledWith(SESSION_A);
   });
 });

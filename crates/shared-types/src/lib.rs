@@ -779,6 +779,15 @@ pub enum RuntimeEvent {
         message: String,
         timestamp: String,
     },
+    /// The bounded UI bridge shed display events for this run. The renderer
+    /// uses this to force a full harness repaint — a diff-painting TUI never
+    /// heals dropped bytes on its own.
+    UiOutputGap {
+        identity: RunEventIdentity,
+        session: String,
+        dropped_events: u64,
+        timestamp: String,
+    },
     ControlPlaneReady {
         endpoint: String,
         transport: String,

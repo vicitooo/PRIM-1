@@ -750,6 +750,22 @@ class SessionTerminal {
     this.pendingRepaintResync = true;
   }
 
+  /** Immediate heal for a live pane that lost display bytes upstream (UI
+      bridge shed): wiggle the PTY rows now so ConPTY and the harness repaint
+      the whole screen. Defers to the next live grid apply when not running. */
+  forceFullRepaintResyncNow(): void {
+    const cols = this.terminal.cols;
+    const rows = this.terminal.rows;
+    if (this.snapshot?.running && rows > 1) {
+      this.pendingRepaintResync = false;
+      void resizeSession(this.sessionId, cols, rows - 1).then(() =>
+        resizeSession(this.sessionId, cols, rows),
+      );
+      return;
+    }
+    this.pendingRepaintResync = true;
+  }
+
   dispose(): void {
     this.terminal.dispose();
   }
@@ -1744,6 +1760,17 @@ const runtimeEventContext: RuntimeEventContext = {
   },
   handleRoomEvent(event) {
     handleRoomRuntimeEvent(event);
+  },
+  requestRepaintResync(sessionId) {
+    const pane = paneMap.get(sessionId);
+    if (!pane) {
+      return;
+    }
+    pane.forceFullRepaintResyncNow();
+    writeSystem(
+      "warn",
+      `display gap heal: forcing ${pane.label} to repaint the full screen`,
+    );
   },
 };
 

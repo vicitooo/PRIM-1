@@ -293,6 +293,13 @@ export type RuntimeEvent =
       timestamp: string;
     }
   | {
+      event: "ui_output_gap";
+      identity: RunEventIdentity;
+      session: string;
+      dropped_events: number;
+      timestamp: string;
+    }
+  | {
       event: "session_state";
       identity: RunEventIdentity;
       session: string;

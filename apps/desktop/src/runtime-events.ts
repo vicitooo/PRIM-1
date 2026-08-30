@@ -46,6 +46,10 @@ export interface RunEventGateState {
   retiredGenerationFloorBySessionId: Map<string, number>;
   retiredCursorEvictions: number;
   reportedRetiredCursorEvictions: number;
+  /** Newer-generation runs adopted from a content event because their
+      `starting` state had not arrived yet (upstream emit race). */
+  contentAdoptions: number;
+  reportedContentAdoptions: number;
 }
 
 interface RunEventCursor {
@@ -71,6 +75,9 @@ export interface RuntimeEventContext {
   applyPaneSnapshot: (sessionId: string, snapshot: SessionSnapshot) => void;
   setControlEndpoint: (endpoint: string) => void;
   handleRoomEvent?: (event: RoomRuntimeEvent) => void;
+  /** The UI bridge shed display bytes for this session: force a full
+      harness repaint so the diff-painted terminal heals. */
+  requestRepaintResync?: (sessionId: string) => void;
 }
 
 export type RoomRuntimeEvent = Extract<
@@ -108,6 +115,8 @@ export function createRunEventGateState(): RunEventGateState {
     retiredGenerationFloorBySessionId: new Map(),
     retiredCursorEvictions: 0,
     reportedRetiredCursorEvictions: 0,
+    contentAdoptions: 0,
+    reportedContentAdoptions: 0,
   };
 }
 
@@ -435,7 +444,33 @@ function acceptRunDerivedEvent(
       }
     }
   } else if (event.event !== "session_state") {
-    return false;
+    if (!isContentEvent(event)) {
+      // A newer run's exit before any of its content or state: wait for the
+      // state event to establish the run.
+      return false;
+    }
+    // A newer run's CONTENT arrived before its `starting` state — the pty
+    // reader thread won the emit race against the spawner. The identity on
+    // the event is supervisor-authoritative and complete, so adopt the new
+    // run instead of silently discarding its first paint: a resumed
+    // harness's transcript replay lands exactly here when the race hits,
+    // and a diff-painting TUI never repaints what the gate swallowed.
+    const adoptedSnapshot: SessionSnapshot = {
+      ...current,
+      generation: event.identity.generation,
+      run_id: event.identity.run_id,
+      run_event_sequence: event.identity.sequence,
+    };
+    rotateRunCursorToRetired(current, adoptedSnapshot, gate);
+    gate.cursorBySessionId.set(current.session_id, {
+      runId: event.identity.run_id,
+      generation: event.identity.generation,
+      lastContentSequence: event.identity.sequence,
+      lastLifecycleSequence: 0,
+      terminal: false,
+      contentHighWater: null,
+    });
+    gate.contentAdoptions += 1;
   } else {
     const nextSnapshot: SessionSnapshot = {
       ...current,
@@ -581,6 +616,19 @@ export function flushRunEventGateWarnings(ctx: RuntimeEventContext): void {
   );
 }
 
+function flushContentAdoptionWarnings(ctx: RuntimeEventContext): void {
+  const gate = ctx.runEventGate;
+  const unreported = gate.contentAdoptions - gate.reportedContentAdoptions;
+  if (unreported <= 0) {
+    return;
+  }
+  gate.reportedContentAdoptions = gate.contentAdoptions;
+  ctx.writeSystem(
+    "warn",
+    `run-event gate: ${unreported} new run${unreported === 1 ? "" : "s"} adopted from terminal output before the starting state arrived (upstream emit race); no output was lost`,
+  );
+}
+
 export function handleRuntimeEvent(
   event: RuntimeEvent,
   ctx: RuntimeEventContext,
@@ -596,6 +644,7 @@ export function handleRuntimeEvent(
       ctx.runEventGate,
     );
     flushRunEventGateWarnings(ctx);
+    flushContentAdoptionWarnings(ctx);
     if (!accepted) {
       return;
     }
@@ -631,6 +680,12 @@ export function handleRuntimeEvent(
           `session_output buffer overflow: ${event.session} shed the entire buffered stream (${entry.shed}×); full repaint scheduled on attach`,
         );
       }
+      break;
+    }
+    case "ui_output_gap": {
+      // The bounded UI bridge shed display events for this run; the harness
+      // will never repaint dropped bytes on its own — force a full repaint.
+      ctx.requestRepaintResync?.(event.identity.session_id);
       break;
     }
     case "session_state": {

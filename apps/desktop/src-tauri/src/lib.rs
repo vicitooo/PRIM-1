@@ -1467,6 +1467,18 @@ fn emit_ui_output_gaps(
             diagnostics.log("warn", "ui_output_bridge_gap", message.clone());
         }
         emit_runtime_event(app, diagnostics, event);
+        // Structured companion: lets the renderer heal the pane (full-repaint
+        // resync) instead of leaving a diff-painted terminal truncated.
+        emit_runtime_event(
+            app,
+            diagnostics,
+            shared_types::RuntimeEvent::UiOutputGap {
+                identity: gap.identity,
+                session: gap.session.clone(),
+                dropped_events: gap.dropped_events,
+                timestamp: shared_types::now_rfc3339(),
+            },
+        );
     }
 }
 
