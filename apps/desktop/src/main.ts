@@ -962,9 +962,11 @@ let activeRoomId: string | null = null;
    a room never stops its agents. On boot only the restored context's sessions
    relaunch; each other room spends its owed resumes on first entry. */
 const WORK_CONTEXT_KEY = "prim1-work-context";
-let workContext: WorkContext = parseWorkContext(
-  localStorage.getItem(WORK_CONTEXT_KEY),
-);
+const storedWorkContextRaw = localStorage.getItem(WORK_CONTEXT_KEY);
+let workContext: WorkContext = parseWorkContext(storedWorkContextRaw);
+/** False only until a context has ever been chosen on this origin — gates the
+    one-shot first-boot default below. */
+let workContextWasStored = storedWorkContextRaw !== null;
 let roomsViewMode: "overview" | "panel" = "overview";
 /** Remembered active tab per context, so re-entering lands where you left. */
 const lastActiveByContext = new Map<string, string>();
@@ -1793,6 +1795,18 @@ function maybeResumeWorkspace(): void {
     if (session.was_running_at_shutdown && !session.running) {
       resumeOwed.add(session.session_id);
     }
+  }
+  if (
+    !workContextWasStored
+    && visibleTabOrder().length === 0
+    && roomSnapshots.length > 0
+  ) {
+    // First boot on the rooms shell with every session already in a room:
+    // land in the first room, not an empty lobby. enterWorkContext persists
+    // the choice and spends that room's owed resumes.
+    workContextWasStored = true;
+    enterWorkContext({ kind: "room", roomId: roomSnapshots[0].room_id });
+    return;
   }
   spendOwedResumes();
 }
