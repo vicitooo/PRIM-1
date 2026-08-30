@@ -5798,10 +5798,9 @@ impl SupervisorHandle {
     pub fn create_room(&self, mut request: CreateRoomRequest) -> Result<RoomSnapshot> {
         self.ensure_active()?;
         let brief_template = normalize_room_brief_template(request.brief_template.take())?;
+        // Any member count from zero up is a legal room: an empty room is a
+        // workspace set up before its team arrives (Rooms B1, 2026-08-30).
         let mut unique_members = HashSet::new();
-        if request.member_ids.len() < 2 {
-            return Err(anyhow!("room creation requires at least two sessions"));
-        }
         if request.member_ids.len() > ROOM_MEMBER_MAX_COUNT {
             return Err(anyhow!(
                 "room creation cannot exceed {ROOM_MEMBER_MAX_COUNT} sessions"
@@ -6171,9 +6170,9 @@ impl SupervisorHandle {
             let room = rooms
                 .get(request.room_id)
                 .ok_or_else(|| anyhow!("unknown room id '{}'", request.room_id))?;
-            if room.definition.member_ids.len() < 2 {
+            if room.definition.member_ids.is_empty() {
                 return Err(anyhow!(
-                    "room '{}' is dormant; room delivery requires at least two members",
+                    "room '{}' has no members; add a member before sending",
                     request.room_id
                 ));
             }
@@ -8998,11 +8997,8 @@ impl SupervisorHandle {
             let room = rooms
                 .get(room_id)
                 .expect("validated pane room disappeared while room state was locked");
-            if room.definition.member_ids.len() < 2 {
-                return Err(anyhow!(
-                    "room '{room_id}' is dormant; room delivery requires at least two members"
-                ));
-            }
+            // No member-count gate here: `resolve_pane_delivery_recipients`
+            // names the exact reason when a solo pane has no one to reach.
             let recipient_ids =
                 Self::resolve_pane_delivery_recipients(room, &slots, caller.session_id, recipient)?;
             let sender_label = slots
@@ -22609,6 +22605,101 @@ mod tests {
         let audit = fs::read_to_string(supervisor.audit_log_path()).unwrap();
         assert!(!audit.contains(sentinel));
         assert!(audit.contains("[content omitted]"));
+    }
+
+    #[test]
+    fn empty_and_single_member_rooms_are_legal_and_solo_send_delivers() {
+        let supervisor = test_supervisor();
+        // An empty room is a workspace set up before its team arrives.
+        let empty = supervisor
+            .create_room(CreateRoomRequest {
+                brief_on_join: true,
+                brief_template: None,
+                label: Some("Set up first".into()),
+                member_ids: Vec::new(),
+            })
+            .unwrap();
+        assert!(empty.member_ids.is_empty());
+        let refusal = supervisor
+            .deliver_room_message(DeliverRoomMessageRequest {
+                room_id: empty.room_id,
+                recipients: RoomRecipientSelection::All {},
+                content: "anyone home?".into(),
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refusal.contains("has no members"),
+            "an empty room refuses delivery with the plain reason, got: {refusal}"
+        );
+
+        // A single-member room is a team of one: operator Send reaches it.
+        let (claude_pty, claude_inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            claude_pty,
+        );
+        let solo = supervisor
+            .create_room(CreateRoomRequest {
+                brief_on_join: false,
+                brief_template: None,
+                label: Some("Solo".into()),
+                member_ids: vec![test_session_id(&supervisor, "claude")],
+            })
+            .unwrap();
+        let result = supervisor
+            .deliver_room_message(DeliverRoomMessageRequest {
+                room_id: solo.room_id,
+                recipients: RoomRecipientSelection::All {},
+                content: "solo delivery".into(),
+            })
+            .unwrap();
+        assert_eq!(result.recipient_count, 1);
+        assert_eq!(result.written_count, 1);
+        assert!(result.failures.is_empty());
+        assert!(!claude_inputs.lock().is_empty());
+    }
+
+    #[test]
+    fn solo_pane_room_deliver_names_the_missing_audience() {
+        let supervisor = test_supervisor();
+        let live_pid = std::process::id();
+        let (claude_pty, claude_inputs) = recording_pty_session(live_pid);
+        install_mock_running_session_with_process_id_and_bracketed_paste_enabled(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            Some(live_pid),
+            claude_pty,
+        );
+        supervisor
+            .create_room(CreateRoomRequest {
+                brief_on_join: false,
+                brief_template: None,
+                label: Some("Solo pane".into()),
+                member_ids: vec![test_session_id(&supervisor, "claude")],
+            })
+            .unwrap();
+        let caller = supervisor
+            .resolve_pane_caller(TestPaneProcess::new(9001, [live_pid]))
+            .unwrap();
+
+        let refused = supervisor.apply_sideband_request(
+            &caller,
+            SidebandRequest::RoomDeliver {
+                recipient: "all".into(),
+                content: "echo?".into(),
+            },
+        );
+        assert!(!refused.ok);
+        assert!(
+            refused.message.contains("no other members"),
+            "a solo pane's 'all' names the missing audience, got: {}",
+            refused.message
+        );
+        assert!(claude_inputs.lock().is_empty());
     }
 
     #[test]

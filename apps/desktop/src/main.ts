@@ -234,7 +234,7 @@ app.innerHTML = `
         <form id="room-create-form" class="room-create-form" hidden>
           <label><span>Room label <small>optional</small></span><input id="room-label" maxlength="128" autocomplete="off" /></label>
           <fieldset>
-            <legend>Select at least two sessions</legend>
+            <legend>Sessions <small>optional — an empty room is fine; add members any time</small></legend>
             <div id="room-member-choices" class="room-member-choices"></div>
           </fieldset>
           <label class="room-brief-auto" for="room-brief-auto">
@@ -253,7 +253,7 @@ app.innerHTML = `
           </div>
         </form>
         <div id="room-empty" class="room-empty">
-          <p>No rooms yet. Create one from existing sessions; no harness will be started or replaced.</p>
+          <p>No rooms yet. Create one — empty or from existing sessions; no harness will be started or replaced.</p>
         </div>
         <div id="room-content" class="room-content" hidden>
           <div class="room-members-row">
@@ -2022,7 +2022,7 @@ function renderRoomUi(): void {
   renderRoomMembers(selected);
   renderRoomRecipientOptions(selected);
   renderRoomFeed(roomFeedEvents.get(selected.room_id) ?? []);
-  roomSendButton.disabled = selected.member_ids.length < 2;
+  roomSendButton.disabled = selected.member_ids.length < 1;
 }
 
 function renderRoomMembers(room: RoomSnapshot): void {
@@ -2065,7 +2065,9 @@ function renderRoomRecipientOptions(room: RoomSnapshot): void {
   roomRecipient.replaceChildren();
   const all = document.createElement("option");
   all.value = "all";
-  all.textContent = `Send to all ${room.member_ids.length} members`;
+  all.textContent = room.member_ids.length === 1
+    ? "Send to the only member"
+    : `Send to all ${room.member_ids.length} members`;
   roomRecipient.append(all);
   for (const sessionId of room.member_ids) {
     const option = document.createElement("option");
@@ -3662,11 +3664,6 @@ async function createRoomFromForm(): Promise<void> {
   const memberIds = Array.from(
     roomMemberChoices.querySelectorAll<HTMLInputElement>('input[type="checkbox"]:checked'),
   ).map((checkbox) => checkbox.value);
-  if (memberIds.length < 2) {
-    roomCreateError.textContent = "Select at least two sessions.";
-    roomCreateError.hidden = false;
-    return;
-  }
   const label = roomLabelInput.value.trim();
   try {
     const briefText = roomBriefTemplate.value;
@@ -3806,7 +3803,7 @@ async function postActiveRoomMessage(): Promise<void> {
     }
   } finally {
     roomPostButton.disabled = false;
-    roomSendButton.disabled = (activeRoom()?.member_ids.length ?? 0) < 2;
+    roomSendButton.disabled = (activeRoom()?.member_ids.length ?? 0) < 1;
   }
 }
 
@@ -3817,8 +3814,8 @@ async function deliverActiveRoomMessage(): Promise<void> {
     setRoomStatus("Enter a message before sending.", "warn");
     return;
   }
-  if (room.member_ids.length < 2) {
-    setRoomStatus("Room delivery requires at least two members.", "warn");
+  if (room.member_ids.length === 0) {
+    setRoomStatus("This room has no members yet — add one before sending.", "warn");
     return;
   }
   const recipients = roomRecipient.value === "all"
@@ -3859,7 +3856,7 @@ async function deliverActiveRoomMessage(): Promise<void> {
     }
   } finally {
     roomPostButton.disabled = false;
-    roomSendButton.disabled = (activeRoom()?.member_ids.length ?? 0) < 2;
+    roomSendButton.disabled = (activeRoom()?.member_ids.length ?? 0) < 1;
   }
 }
 

@@ -99,8 +99,10 @@ items. UI emission is never a model receipt.
 
 Room membership belongs to the durable session definition, not to one live
 run: closed members remain members, while delivery requires every selected
-recipient to have a compatible live run at whole-message preflight. A dormant
-zero- or one-member room remains visible until explicitly deleted. Every room
+recipient to have a compatible live run at whole-message preflight. Zero- and
+one-member rooms are ordinary workspaces (Rooms B1, 2026-08-30): operator
+delivery needs at least one member — an empty room refuses with the plain
+reason — and a pane's `all` needs at least one other member. Every room
 member can read an addressed message from the shared feed even when only one
 member was selected for PTY delivery. The operator is not a room member, so
 **Send All** means every member in the pinned revision; a pane's `room_deliver`

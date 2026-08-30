@@ -38,7 +38,7 @@ This gives the operator visibility but cannot support harness-to-harness collabo
 - A room and its membership are identified by stable IDs; names grant no authority.
 - Joining begins at the current room-feed cursor. PRIM-1 never imports or replays private terminal history or earlier room messages to the new member.
 - Join and removal append visible system membership events. A newly joined harness receives only the minimal explicit notice needed to discover the room and sideband operation; the notice is not prior conversation.
-- Creation requires at least two members. Removal may leave a stable dormant room with zero or one member; it remains visible but room delivery is disabled until it again has at least two members.
+- Creation accepts any member count from zero up to the member cap (amended 2026-08-30, Rooms B1: rooms are workspaces, and an empty room may be set up before its team arrives). Operator delivery requires at least one member — an empty room refuses with the plain reason — and a pane's `all` requires at least one *other* member.
 - The visible provenance envelope and immutable source content are separate. The source bytes must reconstruct exactly inside any clearly delimited envelope, and the driver submits the complete envelope as one logical harness turn.
 - Direct delivery names explicit sessions. Send All snapshots the room membership revision and recipient set before the first write.
 - Every recipient and its measured input capability is preflighted before delivery begins. Preflight failure writes nothing.
