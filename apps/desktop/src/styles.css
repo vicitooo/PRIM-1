@@ -2762,3 +2762,195 @@ textarea:focus-visible {
 .rooms-view #room-add-member-select { max-width: none; }
 .rooms-view .room-empty { min-height: 200px; }
 .rooms-view .room-create-form { align-content: start; }
+
+/* ═══ Rooms B1: work-context chips, rooms overview, readiness dots ═══ */
+
+.context-chip {
+  flex: 0 0 auto;
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.3rem 0.55rem;
+  border: 1px solid var(--copper-hot);
+  background: var(--bg-panel);
+  color: var(--copper-hot);
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.context-chip:hover:not([disabled]) {
+  background: var(--bg-hover);
+  color: var(--cyan-bright);
+}
+
+.context-chip-name {
+  border-color: var(--frame-soft);
+  color: var(--text-primary);
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.context-chip[disabled] {
+  cursor: default;
+  color: var(--text-secondary);
+}
+
+.rooms-overview {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.rooms-overview-grid {
+  min-height: 0;
+  overflow-y: auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 0.9rem;
+  padding: 0.9rem 0.4rem;
+  align-content: start;
+}
+
+.rooms-overview-card {
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.6rem;
+  padding: 0.85rem 0.95rem;
+  min-height: 96px;
+  border: 1px solid var(--frame-soft);
+  background: var(--bg-panel);
+  color: var(--text-primary);
+  cursor: pointer;
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.rooms-overview-card:hover {
+  border-color: var(--frame);
+  background: var(--bg-hover);
+}
+
+.rooms-overview-card[data-current="true"] {
+  border-color: var(--copper-hot);
+  box-shadow: inset 0 0 0 1px var(--copper-hot);
+}
+
+.rooms-overview-card h3 {
+  margin: 0;
+  font-size: 13px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-primary);
+}
+
+.rooms-overview-members {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.rooms-member-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.25rem 0.45rem;
+  border: 1px solid var(--frame-inner);
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 9px;
+  color: var(--text-secondary);
+}
+
+.rooms-member-driver {
+  color: var(--copper-hot);
+}
+
+.rooms-overview-empty {
+  color: var(--text-tertiary);
+  font-size: 10px;
+}
+
+.rooms-overview-new {
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  color: var(--copper-hot);
+  border-style: dashed;
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.rooms-overview-new-glyph {
+  font-size: 18px;
+  line-height: 1;
+}
+
+.readiness-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border: 1px solid currentColor;
+}
+
+.readiness-dot[data-state="working"] {
+  background: var(--bronze);
+  color: var(--bronze);
+  box-shadow: 0 0 6px var(--bronze-glow);
+}
+
+.readiness-dot[data-state="ready"] {
+  background: var(--copper-hot);
+  color: var(--copper-hot);
+}
+
+.readiness-dot[data-state="starting"] {
+  background: transparent;
+  color: var(--bronze);
+}
+
+.readiness-dot[data-state="blocked"] {
+  background: var(--red);
+  color: var(--red-bright);
+  box-shadow: 0 0 6px rgba(230, 41, 58, 0.5);
+}
+
+.readiness-dot[data-state="off"] {
+  background: transparent;
+  color: var(--text-tertiary);
+}
+
+.rooms-back {
+  flex: 0 0 auto;
+  padding: 0.25rem 0.5rem;
+  font-size: 10px;
+}
+
+/* display:flex on these panels would defeat the UA [hidden] rule */
+.rooms-overview[hidden],
+.room-card[hidden] {
+  display: none;
+}
+
+.room-member-chip > .readiness-dot {
+  padding: 0;
+  margin-left: 0.45rem;
+}
+
+.room-member-brief {
+  min-width: 0;
+  padding: 0.25rem 0.4rem;
+  border-width: 0 0 0 1px;
+  clip-path: none;
+  font-size: 9px;
+}

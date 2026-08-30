@@ -48,10 +48,21 @@ import {
   appendRoomFeedEvent as reconcileRoomFeedEvent,
   retainRoomFeedWindow,
 } from "./room-feed";
+import {
+  contextDisplayLabel,
+  contextKey,
+  parseWorkContext,
+  sessionInContext as sessionInContextPure,
+  sessionReadiness,
+  sessionRoomId as sessionRoomIdPure,
+  visibleSessionOrder,
+  type WorkContext,
+} from "./work-context";
 import "./styles.css";
 import { SgrColourFilter } from "./sgr-filter";
 import type {
   AddRoomMemberRequest,
+  BriefRoomMemberRequest,
   ChooseSessionWorkingDirectoryRequest,
   CreateRoomRequest,
   DeleteRoomRequest,
@@ -127,6 +138,8 @@ app.innerHTML = `
         <span class="topbar-active-tag" id="brand-active-tag" data-tauri-drag-region>Sessions</span>
       </div>
       <nav class="session-tabs-shell" aria-label="Terminal sessions">
+        <button type="button" class="context-chip" id="context-rooms-chip" title="All rooms — pick a room or the lobby">&#8962; Rooms</button>
+        <button type="button" class="context-chip context-chip-name" id="context-name-chip"></button>
         <div class="session-tabs" id="session-tabs" role="tablist" aria-label="Sessions" data-tauri-drag-region></div>
         <button type="button" class="new-session-button" id="new-session-button" aria-haspopup="menu" aria-expanded="false" aria-label="Attach a harness" title="Attach a harness — Ctrl+Shift+T">+</button>
       </nav>
@@ -203,7 +216,7 @@ app.innerHTML = `
 
       <section class="zero-session panel" id="zero-session" hidden>
         <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
-        <p class="card-kicker">No sessions</p>
+        <p class="card-kicker" id="zero-kicker">No sessions</p>
         <h2>Attach a harness</h2>
         <p>Starts in <span id="zero-workspace">the selected workspace</span>.</p>
         <div class="zero-attach-choices" id="zero-attach-choices"></div>
@@ -213,17 +226,29 @@ app.innerHTML = `
       <section class="workspace-grid" id="workspace-grid" aria-live="polite"></section>
     </section>
 
-    <!-- Rooms view: swaps in for the workspace (corner menu → Rooms). Same room DOM + handlers. -->
+    <!-- Rooms view: the overview (one card per room + the lobby; click to enter)
+         or the active room's panel (feed, members, composer — today's in-room UI).
+         The workspace top bar shows only the entered context's sessions. -->
     <section class="rooms-view" id="rooms-view" hidden aria-label="Rooms">
-      <article class="room-card panel" id="room-card">
+      <article class="rooms-overview panel" id="rooms-overview">
         <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
-        <div class="card-head room-card-head">
+        <div class="card-head">
           <div class="card-title">
             <span class="card-icon icon-room" aria-hidden="true"></span>
             <h2>Rooms</h2>
           </div>
+        </div>
+        <div id="rooms-overview-grid" class="rooms-overview-grid"></div>
+      </article>
+      <article class="room-card panel" id="room-card" hidden>
+        <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
+        <div class="card-head room-card-head">
+          <div class="card-title">
+            <span class="card-icon icon-room" aria-hidden="true"></span>
+            <button type="button" class="rooms-back" id="rooms-back" title="Back to all rooms">&larr; All rooms</button>
+            <h2 id="room-panel-title">Rooms</h2>
+          </div>
           <div class="room-toolbar">
-            <select id="room-select" aria-label="Active room"></select>
             <button type="button" id="new-room">New</button>
             <button type="button" class="ghost" id="rename-room">Rename</button>
             <button type="button" class="ghost" id="move-room-left" aria-label="Move room left" hidden>←</button>
@@ -296,7 +321,7 @@ app.innerHTML = `
               <input type="checkbox" id="auto-resume-toggle" />
               <span class="theme-option-text">
                 <span class="theme-option-name">Continue where I left off</span>
-                <span class="theme-option-hint">On open, relaunch every session that was running when PRIM-1 last closed — each harness resumes its previous conversation. Launch always resumes when a conversation is stored; right-click a tab for Start fresh session.</span>
+                <span class="theme-option-hint">On open, relaunch the sessions of the room (or lobby) you were last in — each harness resumes its previous conversation. Another room's sessions resume when you first enter that room. Launch always resumes when a conversation is stored; right-click a tab for Start fresh session.</span>
               </span>
             </label>
           </section>
@@ -885,7 +910,14 @@ function quickAttachDrivers(): DriverKind[] {
   return quickAttachPrefs.order.filter((driver) => !quickAttachPrefs.hidden.includes(driver));
 }
 const zeroWorkspace = must<HTMLElement>("#zero-workspace");
-const roomSelect = must<HTMLSelectElement>("#room-select");
+const zeroKicker = must<HTMLElement>("#zero-kicker");
+const contextRoomsChip = must<HTMLButtonElement>("#context-rooms-chip");
+const contextNameChip = must<HTMLButtonElement>("#context-name-chip");
+const roomsOverviewGrid = must<HTMLDivElement>("#rooms-overview-grid");
+const roomsOverviewCard = must<HTMLElement>("#rooms-overview");
+const roomsBackButton = must<HTMLButtonElement>("#rooms-back");
+const roomPanelTitle = must<HTMLElement>("#room-panel-title");
+const roomCard = must<HTMLElement>("#room-card");
 const newRoomButton = must<HTMLButtonElement>("#new-room");
 const renameRoomButton = must<HTMLButtonElement>("#rename-room");
 const moveRoomLeftButton = must<HTMLButtonElement>("#move-room-left");
@@ -922,6 +954,44 @@ let activeCopySurface: CopySurface = null;
 let workspacePreference = "";
 let roomSnapshots: RoomSnapshot[] = [];
 let activeRoomId: string | null = null;
+
+/* ── Work contexts (Rooms B1) ──
+   The operator stands in the lobby or in one room; the top bar, grid,
+   zero-state and keyboard order show only that context's sessions. Panes of
+   every other context stay mounted and their harnesses keep running — leaving
+   a room never stops its agents. On boot only the restored context's sessions
+   relaunch; each other room spends its owed resumes on first entry. */
+const WORK_CONTEXT_KEY = "prim1-work-context";
+let workContext: WorkContext = parseWorkContext(
+  localStorage.getItem(WORK_CONTEXT_KEY),
+);
+let roomsViewMode: "overview" | "panel" = "overview";
+/** Remembered active tab per context, so re-entering lands where you left. */
+const lastActiveByContext = new Map<string, string>();
+/** Sessions still owed their boot resume; spent on first context entry. */
+const resumeOwed = new Set<string>();
+
+function persistWorkContext(): void {
+  localStorage.setItem(WORK_CONTEXT_KEY, JSON.stringify(workContext));
+}
+
+function sessionInContext(sessionId: string): boolean {
+  return sessionInContextPure(roomSnapshots, sessionId, workContext);
+}
+
+function visibleTabOrder(): string[] {
+  return visibleSessionOrder(tabState.order, roomSnapshots, workContext);
+}
+
+function contextLabel(): string {
+  return contextDisplayLabel(roomSnapshots, workContext);
+}
+
+function currentContextSessions(): SessionSnapshot[] {
+  return tabState.order
+    .map((sessionId) => snapshotById.get(sessionId))
+    .filter((session): session is SessionSnapshot => session !== undefined);
+}
 const roomFeedEvents = new Map<string, RoomFeedEvent[]>();
 const roomFeedCursors = new Map<string, RoomFeedCursor>();
 const queuedRoomFeedEvents = new Map<string, RoomFeedEvent[]>();
@@ -1190,6 +1260,10 @@ function setShellView(view: ShellView): void {
   shellView = view;
   appShell.dataset.view = view;
   roomsView.hidden = view !== "rooms";
+  if (view === "rooms") {
+    roomsOverviewCard.hidden = roomsViewMode !== "overview";
+    roomCard.hidden = roomsViewMode !== "panel";
+  }
   settingsView.hidden = view !== "settings";
   helpView.hidden = view !== "help";
   themesView.hidden = view !== "themes";
@@ -1364,7 +1438,15 @@ function wireCornerButton(): void {
 
 function runCornerAction(kind: string): void {
   switch (kind) {
-    case "rooms":
+    case "rooms": {
+      if (shellView === "rooms") {
+        setShellView("sessions");
+      } else {
+        openRoomsOverview();
+      }
+      setCornerMenuOpen(false);
+      break;
+    }
     case "settings":
     case "help":
     case "themes": {
@@ -1689,9 +1771,13 @@ async function bootstrap(): Promise<void> {
   maybeResumeWorkspace();
 }
 
-/** "Continue where I left off" (Settings, on by default): on app open,
-    relaunch every session that had a live run when the app last went down.
-    Each launch resumes the harness's stored conversation. */
+/** "Continue where I left off" (Settings, on by default): on app open, every
+    session that had a live run when the app last went down becomes an owed
+    resume — but only the restored context's sessions launch NOW. Another
+    room's sessions launch when the operator first enters that room; starting
+    every room at boot is explicitly rejected (Rooms B1 invariant 2). The debt
+    survives restarts on its own: the supervisor sets running_at_shutdown when
+    a run spawns and clears it only on an operator stop. */
 const AUTO_RESUME_KEY = "prim1-auto-resume";
 let workspaceResumeAttempted = false;
 
@@ -1703,26 +1789,12 @@ function maybeResumeWorkspace(): void {
   if (localStorage.getItem(AUTO_RESUME_KEY) === "0") {
     return;
   }
-  const targets = [...snapshotById.values()].filter(
-    (session) => session.was_running_at_shutdown && !session.running,
-  );
-  if (targets.length === 0) {
-    return;
+  for (const session of snapshotById.values()) {
+    if (session.was_running_at_shutdown && !session.running) {
+      resumeOwed.add(session.session_id);
+    }
   }
-  writeSystem(
-    "info",
-    `Continuing where you left off: launching ${targets.map((s) => s.label).join(", ")}.`,
-  );
-  for (const session of targets) {
-    void command<SessionSnapshot>("start_session", {
-      request: { session_id: session.session_id } satisfies StartSessionRequest,
-    }).catch((error) =>
-      writeSystem("error", `Auto-launch ${session.label} failed: ${String(error)}`),
-    );
-  }
-  window.setTimeout(() => {
-    void refreshSnapshot(tabState.activeId ?? undefined).catch(() => {});
-  }, 1800);
+  spendOwedResumes();
 }
 
 /** Tab menu → Start fresh session: a NEW harness conversation, abandoning the
@@ -1770,8 +1842,10 @@ function applySnapshot(snapshot: RuntimeSnapshot, preferredSessionId?: string): 
   flushRunEventGateWarnings(runtimeEventContext);
 
   workspacePreference = snapshot.workspace_preference;
-  syncPaneInventory(snapshot.sessions, preferredSessionId);
+  // Rooms first: the tab bar, grid and zero-state filter by room membership,
+  // so the context must be reconciled before the panes render.
   syncRoomInventory(snapshot.rooms);
+  syncPaneInventory(snapshot.sessions, preferredSessionId);
   syncSessionForm();
   controlEndpoint.textContent = snapshot.control_plane?.endpoint ?? "starting...";
   auditPath.textContent = snapshot.audit_log_path;
@@ -1819,10 +1893,19 @@ function syncRoomInventory(incoming: RoomSnapshot[]): void {
       roomFeedReloadRequired.delete(roomId);
     }
   }
-  if (!activeRoomId || !liveIds.has(activeRoomId)) {
+  if (workContext.kind === "room" && !liveIds.has(workContext.roomId)) {
+    workContext = { kind: "lobby" };
+    persistWorkContext();
+    writeSystem("warn", "The room this workspace was in is gone — back to the lobby.");
+  }
+  if (workContext.kind === "room") {
+    activeRoomId = workContext.roomId;
+  } else if (!activeRoomId || !liveIds.has(activeRoomId)) {
     activeRoomId = incoming[0]?.room_id ?? null;
   }
   discardInactiveRoomFeedState();
+  renderWorkContextChips();
+  renderRoomsOverview();
   renderRoomUi();
   if (activeRoomId) {
     void initializeRoomFeed(activeRoomId);
@@ -1987,29 +2070,196 @@ async function initializeRoomFeed(roomId: string, force = false): Promise<void> 
   }
 }
 
+function renderWorkContextChips(): void {
+  contextNameChip.textContent = contextLabel();
+  contextNameChip.dataset.kind = workContext.kind;
+  if (workContext.kind === "room") {
+    contextNameChip.disabled = false;
+    contextNameChip.title = "Open this room's feed and members";
+  } else {
+    contextNameChip.disabled = true;
+    contextNameChip.title = "Sessions in no room";
+  }
+}
+
+function openRoomsOverview(): void {
+  roomsViewMode = "overview";
+  renderRoomsOverview();
+  setShellView("rooms");
+}
+
+function openRoomPanel(roomId: string): void {
+  activeRoomId = roomId;
+  roomsViewMode = "panel";
+  renderRoomUi();
+  void initializeRoomFeed(roomId);
+  setShellView("rooms");
+}
+
+/** Enter the lobby or a room: the top bar swaps to that context's sessions,
+    the remembered tab (or the first) becomes active, and any resumes the
+    context is still owed from the last shutdown are spent now. */
+function enterWorkContext(context: WorkContext): void {
+  const changed = contextKey(context) !== contextKey(workContext);
+  if (changed && tabState.activeId) {
+    lastActiveByContext.set(contextKey(workContext), tabState.activeId);
+  }
+  workContext = context;
+  persistWorkContext();
+  if (context.kind === "room") {
+    activeRoomId = context.roomId;
+  }
+  renderWorkContextChips();
+  renderSessionTabs(currentContextSessions());
+  const visible = visibleTabOrder();
+  const remembered = lastActiveByContext.get(contextKey(context));
+  setActiveSession(
+    remembered && visible.includes(remembered) ? remembered : visible[0] ?? null,
+    false,
+  );
+  updateZeroSessionState();
+  setShellView("sessions");
+  if (context.kind === "room") {
+    void initializeRoomFeed(context.roomId);
+  }
+  spendOwedResumes();
+  renderRoomsOverview();
+}
+
+/** Launch the current context's sessions that still owe their boot resume.
+    Other contexts' debts stay owed until the operator enters them —
+    starting every room at boot is explicitly rejected (Rooms B1). */
+function spendOwedResumes(): void {
+  if (resumeOwed.size === 0) {
+    return;
+  }
+  const targets: SessionSnapshot[] = [];
+  for (const sessionId of Array.from(resumeOwed)) {
+    const session = snapshotById.get(sessionId);
+    if (!session) {
+      resumeOwed.delete(sessionId);
+      continue;
+    }
+    if (!sessionInContext(sessionId)) {
+      continue;
+    }
+    resumeOwed.delete(sessionId);
+    if (!session.running) {
+      targets.push(session);
+    }
+  }
+  if (targets.length === 0) {
+    return;
+  }
+  writeSystem(
+    "info",
+    `Continuing where you left off in ${contextLabel()}: launching ${targets
+      .map((session) => session.label)
+      .join(", ")}.`,
+  );
+  for (const session of targets) {
+    void command<SessionSnapshot>("start_session", {
+      request: { session_id: session.session_id } satisfies StartSessionRequest,
+    }).catch((error) =>
+      writeSystem("error", `Auto-launch ${session.label} failed: ${String(error)}`),
+    );
+  }
+  window.setTimeout(() => {
+    void refreshSnapshot(tabState.activeId ?? undefined).catch(() => {});
+  }, 1800);
+}
+
+function renderRoomsOverview(): void {
+  const fragment = document.createDocumentFragment();
+  fragment.appendChild(buildContextCard(null));
+  for (const room of roomSnapshots) {
+    fragment.appendChild(buildContextCard(room));
+  }
+  const create = document.createElement("button");
+  create.type = "button";
+  create.className = "rooms-overview-card rooms-overview-new";
+  const glyph = document.createElement("span");
+  glyph.className = "rooms-overview-new-glyph";
+  glyph.textContent = "+";
+  const text = document.createElement("span");
+  text.textContent = "New room";
+  create.append(glyph, text);
+  create.addEventListener("click", () => {
+    roomsViewMode = "panel";
+    setShellView("rooms");
+    openRoomCreateForm();
+  });
+  fragment.appendChild(create);
+  roomsOverviewGrid.replaceChildren(fragment);
+}
+
+function buildContextCard(room: RoomSnapshot | null): HTMLElement {
+  const card = document.createElement("button");
+  card.type = "button";
+  card.className = "rooms-overview-card";
+  const standing =
+    room === null
+      ? workContext.kind === "lobby"
+      : workContext.kind === "room" && workContext.roomId === room.room_id;
+  if (standing) {
+    card.dataset.current = "true";
+  }
+  const name = document.createElement("h3");
+  name.textContent = room === null ? "Lobby" : room.label;
+  const members = document.createElement("div");
+  members.className = "rooms-overview-members";
+  const memberIds =
+    room === null
+      ? tabState.order.filter(
+          (sessionId) => sessionRoomIdPure(roomSnapshots, sessionId) === null,
+        )
+      : room.member_ids;
+  if (memberIds.length === 0) {
+    const empty = document.createElement("span");
+    empty.className = "rooms-overview-empty";
+    empty.textContent =
+      room === null ? "No sessions outside rooms" : "No members yet";
+    members.append(empty);
+  } else {
+    for (const sessionId of memberIds) {
+      members.append(buildMemberChip(sessionId));
+    }
+  }
+  card.append(name, members);
+  card.addEventListener("click", () =>
+    enterWorkContext(
+      room === null ? { kind: "lobby" } : { kind: "room", roomId: room.room_id },
+    ),
+  );
+  return card;
+}
+
+function buildMemberChip(sessionId: string): HTMLElement {
+  const chip = document.createElement("span");
+  chip.className = "rooms-member-chip";
+  const session = snapshotById.get(sessionId);
+  const readiness = sessionReadiness(session, resumeOwed.has(sessionId));
+  const dot = document.createElement("span");
+  dot.className = "readiness-dot";
+  dot.dataset.state = readiness.kind;
+  const tag = document.createElement("span");
+  tag.className = "rooms-member-driver";
+  tag.textContent = session ? driverTag(session.driver) : "";
+  const label = document.createElement("span");
+  label.textContent = session ? session.label : shortSessionId(sessionId);
+  chip.append(dot, tag, label);
+  chip.title = readiness.reason;
+  return chip;
+}
+
 function renderRoomUi(): void {
   const selected = activeRoom();
-  roomSelect.replaceChildren();
-  if (roomSnapshots.length === 0) {
-    const option = document.createElement("option");
-    option.textContent = "No rooms";
-    option.value = "";
-    roomSelect.append(option);
-  } else {
-    for (const room of roomSnapshots) {
-      const option = document.createElement("option");
-      option.value = room.room_id;
-      option.textContent = `${room.label} · ${shortSessionId(room.room_id)}`;
-      roomSelect.append(option);
-    }
-    roomSelect.value = selected?.room_id ?? roomSnapshots[0].room_id;
-  }
+  roomPanelTitle.textContent = selected ? selected.label : "Rooms";
   roomEmpty.hidden = selected !== null || !roomCreateForm.hidden;
   roomContent.hidden = selected === null || !roomCreateForm.hidden;
   const roomIndex = selected
     ? roomSnapshots.findIndex((room) => room.room_id === selected.room_id)
     : -1;
-  roomSelect.disabled = roomSnapshots.length === 0;
   renameRoomButton.disabled = selected === null;
   deleteRoomButton.disabled = selected === null;
   moveRoomLeftButton.disabled = roomIndex <= 0;
@@ -2023,6 +2273,9 @@ function renderRoomUi(): void {
   renderRoomRecipientOptions(selected);
   renderRoomFeed(roomFeedEvents.get(selected.room_id) ?? []);
   roomSendButton.disabled = selected.member_ids.length < 1;
+  roomSendButton.title = roomSendButton.disabled
+    ? "Add a member before sending"
+    : "Type the message into the selected member terminals";
 }
 
 function renderRoomMembers(room: RoomSnapshot): void {
@@ -2030,15 +2283,29 @@ function renderRoomMembers(room: RoomSnapshot): void {
   for (const sessionId of room.member_ids) {
     const chip = document.createElement("span");
     chip.className = "room-member-chip";
+    const readiness = sessionReadiness(
+      snapshotById.get(sessionId),
+      resumeOwed.has(sessionId),
+    );
+    const dot = document.createElement("span");
+    dot.className = "readiness-dot room-member-dot";
+    dot.dataset.state = readiness.kind;
     const label = document.createElement("span");
     label.textContent = `${paneLabel(sessionId)} · ${shortSessionId(sessionId)}`;
+    label.title = readiness.reason;
+    const brief = document.createElement("button");
+    brief.type = "button";
+    brief.className = "room-member-brief";
+    brief.textContent = "Brief";
+    brief.title = `Type the room brief into ${paneLabel(sessionId)}'s terminal now`;
+    brief.addEventListener("click", () => void briefRoomMemberNow(room.room_id, sessionId));
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "room-member-remove";
     remove.textContent = "×";
     remove.title = `Remove ${paneLabel(sessionId)} from ${room.label}`;
     remove.addEventListener("click", () => void removeRoomMember(room.room_id, sessionId));
-    chip.append(label, remove);
+    chip.append(dot, label, brief, remove);
     roomMembers.append(chip);
   }
 
@@ -2299,6 +2566,9 @@ function syncPaneInventory(
   renderSessionTabs(effectiveSessions);
   updateZeroSessionState();
   setActiveSession(tabState.activeId, false);
+  // Rooms sync ran before the panes existed in tabState; re-render the
+  // overview so its member chips reflect this same snapshot.
+  renderRoomsOverview();
   applyTheme(currentThemeName());
   wireButtons();
 }
@@ -2387,6 +2657,9 @@ function renderSessionTabs(sessions: SessionSnapshot[]): void {
     const session = byId.get(sessionId);
     if (!session) {
       continue;
+    }
+    if (!sessionInContext(sessionId)) {
+      continue; // another context's session: running, mounted, just not shown here
     }
     const shell = document.createElement("div");
     shell.className = "session-tab-shell";
@@ -2748,10 +3021,11 @@ function setActiveSession(
   requestedId: string | null,
   focusTerminal: boolean,
 ): void {
+  const visible = visibleTabOrder();
   const activeId =
-    requestedId && tabState.order.includes(requestedId)
+    requestedId && visible.includes(requestedId)
       ? requestedId
-      : tabState.order[0] ?? null;
+      : visible[0] ?? null;
   tabState = { ...tabState, activeId };
 
   for (const tab of sessionTabs.querySelectorAll<HTMLButtonElement>(
@@ -2784,11 +3058,12 @@ function handleFocusedTabKeydown(
   event: KeyboardEvent,
   sessionId: string,
 ): void {
-  const currentIndex = tabState.order.indexOf(sessionId);
+  const visible = visibleTabOrder();
+  const currentIndex = visible.indexOf(sessionId);
   const action = resolveFocusedTabAction(
     shortcutInput(event),
     currentIndex,
-    tabState.order.length,
+    visible.length,
   );
   if (!action) {
     return;
@@ -2798,7 +3073,7 @@ function handleFocusedTabKeydown(
     void moveSession(sessionId, action.delta);
     return;
   }
-  const targetId = tabState.order[action.index];
+  const targetId = visible[action.index];
   if (!targetId) {
     return;
   }
@@ -2811,13 +3086,15 @@ function handleFocusedTabKeydown(
 }
 
 function updateZeroSessionState(): void {
-  const visible = shouldShowZeroSession(
-    tabState.order,
-    sessionFormMode !== null,
-  );
+  const contextIds = visibleTabOrder();
+  const visible = shouldShowZeroSession(contextIds, sessionFormMode !== null);
   zeroSession.hidden = !visible;
+  zeroKicker.textContent =
+    workContext.kind === "room"
+      ? "No sessions in " + contextLabel()
+      : "No sessions";
   // The form owns the whole area while it is open — never a form over a live terminal.
-  const gridHidden = tabState.order.length === 0 || sessionFormMode !== null;
+  const gridHidden = contextIds.length === 0 || sessionFormMode !== null;
   if (workspaceGrid.hidden && !gridHidden) {
     requestAnimationFrame(fitVisiblePanes);
   }
@@ -3050,9 +3327,11 @@ async function quickAttach(driver: DriverKind): Promise<void> {
   setAttachPending(true);
   let created: SessionSnapshot;
   try {
-    created = await command<SessionSnapshot>("create_session", {
-      request: createSessionRequestFromForm("", driver, "normal", ""),
-    });
+    const request = createSessionRequestFromForm("", driver, "normal", "");
+    if (workContext.kind === "room") {
+      request.room_id = workContext.roomId; // born into the room you stand in
+    }
+    created = await command<SessionSnapshot>("create_session", { request });
   } catch (error) {
     setAttachPending(false);
     openCreateSessionForm(driver);
@@ -3327,14 +3606,16 @@ async function submitSessionForm(): Promise<void> {
   if (mode.kind === "create") {
     let created: SessionSnapshot;
     try {
-      created = await command<SessionSnapshot>("create_session", {
-        request: createSessionRequestFromForm(
-          label,
-          driver,
-          permissionProfile,
-          linuxWorkingDirectory,
-        ),
-      });
+      const request = createSessionRequestFromForm(
+        label,
+        driver,
+        permissionProfile,
+        linuxWorkingDirectory,
+      );
+      if (workContext.kind === "room") {
+        request.room_id = workContext.roomId; // born into the room you stand in
+      }
+      created = await command<SessionSnapshot>("create_session", { request });
     } catch (error) {
       sessionFormPending = false;
       setSessionFormError("Create session failed: " + String(error));
@@ -3678,9 +3959,11 @@ async function createRoomFromForm(): Promise<void> {
           briefText.trim() === "" || briefText === defaultRoomBrief ? null : briefText,
       } satisfies CreateRoomRequest,
     });
-    activeRoomId = room.room_id;
     closeRoomCreateForm();
     await refreshSnapshot(tabState.activeId ?? undefined);
+    // A fresh room is where you're headed: enter it (empty is fine — "+"
+    // inside spawns harnesses already in the room).
+    enterWorkContext({ kind: "room", roomId: room.room_id });
   } catch (error) {
     roomCreateError.textContent = `Create room failed: ${String(error)}`;
     roomCreateError.hidden = false;
@@ -3831,9 +4114,13 @@ async function deliverActiveRoomMessage(): Promise<void> {
         content,
       } satisfies DeliverRoomMessageRequest,
     });
+    // Deliver to the deliverable, report the refused — by name, with the reason.
+    const refused = result.failures
+      .map((failure) => `${paneLabel(failure.recipient_id)} (${failure.error.slice(0, 120)})`)
+      .join("; ");
     const resultMessage = result.failures.length === 0
       ? `PTY write completed for ${result.written_count}/${result.recipient_count}; model receipt remains unconfirmed.`
-      : `${result.written_count}/${result.recipient_count} PTY writes completed; ${result.failures.length} failed. See feed details.`;
+      : `${result.written_count}/${result.recipient_count} PTY writes completed; refused: ${refused}. See feed details.`;
     if (activeRoomId === room.room_id) {
       if (roomMessage.value === content) {
         roomMessage.value = "";
@@ -3865,6 +4152,22 @@ function setRoomStatus(message: string, level: "info" | "warn" | "error"): void 
   roomStatus.dataset.level = level;
 }
 
+/** "Brief now": type the canonical room brief into one member's terminal on
+    demand — the same text the join path delivers. */
+async function briefRoomMemberNow(roomId: string, sessionId: string): Promise<void> {
+  try {
+    await command<RoomDeliveryResult>("brief_room_member", {
+      request: {
+        room_id: roomId,
+        session_id: sessionId,
+      } satisfies BriefRoomMemberRequest,
+    });
+    setRoomStatus(`Room brief sent to ${paneLabel(sessionId)}.`, "info");
+  } catch (error) {
+    setRoomStatus(`Brief ${paneLabel(sessionId)} failed: ${String(error)}`, "error");
+  }
+}
+
 function wireRoomUi(): void {
   void loadDefaultRoomBrief();
   newRoomButton.addEventListener("click", openRoomCreateForm);
@@ -3873,14 +4176,13 @@ function wireRoomUi(): void {
     event.preventDefault();
     void createRoomFromForm();
   });
-  roomSelect.addEventListener("change", () => {
-    activeRoomId = roomSelect.value || null;
-    discardInactiveRoomFeedState();
-    roomStatus.textContent = "";
-    roomStatus.dataset.level = "info";
-    renderRoomUi();
-    if (activeRoomId) {
-      void initializeRoomFeed(activeRoomId);
+  roomPostButton.title = "Append to the shared feed — no harness is prompted";
+  roomSendButton.title = "Type the message into the selected member terminals";
+  roomsBackButton.addEventListener("click", openRoomsOverview);
+  contextRoomsChip.addEventListener("click", openRoomsOverview);
+  contextNameChip.addEventListener("click", () => {
+    if (workContext.kind === "room") {
+      openRoomPanel(workContext.roomId);
     }
   });
   renameRoomButton.addEventListener("click", () => void renameActiveRoom());
@@ -4094,7 +4396,7 @@ function wireTerminalShortcuts(): void {
         return;
       }
       const targetId = relativeSessionId(
-        tabState.order,
+        visibleTabOrder(),
         tabState.activeId,
         action.delta,
       );

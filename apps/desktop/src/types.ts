@@ -258,6 +258,11 @@ export interface RoomPostResult {
   cursor: RoomFeedCursor;
 }
 
+export interface BriefRoomMemberRequest {
+  room_id: string;
+  session_id: string;
+}
+
 export interface RoomDeliveryFailure {
   recipient_id: string;
   bytes_written: number;
