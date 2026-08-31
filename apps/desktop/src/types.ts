@@ -9,6 +9,7 @@ export type LifecycleState =
   | "restarting"
   | "failed"
   | "closed";
+export type SessionErrorKind = "executable_not_found";
 export type MessageScope = "direct" | "room" | "system" | "private";
 export type LogLevel = "info" | "warn" | "error";
 export type WorkState =
@@ -57,6 +58,7 @@ export interface SessionSnapshot {
   was_running_at_shutdown: boolean;
   last_activity_at: string | null;
   last_error: string | null;
+  last_error_kind: SessionErrorKind | null;
 }
 
 export interface RoomFeedCursor {
@@ -152,6 +154,8 @@ export interface StartSessionRequest {
   session_id: string;
   /** Start a NEW harness conversation instead of resuming the stored one. */
   fresh?: boolean;
+  /** After PATH + cmd-shim miss, walk the usual install locations. */
+  search?: boolean;
 }
 
 export interface StopSessionRequest {

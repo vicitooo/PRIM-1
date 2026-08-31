@@ -33,16 +33,19 @@ use shared_types::{
     RoomDeliveryFailure, RoomDeliveryResult, RoomDeliveryStatus, RoomFeedItem, RoomFeedPage,
     RoomId, RoomMember, RoomMembershipAction, RoomMessageSender, RoomPostResult,
     RoomRecipientSelection, RoomRevision, RoomSnapshot, RouteDeliveryPhase, RunEventIdentity,
-    RuntimeEvent, RuntimeSnapshot, SendInputRequest, SessionDefinition, SessionExitReason,
-    SessionGeneration, SessionId, SessionSnapshot, SidebandRequest, SidebandResponse,
+    RuntimeEvent, RuntimeSnapshot, SendInputRequest, SessionDefinition, SessionErrorKind,
+    SessionExitReason, SessionGeneration, SessionId, SessionSnapshot, SidebandRequest,
+    SidebandResponse,
     SidebandResponsePayload, SupervisorAlertType, WaitQuietRequest, WorkState, now_rfc3339,
 };
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
+mod harness_executable;
 mod rooms;
 
+use harness_executable::ResolvedLaunchProgram;
 use rooms::{
     PersistedRoomV1, ROOM_CATALOG_FILE_NAME, ROOM_MAX_COUNT, ROOM_MEMBER_MAX_COUNT, RoomCatalogV1,
     RoomRuntime, RoomState, default_room_label, validate_room_label,
@@ -782,21 +785,22 @@ trait WslControl: Send + Sync {
     fn terminate_scope(&self, scope: &WslRunScope) -> Result<()>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ResolvedLaunchProgram {
-    program: String,
-    prefix_args: Vec<String>,
-}
-
 trait DriverExecutableResolver: Send + Sync {
     fn resolve(&self, driver: DriverKind) -> Result<ResolvedLaunchProgram>;
+    fn resolve_searching(&self, driver: DriverKind) -> Result<ResolvedLaunchProgram> {
+        self.resolve(driver)
+    }
 }
 
 struct HostDriverExecutableResolver;
 
 impl DriverExecutableResolver for HostDriverExecutableResolver {
     fn resolve(&self, driver: DriverKind) -> Result<ResolvedLaunchProgram> {
-        resolve_driver_executable(driver)
+        harness_executable::resolve_driver_executable(driver, false)
+    }
+
+    fn resolve_searching(&self, driver: DriverKind) -> Result<ResolvedLaunchProgram> {
+        harness_executable::resolve_driver_executable(driver, true)
     }
 }
 
@@ -2114,6 +2118,7 @@ impl SessionSlot {
             running: self.running.is_some(),
             last_activity_at: self.last_activity_at.clone(),
             last_error: self.last_error.clone(),
+            last_error_kind: executable_not_found_kind(self.last_error.as_deref()),
             resume_available: self.harness_session_id.is_some(),
             was_running_at_shutdown: self.running_at_shutdown,
         }
@@ -3018,7 +3023,7 @@ fn comparable_storage_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-fn child_process_path(path: &Path) -> PathBuf {
+pub(crate) fn child_process_path(path: &Path) -> PathBuf {
     #[cfg(windows)]
     {
         let path = path.to_string_lossy();
@@ -4800,7 +4805,7 @@ impl SupervisorHandle {
     }
 
     pub fn start_session_by_id(&self, session_id: SessionId) -> Result<SessionSnapshot> {
-        self.start_session_by_id_with_mode(session_id, false)
+        self.start_session_by_id_with_options(session_id, false, false)
     }
 
     /// `fresh = true` starts a NEW harness conversation; default Launch
@@ -4809,6 +4814,15 @@ impl SupervisorHandle {
         &self,
         session_id: SessionId,
         fresh: bool,
+    ) -> Result<SessionSnapshot> {
+        self.start_session_by_id_with_options(session_id, fresh, false)
+    }
+
+    pub fn start_session_by_id_with_options(
+        &self,
+        session_id: SessionId,
+        fresh: bool,
+        search: bool,
     ) -> Result<SessionSnapshot> {
         self.ensure_active()?;
         self.refresh_session_liveness();
@@ -4854,7 +4868,18 @@ impl SupervisorHandle {
             definition.driver,
             &qualified_directory,
         )?;
-        let plan = self.prepare_launch_spec_for_spawn(&definition, &qualified_directory, fresh)?;
+        let plan = match self.prepare_launch_spec_for_spawn(
+            &definition,
+            &qualified_directory,
+            fresh,
+            search,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.record_launch_prepare_failure(session_id, &error);
+                return Err(error);
+            }
+        };
         let expected = {
             let mut slots = self.inner.slots.lock();
             self.ensure_active()?;
@@ -7280,7 +7305,18 @@ impl SupervisorHandle {
             definition.driver,
             &qualified_directory,
         )?;
-        let plan = self.prepare_launch_spec_for_spawn(&definition, &qualified_directory, false)?;
+        let plan = match self.prepare_launch_spec_for_spawn(
+            &definition,
+            &qualified_directory,
+            false,
+            false,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.record_launch_prepare_failure(session_id, &error);
+                return Err(error);
+            }
+        };
         let (_, expected_stop) = self.declare_stop_operation(
             session_id,
             Some((expected_generation, expected_run_id)),
@@ -9804,11 +9840,24 @@ impl SupervisorHandle {
 }
 
 impl SupervisorHandle {
+    fn record_launch_prepare_failure(&self, session_id: SessionId, error: &anyhow::Error) {
+        let mut slots = self.inner.slots.lock();
+        let Some(slot) = slots.get_by_id_mut(session_id) else {
+            return;
+        };
+        if slot.running.is_some() || slot.spawn_in_flight.is_some() {
+            return;
+        }
+        slot.state = LifecycleState::Failed;
+        slot.last_error = Some(format!("{error:#}"));
+    }
+
     fn prepare_launch_spec_for_spawn(
         &self,
         definition: &SessionDefinition,
         qualified_directory: &QualifiedWorkingDirectory,
         fresh: bool,
+        search: bool,
     ) -> Result<PreparedLaunch> {
         validate_driver_working_directory_pair(definition.driver, qualified_directory)?;
         let harness_session = self.resolve_harness_launch_session(definition, fresh);
@@ -9843,11 +9892,13 @@ impl SupervisorHandle {
             )?;
             (spec, Some(scope))
         } else {
-            let resolved = self
-                .inner
-                .executable_resolver
-                .read()
-                .resolve(definition.driver)?;
+            let resolver = self.inner.executable_resolver.read();
+            let resolved = if search {
+                resolver.resolve_searching(definition.driver)?
+            } else {
+                resolver.resolve(definition.driver)?
+            };
+            drop(resolver);
             (build_launch_spec(definition, &resolved, &harness_session)?, None)
         };
 
@@ -10162,7 +10213,7 @@ fn build_launch_spec(
     resolved: &ResolvedLaunchProgram,
     harness_session: &HarnessLaunchSession,
 ) -> Result<LaunchSpec> {
-    match definition.driver {
+    let mut spec = match definition.driver {
         DriverKind::Claude => {
             driver_claude::launch_spec(definition, &resolved.program, harness_session)
         }
@@ -10179,12 +10230,19 @@ fn build_launch_spec(
             ));
         }
         DriverKind::GenericTerminal => {
-            let mut spec = driver_generic_terminal::launch_spec(definition, &resolved.program)?;
-            spec.args.extend(resolved.prefix_args.clone());
-            return Ok(spec);
+            driver_generic_terminal::launch_spec(definition, &resolved.program)
         }
     }
-    .map_err(anyhow::Error::from)
+    .map_err(anyhow::Error::from)?;
+    if definition.driver == DriverKind::GenericTerminal {
+        spec.args.extend(resolved.prefix_args.clone());
+    } else if definition.driver != DriverKind::Codex && !resolved.prefix_args.is_empty() {
+        // node.exe + script shims: the script must sit in front of driver flags.
+        let mut args = resolved.prefix_args.clone();
+        args.extend(spec.args);
+        spec.args = args;
+    }
+    Ok(spec)
 }
 
 #[cfg(windows)]
@@ -10262,106 +10320,23 @@ fn augment_launch_spec_with_pane_mcp(
     Ok(())
 }
 
-fn resolve_driver_executable(driver: DriverKind) -> Result<ResolvedLaunchProgram> {
-    match driver {
-        DriverKind::Claude => Ok(ResolvedLaunchProgram {
-            program: find_direct_executable(&[if cfg!(windows) {
-                "claude.exe"
-            } else {
-                "claude"
-            }])?,
-            prefix_args: Vec::new(),
-        }),
-        DriverKind::Codex => resolve_codex_executable(),
-        DriverKind::Grok => Ok(ResolvedLaunchProgram {
-            program: find_direct_executable(&[if cfg!(windows) { "grok.exe" } else { "grok" }])?,
-            prefix_args: Vec::new(),
-        }),
-        DriverKind::Prime => Err(anyhow!(
-            "Prime executable resolution is owned by the Ubuntu WSL controller"
-        )),
-        DriverKind::GenericTerminal => Ok(ResolvedLaunchProgram {
-            program: find_direct_executable(if cfg!(windows) {
-                &["powershell.exe", "pwsh.exe"]
-            } else {
-                &["bash"]
-            })?,
-            prefix_args: Vec::new(),
-        }),
-    }
-}
-
+#[cfg(test)]
 fn find_direct_executable(names: &[&str]) -> Result<String> {
-    let search_path = std::env::var_os("PATH").ok_or_else(|| anyhow!("PATH is not set"))?;
-    find_direct_executable_on_path(names, &search_path)
+    harness_executable::find_direct_executable(names)
 }
 
+#[cfg(test)]
 fn find_direct_executable_on_path(names: &[&str], search_path: &std::ffi::OsStr) -> Result<String> {
-    // `names` is an ordered preference list. Search every PATH directory for
-    // the preferred executable before considering a fallback. On Windows this
-    // keeps the built-in powershell.exe ahead of Store/App Execution Alias
-    // pwsh.exe entries that cannot be launched in the session job.
-    for name in names {
-        for directory in std::env::split_paths(search_path) {
-            let candidate = directory.join(name);
-            let Ok(metadata) = fs::metadata(&candidate) else {
-                continue;
-            };
-            if !metadata.is_file() {
-                continue;
-            }
-            let canonical = fs::canonicalize(&candidate)
-                .with_context(|| format!("failed to qualify executable {}", candidate.display()))?;
-            return Ok(child_process_path(&canonical)
-                .to_string_lossy()
-                .into_owned());
-        }
-    }
-    Err(anyhow!(
-        "no supported direct executable found on PATH (looked for {})",
-        names.join(", ")
-    ))
+    harness_executable::find_direct_executable_on_path(names, search_path)
 }
 
-fn resolve_codex_executable() -> Result<ResolvedLaunchProgram> {
-    let direct_name = if cfg!(windows) { "codex.exe" } else { "codex" };
-    if let Ok(program) = find_direct_executable(&[direct_name]) {
-        return Ok(ResolvedLaunchProgram {
-            program,
-            prefix_args: Vec::new(),
-        });
+fn executable_not_found_kind(error: Option<&str>) -> Option<SessionErrorKind> {
+    let error = error?;
+    if error.starts_with("Can't find ") && error.ends_with(" on PATH.") {
+        Some(SessionErrorKind::ExecutableNotFound)
+    } else {
+        None
     }
-
-    #[cfg(windows)]
-    {
-        let search_path = std::env::var_os("PATH").ok_or_else(|| anyhow!("PATH is not set"))?;
-        for directory in std::env::split_paths(&search_path) {
-            let shim = directory.join("codex.cmd");
-            if !shim.is_file() {
-                continue;
-            }
-            let script = directory
-                .join("node_modules")
-                .join("@openai")
-                .join("codex")
-                .join("bin")
-                .join("codex.js");
-            if !script.is_file() {
-                continue;
-            }
-            let node = find_direct_executable(&["node.exe"])?;
-            let script = fs::canonicalize(&script)
-                .with_context(|| format!("failed to qualify Codex script {}", script.display()))?;
-            return Ok(ResolvedLaunchProgram {
-                program: node,
-                prefix_args: vec![child_process_path(&script).to_string_lossy().into_owned()],
-            });
-        }
-    }
-
-    Err(anyhow!(
-        "Codex requires a direct codex executable or node.exe plus the canonical npm codex.js"
-    ))
 }
 
 fn scope_label(scope: MessageScope) -> &'static str {
@@ -23852,10 +23827,30 @@ mod tests {
                 .to_string()
                 .contains("injected unresolved Claude executable")
         );
-        assert_eq!(slots_mutation_probe(&supervisor), slots_before);
         assert_eq!(fs::read(&catalog_path).unwrap(), catalog_before);
         assert!(specs.lock().is_empty());
         assert!(events.lock().is_empty());
+        let snapshot = supervisor
+            .snapshot()
+            .sessions
+            .into_iter()
+            .find(|item| item.session_id == session.session_id)
+            .expect("session remains in the catalog");
+        assert_eq!(snapshot.lifecycle_state, LifecycleState::Failed);
+        assert_eq!(
+            snapshot.last_error.as_deref(),
+            Some("injected unresolved Claude executable")
+        );
+        assert_eq!(snapshot.last_error_kind, None);
+        assert!(!snapshot.running);
+        assert_eq!(snapshot.generation, 0);
+        let mut after = slots_mutation_probe(&supervisor);
+        let mut before = slots_before;
+        for probe in before.iter_mut().chain(after.iter_mut()) {
+            probe.state = LifecycleState::Closed;
+            probe.last_error = None;
+        }
+        assert_eq!(after, before);
     }
 
     #[test]

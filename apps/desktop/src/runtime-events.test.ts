@@ -65,6 +65,7 @@ function sessionSnapshot(
     was_running_at_shutdown: false,
     last_activity_at: "2026-08-10T00:00:00Z",
     last_error: null,
+    last_error_kind: null,
     ...overrides,
   };
 }

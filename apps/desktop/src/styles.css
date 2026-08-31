@@ -1362,8 +1362,24 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
   pointer-events: none;
 }
 
+.terminal-prelaunch.is-interactive {
+  pointer-events: auto;
+}
+
+.terminal-prelaunch[hidden] {
+  display: none;
+}
+
 .terminal-prelaunch strong {
   color: var(--prim1);
+}
+
+.terminal-prelaunch-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem;
+  margin-top: 0.35rem;
 }
 
 .system-card { position: relative; }

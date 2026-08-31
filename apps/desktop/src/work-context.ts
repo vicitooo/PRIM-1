@@ -85,6 +85,12 @@ export function sessionReadiness(
   if (!session) {
     return { kind: "off", reason: "Unknown session" };
   }
+  if (session.lifecycle_state === "failed") {
+    return {
+      kind: "blocked",
+      reason: session.last_error ? "Failed: " + session.last_error : "Failed",
+    };
+  }
   if (!session.running) {
     if (resumeOwed) {
       return { kind: "off", reason: "Not running — resumes when you enter its room" };
@@ -102,11 +108,6 @@ export function sessionReadiness(
       return { kind: "starting", reason: "Starting" };
     case "stalled":
       return { kind: "blocked", reason: "Stalled — no output for a while" };
-    case "failed":
-      return {
-        kind: "blocked",
-        reason: session.last_error ? "Failed: " + session.last_error : "Failed",
-      };
     case "closed":
       return { kind: "off", reason: "Closed" };
     default:

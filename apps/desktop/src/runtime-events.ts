@@ -699,6 +699,8 @@ export function handleRuntimeEvent(
           last_activity_at: event.timestamp,
           last_error:
             event.state === "failed" ? event.reason : previous.last_error,
+          last_error_kind:
+            event.state === "failed" ? null : previous.last_error_kind,
         };
         ctx.snapshotById.set(sessionId, next);
         ctx.applyPaneSnapshot(sessionId, next);
@@ -723,6 +725,7 @@ export function handleRuntimeEvent(
           running: false,
           last_activity_at: event.timestamp,
           last_error: lastError,
+          last_error_kind: null,
         };
         ctx.snapshotById.set(sessionId, next);
         ctx.applyPaneSnapshot(sessionId, next);

@@ -59,6 +59,15 @@ pub enum LifecycleState {
     Closed,
 }
 
+/// Why the last launch/run failed, when the UI can offer a specific recovery.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionErrorKind {
+    /// Host binary was not on PATH (and no cmd shim resolved). The pane may
+    /// offer a bounded search of usual install locations.
+    ExecutableNotFound,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkState {
@@ -193,6 +202,9 @@ pub struct SessionSnapshot {
     pub was_running_at_shutdown: bool,
     pub last_activity_at: Option<String>,
     pub last_error: Option<String>,
+    /// Set with `last_error` when the UI can offer a specific recovery.
+    #[serde(default)]
+    pub last_error_kind: Option<SessionErrorKind>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -489,6 +501,10 @@ pub struct StartSessionRequest {
     /// Default false: Launch continues where the session left off.
     #[serde(default)]
     pub fresh: bool,
+    /// Walk the usual install locations after PATH + cmd-shim miss.
+    /// Default false: Launch only uses PATH and cmd shims.
+    #[serde(default)]
+    pub search: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -903,6 +919,7 @@ mod tests {
             was_running_at_shutdown: false,
             last_activity_at: Some("2026-08-10T00:00:00Z".into()),
             last_error: None,
+            last_error_kind: None,
         }
     }
 
@@ -1314,6 +1331,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(request.session_id, session_id);
+        assert!(!request.fresh);
+        assert!(!request.search);
         assert!(
             serde_json::from_value::<StartSessionRequest>(json!({
                 "session_id": session_id,

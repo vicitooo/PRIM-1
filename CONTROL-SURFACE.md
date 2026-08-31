@@ -29,7 +29,9 @@ authority. Create accepts only a driver, optional label, and typed permission
 profile. Prime create may additionally carry one typed absolute Ubuntu working
 directory; the backend canonicalizes and identity-binds it, and the UI prefills
 the qualified Ubuntu home. Launch accepts no renderer-controlled command,
-arguments, environment, or native working-directory path. Windows folder paths
+arguments, environment, or native working-directory path. A launch miss on PATH
+is shown on the pane; `search: true` asks the backend to walk the usual install
+locations (the renderer still cannot supply a program path). Windows folder paths
 enter through the native Rust picker. Room definitions and membership persist;
 room content remains bounded process-memory state and does not survive restart.
 

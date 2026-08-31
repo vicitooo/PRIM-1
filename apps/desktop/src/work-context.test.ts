@@ -41,6 +41,7 @@ function session(overrides: Partial<SessionSnapshot>): SessionSnapshot {
     was_running_at_shutdown: false,
     last_activity_at: null,
     last_error: null,
+    last_error_kind: null,
     ...overrides,
   };
 }
@@ -116,6 +117,19 @@ describe("sessionReadiness", () => {
   });
 
   it("names the failure when a session failed, and the owed resume when stopped", () => {
+    expect(
+      sessionReadiness(
+        session({
+          running: false,
+          lifecycle_state: "failed",
+          last_error: "Can't find claude.exe on PATH.",
+        }),
+        false,
+      ),
+    ).toEqual({
+      kind: "blocked",
+      reason: "Failed: Can't find claude.exe on PATH.",
+    });
     expect(
       sessionReadiness(
         session({ lifecycle_state: "failed", last_error: "exit code 1" }),

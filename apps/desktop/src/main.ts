@@ -26,6 +26,7 @@ import {
   type PendingBuffer,
   type RuntimeEventContext,
 } from "./runtime-events";
+import { prelaunchView, searchPrompt } from "./pane-prelaunch";
 import {
   canUseUnsafePermission,
   createSessionRequestFromForm,
@@ -379,7 +380,7 @@ app.innerHTML = `
               <dt><kbd>+</kbd></dt><dd>Pick a harness — the session is created and launched in one step. <b>Custom…</b> opens the full form (label, permission profile, working directory). Settings chooses which harnesses are listed.</dd>
               <dt>Tab</dt><dd>Click to switch. <b>Drag</b> a tab to reorder. <b>Right-click</b> for Move left / Move right / Edit… / Close.</dd>
               <dt>×</dt><dd>Closes the session the way you would by hand: leaves its room, stops the harness, deletes it — one confirmation. Terminal scrollback is discarded.</dd>
-              <dt>Launch</dt><dd>Resumes the session's previous conversation when one is stored (Claude, Codex, Grok). Right-click the tab → <b>Start fresh session</b> for a clean one.</dd>
+              <dt>Launch</dt><dd>Resumes the session's previous conversation when one is stored (Claude, Codex, Grok). If the harness binary is missing, the pane names the error and can look in the usual places. Right-click the tab → <b>Start fresh session</b> for a clean one.</dd>
               <dt>Pane strip</dt><dd>Launch / Restart / Stop / Edit for the open session; the dot in the tab is its state (copper = ready or idle, bronze = busy or starting, red = stalled or failed).</dd>
               <dt>Normal / Unsafe</dt><dd>What the profile actually passes to the harness — Claude Code: <code>--permission-mode manual</code> vs <code>--dangerously-skip-permissions</code>. Codex: <code>--ask-for-approval on-request --sandbox workspace-write</code> vs <code>--dangerously-bypass-approvals-and-sandbox</code>. Grok Build: <code>--permission-mode default</code> vs <code>--permission-mode bypassPermissions</code>. Prime and Terminal: Normal only.</dd>
             </dl>
@@ -586,6 +587,8 @@ class SessionTerminal {
   private hooked = false;
   private readonly initialBanner: InitialTerminalBanner;
   private readonly initialBannerLabel: HTMLElement;
+  private readonly initialBannerBody: HTMLElement;
+  private readonly initialBannerActions: HTMLDivElement;
   private readonly initialBannerElement: HTMLDivElement;
   private snapshot: SessionSnapshot | null = null;
   private pendingRepaintResync = false;
@@ -629,12 +632,20 @@ class SessionTerminal {
     this.initialBannerElement.setAttribute("role", "status");
     this.initialBannerLabel = document.createElement("strong");
     this.initialBannerLabel.textContent = `${this.label} pane ready.`;
-    const instruction = document.createElement("span");
-    instruction.textContent = "Launch the session from the header to begin.";
-    this.initialBannerElement.append(this.initialBannerLabel, instruction);
+    this.initialBannerBody = document.createElement("span");
+    this.initialBannerBody.textContent = "Launch the session from the header to begin.";
+    this.initialBannerActions = document.createElement("div");
+    this.initialBannerActions.className = "terminal-prelaunch-actions";
+    this.initialBannerElement.append(
+      this.initialBannerLabel,
+      this.initialBannerBody,
+      this.initialBannerActions,
+    );
     this.host.appendChild(this.initialBannerElement);
     this.initialBanner = new InitialTerminalBanner(
-      () => this.initialBannerElement.remove(),
+      () => {
+        this.initialBannerElement.hidden = true;
+      },
       (chunk) => this.terminal.write(chunk),
     );
     this.host.addEventListener("focusin", () => {
@@ -670,7 +681,6 @@ class SessionTerminal {
   applySnapshot(snapshot: SessionSnapshot): void {
     this.alias = snapshot.alias;
     this.label = snapshot.label;
-    this.initialBannerLabel.textContent = `${this.label} pane ready.`;
     this.snapshot = snapshot;
     this.stateEl.textContent = snapshot.lifecycle_state;
     this.stateEl.dataset.state = snapshot.lifecycle_state;
@@ -682,7 +692,46 @@ class SessionTerminal {
     this.activityEl.dataset.running = String(snapshot.running);
 
     this.initialBanner.observeRunning(snapshot.running);
+    if (!snapshot.running) {
+      this.renderPrelaunch(snapshot);
+    }
     this.hookInput();
+  }
+
+  private renderPrelaunch(snapshot: SessionSnapshot): void {
+    const view = prelaunchView(snapshot);
+    if (view.kind === "idle" && this.initialBannerElement.hidden) {
+      return;
+    }
+    this.initialBannerLabel.textContent = view.title;
+    this.initialBannerBody.textContent = view.body;
+    this.initialBannerActions.replaceChildren();
+    this.initialBannerElement.hidden = false;
+    if (view.canSearch) {
+      const ask = document.createElement("span");
+      ask.textContent = searchPrompt(snapshot);
+      const yes = document.createElement("button");
+      yes.type = "button";
+      yes.className = "ghost";
+      yes.textContent = "Yes";
+      yes.addEventListener("click", (event) => {
+        event.preventDefault();
+        void launchSession(this.sessionId, { search: true });
+      });
+      const no = document.createElement("button");
+      no.type = "button";
+      no.className = "ghost";
+      no.textContent = "No";
+      no.addEventListener("click", (event) => {
+        event.preventDefault();
+        this.initialBannerActions.replaceChildren();
+        this.initialBannerElement.classList.remove("is-interactive");
+      });
+      this.initialBannerActions.append(ask, yes, no);
+      this.initialBannerElement.classList.add("is-interactive");
+    } else {
+      this.initialBannerElement.classList.remove("is-interactive");
+    }
   }
 
   write(chunk: string): void {
@@ -1855,7 +1904,7 @@ async function startFreshSession(sessionId: string): Promise<void> {
     });
     await refreshSnapshot(sessionId);
   } catch (error) {
-    writeSystem("error", `Start fresh failed: ${String(error)}`);
+    await reportLaunchFailure(sessionId, error, "Start fresh");
   }
 }
 
@@ -2199,11 +2248,7 @@ function spendOwedResumes(): void {
       .join(", ")}.`,
   );
   for (const session of targets) {
-    void command<SessionSnapshot>("start_session", {
-      request: { session_id: session.session_id } satisfies StartSessionRequest,
-    }).catch((error) =>
-      writeSystem("error", `Auto-launch ${session.label} failed: ${String(error)}`),
-    );
+    void launchSession(session.session_id);
   }
   window.setTimeout(() => {
     void refreshSnapshot(tabState.activeId ?? undefined).catch(() => {});
@@ -3421,16 +3466,46 @@ function setAttachPending(pending: boolean): void {
 }
 
 /** Creating is half the job — the harness has to run. Same command as the pane's
-    Start button; a failure leaves the stopped session with that button as the retry. */
-async function launchSession(sessionId: string): Promise<void> {
+    Start button; a failure leaves the stopped session with the error on the pane. */
+async function launchSession(
+  sessionId: string,
+  options: { search?: boolean; fresh?: boolean } = {},
+): Promise<void> {
   try {
     const snapshot = await command<SessionSnapshot>("start_session", {
-      request: { session_id: sessionId },
+      request: {
+        session_id: sessionId,
+        search: options.search,
+        fresh: options.fresh,
+      } satisfies StartSessionRequest,
     });
     applyCommandSessionSnapshot(snapshot);
     setActiveSession(sessionId, true);
   } catch (error) {
-    writeSystem("error", `launch ${paneLabel(sessionId)} failed: ${String(error)}`);
+    await reportLaunchFailure(sessionId, error, "launch");
+  }
+}
+
+async function reportLaunchFailure(
+  sessionId: string,
+  error: unknown,
+  action: string,
+): Promise<void> {
+  writeSystem("error", `${action} ${paneLabel(sessionId)} failed: ${String(error)}`);
+  try {
+    await refreshSnapshot(sessionId);
+  } catch {
+    const pane = paneMap.get(sessionId);
+    const previous = snapshotById.get(sessionId);
+    if (pane && previous) {
+      pane.applySnapshot({
+        ...previous,
+        running: false,
+        lifecycle_state: "failed",
+        last_error: String(error),
+        last_error_kind: null,
+      });
+    }
   }
 }
 
@@ -4354,10 +4429,7 @@ function wireButtons(): void {
 
     try {
       if (action === "start") {
-        const snapshot = await command<SessionSnapshot>("start_session", {
-          request: { session_id: sessionId },
-        });
-        applyCommandSessionSnapshot(snapshot);
+        await launchSession(sessionId);
       } else if (action === "restart") {
         const snapshot = await command<SessionSnapshot>("restart_session", {
           request: { session_id: sessionId },

@@ -54,6 +54,7 @@ function session(
     was_running_at_shutdown: false,
     last_activity_at: null,
     last_error: null,
+    last_error_kind: null,
     ...overrides,
   };
 }
