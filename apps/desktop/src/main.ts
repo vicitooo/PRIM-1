@@ -1326,6 +1326,7 @@ function markCurrentThemeCard(name: ThemeName): void {
 function setShellView(view: ShellView): void {
   shellView = view;
   appShell.dataset.view = view;
+  appShell.dataset.roomsMode = roomsViewMode;
   roomsView.hidden = view !== "rooms";
   if (view === "rooms") {
     roomsOverviewCard.hidden = roomsViewMode !== "overview";
@@ -1342,6 +1343,7 @@ function setShellView(view: ShellView): void {
   if (view === "settings") {
     renderQuickAttachSettings();
   }
+  syncContextChipCurrent();
   requestAnimationFrame(() => {
     fitVisiblePanes();
     systemFit.fit();
@@ -2169,6 +2171,32 @@ function renderWorkContextChips(): void {
   } else {
     contextNameChip.disabled = true;
     contextNameChip.title = "Sessions in no room";
+  }
+  syncContextChipCurrent();
+}
+
+/** The top bar highlights what is on screen: the active tab in the sessions
+    view, the Rooms chip on the rooms overview, the room-name chip on the
+    standing room's panel. Presentation only — tab selection (aria-selected,
+    keyboard order) is untouched; the CSS mutes the selected tab's active look
+    outside the sessions view. */
+function syncContextChipCurrent(): void {
+  const inRooms = shellView === "rooms";
+  const roomsChipCurrent = inRooms && roomsViewMode === "overview";
+  const nameChipCurrent =
+    inRooms
+    && roomsViewMode === "panel"
+    && workContext.kind === "room"
+    && activeRoomId === workContext.roomId;
+  setChipCurrent(contextRoomsChip, roomsChipCurrent);
+  setChipCurrent(contextNameChip, nameChipCurrent);
+}
+
+function setChipCurrent(chip: HTMLButtonElement, current: boolean): void {
+  if (current) {
+    chip.setAttribute("aria-current", "true");
+  } else {
+    chip.removeAttribute("aria-current");
   }
 }
 

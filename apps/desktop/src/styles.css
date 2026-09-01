@@ -2817,6 +2817,39 @@ textarea:focus-visible {
   color: var(--text-secondary);
 }
 
+/* The bar highlights what is on screen. Outside the sessions view the selected
+   tab keeps its selection (aria, keyboard order) but drops the active look;
+   the chip for the current rooms surface carries it instead. Prefixed with
+   .app-shell so these outrank the per-theme tab overrides below. */
+.app-shell:not([data-view="sessions"]) .session-tab-shell:has(.session-tab[aria-selected="true"]) {
+  border-color: var(--frame-soft);
+}
+
+.app-shell:not([data-view="sessions"]) .session-tab[aria-selected="true"] {
+  color: inherit;
+  background: transparent;
+  box-shadow: none;
+}
+
+.app-shell:not([data-view="sessions"]) .session-tab[aria-selected="true"] .session-tab-label {
+  color: var(--text-primary);
+}
+
+.context-chip[aria-current="true"] {
+  border-color: var(--frame);
+  color: var(--prim1);
+  background: color-mix(in srgb, var(--prim1) 10%, transparent);
+  box-shadow: inset 0 -2px 0 var(--prim1);
+}
+
+/* The rooms overview is outside every room: the operator is choosing one, so
+   no room's roster belongs in the bar. Tabs and the attach button return in
+   the room panel and the sessions view. Panes stay mounted underneath. */
+.app-shell[data-view="rooms"][data-rooms-mode="overview"] .session-tabs,
+.app-shell[data-view="rooms"][data-rooms-mode="overview"] .new-session-button {
+  display: none;
+}
+
 .rooms-overview {
   position: relative;
   min-width: 0;
