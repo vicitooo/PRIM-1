@@ -796,6 +796,16 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
   color: var(--copper-hot);
   font-weight: 700;
 }
+.help-list dt small {
+  font-weight: 400;
+  color: var(--text-primary);
+}
+.help-note {
+  margin: 0.8rem 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-primary);
+}
 .view-body kbd {
   display: inline-block;
   padding: 0 0.4em;

@@ -8,9 +8,16 @@ import { InitialTerminalBanner } from "./terminal-banner";
 import "@xterm/xterm/css/xterm.css";
 
 import { exposeAutomationBridge } from "./automation-bridge";
+import {
+  detectPlatform,
+  helpRows,
+  resolveKeyMatch,
+  type Platform,
+} from "./keymap";
 
 import {
   resolveCopySelection,
+  type CopySelectionResult,
   type CopySurface,
 } from "./copy-selection";
 import {
@@ -38,7 +45,6 @@ import {
   reconcileSessionTabs,
   relativeSessionId,
   resolveFocusedTabAction,
-  resolveGlobalSessionShortcut,
   sessionTabDescription,
   shouldShowZeroSession,
   shortSessionId,
@@ -99,6 +105,51 @@ type SessionFormMode =
 const app = document.querySelector("#app");
 if (!(app instanceof HTMLDivElement)) {
   throw new Error("Missing #app root element");
+}
+
+/** Decided once at boot from the webview's platform hints (see keymap.ts). */
+const keyPlatform: Platform = detectPlatform();
+
+function keyboardPlatformLabel(platform: Platform): string {
+  switch (platform) {
+    case "windows":
+      return "Windows";
+    case "linux":
+      return "Linux";
+    case "macos":
+      return "macOS";
+  }
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function kbdMarkup(label: string): string {
+  return label
+    .split("+")
+    .map((part) => `<kbd>${escapeHtml(part)}</kbd>`)
+    .join("+");
+}
+
+/** The F1 "Keyboard" rows, generated from the keymap so they cannot drift. */
+function keyboardHelpMarkup(platform: Platform): string {
+  return helpRows(platform)
+    .map((row) => {
+      const chords = row.chords
+        .map((chord) =>
+          chord.note
+            ? `${kbdMarkup(chord.label)} <small>(${escapeHtml(chord.note)})</small>`
+            : kbdMarkup(chord.label),
+        )
+        .join(" / ");
+      return `<dt>${chords}</dt><dd>${escapeHtml(row.help)}</dd>`;
+    })
+    .join("");
 }
 
 app.innerHTML = `
@@ -386,18 +437,9 @@ app.innerHTML = `
             </dl>
           </section>
           <section class="view-section">
-            <h3>Keyboard</h3>
-            <dl class="help-list">
-              <dt><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>T</kbd></dt><dd>Attach a harness (opens the + menu)</dd>
-              <dt><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>W</kbd></dt><dd>Close the active session</dd>
-              <dt><kbd>Ctrl</kbd>+<kbd>Tab</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Tab</kbd></dt><dd>Next / previous tab</dd>
-              <dt><kbd>←</kbd> <kbd>→</kbd> <kbd>Home</kbd> <kbd>End</kbd></dt><dd>With a tab focused: select a tab</dd>
-              <dt><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd></dt><dd>With a tab focused: move it</dd>
-              <dt><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd> / <kbd>V</kbd></dt><dd>Copy the selection / paste into the focused terminal</dd>
-              <dt><kbd>F11</kbd></dt><dd>Fullscreen on / off — double-clicking the bar also leaves fullscreen</dd>
-              <dt><kbd>F1</kbd></dt><dd>This page</dd>
-              <dt><kbd>Esc</kbd></dt><dd>Closes any open menu</dd>
-            </dl>
+            <h3>Keyboard (${keyboardPlatformLabel(keyPlatform)} bindings)</h3>
+            <dl class="help-list">${keyboardHelpMarkup(keyPlatform)}</dl>
+            <p class="help-note">Every binding above comes from one table, <code>apps/desktop/src/keymap.ts</code>; anything not listed reaches the focused terminal as keystrokes, so Ctrl+C with nothing selected is still the interrupt.</p>
           </section>
           <section class="view-section">
             <h3>The ⇄ button — click for the menu, drag it anywhere</h3>
@@ -4523,120 +4565,142 @@ function isPaneVisible(sessionId: string): boolean {
   return tabState.activeId === sessionId;
 }
 
+/**
+ * The one keyboard dispatcher. Every chord the app consumes is declared in
+ * keymap.ts; this listener runs in the capture phase so a consumed chord never
+ * reaches xterm (which would otherwise turn Ctrl+V into byte 0x16 for the
+ * CLI), and an unconsumed one falls through untouched — to the browser inside
+ * an editable field, to the pty inside a terminal.
+ *
+ * Tab-scoped chords (arrows on a focused tab) are dispatched by the tab
+ * element's own handler; Escape-closes-menu by the menu-scoped listeners.
+ */
 function wireTerminalShortcuts(): void {
+  writeSystem("info", `Keyboard: ${keyboardPlatformLabel(keyPlatform)} bindings (F1 lists them)`);
   window.addEventListener(
     "keydown",
     (event) => {
-      if (event.key === "F1") {
-        event.preventDefault();
-        runCornerAction("help");
-        return;
-      }
-      if (event.key !== "F11") {
-        return;
-      }
-
-      event.preventDefault();
-      void toggleFullscreen();
-    },
-    { capture: true },
-  );
-
-  window.addEventListener(
-    "keydown",
-    (event) => {
-      const action = resolveGlobalSessionShortcut(shortcutInput(event));
-      if (!action) {
-        return;
-      }
-      event.preventDefault();
-      if (action.kind === "new-session") {
-        toggleAttachMenu(newSessionButton, true);
-        return;
-      }
-      if (action.kind === "close-session") {
-        if (tabState.activeId) {
-          void deleteSession(tabState.activeId);
+      let selection: CopySelectionResult | null | undefined;
+      const currentSelection = (): CopySelectionResult | null => {
+        if (selection === undefined) {
+          selection = resolveCopySelection({
+            domSelection: activeNonTerminalDomSelectionText(),
+            activeSurface: activeCopySurface,
+            terminalSelections: Object.fromEntries(
+              Array.from(paneMap.entries()).map(([sessionId, pane]) => [
+                sessionId,
+                pane.terminal.getSelection(),
+              ]),
+            ),
+            systemSelection: systemTerminal.getSelection(),
+          });
         }
+        return selection;
+      };
+      const activePane = activeTerminal();
+      const match = resolveKeyMatch(event, keyPlatform, {
+        editable: isEditableShortcutTarget(event.target),
+        terminalFocused: activePane !== null && activeTerminalOwnsFocus(activePane),
+        tabFocused: false,
+        hasSelection: () => currentSelection() !== null,
+      });
+      if (!match) {
         return;
       }
-      const targetId = relativeSessionId(
-        visibleTabOrder(),
-        tabState.activeId,
-        action.delta,
-      );
-      if (targetId) {
-        setActiveSession(targetId, true);
+      switch (match.action) {
+        case "help":
+          event.preventDefault();
+          runCornerAction("help");
+          return;
+        case "fullscreen":
+          event.preventDefault();
+          void toggleFullscreen();
+          return;
+        case "new-session":
+          event.preventDefault();
+          toggleAttachMenu(newSessionButton, true);
+          return;
+        case "close-session":
+          event.preventDefault();
+          if (tabState.activeId) {
+            void deleteSession(tabState.activeId);
+          }
+          return;
+        case "next-tab":
+        case "previous-tab": {
+          event.preventDefault();
+          const targetId = relativeSessionId(
+            visibleTabOrder(),
+            tabState.activeId,
+            match.action === "next-tab" ? 1 : -1,
+          );
+          if (targetId) {
+            setActiveSession(targetId, true);
+          }
+          return;
+        }
+        case "copy": {
+          const selected = currentSelection();
+          if (!selected) {
+            return;
+          }
+          event.preventDefault();
+          copySelectionToClipboard(selected, match.chord.requiresSelection === true);
+          return;
+        }
+        case "paste":
+          if (!activePane) {
+            return;
+          }
+          event.preventDefault();
+          void pasteClipboardIntoTerminal(activePane);
+          return;
+        default:
+          return;
       }
     },
     { capture: true },
   );
+}
 
-  window.addEventListener("keydown", (event) => {
-    if (event.altKey && !event.ctrlKey && !event.metaKey) {
-      return;
-    }
-
-    if (!event.ctrlKey || !event.shiftKey || event.metaKey) {
-      return;
-    }
-
-    const key = event.key.toLowerCase();
-    if (key === "c") {
-      const selection = resolveCopySelection({
-        domSelection: activeNonTerminalDomSelectionText(),
-        activeSurface: activeCopySurface,
-        terminalSelections: Object.fromEntries(
-          Array.from(paneMap.entries()).map(([sessionId, pane]) => [
-            sessionId,
-            pane.terminal.getSelection(),
-          ]),
-        ),
-        systemSelection: systemTerminal.getSelection(),
-      });
-      if (!selection) {
-        return;
+/**
+ * `clearPaneSelection` is the Windows Terminal rule for the bare Ctrl+C chord:
+ * copy, then drop the selection so the next Ctrl+C is the interrupt again.
+ * The explicit copy chords (Ctrl+Shift+C, Ctrl+Insert) leave it in place.
+ */
+function copySelectionToClipboard(
+  selection: CopySelectionResult,
+  clearPaneSelection: boolean,
+): void {
+  void navigator.clipboard
+    .writeText(selection.text)
+    .then(() => {
+      writeSystem(
+        "info",
+        selection.kind === "dom"
+          ? "DOM selection copied"
+          : selection.kind === "system"
+            ? "System log selection copied"
+            : `${paneLabel(selection.session)} selection copied`,
+      );
+      if (clearPaneSelection) {
+        if (selection.kind === "session") {
+          paneMap.get(selection.session)?.terminal.clearSelection();
+        } else if (selection.kind === "system") {
+          systemTerminal.clearSelection();
+        }
       }
-
-      event.preventDefault();
-      void navigator.clipboard
-        .writeText(selection.text)
-        .then(() =>
-          writeSystem(
-            "info",
-            selection.kind === "dom"
-              ? "DOM selection copied"
-              : selection.kind === "system"
-                ? "System log selection copied"
-                : `${paneLabel(selection.session)} selection copied`,
-          ),
-        )
-        .catch((error) =>
-          writeSystem(
-            "error",
-            selection.kind === "dom"
-              ? `copy failed for DOM selection: ${String(error)}`
-              : selection.kind === "system"
-                ? `copy failed for System log: ${String(error)}`
-                : `copy failed for ${paneLabel(selection.session)}: ${String(error)}`,
-          ),
-        );
-      return;
-    }
-
-    const activePane = activeTerminal();
-    if (!activePane) {
-      return;
-    }
-
-    if (key === "v") {
-      if (!activeTerminalOwnsFocus(activePane)) {
-        return;
-      }
-      event.preventDefault();
-      void pasteClipboardIntoTerminal(activePane);
-    }
-  });
+    })
+    .catch((error) =>
+      writeSystem(
+        "error",
+        selection.kind === "dom"
+          ? `copy failed for DOM selection: ${String(error)}`
+          : selection.kind === "system"
+            ? `copy failed for System log: ${String(error)}`
+            : `copy failed for ${paneLabel(selection.session)}: ${String(error)}`,
+      ),
+    );
 }
 
 function shortcutInput(event: KeyboardEvent) {

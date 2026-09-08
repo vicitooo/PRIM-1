@@ -129,35 +129,35 @@ describe("tab movement and keyboard commands", () => {
   });
 
   it("maps only the locked global shortcuts", () => {
-    expect(resolveGlobalSessionShortcut(shortcut({ key: "Tab", ctrlKey: true }))).toEqual({
+    expect(resolveGlobalSessionShortcut(shortcut({ key: "Tab", ctrlKey: true }), "windows")).toEqual({
       kind: "select-relative",
       delta: 1,
     });
-    expect(resolveGlobalSessionShortcut(shortcut({ key: "Tab", ctrlKey: true, shiftKey: true }))).toEqual({
+    expect(resolveGlobalSessionShortcut(shortcut({ key: "Tab", ctrlKey: true, shiftKey: true }), "windows")).toEqual({
       kind: "select-relative",
       delta: -1,
     });
-    expect(resolveGlobalSessionShortcut(shortcut({ key: "T", ctrlKey: true, shiftKey: true }))).toEqual({
+    expect(resolveGlobalSessionShortcut(shortcut({ key: "T", ctrlKey: true, shiftKey: true }), "windows")).toEqual({
       kind: "new-session",
     });
-    expect(resolveGlobalSessionShortcut(shortcut({ key: "w", ctrlKey: true, shiftKey: true }))).toEqual({
+    expect(resolveGlobalSessionShortcut(shortcut({ key: "w", ctrlKey: true, shiftKey: true }), "windows")).toEqual({
       kind: "close-session",
     });
-    expect(resolveGlobalSessionShortcut(shortcut({ key: "w", ctrlKey: true }))).toBeNull();
-    expect(resolveGlobalSessionShortcut(shortcut({ key: "n", ctrlKey: true }))).toBeNull();
-    expect(resolveGlobalSessionShortcut(shortcut({ key: "Tab", ctrlKey: true, editable: true }))).toBeNull();
+    expect(resolveGlobalSessionShortcut(shortcut({ key: "w", ctrlKey: true }), "windows")).toBeNull();
+    expect(resolveGlobalSessionShortcut(shortcut({ key: "n", ctrlKey: true }), "windows")).toBeNull();
+    expect(resolveGlobalSessionShortcut(shortcut({ key: "Tab", ctrlKey: true, editable: true }), "windows")).toBeNull();
   });
 
   it("supports roving focus and keyboard reordering only from a focused tab", () => {
-    expect(resolveFocusedTabAction(shortcut({ key: "ArrowRight" }), 1, 3)).toEqual({
+    expect(resolveFocusedTabAction(shortcut({ key: "ArrowRight" }), 1, 3, "windows")).toEqual({
       kind: "select-index",
       index: 2,
     });
-    expect(resolveFocusedTabAction(shortcut({ key: "Home" }), 2, 3)).toEqual({
+    expect(resolveFocusedTabAction(shortcut({ key: "Home" }), 2, 3, "windows")).toEqual({
       kind: "select-index",
       index: 0,
     });
-    expect(resolveFocusedTabAction(shortcut({ key: "ArrowLeft", ctrlKey: true, shiftKey: true }), 1, 3)).toEqual({
+    expect(resolveFocusedTabAction(shortcut({ key: "ArrowLeft", ctrlKey: true, shiftKey: true }), 1, 3, "windows")).toEqual({
       kind: "move",
       delta: -1,
     });

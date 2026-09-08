@@ -1,3 +1,4 @@
+import { detectPlatform, resolveKeyAction, type Platform } from "./keymap";
 import type {
   CreateSessionRequest,
   DriverKind,
@@ -116,59 +117,65 @@ export function movedSessionOrder(
   return next;
 }
 
+/**
+ * Session-wide chords (tab switching, attach, close), read from the keymap.
+ * `platform` defaults to the running platform; tests pass it explicitly.
+ */
 export function resolveGlobalSessionShortcut(
   input: ShortcutInput,
+  platform: Platform = detectPlatform(),
 ): GlobalSessionShortcut | null {
-  if (input.editable || input.metaKey || input.altKey || !input.ctrlKey) {
-    return null;
-  }
-  if (input.key === "Tab") {
-    return { kind: "select-relative", delta: input.shiftKey ? -1 : 1 };
-  }
-  if (!input.shiftKey) {
-    return null;
-  }
-  switch (input.key.toLowerCase()) {
-    case "t":
+  const action = resolveKeyAction(input, platform, {
+    editable: input.editable,
+    terminalFocused: false,
+    tabFocused: false,
+    hasSelection: () => false,
+  });
+  switch (action) {
+    case "next-tab":
+      return { kind: "select-relative", delta: 1 };
+    case "previous-tab":
+      return { kind: "select-relative", delta: -1 };
+    case "new-session":
       return { kind: "new-session" };
-    case "w":
+    case "close-session":
       return { kind: "close-session" };
     default:
       return null;
   }
 }
 
+/** Chords that are live only while a tab button owns focus, from the keymap. */
 export function resolveFocusedTabAction(
   input: ShortcutInput,
   currentIndex: number,
   tabCount: number,
+  platform: Platform = detectPlatform(),
 ): FocusedTabAction | null {
-  if (input.editable || input.metaKey || input.altKey || tabCount <= 0) {
+  if (tabCount <= 0) {
     return null;
   }
-  if (input.ctrlKey && input.shiftKey) {
-    if (input.key === "ArrowLeft") {
+  const action = resolveKeyAction(input, platform, {
+    editable: input.editable,
+    terminalFocused: false,
+    tabFocused: true,
+    hasSelection: () => false,
+  });
+  switch (action) {
+    case "tab-move-left":
       return { kind: "move", delta: -1 };
-    }
-    if (input.key === "ArrowRight") {
+    case "tab-move-right":
       return { kind: "move", delta: 1 };
-    }
-    return null;
-  }
-  if (input.ctrlKey || input.shiftKey) {
-    return null;
-  }
-  switch (input.key) {
-    case "ArrowLeft":
+    case "tab-select-previous":
       return {
         kind: "select-index",
         index: (currentIndex - 1 + tabCount) % tabCount,
       };
-    case "ArrowRight":
+    case "tab-select-next":
       return { kind: "select-index", index: (currentIndex + 1) % tabCount };
-    case "Home":
+    case "tab-select-first":
       return { kind: "select-index", index: 0 };
-    case "End":
+    case "tab-select-last":
       return { kind: "select-index", index: tabCount - 1 };
     default:
       return null;

@@ -78,6 +78,32 @@ the narrow PowerShell helper can address that pane through its injected endpoint
 
 Full operator surface is documented in [CONTROL-SURFACE.md](CONTROL-SURFACE.md).
 
+### Keyboard
+
+Bindings follow the native terminal of the platform the app runs on — Windows
+Terminal on Windows, GNOME Terminal on Linux, Terminal.app / iTerm2 on macOS.
+Every binding lives in one table, `apps/desktop/src/keymap.ts`; the F1 page
+and this list are rendered from it. Anything not listed reaches the focused
+terminal as keystrokes, so Ctrl+C with nothing selected is still the interrupt
+everywhere, and on Linux Ctrl+V still reaches the harness as `^V`.
+
+| Action | Windows | Linux | macOS (untested) |
+|---|---|---|---|
+| Copy the selection | Ctrl+C (with a selection), Ctrl+Shift+C, Ctrl+Insert | Ctrl+Shift+C, Ctrl+Insert | Cmd+C (with a selection) |
+| Paste into the focused terminal | Ctrl+V, Ctrl+Shift+V, Shift+Insert | Ctrl+Shift+V, Shift+Insert | Cmd+V |
+| Attach a harness | Ctrl+Shift+T | Ctrl+Shift+T | Cmd+T |
+| Close the active session | Ctrl+Shift+W | Ctrl+Shift+W | Cmd+W |
+| Next / previous tab | Ctrl+Tab / Ctrl+Shift+Tab | Ctrl+Tab / Ctrl+Shift+Tab, Ctrl+PageDown / Ctrl+PageUp | Ctrl+Tab / Ctrl+Shift+Tab, Cmd+Shift+] / Cmd+Shift+[ |
+| With a tab focused: select / move it | ← → Home End / Ctrl+Shift+← → | same | same |
+| Fullscreen | F11 | F11 | Ctrl+Cmd+F |
+| Help | F1 | F1 | F1 |
+| Close any open menu | Esc | Esc | Esc |
+
+The bare Windows Ctrl+C copies and then drops the selection, so the next Ctrl+C
+is the interrupt again (the Windows Terminal rule). Ctrl+V on Windows pastes
+text; the harnesses' image paste stays on Alt+V. To change a binding, edit the
+table and its tests (`keymap.test.ts`); nothing else knows a key.
+
 ## Architecture
 
 PRIM-1 separates three concerns:
