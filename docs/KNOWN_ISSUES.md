@@ -218,6 +218,54 @@ produce — a false phrase-level latch during replay would still stick.
 Watchlist: the day's FIRST resumed run of a harness has died silently ~30 s
 in twice (Grok 10:34, Codex 12:09, both 2026-08-29); relaunch recovered both.
 
+### driver-codex tracker: transcript text latched a phantom block (fixed 2026-09-08)
+
+The "still open" half of the entry above happened, for four hours, on a
+healthy pane. `WorkStateTracker` treated every `Blocked` detail alike and
+cleared one only via a trusted clean-prompt screen **with no blocker phrase
+anywhere on the visible screen**. Codex's final answer ended in
+"…screenshot capture timed out."; bare `timed out` was a
+`stream_disconnected` trigger; the answer stayed in the transcript above a
+perfectly clean prompt, so every rescan (each keystroke echo, `/new` +
+`/resume`) re-latched it and three re-latches in a minute escalated to
+`error_loop`. Every room send to all members was refused before delivery —
+to anyone — with a message that named nothing an operator could act on.
+
+Now (see `CONTRACT-BLOCKED-LATCH.md`):
+
+- **Blocker classes.** `Modal` (`workspace_trust`, `approval_prompt`,
+  `plan_mode_prompt`) latches on the trusted screen exactly as before.
+  `Notice` (`stream_disconnected`, `rate_limit`, `usage_limit`,
+  `auth_refresh`) is detected only from fresh output, never from a screen
+  rescan, and is cleared by the next clean prompt or any later activity
+  (`Working…`, a tool call). A notice's text staying in the transcript is
+  not a block. A modal on the same screen as stale notice text still wins.
+- **Phrase precision.** Codex's `stream_disconnected` triggers are its real
+  banners (`stream disconnected - retrying sampling request (`,
+  `Reconnecting...`, `Reconnect failed`, `Network request disconnected
+  after`, `request timed out`). Bare `timed out` / `network error` / `retry
+  your request` are gone from the Codex list; Claude and Grok keep their
+  lists but `timed out` became `request timed out` there too.
+- **Operator-legible refusals.** Preflight errors read
+  `Codex (f3f34814) can't take a routed message right now: its connection to
+  the model dropped (it printed "stream disconnected") — wait for it to
+  reconnect and show its prompt, or restart it from its tab.
+  [session-…: work state is blocked (stream_disconnected); …]`. A room send
+  says up front `Nothing was delivered to any of the 3 recipients (a room
+  send is all-or-nothing).` The bracketed tail keeps the raw state.
+
+Still open, same incident: **the Codex resume-id capture can pick the wrong
+thread.** `spawn_codex_session_capture` (fresh Codex launches only) takes the
+newest `~/.codex/sessions` rollout with a matching cwd modified after spawn.
+With another Codex process writing rollouts in that cwd (an unrelated
+multi-agent child thread was appending every few seconds), it captured that
+thread 7 s after launch and persisted it in `session-catalog-v1.json`; the
+pane's real thread (hand-resumed 12 min later) is a different id, and the
+next PRIM-1 restart of that pane resumes the wrong one. Fix candidates: match
+only `thread_source: user` rollouts, or read the id from the pane's own
+first paint. Also open: best-effort multi-recipient delivery with a
+per-recipient report instead of all-or-nothing.
+
 ## Roadmap items tracked publicly
 
 The following are not bugs but in-progress structural improvements. They affect what consumers can rely on:

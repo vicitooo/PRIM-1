@@ -2660,6 +2660,111 @@ fn run_binding_from_target(target: &RunWriteTarget) -> RunBinding {
     }
 }
 
+/// `Label (shortid)` — how an operator recognises a session in an error.
+fn session_display_name(definition: &SessionDefinition) -> String {
+    let id = definition.session_id.to_string();
+    let short = id.get(..8).unwrap_or(id.as_str());
+    format!("{} ({short})", definition.label)
+}
+
+/// Plain-language reason + the action that actually clears it, keyed by the
+/// driver's work-state detail. The technical detail is still appended to
+/// every message in a bracketed tail, so nothing is hidden from a reader who
+/// wants the raw state.
+fn describe_work_state_block(
+    state: WorkState,
+    detail: Option<&str>,
+    evidence: Option<&str>,
+) -> (String, &'static str) {
+    let quoted = evidence
+        .map(|phrase| format!(" (it printed \"{phrase}\")"))
+        .unwrap_or_default();
+    match (state, detail) {
+        (WorkState::Exited, _) => (
+            "its process has exited".into(),
+            "start it again from its tab",
+        ),
+        (WorkState::ErrorLoop, Some("rate_limit")) => (
+            "it keeps hitting a rate limit".into(),
+            "wait for the limit to reset, then send again",
+        ),
+        (WorkState::ErrorLoop, Some("context_length_exceeded")) => (
+            "its context window is full".into(),
+            "compact or restart it from its tab",
+        ),
+        (WorkState::ErrorLoop, Some(detail)) => (
+            format!("it has repeated the same error ({detail}) several times in the last minute"),
+            "look at its terminal, fix the cause, then send again",
+        ),
+        (WorkState::ErrorLoop, None) => (
+            "it has repeated the same error several times in the last minute".into(),
+            "look at its terminal, fix the cause, then send again",
+        ),
+        (_, Some("workspace_trust")) | (_, Some("trust_prompt")) => (
+            "it is asking whether to trust the folder".into(),
+            "answer that question in its terminal, then send again",
+        ),
+        (_, Some("approval_prompt")) => (
+            "it is asking for approval to run a command".into(),
+            "answer that question in its terminal, then send again",
+        ),
+        (_, Some("plan_mode_prompt")) => (
+            "it is showing a plan-mode chooser".into(),
+            "dismiss it in its terminal, then send again",
+        ),
+        (_, Some("authentication")) => (
+            "it is asking you to sign in".into(),
+            "sign in from its terminal, then send again",
+        ),
+        (_, Some("auth_refresh")) => (
+            format!("its login needs refreshing{quoted}"),
+            "log in again from its terminal, then send again",
+        ),
+        (_, Some("stream_disconnected")) => (
+            format!("its connection to the model dropped{quoted}"),
+            "wait for it to reconnect and show its prompt, or restart it from its tab",
+        ),
+        (_, Some("rate_limit")) => (
+            format!("it hit a rate limit{quoted}"),
+            "wait for the limit to reset, then send again",
+        ),
+        (_, Some("usage_limit")) => (
+            format!("it hit its usage limit{quoted}"),
+            "wait for the limit to reset or add credits, then send again",
+        ),
+        (_, Some("launcher_menu")) => (
+            "it is still on its launcher menu".into(),
+            "pick an option in its terminal, then send again",
+        ),
+        (_, Some("session_starting")) => (
+            "it is still starting up".into(),
+            "wait for its prompt, then send again",
+        ),
+        (_, Some(detail)) => (
+            format!("it reported '{detail}'{quoted}"),
+            "look at its terminal, resolve it there, then send again",
+        ),
+        (_, None) => (
+            "it is sitting on something PRIM-1 could not name".into(),
+            "look at its terminal, resolve it there, then send again",
+        ),
+    }
+}
+
+fn routed_input_refusal(
+    slot: &SessionSlot,
+    target: &RunWriteTarget,
+    reason: &str,
+    action: &str,
+    technical: &str,
+) -> anyhow::Error {
+    anyhow!(
+        "{} can't take a routed message right now: {reason} — {action}. [{}: {technical}]",
+        session_display_name(&slot.definition),
+        target.session,
+    )
+}
+
 fn ensure_run_input_safety_locked(
     slot: &SessionSlot,
     target: &RunWriteTarget,
@@ -2671,20 +2776,29 @@ fn ensure_run_input_safety_locked(
 
     if slot.definition.driver == DriverKind::Codex {
         if slot.codex_work_state.is_blocked() {
-            let detail = slot
-                .codex_work_state
-                .blocked_detail()
-                .map(|detail| format!(" ({detail})"))
-                .unwrap_or_default();
-            return Err(anyhow!(
-                "session '{}' work state is blocked{detail}; routed/delivered framing is blocked; use raw terminal input to resolve the prompt",
-                target.session,
+            let detail = slot.codex_work_state.blocked_detail();
+            let (reason, action) = describe_work_state_block(
+                WorkState::Blocked,
+                detail,
+                slot.codex_work_state.blocked_evidence(),
+            );
+            let technical = format!(
+                "work state is blocked{}; routed/delivered framing is blocked",
+                detail
+                    .map(|detail| format!(" ({detail})"))
+                    .unwrap_or_default()
+            );
+            return Err(routed_input_refusal(
+                slot, target, &reason, action, &technical,
             ));
         }
         if !slot.work_state_observed {
-            return Err(anyhow!(
-                "session '{}' work state is unknown; routed/delivered framing is blocked until Codex emits an explicit interactive state; use raw terminal input to resolve any startup prompt",
-                target.session,
+            return Err(routed_input_refusal(
+                slot,
+                target,
+                "PRIM-1 has not seen its prompt yet since it started",
+                "wait for its prompt, or answer any startup question in its terminal, then send again",
+                "work state is unknown; routed/delivered framing is blocked until Codex emits an explicit interactive state",
             ));
         }
     }
@@ -2695,23 +2809,30 @@ fn ensure_run_input_safety_locked(
             WorkState::Blocked | WorkState::ErrorLoop | WorkState::Exited
         )
     {
-        let detail = slot
-            .work_detail
-            .as_deref()
-            .map(|detail| format!(" ({detail})"))
-            .unwrap_or_default();
-        return Err(anyhow!(
-            "session '{}' work state is {}{detail}; routed/delivered framing is blocked; use raw terminal input to resolve the prompt",
-            target.session,
+        let detail = slot.work_detail.as_deref();
+        let (reason, action) = describe_work_state_block(slot.work_state, detail, None);
+        let technical = format!(
+            "work state is {}{}; routed/delivered framing is blocked",
             work_state_alert_label(Some(slot.work_state)),
+            detail
+                .map(|detail| format!(" ({detail})"))
+                .unwrap_or_default()
+        );
+        return Err(routed_input_refusal(
+            slot, target, &reason, action, &technical,
         ));
     }
 
     if slot.definition.driver == DriverKind::Grok && slot.state == LifecycleState::Starting {
-        return Err(anyhow!(
-            "session '{}' lifecycle state {:?} is not ready for routed/delivered framing",
-            target.session,
-            slot.state
+        return Err(routed_input_refusal(
+            slot,
+            target,
+            "it is still starting up",
+            "wait for its prompt, then send again",
+            &format!(
+                "lifecycle state {:?} is not ready for routed/delivered framing",
+                slot.state
+            ),
         ));
     }
 
@@ -2724,13 +2845,19 @@ fn ensure_run_input_safety_locked(
         .mode_for(run_binding_from_target(target))
     {
         BracketedPasteMode::Enabled => Ok(()),
-        BracketedPasteMode::Unknown => Err(anyhow!(
-            "session '{}' bracketed-paste mode is unknown for the active run; routed/delivered framing is blocked",
-            target.session
+        BracketedPasteMode::Unknown => Err(routed_input_refusal(
+            slot,
+            target,
+            "its terminal has not yet confirmed that it accepts pasted text for this run",
+            "wait a moment and send again, or type into its terminal",
+            "bracketed-paste mode is unknown for the active run; routed/delivered framing is blocked",
         )),
-        BracketedPasteMode::Disabled => Err(anyhow!(
-            "session '{}' bracketed-paste mode is disabled for the active run; routed/delivered framing is blocked",
-            target.session
+        BracketedPasteMode::Disabled => Err(routed_input_refusal(
+            slot,
+            target,
+            "its terminal has switched off pasted-text mode for this run",
+            "type into its terminal, or restart it from its tab",
+            "bracketed-paste mode is disabled for the active run; routed/delivered framing is blocked",
         )),
     }
 }
@@ -6287,7 +6414,7 @@ impl SupervisorHandle {
                         Some(DriverKind::Prime)
                     ) {
                         return Err(anyhow!(
-                            "Prime/WSL room delivery is not admitted; use its visible raw terminal input"
+                            "Prime/WSL panes only take typed input — type into its terminal instead. [Prime/WSL room delivery is not admitted; use its visible raw terminal input]"
                         ));
                     }
                     validate_message_framing(&content, behavior)?;
@@ -6300,8 +6427,16 @@ impl SupervisorHandle {
                     Ok((target, behavior, routed_message_payload(&route, behavior)))
                 })
                 .map_err(|error| {
+                    let scope = if recipient_ids.len() > 1 {
+                        format!(
+                            "Nothing was delivered to any of the {} recipients (a room send is all-or-nothing).",
+                            recipient_ids.len()
+                        )
+                    } else {
+                        "Nothing was delivered.".to_string()
+                    };
                     anyhow!(
-                        "room delivery preflight failed for recipient '{recipient_id}': {error}"
+                        "{scope} {error} [room delivery preflight failed for recipient '{recipient_id}']"
                     )
                 })?;
             delivery_plan.push((
@@ -7724,7 +7859,7 @@ impl SupervisorHandle {
                 .ok_or_else(|| anyhow!("unknown session id '{}'", request.recipient_id))?;
             if slot.definition.driver == DriverKind::Prime {
                 return Err(anyhow!(
-                    "Prime/WSL routed delivery is not admitted in this release; use the visible raw terminal input"
+                    "Prime/WSL panes only take typed input — type into its terminal instead. [Prime/WSL routed delivery is not admitted in this release; use the visible raw terminal input]"
                 ));
             }
         }
@@ -7751,7 +7886,7 @@ impl SupervisorHandle {
                 Ok((target, behavior))
             })
             .map_err(|error| {
-                anyhow!("route preflight failed for recipient '{recipient}': {error}")
+                anyhow!("Nothing was delivered. {error} [route preflight failed for recipient '{recipient}']")
             })?;
         let payload = routed_message_payload(&route, behavior);
         let delivery_plan = vec![PlannedDelivery {
@@ -21697,11 +21832,25 @@ mod tests {
                 )),
                 "{error:#}"
             );
+            let text = error.to_string();
             assert!(
-                error
-                    .to_string()
-                    .contains("use raw terminal input to resolve the prompt"),
-                "{error:#}"
+                text.starts_with("Nothing was delivered. codex (")
+                    && text.contains(") can't take a routed message right now: "),
+                "operator-legible lead: {error:#}"
+            );
+            let expected_reason = match detail {
+                "workspace_trust" => {
+                    "it is asking whether to trust the folder — answer that question in its terminal, then send again."
+                }
+                "rate_limit" => {
+                    "it keeps hitting a rate limit — wait for the limit to reset, then send again."
+                }
+                _ => unreachable!(),
+            };
+            assert!(text.contains(expected_reason), "{error:#}");
+            assert!(
+                !text.contains("use raw terminal input to resolve the prompt"),
+                "the old instruction did not clear notices and is gone: {error:#}"
             );
             assert_eq!(slots_mutation_probe(&supervisor), before);
             assert!(inputs.lock().is_empty());

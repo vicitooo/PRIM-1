@@ -39,10 +39,105 @@ fn is_clean_prompt_screen(screen: &TrustedScreen<'_>) -> bool {
     !model.trim().is_empty() && looks_like_status_working_directory(working_dir.trim())
 }
 
-fn classify_current_screen_blocker(
-    screen: &TrustedScreen<'_>,
-) -> Option<(WorkState, Option<String>)> {
-    classify_normalized_work_state(&screen.text()).filter(|(state, _)| *state == WorkState::Blocked)
+/// How a `Blocked` classification is cleared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockerClass {
+    /// A modal prompt that occupies the screen until it is answered (workspace
+    /// trust, command approval, plan chooser). It stays latched for as long as
+    /// it is visible on the trusted screen; unrelated output never clears it.
+    Modal,
+    /// A transient notice printed into the transcript (stream disconnect,
+    /// rate/usage limit, auth). It is detected only from fresh output — never
+    /// from a rescan of the visible screen — and it is cleared by the next
+    /// clean prompt or by later activity. Its text staying in the transcript
+    /// after Codex is back at its prompt is not a block (2026-09-08: a final
+    /// answer ending in "…screenshot capture timed out." held a room pane
+    /// unreachable for four hours).
+    Notice,
+}
+
+pub fn blocker_class(detail: &str) -> BlockerClass {
+    match detail {
+        "workspace_trust" | "approval_prompt" | "plan_mode_prompt" => BlockerClass::Modal,
+        _ => BlockerClass::Notice,
+    }
+}
+
+/// Codex's real connection-trouble banners (codex-cli 0.153 binary strings).
+/// Bare "timed out" / "network error" / "retry your request" are NOT in this
+/// list on purpose: they match ordinary tool output and agents' own prose.
+const STREAM_DISCONNECT_PHRASES: [&str; 5] = [
+    "stream disconnected",
+    "reconnecting...",
+    "reconnect failed",
+    "network request disconnected",
+    "request timed out",
+];
+
+const AUTH_REFRESH_PHRASES: [&str; 11] = [
+    "access token could not be refreshed",
+    "refresh token",
+    "auth refresh",
+    "please log out",
+    "signed in to another account",
+    "401 unauthorized",
+    "error 401",
+    "http 401",
+    "403 forbidden",
+    "error 403",
+    "http 403",
+];
+
+const RATE_LIMIT_PHRASES: [&str; 4] = ["rate limit", "429 too many", "error 429", "http 429"];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Classified {
+    state: WorkState,
+    detail: Option<String>,
+    /// The phrase that produced a `Blocked` state, for operator-facing errors.
+    evidence: Option<String>,
+}
+
+impl Classified {
+    fn state(state: WorkState, detail: Option<String>) -> Self {
+        Self {
+            state,
+            detail,
+            evidence: None,
+        }
+    }
+
+    fn blocked(detail: &str, evidence: &str) -> Self {
+        Self {
+            state: WorkState::Blocked,
+            detail: Some(detail.into()),
+            evidence: Some(evidence.into()),
+        }
+    }
+
+    fn into_pair(self) -> (WorkState, Option<String>) {
+        (self.state, self.detail)
+    }
+}
+
+fn first_phrase<'a>(lower: &str, phrases: &[&'a str]) -> Option<&'a str> {
+    phrases
+        .iter()
+        .copied()
+        .find(|phrase| lower.contains(phrase))
+}
+
+/// Only modal blockers are read off the visible screen: a modal is on screen
+/// exactly while it blocks. Notices are transcript text and never come from
+/// a screen rescan (see `BlockerClass::Notice`).
+fn classify_current_screen_blocker(screen: &TrustedScreen<'_>) -> Option<Classified> {
+    classify_normalized(&screen.text()).filter(|classified| {
+        classified.state == WorkState::Blocked
+            && classified
+                .detail
+                .as_deref()
+                .is_some_and(|detail| blocker_class(detail) == BlockerClass::Modal)
+    })
 }
 
 /// Tracks Codex's bounded interactive-prompt context across arbitrary PTY
@@ -56,6 +151,7 @@ pub struct WorkStateTracker {
     clean_commit_pending: bool,
     blocked: bool,
     blocked_detail: Option<String>,
+    blocked_evidence: Option<String>,
     pending_classification: Option<(WorkState, Option<String>)>,
 }
 
@@ -66,6 +162,7 @@ impl WorkStateTracker {
         self.clean_commit_pending = false;
         self.blocked = false;
         self.blocked_detail = None;
+        self.blocked_evidence = None;
         self.pending_classification = None;
     }
 
@@ -74,8 +171,11 @@ impl WorkStateTracker {
     }
 
     pub fn observe_output(&mut self, chunk: &str) -> Option<(WorkState, Option<String>)> {
-        let mut observed = None;
-        let mut blocker_resolved = !self.blocked;
+        let mut observed: Option<Classified> = None;
+        // A latched modal is resolved only by the screen; a latched notice is
+        // stale as soon as any later classification (prompt or activity) lands.
+        let mut blocker_resolved =
+            !self.blocked || self.latched_class() == Some(BlockerClass::Notice);
         for character in chunk.chars() {
             self.context.push(character);
             if self.context.len() > WORK_STATE_CONTEXT_MAX_BYTES * 2 {
@@ -84,7 +184,9 @@ impl WorkStateTracker {
 
             let signals = self.viewport.observe_character(character);
             if (signals.cursor_hidden || signals.projection_invalidated)
-                && matches!(observed, Some((WorkState::Idle, _)))
+                && observed
+                    .as_ref()
+                    .is_some_and(|classified| classified.state == WorkState::Idle)
             {
                 observed = None;
             }
@@ -95,7 +197,7 @@ impl WorkStateTracker {
             if signals.cursor_shown {
                 if let Some(classification) = self.classify_context() {
                     self.clean_commit_pending = false;
-                    if classification.0 == WorkState::Blocked {
+                    if classification.state == WorkState::Blocked {
                         blocker_resolved = false;
                         observed = Some(classification);
                     } else if blocker_resolved {
@@ -110,7 +212,7 @@ impl WorkStateTracker {
                     } else if is_clean_prompt_screen(&screen) {
                         self.clean_commit_pending = true;
                         blocker_resolved = true;
-                        observed = Some((WorkState::Idle, None));
+                        observed = Some(Classified::state(WorkState::Idle, None));
                     }
                 }
                 self.context.clear();
@@ -119,7 +221,7 @@ impl WorkStateTracker {
 
         if let Some(classification) = self.classify_context() {
             self.clean_commit_pending = false;
-            if classification.0 == WorkState::Blocked {
+            if classification.state == WorkState::Blocked {
                 blocker_resolved = false;
                 observed = Some(classification);
             } else if blocker_resolved {
@@ -132,11 +234,12 @@ impl WorkStateTracker {
                 self.clean_commit_pending = false;
                 blocker_resolved = false;
                 let repeated_in_this_chunk = observed.as_ref().is_some_and(|classification| {
-                    classification.0 == WorkState::Blocked && classification.1 == blocker.1
+                    classification.state == WorkState::Blocked
+                        && classification.detail == blocker.detail
                 });
                 observed = if repeated_in_this_chunk
                     || !self.blocked
-                    || self.blocked_detail.as_deref() != blocker.1.as_deref()
+                    || self.blocked_detail.as_deref() != blocker.detail.as_deref()
                 {
                     Some(blocker)
                 } else {
@@ -145,37 +248,52 @@ impl WorkStateTracker {
             } else if is_clean_prompt_screen(&screen) {
                 if observed.is_none() && self.clean_commit_pending {
                     blocker_resolved = true;
-                    observed = Some((WorkState::Idle, None));
+                    observed = Some(Classified::state(WorkState::Idle, None));
                 }
             } else {
-                if matches!(observed, Some((WorkState::Idle, _))) {
+                if observed
+                    .as_ref()
+                    .is_some_and(|classified| classified.state == WorkState::Idle)
+                {
                     observed = None;
                 }
                 self.clean_commit_pending = false;
             }
-        } else if matches!(observed, Some((WorkState::Idle, _))) {
+        } else if observed
+            .as_ref()
+            .is_some_and(|classified| classified.state == WorkState::Idle)
+        {
             observed = None;
         }
 
         trim_context_suffix(&mut self.context);
         if let Some(classification) = observed.filter(|classification| {
-            classification.0 == WorkState::Blocked || !self.blocked || blocker_resolved
+            classification.state == WorkState::Blocked || !self.blocked || blocker_resolved
         }) {
-            if classification.0 == WorkState::Idle {
+            if classification.state == WorkState::Idle {
                 self.clean_commit_pending = false;
             }
-            self.blocked = classification.0 == WorkState::Blocked;
-            self.blocked_detail = classification.1.clone().filter(|_| self.blocked);
-            self.pending_classification = Some(classification.clone());
-            Some(classification)
+            self.blocked = classification.state == WorkState::Blocked;
+            self.blocked_detail = classification.detail.clone().filter(|_| self.blocked);
+            self.blocked_evidence = classification.evidence.clone().filter(|_| self.blocked);
+            let pair = classification.into_pair();
+            self.pending_classification = Some(pair.clone());
+            Some(pair)
         } else {
             None
         }
     }
 
-    fn classify_context(&mut self) -> Option<(WorkState, Option<String>)> {
+    fn latched_class(&self) -> Option<BlockerClass> {
+        self.blocked_detail
+            .as_deref()
+            .filter(|_| self.blocked)
+            .map(blocker_class)
+    }
+
+    fn classify_context(&mut self) -> Option<Classified> {
         let normalized = strip_ansi_and_controls(&self.context);
-        let classification = classify_normalized_work_state(&normalized);
+        let classification = classify_normalized(&normalized);
         if classification.is_some() {
             self.context.clear();
         }
@@ -198,6 +316,15 @@ impl WorkStateTracker {
         self.blocked_detail.as_deref()
     }
 
+    /// The phrase that produced the current block, e.g. `stream disconnected`.
+    pub fn blocked_evidence(&self) -> Option<&str> {
+        self.blocked_evidence.as_deref()
+    }
+
+    pub fn blocked_class(&self) -> Option<BlockerClass> {
+        self.latched_class()
+    }
+
     pub fn is_blocked(&self) -> bool {
         self.blocked
     }
@@ -216,17 +343,29 @@ fn trim_context_suffix(context: &mut String) {
 
 pub fn classify_work_state(chunk: &str) -> Option<(WorkState, Option<String>)> {
     let normalized = strip_ansi_and_controls(chunk);
-    classify_normalized_work_state(&normalized)
+    classify_normalized(&normalized).map(Classified::into_pair)
 }
 
-fn classify_normalized_work_state(normalized: &str) -> Option<(WorkState, Option<String>)> {
+/// Like `classify_work_state`, also returning the phrase behind a `Blocked`.
+pub fn classify_work_state_with_evidence(
+    chunk: &str,
+) -> Option<(WorkState, Option<String>, Option<String>)> {
+    let normalized = strip_ansi_and_controls(chunk);
+    classify_normalized(&normalized)
+        .map(|classified| (classified.state, classified.detail, classified.evidence))
+}
+
+fn classify_normalized(normalized: &str) -> Option<Classified> {
     let lower = normalized.to_ascii_lowercase();
 
     if lower.contains("do you trust the contents of this directory?")
         && lower.contains("yes, continue")
         && lower.contains("press enter to continue")
     {
-        return Some((WorkState::Blocked, Some("workspace_trust".into())));
+        return Some(Classified::blocked(
+            "workspace_trust",
+            "Do you trust the contents of this directory?",
+        ));
     }
 
     if (lower.contains("would you like to run the following command?")
@@ -234,56 +373,47 @@ fn classify_normalized_work_state(normalized: &str) -> Option<(WorkState, Option
         && lower.contains("yes")
         && lower.contains("no")
     {
-        return Some((WorkState::Blocked, Some("approval_prompt".into())));
+        return Some(Classified::blocked(
+            "approval_prompt",
+            "Would you like to run the following command?",
+        ));
     }
 
-    if lower.contains("choose a plan")
-        || lower.contains("create a plan")
-        || lower.contains("press [tab]")
-        || lower.contains("shift+tab")
-        || lower.contains("plan mode")
-    {
-        return Some((WorkState::Blocked, Some("plan_mode_prompt".into())));
+    if let Some(phrase) = first_phrase(
+        &lower,
+        &[
+            "choose a plan",
+            "create a plan",
+            "press [tab]",
+            "shift+tab",
+            "plan mode",
+        ],
+    ) {
+        return Some(Classified::blocked("plan_mode_prompt", phrase));
     }
 
     // Numeric status codes require their HTTP phrasing: a bare "401"/"403"
     // matches any digit run (token counts, offsets, sequence numbers — a
     // resumed replay carried 131 of them and latched a false auth block).
-    if lower.contains("access token could not be refreshed")
-        || lower.contains("refresh token")
-        || lower.contains("auth refresh")
-        || lower.contains("please log out")
-        || lower.contains("signed in to another account")
-        || lower.contains("401 unauthorized")
-        || lower.contains("error 401")
-        || lower.contains("http 401")
-        || lower.contains("403 forbidden")
-        || lower.contains("error 403")
-        || lower.contains("http 403")
-    {
-        return Some((WorkState::Blocked, Some("auth_refresh".into())));
+    if let Some(phrase) = first_phrase(&lower, &AUTH_REFRESH_PHRASES) {
+        return Some(Classified::blocked("auth_refresh", phrase));
     }
 
     if lower.contains("hit your usage") {
-        return Some((WorkState::Blocked, Some("usage_limit".into())));
+        return Some(Classified::blocked("usage_limit", "hit your usage limit"));
     }
-    if lower.contains("rate limit")
-        || lower.contains("429 too many")
-        || lower.contains("error 429")
-        || lower.contains("http 429")
-    {
-        return Some((WorkState::Blocked, Some("rate_limit".into())));
+    if let Some(phrase) = first_phrase(&lower, &RATE_LIMIT_PHRASES) {
+        return Some(Classified::blocked("rate_limit", phrase));
     }
-    if lower.contains("stream disconnected")
-        || lower.contains("retry your request")
-        || lower.contains("network error")
-        || lower.contains("timed out")
-    {
-        return Some((WorkState::Blocked, Some("stream_disconnected".into())));
+    if let Some(phrase) = first_phrase(&lower, &STREAM_DISCONNECT_PHRASES) {
+        return Some(Classified::blocked("stream_disconnected", phrase));
     }
 
     if contains_working_timer(normalized) {
-        return Some((WorkState::Thinking, extract_working_detail(normalized)));
+        return Some(Classified::state(
+            WorkState::Thinking,
+            extract_working_detail(normalized),
+        ));
     }
 
     if lower.contains("> run ")
@@ -293,7 +423,7 @@ fn classify_normalized_work_state(normalized: &str) -> Option<(WorkState, Option
         || lower.contains("tool call")
         || lower.contains("apply_patch")
     {
-        return Some((WorkState::ToolCall, None));
+        return Some(Classified::state(WorkState::ToolCall, None));
     }
 
     None
@@ -806,44 +936,190 @@ mod tests {
     }
 
     #[test]
-    fn current_screen_blockers_and_clean_commits_preserve_stream_order() {
+    fn current_screen_modal_blockers_and_clean_commits_preserve_stream_order() {
         let clean = current_prompt_screen("");
-        let blocker = "You've hit your usage limit.";
+        let modal = "Would you like to run the following command?\n› 1. Yes\n  2. No";
 
         let mut persistent = WorkStateTracker::default();
         assert_eq!(
-            persistent.observe_output(&current_prompt_screen(blocker)),
-            Some((WorkState::Blocked, Some("usage_limit".into())))
+            persistent.observe_output(&current_prompt_screen(modal)),
+            Some((WorkState::Blocked, Some("approval_prompt".into())))
         );
+        assert_eq!(persistent.blocked_class(), Some(BlockerClass::Modal));
         persistent.acknowledge_pending();
         assert_eq!(persistent.observe_output("unrelated repaint"), None);
         assert!(persistent.is_blocked());
         assert_eq!(
             persistent.observe_output("\u{1b}[999zWorking 1s"),
             None,
-            "activity text on an untrusted projection cannot clear a blocker"
+            "activity text on an untrusted projection cannot clear a modal"
         );
         assert!(persistent.is_blocked());
 
         let mut blocker_after_clean = WorkStateTracker::default();
         assert_eq!(
-            blocker_after_clean.observe_output(&format!("{clean}{blocker}")),
-            Some((WorkState::Blocked, Some("usage_limit".into()))),
-            "a blocker observed after the clean commit must win"
+            blocker_after_clean.observe_output(&format!("{clean}{modal}")),
+            Some((WorkState::Blocked, Some("approval_prompt".into()))),
+            "a modal painted after the clean commit must win"
         );
 
         let mut clean_after_blocker = WorkStateTracker::default();
         assert_eq!(
-            clean_after_blocker.observe_output(&format!("{blocker}{clean}")),
+            clean_after_blocker.observe_output(&format!("{modal}{clean}")),
             Some((WorkState::Idle, None)),
-            "a later trusted repaint may clear an erased blocker"
+            "a later trusted repaint may clear an erased modal"
         );
 
         let mut final_clean = WorkStateTracker::default();
         assert_eq!(
-            final_clean.observe_output(&format!("{clean}{blocker}{clean}")),
+            final_clean.observe_output(&format!("{clean}{modal}{clean}")),
             Some((WorkState::Idle, None)),
             "the final trusted current screen is authoritative"
+        );
+    }
+
+    #[test]
+    fn notice_in_the_transcript_does_not_block_a_pane_that_is_back_at_its_prompt() {
+        // The 2026-09-08 room incident, byte-shape: Codex prints its final
+        // answer (which happens to contain a notice phrase), then paints a
+        // clean prompt. The pane is typeable; nothing is blocked.
+        let clean = current_prompt_screen("");
+        let notice = "You've hit your usage limit.";
+
+        let mut back_at_prompt = WorkStateTracker::default();
+        assert_eq!(
+            back_at_prompt.observe_output(&current_prompt_screen(notice)),
+            Some((WorkState::Idle, None)),
+            "notice text under a clean prompt on the same screen is not a block"
+        );
+        assert!(!back_at_prompt.is_blocked());
+
+        let mut notice_then_prompt = WorkStateTracker::default();
+        assert_eq!(
+            notice_then_prompt.observe_output(notice),
+            Some((WorkState::Blocked, Some("usage_limit".into())))
+        );
+        assert_eq!(
+            notice_then_prompt.blocked_class(),
+            Some(BlockerClass::Notice)
+        );
+        assert_eq!(
+            notice_then_prompt.blocked_evidence(),
+            Some("hit your usage limit")
+        );
+        notice_then_prompt.acknowledge_pending();
+        assert_eq!(
+            notice_then_prompt.observe_output("unrelated repaint"),
+            None,
+            "silence does not clear a notice either"
+        );
+        assert!(notice_then_prompt.is_blocked());
+        assert_eq!(
+            notice_then_prompt.observe_output(&clean),
+            Some((WorkState::Idle, None)),
+            "the next clean prompt clears a notice even though its text stays in the transcript"
+        );
+        assert!(!notice_then_prompt.is_blocked());
+        assert_eq!(notice_then_prompt.blocked_evidence(), None);
+
+        // A keystroke echo (the operator typing) must not re-latch from the
+        // transcript text still on screen.
+        assert_eq!(
+            notice_then_prompt.observe_output("\u{1b}[5;3Ht\u{1b}[?25h"),
+            None
+        );
+        assert!(!notice_then_prompt.is_blocked());
+
+        // /new + /resume re-renders the transcript with the notice in it and
+        // then paints the prompt: same chunk, same answer.
+        let mut resumed = WorkStateTracker::default();
+        assert_eq!(
+            resumed.observe_output(&format!("{notice}{clean}")),
+            Some((WorkState::Idle, None))
+        );
+        assert!(!resumed.is_blocked());
+    }
+
+    #[test]
+    fn stream_disconnect_banner_blocks_until_codex_recovers() {
+        let banner = "stream disconnected - retrying sampling request (1/5 in 200ms)...";
+        let mut tracker = WorkStateTracker::default();
+        assert_eq!(
+            tracker.observe_output(banner),
+            Some((WorkState::Blocked, Some("stream_disconnected".into())))
+        );
+        assert_eq!(tracker.blocked_evidence(), Some("stream disconnected"));
+        assert_eq!(tracker.blocked_class(), Some(BlockerClass::Notice));
+        tracker.acknowledge_pending();
+
+        // Codex recovered and is working again: the notice is stale.
+        assert_eq!(
+            tracker.observe_output("Working 4s · esc to interrupt"),
+            Some((WorkState::Thinking, Some("Working 4s".into())))
+        );
+        assert!(!tracker.is_blocked());
+
+        let mut failed = WorkStateTracker::default();
+        assert_eq!(
+            failed.observe_output("Reconnect failed"),
+            Some((WorkState::Blocked, Some("stream_disconnected".into())))
+        );
+        assert_eq!(failed.blocked_evidence(), Some("reconnect failed"));
+        assert_eq!(
+            failed.observe_output(&current_prompt_screen("")),
+            Some((WorkState::Idle, None))
+        );
+    }
+
+    #[test]
+    fn modal_wins_over_stale_notice_text_on_the_same_screen() {
+        // Adversarial: the transcript still shows a notice phrase AND an
+        // approval modal is up. The modal is what blocks, and it stays latched
+        // through unrelated output.
+        let screen = current_prompt_screen(
+            "the request timed out earlier\nWould you like to run the following command?\n› 1. Yes\n  2. No",
+        );
+        let mut tracker = WorkStateTracker::default();
+        assert_eq!(
+            tracker.observe_output(&screen),
+            Some((WorkState::Blocked, Some("approval_prompt".into())))
+        );
+        assert_eq!(tracker.blocked_class(), Some(BlockerClass::Modal));
+        tracker.acknowledge_pending();
+        assert_eq!(tracker.observe_output("Working 2s"), None);
+        assert!(tracker.is_blocked());
+    }
+
+    #[test]
+    fn ordinary_timed_out_prose_is_not_a_connection_banner() {
+        for prose in [
+            "Mobile layout measurements passed; the final phone screenshot capture timed out.",
+            "{\"message\":\"Wait timed out.\",\"timed_out\":true}",
+            "network error handling is covered by the retry tests",
+            "please retry your request tomorrow, said the docs",
+        ] {
+            assert_eq!(classify_work_state(prose), None, "{prose:?}");
+        }
+        for banner in [
+            "stream disconnected - retrying sampling request (2/5 in 400ms)...",
+            "Reconnecting...",
+            "Reconnect failed",
+            "Network request disconnected after 30s",
+            "request timed out",
+        ] {
+            assert_eq!(
+                classify_work_state(banner).map(|(state, _)| state),
+                Some(WorkState::Blocked),
+                "{banner:?}"
+            );
+        }
+        assert_eq!(
+            classify_work_state_with_evidence("Reconnecting..."),
+            Some((
+                WorkState::Blocked,
+                Some("stream_disconnected".into()),
+                Some("reconnecting...".into())
+            ))
         );
     }
 

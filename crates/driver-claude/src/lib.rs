@@ -25,10 +25,13 @@ pub fn classify_work_state(chunk: &str) -> Option<(WorkState, Option<String>)> {
         return Some((WorkState::Blocked, Some("approval_prompt".into())));
     }
 
+    // Connection banners only. Bare "timed out" is deliberately absent: it
+    // matches ordinary tool output and the agent's own prose (2026-09-08, a
+    // Codex pane's final answer held a room unreachable for four hours).
     if lower.contains("stream disconnected")
         || lower.contains("retry your request")
         || lower.contains("network error")
-        || lower.contains("timed out")
+        || lower.contains("request timed out")
     {
         return Some((WorkState::Blocked, Some("stream_disconnected".into())));
     }
@@ -267,6 +270,20 @@ mod tests {
             classify_work_state("stream disconnected before completion").unwrap(),
             (WorkState::Blocked, Some("stream_disconnected".into()))
         );
+        assert_eq!(
+            classify_work_state("API Error: Request timed out.").unwrap(),
+            (WorkState::Blocked, Some("stream_disconnected".into()))
+        );
+        for prose in [
+            "the final phone screenshot capture timed out.",
+            "{\"message\":\"Wait timed out.\",\"timed_out\":true}",
+        ] {
+            assert_eq!(
+                classify_work_state(prose),
+                None,
+                "bare \"timed out\" prose is not a connection banner: {prose:?}"
+            );
+        }
         assert_eq!(
             classify_work_state("API Error: rate limit exceeded")
                 .unwrap()

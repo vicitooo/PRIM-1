@@ -303,10 +303,12 @@ pub fn classify_work_state(chunk: &str) -> Option<(WorkState, Option<String>)> {
     if lower.contains("rate limit") || lower.contains("usage limit") {
         return Some((WorkState::ErrorLoop, Some("rate_limit".into())));
     }
+    // Connection banners only; bare "timed out" is ordinary prose (see the
+    // Claude and Codex drivers for the 2026-09-08 room incident).
     if lower.contains("stream disconnected")
         || lower.contains("network error")
         || lower.contains("retry your request")
-        || lower.contains("timed out")
+        || lower.contains("request timed out")
     {
         return Some((WorkState::Blocked, Some("stream_disconnected".into())));
     }
@@ -550,6 +552,15 @@ mod tests {
             WorkState::Thinking
         );
         assert_eq!(classify_work_state("16K / 500K"), None);
+        assert_eq!(
+            classify_work_state("request timed out").unwrap(),
+            (WorkState::Blocked, Some("stream_disconnected".into()))
+        );
+        assert_eq!(
+            classify_work_state("the screenshot capture timed out."),
+            None,
+            "bare \"timed out\" prose is not a connection banner"
+        );
     }
 
     fn repaint(body: &str) -> String {
