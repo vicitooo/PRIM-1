@@ -51,6 +51,13 @@ npm run tauri build
 
 The workspace release binary lands in `target/release/` at the repository root.
 
+**Build the desktop exe only through the Tauri CLI** (`npm run tauri build`, add
+`-- --no-bundle` to skip installers). A plain `cargo build --release` of the
+desktop crate produces a *dev-mode* exe that loads the Vite dev server at
+`localhost:1420` instead of the embedded frontend — it starts, then shows
+"localhost refused to connect". The tell is size: the production exe is ~14 MB,
+the dev-mode one ~12 MB (2026-09-09).
+
 ## Run
 
 ```bash
