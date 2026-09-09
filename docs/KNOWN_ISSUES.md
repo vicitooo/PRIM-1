@@ -254,17 +254,43 @@ Now (see `CONTRACT-BLOCKED-LATCH.md`):
   says up front `Nothing was delivered to any of the 3 recipients (a room
   send is all-or-nothing).` The bracketed tail keeps the raw state.
 
-Still open, same incident: **the Codex resume-id capture can pick the wrong
-thread.** `spawn_codex_session_capture` (fresh Codex launches only) takes the
-newest `~/.codex/sessions` rollout with a matching cwd modified after spawn.
-With another Codex process writing rollouts in that cwd (an unrelated
-multi-agent child thread was appending every few seconds), it captured that
-thread 7 s after launch and persisted it in `session-catalog-v1.json`; the
-pane's real thread (hand-resumed 12 min later) is a different id, and the
-next PRIM-1 restart of that pane resumes the wrong one. Fix candidates: match
-only `thread_source: user` rollouts, or read the id from the pane's own
-first paint. Also open: best-effort multi-recipient delivery with a
-per-recipient report instead of all-or-nothing.
+Also open: best-effort multi-recipient delivery with a per-recipient report
+instead of all-or-nothing.
+
+### Launch failures said "process exited with code 1" and nothing else (fixed 2026-09-09)
+
+Two panes died the same morning with the same four words and different causes:
+
+- **Codex** — the resume-id capture (`spawn_codex_session_capture`, fresh
+  launches only) took the newest `~/.codex/sessions` rollout in the cwd
+  modified after spawn. An unrelated multi-agent *child* thread was appending
+  to its rollout in the same cwd every few seconds, so 7 s after the 2026-09-08
+  launch the child's id was persisted for the room's Codex pane. The next
+  morning `codex resume <child>` printed `thread/resume failed: cannot resume
+  an unloaded multi-agent v2 sub-agent through its parent` and exited 1 — and
+  the pane showed only the exit code, with Restart re-running the same dead
+  command.
+- **Grok** — Grok 1.0.13 self-updated at startup: downloaded 1.0.24, replaced
+  `~/.grok/bin/grok.exe` (old kept as `grok.exe.old`) and exited 1 to be
+  restarted, ten seconds after PRIM-1 marked it idle. PRIM-1 called it a crash.
+  The next Launch ran 1.0.24 fine.
+
+Now (`CONTRACT-LAUNCH-DIAGNOSIS.md`):
+
+- the supervisor keeps the last 2 KiB of control-stripped output per run and an
+  unrequested exit's pane message quotes the harness's last real lines;
+- a resumed Codex run whose tail carries `failed to resume` / `thread/resume
+  failed` / `cannot resume` is reported as *Codex could not resume conversation
+  <id>: "<its sentence>"*, the dead id is dropped from the catalog, and the
+  message names the next click (Launch, or right-click → Start fresh session);
+- a Grok run whose `bin/grok.exe` is newer than the run's start is reported as
+  *Grok updated itself (now <version>) and exited to be restarted — press
+  Launch*;
+- the capture skips any rollout whose `session_meta` has a `parent_thread_id`
+  and prefers `thread_source: "user"` when present.
+
+Not done: auto-relaunch after a Grok self-update (one click today); capture
+by the pane's own first paint instead of newest-file-in-cwd.
 
 ## Roadmap items tracked publicly
 

@@ -763,6 +763,10 @@ struct PreparedLaunch {
     /// None for drivers whose id is captured after spawn (Codex) or that have
     /// no conversation identity (terminal, Prime).
     harness_session_id: Option<String>,
+    /// True when `harness_session_id` is a stored conversation being resumed
+    /// (as opposed to a freshly minted one). A resume that dies at bootstrap
+    /// is diagnosed differently from a crash.
+    resumes_conversation: bool,
     /// The pane's last known terminal size — the PTY spawns at it so early
     /// paint (a resumed replay especially) wraps for the real width.
     pty_size: Option<(u16, u16)>,
@@ -2099,6 +2103,16 @@ struct SessionSlot {
     /// Last terminal size the UI fitted this pane to; the next run's PTY
     /// spawns at it.
     last_pty_size: Option<(u16, u16)>,
+    /// Control-stripped tail of the active run's output (≤ RUN_OUTPUT_TAIL_MAX
+    /// bytes). It is what the operator gets to read when the run dies.
+    run_output_tail: String,
+    /// When the active run was spawned; a harness binary newer than this
+    /// changed underneath the run (Grok self-updates in place).
+    run_started_at: Option<std::time::SystemTime>,
+    /// The stored conversation id the active run was asked to resume, if any.
+    run_resume_id: Option<String>,
+    /// The program the active run was spawned from.
+    run_program: Option<PathBuf>,
 }
 
 impl SessionSlot {
@@ -2626,6 +2640,178 @@ fn closed_session_slot(definition: SessionDefinition) -> SessionSlot {
         harness_session_id: None,
         running_at_shutdown: false,
         last_pty_size: None,
+        run_output_tail: String::new(),
+        run_started_at: None,
+        run_resume_id: None,
+        run_program: None,
+    }
+}
+
+const RUN_OUTPUT_TAIL_MAX: usize = 2048;
+
+/// Keep the last `RUN_OUTPUT_TAIL_MAX` bytes of control-stripped output.
+fn append_run_output_tail(tail: &mut String, chunk: &str) {
+    let visible = strip_terminal_control_sequences(chunk);
+    if visible.is_empty() {
+        return;
+    }
+    tail.push_str(&visible);
+    if tail.len() > RUN_OUTPUT_TAIL_MAX {
+        let mut start = tail.len() - RUN_OUTPUT_TAIL_MAX;
+        while !tail.is_char_boundary(start) {
+            start += 1;
+        }
+        tail.drain(..start);
+    }
+}
+
+/// The last `count` lines of a tail that carry an actual word (four or more
+/// alphanumerics in a row — TUI chrome like "? for" or "│" does not count),
+/// whitespace collapsed, each cut to `max_len` chars.
+fn last_output_lines(tail: &str, count: usize, max_len: usize) -> Vec<String> {
+    let mut lines: Vec<String> = tail
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|line| {
+            line.split(|ch: char| !ch.is_alphanumeric())
+                .any(|word| word.chars().count() >= 4)
+        })
+        .map(|line| {
+            if line.chars().count() > max_len {
+                let cut: String = line.chars().take(max_len).collect();
+                format!("{cut}…")
+            } else {
+                line
+            }
+        })
+        .collect();
+    let keep = lines.len().saturating_sub(count);
+    lines.drain(..keep);
+    lines
+}
+
+const CODEX_RESUME_FAILURE_SIGNATURES: [&str; 3] =
+    ["failed to resume", "thread/resume failed", "cannot resume"];
+
+fn codex_resume_failure_line(tail: &str) -> Option<String> {
+    let lower = tail.to_ascii_lowercase();
+    if !CODEX_RESUME_FAILURE_SIGNATURES
+        .iter()
+        .any(|signature| lower.contains(signature))
+    {
+        return None;
+    }
+    // Codex wraps the error across several terminal rows; join the rows from
+    // the first signature onwards into one readable sentence.
+    let joined = tail
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let joined_lower = joined.to_ascii_lowercase();
+    let start = CODEX_RESUME_FAILURE_SIGNATURES
+        .iter()
+        .filter_map(|signature| joined_lower.find(signature))
+        .min()?;
+    let start = joined_lower[..start].rfind("error").unwrap_or(start);
+    let sentence: String = joined[start..].chars().take(320).collect();
+    Some(sentence.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// The Grok binary was replaced after this run started (Grok self-updates in
+/// place and exits with code 1 to be restarted). Returns the new version when
+/// `~/.grok/version.json` beside the binary says so.
+fn grok_binary_replaced_since(
+    program: Option<&Path>,
+    started: Option<std::time::SystemTime>,
+) -> Option<Option<String>> {
+    let program = program?;
+    let started = started?;
+    let modified = fs::metadata(program).ok()?.modified().ok()?;
+    if modified <= started {
+        return None;
+    }
+    let version = program
+        .parent()
+        .and_then(|bin| bin.parent())
+        .map(|home| home.join("version.json"))
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| value["version"].as_str().map(str::to_string));
+    Some(version)
+}
+
+struct RunDiagnosis {
+    last_error: Option<String>,
+    /// The stored conversation id is provably unresumable; drop it.
+    drop_harness_session_id: bool,
+}
+
+/// Turn "process exited with code 1" into the sentence the operator needs:
+/// the harness's own last words, and for the two failures seen 2026-09-09 —
+/// Codex refusing to resume a sub-agent thread, Grok exiting after replacing
+/// its own binary — the specific reading and the next click.
+fn diagnose_terminal_run(
+    slot: &SessionSlot,
+    classification: Option<&SessionExitClassification>,
+) -> RunDiagnosis {
+    let Some(classification) = classification else {
+        return RunDiagnosis {
+            last_error: None,
+            drop_harness_session_id: false,
+        };
+    };
+    let Some(base) = classification.last_error.clone() else {
+        return RunDiagnosis {
+            last_error: None,
+            drop_harness_session_id: false,
+        };
+    };
+    if classification.requested {
+        return RunDiagnosis {
+            last_error: Some(base),
+            drop_harness_session_id: false,
+        };
+    }
+
+    if slot.definition.driver == DriverKind::Codex
+        && let Some(resume_id) = slot.run_resume_id.as_deref()
+        && let Some(line) = codex_resume_failure_line(&slot.run_output_tail)
+    {
+        return RunDiagnosis {
+            last_error: Some(format!(
+                "Codex could not resume conversation {resume_id}: \"{line}\". PRIM-1 dropped that id (it is not resumable) — press Launch for a fresh conversation, or right-click the tab → Start fresh session. [{base}]"
+            )),
+            drop_harness_session_id: true,
+        };
+    }
+
+    if slot.definition.driver == DriverKind::Grok
+        && let Some(version) =
+            grok_binary_replaced_since(slot.run_program.as_deref(), slot.run_started_at)
+    {
+        let version = version
+            .map(|version| format!(" (now {version})"))
+            .unwrap_or_default();
+        return RunDiagnosis {
+            last_error: Some(format!(
+                "Grok updated itself{version} and exited to be restarted — press Launch. [{base}]"
+            )),
+            drop_harness_session_id: false,
+        };
+    }
+
+    let lines = last_output_lines(&slot.run_output_tail, 2, 200);
+    if lines.is_empty() {
+        return RunDiagnosis {
+            last_error: Some(base),
+            drop_harness_session_id: false,
+        };
+    }
+    RunDiagnosis {
+        last_error: Some(format!("{base} — last output: \"{}\"", lines.join(" ⏎ "))),
+        drop_harness_session_id: false,
     }
 }
 
@@ -3541,6 +3727,9 @@ fn newest_codex_rollout_for_cwd(
                 continue;
             };
             let payload = &meta["payload"];
+            if !codex_rollout_is_resumable_root(payload) {
+                continue;
+            }
             let Some(cwd) = payload["cwd"].as_str() else {
                 continue;
             };
@@ -3557,6 +3746,24 @@ fn newest_codex_rollout_for_cwd(
         }
     }
     best.map(|(_, id)| id)
+}
+
+/// A multi-agent child thread writes its own rollout into the same cwd, and
+/// `codex resume` refuses it ("cannot resume an unloaded multi-agent v2
+/// sub-agent through its parent"). Only a root thread started by a user is a
+/// candidate for the pane's resume id (2026-09-08: a child thread was captured
+/// and the room's Codex pane could not start the next day).
+fn codex_rollout_is_resumable_root(session_meta: &serde_json::Value) -> bool {
+    if session_meta["parent_thread_id"]
+        .as_str()
+        .is_some_and(|parent| !parent.trim().is_empty())
+    {
+        return false;
+    }
+    match session_meta["thread_source"].as_str() {
+        Some(source) => source.eq_ignore_ascii_case("user"),
+        None => true,
+    }
 }
 
 fn persist_room_catalog(runtime_dir: &Path, catalog: &RoomCatalogV1) -> Result<()> {
@@ -7090,6 +7297,13 @@ impl SupervisorHandle {
                                 );
                                 slot.harness_session_id = plan.harness_session_id.clone();
                                 slot.running_at_shutdown = true;
+                                slot.run_output_tail.clear();
+                                slot.run_started_at = Some(std::time::SystemTime::now());
+                                slot.run_resume_id = plan
+                                    .resumes_conversation
+                                    .then(|| plan.harness_session_id.clone())
+                                    .flatten();
+                                slot.run_program = Some(PathBuf::from(&plan.spec.program));
                                 if let Some((cols, rows)) = plan.pty_size {
                                     if let Some(running) = slot.running.as_mut() {
                                         running.last_resize = Some((cols, rows));
@@ -8245,6 +8459,7 @@ impl SupervisorHandle {
             None
         };
 
+        let mut dropped_harness_session_id = false;
         let terminal_events = {
             let mut slots = self.inner.slots.lock();
             let Some(slot) = slots.get_by_id_mut(session_id).filter(|slot| {
@@ -8274,9 +8489,12 @@ impl SupervisorHandle {
                 slot.process_id = None;
                 slot.termination_uncertain = false;
                 slot.state = cause.final_state();
-                slot.last_error = classification
-                    .as_ref()
-                    .and_then(|classification| classification.last_error.clone());
+                let diagnosis = diagnose_terminal_run(slot, classification.as_ref());
+                slot.last_error = diagnosis.last_error;
+                if diagnosis.drop_harness_session_id && slot.harness_session_id.is_some() {
+                    slot.harness_session_id = None;
+                    dropped_harness_session_id = true;
+                }
             } else {
                 slot.state = LifecycleState::Failed;
                 slot.termination_uncertain = true;
@@ -8324,6 +8542,16 @@ impl SupervisorHandle {
                     failure_detail
                         .as_deref()
                         .unwrap_or("termination proof failed")
+                ),
+                timestamp: now_rfc3339(),
+            });
+        }
+        if dropped_harness_session_id {
+            self.persist_slot_harness_state(session_id);
+            self.emit(RuntimeEvent::SystemLog {
+                level: LogLevel::Warn,
+                message: format!(
+                    "{session_alias}: the stored conversation id could not be resumed and was dropped; the next Launch starts fresh"
                 ),
                 timestamp: now_rfc3339(),
             });
@@ -8530,6 +8758,7 @@ impl SupervisorHandle {
                             generation: event_generation,
                         };
                         slot.bracketed_paste.observe_output(binding, &chunk);
+                        append_run_output_tail(&mut slot.run_output_tail, &chunk);
                         let codex_classification = (slot.definition.driver == DriverKind::Codex)
                             .then(|| slot.codex_work_state.observe_output(&chunk))
                             .flatten();
@@ -10118,6 +10347,7 @@ impl SupervisorHandle {
                 | HarnessLaunchSession::Resume { session_id } => Some(session_id.clone()),
                 HarnessLaunchSession::Fresh => None,
             },
+            resumes_conversation: matches!(harness_session, HarnessLaunchSession::Resume { .. }),
             pty_size,
         })
     }
@@ -25411,5 +25641,207 @@ mod tests {
             linux_empty,
             "detached Linux task survived abrupt Windows job death"
         );
+    }
+
+    fn diagnosis_slot(driver: DriverKind) -> SessionSlot {
+        closed_session_slot(SessionDefinition {
+            session_id: SessionId::new_v4(),
+            alias: "session-diagnosis".into(),
+            label: "Codex".into(),
+            driver,
+            working_dir: r"D:\workspace".into(),
+            permission_profile: shared_types::PermissionProfile::Unsafe,
+        })
+    }
+
+    fn crash_exit_classification() -> SessionExitClassification {
+        SessionExitClassification {
+            exit_code: Some(1),
+            signal: None,
+            success: false,
+            reason: SessionExitReason::CrashExit,
+            requested: false,
+            last_error: Some("process exited with code 1".into()),
+        }
+    }
+
+    const CODEX_RESUME_REFUSAL: &str = concat!(
+        "\x1b[?25l  Resuming session…\r\n\r\n› Ask Codex to do anything\r\n\r\n",
+        "  ? for shortcuts\x1b[?25h› Error: Failed to resume session from C:\\Users\\me\\.codex\\sessions\\2026\\09\\08",
+        "\r\n\\rollout-2026-09-08T04-27-18-00000000-0000-4000-8000-000000000002.jsonl: thread/",
+        "\r\nresume failed during TUI bootstrap: thread/resume failed: cannot resume an unloa",
+        "\r\nded multi-agent v2 sub-agent through its parent; resume the parent first, or use",
+        "\r\n thread/read to inspect it (code -32600)\r\n",
+    );
+
+    #[test]
+    fn run_output_tail_is_control_stripped_and_bounded() {
+        let mut tail = String::new();
+        append_run_output_tail(&mut tail, "\x1b[31mhello\x1b[0m \x1b[?25l");
+        assert_eq!(tail, "hello ");
+        append_run_output_tail(&mut tail, &"é".repeat(RUN_OUTPUT_TAIL_MAX));
+        assert!(tail.len() <= RUN_OUTPUT_TAIL_MAX);
+        assert!(tail.chars().all(|ch| ch == 'é'));
+        assert_eq!(
+            last_output_lines(
+                "╭────╮\n│    │\nreal words here\n? for\nlast line of text\n",
+                2,
+                200
+            ),
+            vec![
+                "real words here".to_string(),
+                "last line of text".to_string()
+            ]
+        );
+        assert_eq!(
+            last_output_lines("abcdefghijklmnop\n", 1, 5),
+            vec!["abcde…".to_string()]
+        );
+    }
+
+    #[test]
+    fn codex_resume_refusal_is_named_and_the_dead_id_is_dropped() {
+        let mut slot = diagnosis_slot(DriverKind::Codex);
+        slot.harness_session_id = Some("00000000-0000-4000-8000-000000000002".into());
+        slot.run_resume_id = slot.harness_session_id.clone();
+        append_run_output_tail(&mut slot.run_output_tail, CODEX_RESUME_REFUSAL);
+
+        let diagnosis = diagnose_terminal_run(&slot, Some(&crash_exit_classification()));
+        let message = diagnosis.last_error.expect("a crash carries a message");
+        assert!(
+            message.starts_with(
+                "Codex could not resume conversation 00000000-0000-4000-8000-000000000002: \"Error: Failed to resume session from"
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains("cannot resume an unloa ded multi-agent v2 sub-agent"),
+            "{message}"
+        );
+        assert!(
+            message.contains("right-click the tab → Start fresh session"),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("[process exited with code 1]"),
+            "{message}"
+        );
+        assert!(diagnosis.drop_harness_session_id);
+    }
+
+    #[test]
+    fn fresh_codex_run_mentioning_resume_in_prose_keeps_its_state() {
+        // Adversarial: no resume id on this run, so the words are just words.
+        let mut slot = diagnosis_slot(DriverKind::Codex);
+        append_run_output_tail(
+            &mut slot.run_output_tail,
+            "the docs say you cannot resume a closed thread\r\n",
+        );
+        let diagnosis = diagnose_terminal_run(&slot, Some(&crash_exit_classification()));
+        assert!(!diagnosis.drop_harness_session_id);
+        assert_eq!(
+            diagnosis.last_error.as_deref(),
+            Some(
+                "process exited with code 1 — last output: \"the docs say you cannot resume a closed thread\""
+            )
+        );
+
+        // A requested stop is never rewritten and never drops anything.
+        let requested = SessionExitClassification {
+            requested: true,
+            last_error: None,
+            ..crash_exit_classification()
+        };
+        let quiet = diagnose_terminal_run(&slot, Some(&requested));
+        assert_eq!(quiet.last_error, None);
+        assert!(!quiet.drop_harness_session_id);
+    }
+
+    #[test]
+    fn grok_binary_replaced_during_the_run_reads_as_a_self_update() {
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let program = bin.join("grok.exe");
+        fs::write(&program, b"old").unwrap();
+        fs::write(home.path().join("version.json"), br#"{"version":"1.0.24"}"#).unwrap();
+
+        let mut slot = diagnosis_slot(DriverKind::Grok);
+        slot.run_program = Some(program.clone());
+        slot.run_started_at = Some(std::time::SystemTime::now() + Duration::from_secs(5));
+        let unchanged = diagnose_terminal_run(&slot, Some(&crash_exit_classification()));
+        assert_eq!(
+            unchanged.last_error.as_deref(),
+            Some("process exited with code 1"),
+            "a binary older than the run is a plain crash"
+        );
+
+        slot.run_started_at = Some(std::time::SystemTime::now() - Duration::from_secs(60));
+        fs::write(&program, b"new").unwrap();
+        let updated = diagnose_terminal_run(&slot, Some(&crash_exit_classification()));
+        assert_eq!(
+            updated.last_error.as_deref(),
+            Some(
+                "Grok updated itself (now 1.0.24) and exited to be restarted — press Launch. [process exited with code 1]"
+            )
+        );
+        assert!(!updated.drop_harness_session_id);
+    }
+
+    #[test]
+    fn codex_rollout_capture_skips_sub_agent_threads_and_keeps_newest_root() {
+        let sessions = tempfile::tempdir().unwrap();
+        let day = sessions.path().join("2026").join("09").join("08");
+        fs::create_dir_all(&day).unwrap();
+        let cwd = r"<workspace>";
+        let write = |name: &str, meta: serde_json::Value| {
+            let line = serde_json::json!({
+                "timestamp": "2026-09-08T10:29:31.000Z",
+                "type": "session_meta",
+                "payload": meta,
+            });
+            fs::write(day.join(name), format!("{line}\n")).unwrap();
+        };
+        let started = std::time::SystemTime::now() - Duration::from_secs(120);
+        write(
+            "rollout-2026-09-08T04-27-18-child.jsonl",
+            serde_json::json!({
+                "id": "child-thread",
+                "session_id": "root-thread",
+                "parent_thread_id": "root-thread",
+                "cwd": cwd,
+            }),
+        );
+        write(
+            "rollout-2026-09-08T10-29-31-agent.jsonl",
+            serde_json::json!({
+                "id": "agent-thread",
+                "thread_source": "subagent",
+                "cwd": cwd,
+            }),
+        );
+        write(
+            "rollout-2026-09-08T10-29-30-user.jsonl",
+            serde_json::json!({
+                "id": "user-thread",
+                "thread_source": "user",
+                "cwd": cwd,
+            }),
+        );
+
+        assert_eq!(
+            newest_codex_rollout_for_cwd(sessions.path(), cwd, started).as_deref(),
+            Some("user-thread"),
+            "child and sub-agent rollouts are never the pane's conversation"
+        );
+        assert!(codex_rollout_is_resumable_root(
+            &serde_json::json!({ "id": "x", "cwd": cwd })
+        ));
+        assert!(!codex_rollout_is_resumable_root(
+            &serde_json::json!({ "id": "x", "parent_thread_id": "p" })
+        ));
+        assert!(!codex_rollout_is_resumable_root(
+            &serde_json::json!({ "id": "x", "thread_source": "SubAgent" })
+        ));
     }
 }
