@@ -910,6 +910,10 @@ impl PtySession for WslScopedPtySession {
     fn agent_alive(&self, _driver: DriverKind) -> Result<AgentLiveness> {
         self.inner.agent_alive(DriverKind::GenericTerminal)
     }
+
+    fn live_processes(&self) -> Result<Vec<pty_host::ProcessIdentity>> {
+        self.inner.live_processes()
+    }
 }
 
 impl Drop for WslScopedPtySession {
@@ -2113,6 +2117,9 @@ struct SessionSlot {
     run_resume_id: Option<String>,
     /// The program the active run was spawned from.
     run_program: Option<PathBuf>,
+    /// For a Terminal pane: the harness last found running inside it, so the
+    /// system log announces a detection once per run, not once per message.
+    terminal_harness_announced: Option<DriverKind>,
 }
 
 impl SessionSlot {
@@ -2644,7 +2651,66 @@ fn closed_session_slot(definition: SessionDefinition) -> SessionSlot {
         run_started_at: None,
         run_resume_id: None,
         run_program: None,
+        terminal_harness_announced: None,
     }
+}
+
+/// The harness an operator started by hand inside a plain Terminal pane, read
+/// off the pane's live process images. Shells and console hosts never count.
+/// A bare `node` is a node-hosted CLI whose native child is not up yet — Codex
+/// or Claude Code — and Codex's delivery (bracketed paste, Right-Arrow fence,
+/// Enter) is also correct for Claude Code, so it reads as Codex.
+fn harness_from_process_images<'a>(
+    images: impl IntoIterator<Item = &'a str>,
+) -> Option<DriverKind> {
+    let names: Vec<String> = images
+        .into_iter()
+        .map(pty_host::process_image_file_name)
+        .collect();
+    let is_exe = |name: &str, prefix: &str| {
+        name.starts_with(prefix) && (name.ends_with(".exe") || !name.contains('.'))
+    };
+    if names
+        .iter()
+        .any(|name| name == "grok.exe" || name == "grok")
+    {
+        return Some(DriverKind::Grok);
+    }
+    if names.iter().any(|name| is_exe(name, "codex")) {
+        return Some(DriverKind::Codex);
+    }
+    if names.iter().any(|name| is_exe(name, "claude")) {
+        return Some(DriverKind::Claude);
+    }
+    if names
+        .iter()
+        .any(|name| name == "node.exe" || name == "node")
+    {
+        return Some(DriverKind::Codex);
+    }
+    None
+}
+
+/// The driver whose delivery contract a pane gets: its own, or — for a
+/// Terminal pane — the harness found running inside it (2026-09-09: Claude's
+/// messages to a Terminal pane running `codex` arrived as raw keystrokes and
+/// Codex swallowed the Enter as a pasted newline; nothing was ever submitted).
+fn effective_delivery_driver(slot: &SessionSlot) -> DriverKind {
+    if slot.definition.driver != DriverKind::GenericTerminal {
+        return slot.definition.driver;
+    }
+    slot.running
+        .as_ref()
+        .and_then(|running| running.pty.as_ref())
+        .and_then(|pty| pty.live_processes().ok())
+        .and_then(|processes| {
+            harness_from_process_images(
+                processes
+                    .iter()
+                    .filter_map(|process| process.image_name.as_deref()),
+            )
+        })
+        .unwrap_or(DriverKind::GenericTerminal)
 }
 
 const RUN_OUTPUT_TAIL_MAX: usize = 2048;
@@ -7304,6 +7370,7 @@ impl SupervisorHandle {
                                     .then(|| plan.harness_session_id.clone())
                                     .flatten();
                                 slot.run_program = Some(PathBuf::from(&plan.spec.program));
+                                slot.terminal_harness_announced = None;
                                 if let Some((cols, rows)) = plan.pty_size {
                                     if let Some(running) = slot.running.as_mut() {
                                         running.last_resize = Some((cols, rows));
@@ -8320,13 +8387,39 @@ impl SupervisorHandle {
         &self,
         session_id: SessionId,
     ) -> Result<(RunWriteTarget, SubmitBehavior)> {
-        let slots = self.inner.slots.lock();
-        let slot = slots
-            .get_by_id(session_id)
-            .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
-        let behavior = routed_message_submit_behavior(slot.definition.driver);
-        let target = run_write_target_from_slot(&slot.definition.alias, slot)?;
-        ensure_run_input_safety_locked(slot, &target, RunInputSafety::from(behavior))?;
+        let announcement = {
+            let mut slots = self.inner.slots.lock();
+            let slot = slots
+                .get_by_id_mut(session_id)
+                .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
+            let driver = effective_delivery_driver(slot);
+            let announcement = if slot.definition.driver == DriverKind::GenericTerminal
+                && driver != DriverKind::GenericTerminal
+                && slot.terminal_harness_announced != Some(driver)
+            {
+                slot.terminal_harness_announced = Some(driver);
+                Some(format!(
+                    "{}: {} is running inside this terminal — room messages are delivered as {} messages",
+                    session_display_name(&slot.definition),
+                    driver_display_name(driver),
+                    driver_display_name(driver),
+                ))
+            } else {
+                None
+            };
+            let behavior = routed_message_submit_behavior(driver);
+            let target = run_write_target_from_slot(&slot.definition.alias, slot)?;
+            ensure_run_input_safety_locked(slot, &target, RunInputSafety::from(behavior))?;
+            (target, behavior, announcement)
+        };
+        let (target, behavior, announcement) = announcement;
+        if let Some(message) = announcement {
+            self.emit(RuntimeEvent::SystemLog {
+                level: LogLevel::Info,
+                message,
+                timestamp: now_rfc3339(),
+            });
+        }
         Ok((target, behavior))
     }
 
@@ -11618,6 +11711,8 @@ mod tests {
         process_id: u32,
         inputs: Arc<Mutex<Vec<String>>>,
         resizes: Option<RecordedResizes>,
+        /// Image names the mock reports as live inside its scope.
+        live_images: Vec<String>,
     }
 
     struct FirstWriteSignalPtySession {
@@ -11846,6 +11941,18 @@ mod tests {
         fn agent_alive(&self, _driver: DriverKind) -> Result<AgentLiveness> {
             Ok(AgentLiveness::Alive(Vec::new()))
         }
+
+        fn live_processes(&self) -> Result<Vec<pty_host::ProcessIdentity>> {
+            Ok(self
+                .live_images
+                .iter()
+                .enumerate()
+                .map(|(index, image)| pty_host::ProcessIdentity {
+                    process_id: 1000 + index as u32,
+                    image_name: Some(image.clone()),
+                })
+                .collect())
+        }
     }
 
     impl PtySessionTrait for FirstWriteSignalPtySession {
@@ -11882,12 +11989,22 @@ mod tests {
     fn recording_pty_session(
         process_id: u32,
     ) -> (Box<dyn PtySessionTrait>, Arc<Mutex<Vec<String>>>) {
+        recording_pty_session_hosting(process_id, &[])
+    }
+
+    /// A recording pty whose scope reports the given process images — a
+    /// Terminal pane with a harness started by hand inside it.
+    fn recording_pty_session_hosting(
+        process_id: u32,
+        live_images: &[&str],
+    ) -> (Box<dyn PtySessionTrait>, Arc<Mutex<Vec<String>>>) {
         let inputs = Arc::new(Mutex::new(Vec::new()));
         (
             Box::new(RecordingPtySession {
                 process_id,
                 inputs: inputs.clone(),
                 resizes: None,
+                live_images: live_images.iter().map(|image| image.to_string()).collect(),
             }),
             inputs,
         )
@@ -11902,6 +12019,7 @@ mod tests {
                 process_id,
                 inputs: Arc::new(Mutex::new(Vec::new())),
                 resizes: Some(resizes.clone()),
+                live_images: Vec::new(),
             }),
             resizes,
         )
@@ -13970,6 +14088,125 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn harness_inside_a_terminal_is_read_from_its_process_images() {
+        assert_eq!(
+            harness_from_process_images(["cmd.exe", "conhost.exe"]),
+            None
+        );
+        assert_eq!(
+            harness_from_process_images(["powershell.exe", "conhost.exe"]),
+            None
+        );
+        assert_eq!(
+            harness_from_process_images([
+                r"C:\Windows\System32\cmd.exe",
+                r"C:\Program Files\nodejs\node.exe",
+                r"C:\...\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe",
+            ]),
+            Some(DriverKind::Codex)
+        );
+        assert_eq!(
+            harness_from_process_images(["cmd.exe", r"C:\Users\me\.grok\bin\grok.exe"]),
+            Some(DriverKind::Grok)
+        );
+        assert_eq!(
+            harness_from_process_images(["cmd.exe", "claude.exe"]),
+            Some(DriverKind::Claude)
+        );
+        assert_eq!(
+            harness_from_process_images(["cmd.exe", "node.exe"]),
+            Some(DriverKind::Codex),
+            "a node-hosted CLI whose native child is not up yet takes the Codex contract"
+        );
+        assert_eq!(
+            harness_from_process_images(["bash", "node"]),
+            Some(DriverKind::Codex)
+        );
+        assert_eq!(
+            harness_from_process_images(["cmd.exe", "codex.js"]),
+            None,
+            "a script name is not a running harness image"
+        );
+    }
+
+    #[test]
+    fn terminal_pane_running_codex_gets_the_codex_delivery_contract() {
+        let supervisor = test_supervisor();
+        let events = capture_runtime_events(&supervisor);
+        let (pty, inputs) = recording_pty_session_hosting(
+            std::process::id(),
+            &["cmd.exe", "node.exe", "codex.exe"],
+        );
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "codex",
+            DriverKind::GenericTerminal,
+            pty,
+        );
+        let session_id = test_session_id(&supervisor, "codex");
+
+        for content in ["first line\nsecond line", "again"] {
+            supervisor
+                .route_operator_message(OperatorRouteMessageRequest {
+                    recipient_id: session_id,
+                    content: content.into(),
+                })
+                .unwrap();
+        }
+
+        let written = inputs.lock().clone();
+        assert_eq!(
+            written,
+            vec![
+                format!(
+                    "{BRACKETED_PASTE_START}[Direct message from operator]\nfirst line\nsecond line{BRACKETED_PASTE_END}"
+                ),
+                "\x1b[C\r".to_string(),
+                format!(
+                    "{BRACKETED_PASTE_START}[Direct message from operator]\nagain{BRACKETED_PASTE_END}"
+                ),
+                "\x1b[C\r".to_string(),
+            ],
+            "a hand-started Codex gets the bracketed frame, the provenance header and the arrow fence"
+        );
+        let announcements = events
+            .lock()
+            .iter()
+            .filter(|event| {
+                matches!(event, RuntimeEvent::SystemLog { message, .. } if message.contains("Codex is running inside this terminal"))
+            })
+            .count();
+        assert_eq!(
+            announcements, 1,
+            "the detection is announced once per run, not per message"
+        );
+    }
+
+    #[test]
+    fn terminal_pane_running_a_bare_shell_keeps_the_raw_contract() {
+        let supervisor = test_supervisor();
+        let (pty, inputs) = recording_pty_session_hosting(
+            std::process::id(),
+            &["cmd.exe", "conhost.exe", "powershell.exe"],
+        );
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "codex",
+            DriverKind::GenericTerminal,
+            pty,
+        );
+        let session_id = test_session_id(&supervisor, "codex");
+
+        supervisor
+            .route_operator_message(OperatorRouteMessageRequest {
+                recipient_id: session_id,
+                content: "dir".into(),
+            })
+            .unwrap();
+        assert_eq!(inputs.lock().as_slice(), &["dir\r".to_string()]);
     }
 
     #[test]
@@ -16443,6 +16680,7 @@ mod tests {
                     process_id: std::process::id(),
                     inputs: replacement_inputs_for_sink.clone(),
                     resizes: None,
+                    live_images: Vec::new(),
                 }))));
                 let replacement_run_id = Uuid::new_v4();
                 set_test_bracketed_paste_mode(

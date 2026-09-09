@@ -292,6 +292,28 @@ Now (`CONTRACT-LAUNCH-DIAGNOSIS.md`):
 Not done: auto-relaunch after a Grok self-update (one click today); capture
 by the pane's own first paint instead of newest-file-in-cwd.
 
+### Room delivery follows the harness running inside a Terminal pane (2026-09-09)
+
+A Terminal pane in which the operator started `codex` by hand received room
+messages under the generic-terminal contract — raw keystrokes, no provenance
+header, then Enter — because delivery behaviour was chosen from the pane's
+driver label. Codex's paste-burst detector swallowed the Enter as a pasted
+newline; messages from the Claude pane stacked in the composer unsubmitted
+while Codex kept replying through the feed as if nothing were pending.
+
+Now (`CONTRACT-TERMINAL-HARNESS-DELIVERY.md`): before each delivery to a
+Terminal pane the supervisor reads the pane's live process images. `grok.exe`
+→ Grok, `codex*` → Codex, `claude*` → Claude Code, a bare `node` → Codex
+(whose bracketed paste + Right-Arrow fence + Enter is also right for Claude
+Code); shells and console hosts never count. The detected harness's delivery
+contract applies — framing, fence, submit delay, the `[… message from …]`
+header, and the bracketed-paste-mode requirement — and the first detection in
+a run is announced in the system log. A Terminal pane running a bare shell
+keeps the raw single-line contract. **Not covered:** work-state gating for a
+hand-started harness (a delivery can land in a Codex modal; Codex's own
+Tab-to-queue while a turn runs is not driven). Start a real Codex/Claude/Grok
+pane when those matter.
+
 ## Roadmap items tracked publicly
 
 The following are not bugs but in-progress structural improvements. They affect what consumers can rely on:

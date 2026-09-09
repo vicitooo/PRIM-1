@@ -259,6 +259,11 @@ pub trait PtySession: Send + Sync {
     fn agent_alive(&self, _driver: DriverKind) -> anyhow::Result<AgentLiveness> {
         Ok(AgentLiveness::NotYetObserved(Vec::new()))
     }
+    /// Every live process in this session's scope, with image names where the
+    /// platform reports them. Empty when the session cannot enumerate.
+    fn live_processes(&self) -> anyhow::Result<Vec<ProcessIdentity>> {
+        Ok(Vec::new())
+    }
 }
 
 pub struct ConcretePtySession {
@@ -604,6 +609,10 @@ impl PtySession for ConcretePtySession {
         }
     }
 
+    fn live_processes(&self) -> anyhow::Result<Vec<ProcessIdentity>> {
+        self.live_process_identities()
+    }
+
     fn agent_alive(&self, driver: DriverKind) -> anyhow::Result<AgentLiveness> {
         let live_processes = self.live_process_identities()?;
         let agent_processes = if driver == DriverKind::GenericTerminal {
@@ -689,6 +698,11 @@ pub fn expected_agent_image_name(driver: DriverKind, image_name: &str) -> bool {
         DriverKind::Prime => false,
         DriverKind::GenericTerminal => false,
     }
+}
+
+/// The lower-cased file name of a process image ("codex.exe", "node").
+pub fn process_image_file_name(image_name: &str) -> String {
+    process_image_basename(image_name).to_ascii_lowercase()
 }
 
 fn process_image_basename(image_name: &str) -> &str {
