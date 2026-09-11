@@ -20,6 +20,12 @@ fn is_clean_prompt_screen(screen: &TrustedScreen<'_>) -> bool {
     if !screen.cursor_visible() || screen.cursor_col() != 2 {
         return false;
     }
+    // Only the prompt row and the status footer are read, so only those rows
+    // need to be freshly painted. Requiring the whole grid would strand any
+    // pane whose client repaints just the prompt region after a resize.
+    if !screen.row_trusted(screen.cursor_row()) {
+        return false;
+    }
     let Some(input) = screen.row_text(screen.cursor_row()) else {
         return false;
     };
@@ -27,10 +33,17 @@ fn is_clean_prompt_screen(screen: &TrustedScreen<'_>) -> bool {
         return false;
     }
 
-    let footer = (screen.cursor_row() + 1..screen.rows())
-        .filter_map(|row| screen.row_text(row))
-        .find(|row| !row.trim().is_empty());
-    let Some(footer) = footer.filter(|footer| footer.starts_with("  ")) else {
+    let footer = (screen.cursor_row() + 1..screen.rows()).find_map(|row| {
+        let text = screen.row_text(row)?;
+        (!text.trim().is_empty()).then_some((row, text))
+    });
+    // An untrusted candidate is stale text left behind by an invalidation,
+    // not a footer. Bail rather than scanning past it.
+    let Some(footer) = footer
+        .filter(|(row, _)| screen.row_trusted(*row))
+        .map(|(_, text)| text)
+        .filter(|footer| footer.starts_with("  "))
+    else {
         return false;
     };
     let Some((model, working_dir)) = footer.trim().rsplit_once(" · ") else {
@@ -102,16 +115,24 @@ impl WorkStateTracker {
                         observed = Some(classification);
                     }
                 }
-                if let Some(screen) = self.viewport.trusted_screen() {
-                    if let Some(blocker) = classify_current_screen_blocker(&screen) {
-                        self.clean_commit_pending = false;
-                        blocker_resolved = false;
-                        observed = Some(blocker);
-                    } else if is_clean_prompt_screen(&screen) {
-                        self.clean_commit_pending = true;
-                        blocker_resolved = true;
-                        observed = Some((WorkState::Idle, None));
-                    }
+                if let Some(blocker) = self
+                    .viewport
+                    .trusted_screen()
+                    .as_ref()
+                    .and_then(classify_current_screen_blocker)
+                {
+                    self.clean_commit_pending = false;
+                    blocker_resolved = false;
+                    observed = Some(blocker);
+                } else if self
+                    .viewport
+                    .projected_screen()
+                    .as_ref()
+                    .is_some_and(is_clean_prompt_screen)
+                {
+                    self.clean_commit_pending = true;
+                    blocker_resolved = true;
+                    observed = Some((WorkState::Idle, None));
                 }
                 self.context.clear();
             }
@@ -127,22 +148,27 @@ impl WorkStateTracker {
             }
         }
 
-        if let Some(screen) = self.viewport.trusted_screen() {
-            if let Some(blocker) = classify_current_screen_blocker(&screen) {
-                self.clean_commit_pending = false;
-                blocker_resolved = false;
-                let repeated_in_this_chunk = observed.as_ref().is_some_and(|classification| {
-                    classification.0 == WorkState::Blocked && classification.1 == blocker.1
-                });
-                observed = if repeated_in_this_chunk
-                    || !self.blocked
-                    || self.blocked_detail.as_deref() != blocker.1.as_deref()
-                {
-                    Some(blocker)
-                } else {
-                    None
-                };
-            } else if is_clean_prompt_screen(&screen) {
+        if let Some(blocker) = self
+            .viewport
+            .trusted_screen()
+            .as_ref()
+            .and_then(classify_current_screen_blocker)
+        {
+            self.clean_commit_pending = false;
+            blocker_resolved = false;
+            let repeated_in_this_chunk = observed.as_ref().is_some_and(|classification| {
+                classification.0 == WorkState::Blocked && classification.1 == blocker.1
+            });
+            observed = if repeated_in_this_chunk
+                || !self.blocked
+                || self.blocked_detail.as_deref() != blocker.1.as_deref()
+            {
+                Some(blocker)
+            } else {
+                None
+            };
+        } else if let Some(screen) = self.viewport.projected_screen() {
+            if is_clean_prompt_screen(&screen) {
                 if observed.is_none() && self.clean_commit_pending {
                     blocker_resolved = true;
                     observed = Some((WorkState::Idle, None));
@@ -1181,6 +1207,78 @@ mod tests {
         assert_eq!(
             classify_work_state("literal PowerShell example: `PS C:\\Projects\\PRIM-1>`"),
             None
+        );
+    }
+
+    /// A pane whose grid is invalidated after the initial full-canvas paint
+    /// (`TerminalViewport::resize` marks every cell invalid) must still reach
+    /// Idle from the inline prompt repaints Codex emits under
+    /// `--no-alt-screen`. Demanding whole-grid trust stranded such a pane
+    /// permanently: no Idle meant `work_state_observed` stayed false and the
+    /// supervisor refused every routed room delivery to it.
+    #[test]
+    fn clean_prompt_survives_an_invalidated_grid_without_a_full_repaint() {
+        let stream: String =
+            serde_json::from_str(include_str!("fixtures/codex-clean-prompt-e16a-prefix.json"))
+                .expect("e16a production prefix should remain valid JSON");
+
+        let mut tracker = WorkStateTracker::default();
+        tracker.begin_run();
+        tracker.resize(196, 22);
+        assert_eq!(
+            tracker.observe_output(&stream),
+            Some((WorkState::Idle, None)),
+            "baseline: the full-canvas paint reaches Idle"
+        );
+
+        // The supervisor resizes the viewport (session start, or any pane
+        // geometry change), invalidating every cell.
+        tracker.resize(196, 22);
+
+        // Codex repaints only the prompt region from here on.
+        let inline_repaint = &stream[stream.len() - 700..];
+        assert_eq!(
+            tracker.observe_output(inline_repaint),
+            Some((WorkState::Idle, None)),
+            "an inline prompt repaint must re-establish Idle after invalidation"
+        );
+    }
+
+    /// Stale cells left behind by a projection taint must not be read as a
+    /// status footer: only rows repainted since the taint count. Unlike a
+    /// resize (which allocates a blank grid), a taint keeps the old contents
+    /// while dropping their validity, so an unguarded footer scan would match
+    /// text that is no longer on screen.
+    #[test]
+    fn stale_rows_below_the_prompt_are_not_accepted_as_a_footer() {
+        let stream: String =
+            serde_json::from_str(include_str!("fixtures/codex-clean-prompt-e16a-prefix.json"))
+                .expect("e16a production prefix should remain valid JSON");
+
+        let mut tracker = WorkStateTracker::default();
+        tracker.begin_run();
+        tracker.resize(196, 22);
+        assert_eq!(
+            tracker.observe_output(&stream),
+            Some((WorkState::Idle, None)),
+            "baseline: the full-canvas paint reaches Idle"
+        );
+
+        // Taint the projection: cell contents survive, their validity does not.
+        tracker.observe_output("\u{1b}[999z");
+
+        // Repaint the prompt row alone -- erase-to-end-of-line makes that row
+        // trusted again -- while the status footer below stays stale.
+        let prompt_row_only = concat!(
+            "\u{1b}[?25l\u{1b}[13;1H\u{1b}[K",
+            "\u{1b}[38;2;247;181;85m\u{1b}[1m\u{203a}\u{1b}[39m\u{1b}[22m",
+            " \u{1b}[2mSummarize recent commits\u{1b}[22m\u{1b}[K",
+            "\u{1b}[13;3H\u{1b}[?25h",
+        );
+        assert_eq!(
+            tracker.observe_output(prompt_row_only),
+            None,
+            "a trusted prompt row above a stale footer is not a clean prompt"
         );
     }
 }
