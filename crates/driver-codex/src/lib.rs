@@ -16,6 +16,25 @@ fn looks_like_status_working_directory(value: &str) -> bool {
             .is_some_and(|prefix| prefix[0].is_ascii_alphabetic() && prefix[1] == b':')
 }
 
+/// Codex paints an animated decorative layer of Braille Pattern glyphs
+/// (U+2800-U+28FF) across the whole viewport, the prompt row and status footer
+/// included. Each particle is drawn over a blank cell, so a row reads as
+/// `"›<particle>Ask Codex to do anything"` rather than `"› Ask ..."`, and an
+/// otherwise-empty row reads as non-empty. Structural matching has to see the
+/// blanks the particles sit on, so map them back to spaces rather than dropping
+/// them — dropping would close the gap the particle replaced.
+fn without_decoration(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if matches!(character, '\u{2800}'..='\u{28ff}') {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
 fn is_clean_prompt_screen(screen: &TrustedScreen<'_>) -> bool {
     if !screen.cursor_visible() || screen.cursor_col() != 2 {
         return false;
@@ -26,15 +45,20 @@ fn is_clean_prompt_screen(screen: &TrustedScreen<'_>) -> bool {
     if !screen.row_trusted(screen.cursor_row()) {
         return false;
     }
-    let Some(input) = screen.row_text(screen.cursor_row()) else {
+    let Some(input) = screen
+        .row_text(screen.cursor_row())
+        .as_deref()
+        .map(without_decoration)
+    else {
         return false;
     };
+    let input = input.trim_end();
     if input != "›" && !input.starts_with("› ") {
         return false;
     }
 
     let footer = (screen.cursor_row() + 1..screen.rows()).find_map(|row| {
-        let text = screen.row_text(row)?;
+        let text = without_decoration(&screen.row_text(row)?);
         (!text.trim().is_empty()).then_some((row, text))
     });
     // An untrusted candidate is stale text left behind by an invalidation,
@@ -55,7 +79,10 @@ fn is_clean_prompt_screen(screen: &TrustedScreen<'_>) -> bool {
 fn classify_current_screen_blocker(
     screen: &TrustedScreen<'_>,
 ) -> Option<(WorkState, Option<String>)> {
-    classify_normalized_work_state(&screen.text()).filter(|(state, _)| *state == WorkState::Blocked)
+    // The decorative particle layer lands on top of prompt text too, so a
+    // blocking prompt's keywords are only matchable once it is neutralised.
+    classify_normalized_work_state(&without_decoration(&screen.text()))
+        .filter(|(state, _)| *state == WorkState::Blocked)
 }
 
 /// Tracks Codex's bounded interactive-prompt context across arbitrary PTY
@@ -1279,6 +1306,46 @@ mod tests {
             tracker.observe_output(prompt_row_only),
             None,
             "a trusted prompt row above a stale footer is not a clean prompt"
+        );
+    }
+
+    /// Codex v0.154 paints an animated Braille-glyph particle layer over the
+    /// whole viewport. Particles land on the blank after the prompt marker
+    /// (`"›<particle>Ask Codex..."`) and turn otherwise-empty rows above the
+    /// status footer into non-empty ones, which made the clean-prompt check
+    /// reject every settled prompt. The pane then never reported Idle, so
+    /// `work_state_observed` stayed false and the supervisor refused every
+    /// routed room delivery to it. Captured from a live 447x88 pane.
+    #[test]
+    fn decorated_prompt_is_still_recognised_as_a_clean_prompt() {
+        let stream: String =
+            serde_json::from_str(include_str!("fixtures/codex-decorated-prompt-v0154.json"))
+                .expect("decorated prompt fixture should remain valid JSON");
+        assert!(
+            stream.chars().any(|c| matches!(c, '\u{2800}'..='\u{28ff}')),
+            "fixture must carry the decorative particle layer"
+        );
+
+        let mut tracker = WorkStateTracker::default();
+        tracker.begin_run();
+        tracker.resize(120, 24);
+        assert_eq!(
+            tracker.observe_output(&stream),
+            Some((WorkState::Idle, None)),
+            "a decorated settled prompt must still classify as Idle"
+        );
+    }
+
+    /// The particle layer must be neutralised without closing the gap it was
+    /// drawn over: dropping the glyph would splice `"›"` onto the prompt text.
+    #[test]
+    fn decoration_is_mapped_to_blanks_not_removed() {
+        assert_eq!(without_decoration("›⠁Ask Codex"), "› Ask Codex");
+        assert_eq!(without_decoration("   ⠄  ⢀ ").trim(), "");
+        assert_eq!(
+            without_decoration(r"  gpt-6-astra high · ~\Desktop\sample-main"),
+            r"  gpt-6-astra high · ~\Desktop\sample-main",
+            "undecorated text must pass through untouched"
         );
     }
 }
