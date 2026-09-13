@@ -20,3 +20,9 @@ vendor/portable-pty — a vendored and locally modified copy of
 portable-pty 0.9.0 (https://github.com/wezterm/wezterm).
 Copyright (c) 2018 Wez Furlong. Licensed under the MIT License;
 the full licence text is at vendor/portable-pty/LICENSE.md.
+
+The following unmodified crates are licensed under MPL-2.0 (file-level
+copyleft, compatible with Apache-2.0). Distributing compiled binaries that
+include these files requires MPL source availability and notices for the
+MPL-covered files: cssparser, cssparser-macros, dtoa-short, option-ext,
+selectors.

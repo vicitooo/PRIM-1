@@ -27,26 +27,29 @@ A local multi-agent runtime for terminal-first AI tools. PRIM-1 hosts CLI agents
 
 ## Prerequisites
 
-- **Rust** (1.80+ recommended) with `cargo`
-- **Node.js** (20+) with `npm` for the Tauri frontend
+- **Windows 10/11** — this tree is Windows-only. macOS and Linux ports are planned (see [ROADMAP.md](ROADMAP.md)).
+- **Rust 1.85+** with `cargo` (the workspace uses edition 2024). Last verified with rustc 1.95.0.
+- **MSVC C++ Build Tools** (the Visual Studio "Desktop development with C++" workload, or Build Tools for Visual Studio) — required to compile native crates on Windows.
+- **WebView2 Runtime** — required by the Tauri 2 desktop shell (preinstalled on current Windows 11; install the Evergreen runtime on Windows 10 if missing).
+- **Node.js 20+** with `npm` for the desktop frontend
 - **Tauri 2** CLI: `cargo install tauri-cli --version "^2"`
 - **Claude Code CLI** (`claude`) — for the Claude pane driver
 - **Codex CLI** (`codex`) — for the Codex pane driver
 - **Grok Build CLI** (`grok`) — for the Grok pane driver
 - **Prime Agent** (`prime-agent`) in the Ubuntu WSL distribution — for the Prime pane driver; WSL must have a working user `systemd` manager
-- **Windows 10/11** — currently Windows-first. Linux/macOS work is planned but not yet validated (see [ROADMAP.md](ROADMAP.md)).
 
 ## Build
 
-```bash
-# Check Rust workspace
-cargo check
-cargo test
+The Tauri crate embeds `apps/desktop/dist/index.html`. Build that frontend **before** any workspace `cargo check` / `cargo test` / `cargo build`.
 
-# Build the Tauri desktop app
+```bash
 cd apps/desktop
-npm install
+npm ci
 npm run build
+cd ../..
+
+cargo test --workspace
+cd apps/desktop
 npm run tauri build
 ```
 
@@ -234,5 +237,7 @@ Bug reports and well-scoped pull requests are welcome via GitHub Issues / PRs ag
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE). Software is provided AS IS, without warranty.
+
+Some compiled dependencies (the `cssparser` / `selectors` family) are **MPL-2.0**. That is file-level copyleft: Apache-2.0 is compatible, but distributing binaries that include those files still requires MPL source availability and notices for the MPL-covered files. See [NOTICE](NOTICE).
 
 Copyright 2026 Victor Valtchev.

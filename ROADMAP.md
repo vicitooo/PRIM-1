@@ -220,7 +220,7 @@ CC and Grok may collaborate as PRIM-1 sessions only through the same first-class
 3. driver-specific framing, measured payload ceiling and submit gesture, positive turn-start observation, and independent receiver oracle
 4. fail-closed handling of trust/authentication/limit/modal states while raw recovery input remains usable
 5. direct and explicit `SessionId`/`RoomId` delivery, then multi-member room delivery, with Agent Bus stopped
-6. privacy, ungraceful termination, clean-install, and production performance gates required by `CONTRACT.md`
+6. privacy, ungraceful termination, clean-install, and production-build performance checks against the packaged desktop artifact
 
 Until the independent receiver oracle exists, a response token proves only that a routed turn was reached and answered; it does not prove byte-exact final-child delivery. Agent Bus evidence never substitutes for any native-session gate.
 

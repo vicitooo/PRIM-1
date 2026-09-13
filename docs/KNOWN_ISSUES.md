@@ -6,6 +6,15 @@ A short, public-facing reference for current limitations, known bugs, and versio
 
 PRIM-1 is currently **Windows-first**. The wrapper uses Windows named pipes for the control plane and assumes ConPTY/PTY semantics that have been validated on Windows 10/11. Prime is the one explicit cross-boundary driver: it runs inside the Ubuntu WSL distribution under a user-systemd transient service while the Windows supervisor retains the outer ConPTY job. This is not a general Linux desktop port. Native Linux/macOS work remains on the roadmap. See `ROADMAP.md`.
 
+## Workspace tests
+
+`cargo test --workspace` has failed once on this tree in
+`pty-host::windows_real_process_tests::production_spawn_contains_immediate_descendants_at_process_creation`
+while the same test passed twice when rerun in isolation. The `pty-host` crate
+bytes were unchanged from a prior full-suite pass. Cause is **not established**.
+Do not treat that failure as a known-harmless flake; re-run the full suite on
+the machine that will ship the artifact, and keep the failing assertion output.
+
 ## Pinned CLI versions known to work
 
 The wrapper drives external CLI tools whose UIs evolve. Known-good versions (validated against the wrapper's drivers):
@@ -231,7 +240,7 @@ perfectly clean prompt, so every rescan (each keystroke echo, `/new` +
 `error_loop`. Every room send to all members was refused before delivery —
 to anyone — with a message that named nothing an operator could act on.
 
-Now (see `CONTRACT-BLOCKED-LATCH.md`):
+Now:
 
 - **Blocker classes.** `Modal` (`workspace_trust`, `approval_prompt`,
   `plan_mode_prompt`) latches on the trusted screen exactly as before.
@@ -275,7 +284,7 @@ Two panes died the same morning with the same four words and different causes:
   restarted, ten seconds after PRIM-1 marked it idle. PRIM-1 called it a crash.
   The next Launch ran 1.0.24 fine.
 
-Now (`CONTRACT-LAUNCH-DIAGNOSIS.md`):
+Now:
 
 - the supervisor keeps the last 2 KiB of control-stripped output per run and an
   unrequested exit's pane message quotes the harness's last real lines;
@@ -301,7 +310,7 @@ driver label. Codex's paste-burst detector swallowed the Enter as a pasted
 newline; messages from the Claude pane stacked in the composer unsubmitted
 while Codex kept replying through the feed as if nothing were pending.
 
-Now (`CONTRACT-TERMINAL-HARNESS-DELIVERY.md`): before each delivery to a
+Now: before each delivery to a
 Terminal pane the supervisor reads the pane's live process images. `grok.exe`
 → Grok, `codex*` → Codex, `claude*` → Claude Code, a bare `node` → Codex
 (whose bracketed paste + Right-Arrow fence + Enter is also right for Claude
