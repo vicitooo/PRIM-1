@@ -13,3 +13,10 @@ Acknowledgements
 ----------------
 Martin Tomov produced an earlier private macOS port of a previous
 revision of this project. That work is not included in this tree.
+
+Third-party components
+----------------------
+vendor/portable-pty — a vendored and locally modified copy of
+portable-pty 0.9.0 (https://github.com/wezterm/wezterm).
+Copyright (c) 2018 Wez Furlong. Licensed under the MIT License;
+the full licence text is at vendor/portable-pty/LICENSE.md.
