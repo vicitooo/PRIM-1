@@ -76,6 +76,21 @@ impl Screen {
         self.valid.iter().all(|valid| *valid)
     }
 
+    /// Whether every cell of a single row has been painted since the last
+    /// invalidation. Callers that only read specific rows can rely on this
+    /// instead of demanding the whole grid be trusted; a grid that is only
+    /// ever partially repainted (Codex under `--no-alt-screen`) never
+    /// satisfies [`Screen::is_trusted`].
+    fn row_is_trusted(&self, row: usize) -> bool {
+        if row >= self.rows {
+            return false;
+        }
+        let start = self.index(row, 0);
+        self.valid[start..start + self.cols]
+            .iter()
+            .all(|valid| *valid)
+    }
+
     fn invalidate(&mut self) {
         self.valid.fill(false);
     }
@@ -341,6 +356,16 @@ impl TrustedScreen<'_> {
         (row < self.screen.rows).then(|| self.screen.row_text(row))
     }
 
+    /// Whether `row` has been fully painted since the last invalidation.
+    ///
+    /// Always true for a screen obtained from
+    /// [`TerminalViewport::trusted_screen`]; meaningful only for one obtained
+    /// from [`TerminalViewport::projected_screen`], where the caller must
+    /// check each row it reads.
+    pub fn row_trusted(&self, row: usize) -> bool {
+        self.screen.row_is_trusted(row)
+    }
+
     pub fn text(&self) -> String {
         self.screen.text()
     }
@@ -388,6 +413,24 @@ impl TerminalViewport {
         self.screen
             .as_ref()
             .filter(|screen| self.parser == ParserState::Ground && screen.is_trusted())
+            .map(|screen| TrustedScreen {
+                screen,
+                cursor_visible: self.cursor_visible,
+            })
+    }
+
+    /// The settled screen without the whole-grid trust requirement.
+    ///
+    /// [`TerminalViewport::resize`] invalidates every cell, and a client that
+    /// only ever repaints part of the grid can never clear that. Readers of a
+    /// bounded region should take this screen and gate each row they read on
+    /// [`TrustedScreen::row_trusted`]; readers of the whole screen must keep
+    /// using [`TerminalViewport::trusted_screen`], since cells left over from
+    /// before an invalidation are stale rather than blank.
+    pub fn projected_screen(&self) -> Option<TrustedScreen<'_>> {
+        self.screen
+            .as_ref()
+            .filter(|_| self.parser == ParserState::Ground)
             .map(|screen| TrustedScreen {
                 screen,
                 cursor_visible: self.cursor_visible,
