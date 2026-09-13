@@ -18,7 +18,7 @@ exclude = ["vendor/portable-pty"]
 
 [workspace.package]
 edition = "2024"
-authors = ["Victor Valtchev"]
+authors = ["Victor Valtchev", "Alexander Valtchev"]
 license = "Apache-2.0"
 repository = "https://github.com/vicitooo/PRIM-1"
 description = "PRIM-1 — local desktop runtime for persistent, supervised terminal-first agent sessions."

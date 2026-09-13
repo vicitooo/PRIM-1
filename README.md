@@ -3,7 +3,8 @@
 A local multi-agent runtime for terminal-first AI tools. PRIM-1 hosts CLI agents inside supervised pseudo-terminal sessions in a Tauri desktop app, with stable session identity, a pane-local sideband control plane, and an append-only metadata audit of lifecycle and delivery activity.
 
 **License:** Apache-2.0
-**Status:** Working runtime, in active development. Open-source, single-author personal project.
+**Platform:** Windows 10/11. macOS and Linux ports are planned; they are not in this tree.
+**Status:** Working runtime, in active development.
 
 ---
 
@@ -217,12 +218,21 @@ wildcard origins, and exposes a frozen automation bridge only for the lifetime
 of that explicitly instrumented process. Production-artifact screenshots use
 the WebView's built-in `Page.captureScreenshot` path.
 
+## Contributors
+
+- **Victor Valtchev** — runtime, supervisor, drivers, product
+- **Alexander Valtchev** — desktop UI and bugfixes
+
+## Acknowledgements
+
+An earlier private macOS experiment by Martin Tomov is not part of this repository. A first-class macOS (and Linux) port is planned against the current Windows tree.
+
 ## Contributing
 
-This is a personal open-source project. Bug reports and well-scoped pull requests are welcome via GitHub Issues / PRs against the `main` branch.
+Bug reports and well-scoped pull requests are welcome via GitHub Issues / PRs against `main`.
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE).
+Apache-2.0 — see [LICENSE](LICENSE). Software is provided AS IS, without warranty.
 
 Copyright 2026 Victor Valtchev.

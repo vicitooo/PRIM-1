@@ -26031,7 +26031,7 @@ mod tests {
         let sessions = tempfile::tempdir().unwrap();
         let day = sessions.path().join("2026").join("09").join("08");
         fs::create_dir_all(&day).unwrap();
-        let cwd = r"<workspace>";
+        let cwd = r"C:\Users\dev\project";
         let write = |name: &str, meta: serde_json::Value| {
             let line = serde_json::json!({
                 "timestamp": "2026-09-08T10:29:31.000Z",

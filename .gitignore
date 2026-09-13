@@ -3,6 +3,9 @@
 **/target/
 Cargo.lock.bak
 
+# Internal verification receipts — not part of the product
+/evidence/
+
 # Runtime state (audit logs, pane credentials, sideband mailbox, dispatch staging)
 /.runtime/
 .runtime/

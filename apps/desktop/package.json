@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "type": "module",
   "description": "PRIM-1 desktop runtime for persistent, supervised terminal-first agent sessions.",
-  "author": "Victor Valtchev",
+  "author": "Victor Valtchev and Alexander Valtchev",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
