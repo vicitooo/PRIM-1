@@ -18,7 +18,7 @@ exclude = ["vendor/portable-pty"]
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 authors = ["Victor Valtchev", "Alexander Valtchev"]
 license = "Apache-2.0"
 repository = "https://github.com/vicitooo/PRIM-1"

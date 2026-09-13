@@ -28,7 +28,7 @@ A local multi-agent runtime for terminal-first AI tools. PRIM-1 hosts CLI agents
 ## Prerequisites
 
 - **Windows 10/11** — this tree is Windows-only. macOS and Linux ports are planned (see [ROADMAP.md](ROADMAP.md)).
-- **Rust 1.85+** with `cargo` (the workspace uses edition 2024). Last verified with rustc 1.95.0.
+- **Rust 1.95.0** with `cargo` — the toolchain this tree was last verified with (edition 2024). The Windows lockfile’s reachable crates (`time` 0.3.47, `serde_with` 3.18.0, `darling` 0.23.0) declare a compile floor of **1.88**; we have not verified 1.88–1.94.
 - **MSVC C++ Build Tools** (the Visual Studio "Desktop development with C++" workload, or Build Tools for Visual Studio) — required to compile native crates on Windows.
 - **WebView2 Runtime** — required by the Tauri 2 desktop shell (preinstalled on current Windows 11; install the Evergreen runtime on Windows 10 if missing).
 - **Node.js 20+** with `npm` for the desktop frontend
