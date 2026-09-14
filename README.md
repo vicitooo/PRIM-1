@@ -2,20 +2,18 @@
 
 A **Windows** desktop app that runs terminal-first AI agents (Claude Code, Codex, Grok, Prime, or a generic shell) as real sessions you can see, start, stop, and put in a room together.
 
-Local only. Not a cloud. Not a hosted agent platform.
+The app itself runs on your machine. It is not a hosted agent platform and does not run models locally — the CLIs you attach still use their own providers and accounts.
 
 **License:** Apache-2.0 · **OS:** Windows 10/11 · macOS/Linux are planned, not in this tree.
 
 ## Run
 
-You need Rust **1.95.0**, MSVC C++ Build Tools, WebView2, Node.js 20+, and the Tauri 2 CLI. Then:
+You need Rust **1.95.0**, MSVC C++ Build Tools, WebView2, Node.js 20+, the Tauri 2 CLI, and **the CLI(s) you actually want to run**, already installed and logged in (`claude`, `codex`, `grok`, and/or `prime-agent`). Prime also needs Ubuntu WSL with a working user `systemd`. Then:
 
 ```bash
 cd apps/desktop
 npm ci
 npm run build
-cd ../..
-cd apps/desktop
 npm run tauri build
 ```
 

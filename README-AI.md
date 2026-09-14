@@ -100,7 +100,7 @@ Windows default runtime: `%LOCALAPPDATA%\io.prim1.runtime\runtime`. Session cata
 
 ## Security
 
-PRIM-1 runs locally. The pane sideband carries no bearer token. Native pane authority is derived from the named-pipe caller bound to the live PTY job and generation, or from the per-run `PRIM1_PANE_SECRET` for callers outside every pane Job. Prime/WSL sessions do not receive the sideband. Treat the app-local runtime directory as private machine-local state.
+The desktop app runs on the operator's machine; attached CLIs still use their own providers and accounts. Pane authority is one of two paths: (1) kernel Job membership of the named-pipe caller, bound to the live PTY job and generation; (2) the per-run `PRIM1_PANE_SECRET` as the connection's first line, for callers outside every pane Job. There is no operator-issued bearer file. Prime/WSL sessions do not receive the sideband. Treat the app-local runtime directory as private machine-local state.
 
 The packaged renderer loads only bundled assets under CSP, no global Tauri API, no in-app devtools. `PRIM1_CDP_PORT` is QA-only, loopback WebView2 debugging.
 
