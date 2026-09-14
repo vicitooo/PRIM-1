@@ -28,7 +28,7 @@ The exe lands at `target/release/cli-master-wrapper-desktop.exe`. On first launc
 | Who | Where |
 |---|---|
 | Humans | this file, then [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) and [ROADMAP.md](ROADMAP.md) |
-| Agents | [AGENTS.md](AGENTS.md) — contracts, sideband, rooms, env, security |
+| Agents | [README-AI.md](README-AI.md) (also [AGENTS.md](AGENTS.md)) |
 | Deeper | [ARCHITECTURE.md](ARCHITECTURE.md), [RUNTIME-CONTRACTS.md](RUNTIME-CONTRACTS.md), [CONTROL-SURFACE.md](CONTROL-SURFACE.md) |
 
 ## Contributors
