@@ -24,7 +24,7 @@ From the repository root, the executable is `target/release/cli-master-wrapper-d
 
 ## Your first room
 
-Use two installed harnesses for this walkthrough, for example Claude Code and Codex. They use your existing accounts and provider usage.
+Use two agent sessions for this walkthrough, for example Claude Code and Codex, or two instances of one installed CLI. They use your existing accounts and provider usage.
 
 1. Open PRIM-1, click **Rooms**, then **New room**. Name it `First room`, leave **Brief members automatically** checked, and click **Create room**. You can create the room before adding any sessions.
 2. In the room, click **+** (**Attach a harness**) → **Custom…**. Choose your first harness, give it a label, keep **Normal** permissions, and use **Browse…** to choose a project folder. Click **Create session** to launch it. Repeat for the second harness.

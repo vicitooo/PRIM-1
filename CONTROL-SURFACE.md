@@ -117,7 +117,7 @@ Behavior:
 
 The helper does not accept list, lifecycle, arbitrary cross-room route,
 signal, or session/room-management actions. It never reads `control-plane.json`,
-`PRIM1_PANE_CREDENTIALS`, or any bearer token.
+`PRIM1_PANE_CREDENTIALS`, or a bearer-token file.
 
 Model shell tools are not assumed to preserve Job membership. Processes outside
 all pane Jobs can authenticate with their inherited per-run pane secret. An
