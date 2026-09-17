@@ -2,13 +2,11 @@
 
 Claude CLI driver.
 
-Expected responsibilities:
+Responsibilities:
 
 - launch Claude
 - resume Claude sessions
-- normalize Claude session metadata
-- define Claude-specific output parsing hooks
-- expose Claude-specific interrupt/close behavior
+- select permission flags and validate direct executable launch
+- classify Claude-specific output and work-state markers
 
-This crate should not own general lifecycle logic; that belongs to the supervisor.
-
+General lifecycle and routed-input policy belong to the supervisor.

@@ -1,13 +1,16 @@
 # PRIM-1 room brief (canonical)
 
-The one text every harness gets when it joins a room. **Source of truth:
-`crates/supervisor/src/room_brief.txt`** — compiled into the supervisor, which
-delivers it into a member's terminal on join and on the run's first idle (and
-on the UI's *Brief now*), through the same Send path as the operator, with the
+The default text for room briefing. **Source of truth:
+`crates/supervisor/src/room_brief.txt`** — compiled into the supervisor. When
+automatic briefing is enabled, delivery is owed once per membership and waits
+until the member can accept it. Restarting a session does not repeat a completed
+brief. The operator can customize the room's template or use **Brief now**.
+Delivery uses the same Send path as the operator, with the
 placeholders filled in: `{room_label}`, `{members}` (the other members as
 "label (harness)"), `{your_label}`, `{tools}` (the `prim1_pane` MCP tools for
 Claude Code and Codex; the `PRIM1_CLI --prim1-room …` commands for everyone
-else). Terminal members receive it as one line (raw single-line framing).
+else, except Prime, which has no routed delivery). A bare Terminal member uses
+single-line framing.
 
 Keep it short: it lands in a terminal as one prompt. Edit the `.txt`, not this
 page; this copy is for reading.

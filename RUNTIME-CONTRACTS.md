@@ -1,7 +1,6 @@
 # PRIM-1 — Runtime Contracts
 
-**Status:** Active implementation contract; release gates remain open
-**Date:** 2026-04-14
+The current runtime behavior and its boundaries. See [ARCHITECTURE.md](ARCHITECTURE.md) for the component overview and [CONTROL-SURFACE.md](CONTROL-SURFACE.md) for commands.
 
 ## 1. Purpose
 
@@ -33,8 +32,9 @@ the narrow self-pane sideband and internal terminal provenance.
 
 The private version-1 catalog atomically persists one workspace preference plus
 ordered session intent: `SessionId`, label, driver, qualified cwd identity, and
-permission profile. It never persists `RunId`, process/lifecycle state, commands,
-arguments, environment variables, terminal output, or message content. A fresh
+permission profile, plus stored conversation references and whether a session
+was running at shutdown. It does not persist a live `RunId`, PID, command/argument
+list, environment, terminal output, or message content. A fresh
 catalog contains zero sessions. Corrupt or unknown versions fail visibly without
 default replacement.
 
@@ -52,16 +52,18 @@ separate typed `RoomId` request with either one member `SessionId` or explicit
 `all`; there is no unknown-target, name-derived, implicit, or all-session
 broadcast fallback.
 
-The tokenless pane sideband exposes no recipient-delivery operation. Its
-`room_read` and `room_post` requests carry neither `RoomId` nor sender: the
-supervisor derives the exact live caller, current room membership, join floor,
-and sender `SessionId` from the connected process job. A caller-supplied name is
-never room authority.
+The pane sideband exposes `room_read`, `room_post`, and `room_deliver`. Requests
+carry neither a `RoomId` nor sender: the supervisor derives both from the
+authenticated live run and its current membership. Delivery accepts a member
+label, session ID, or `all` (every other member); ambiguous labels fail closed.
+Identity comes from native Job membership or, for callers outside all pane Jobs,
+the per-run pane secret. A supplied recipient never grants cross-room authority.
 
 ## 4. Room/feed envelope
 
 The private room catalog atomically persists ordered `RoomId`, label, member
-`SessionId` values, and a nonzero membership revision. Feed epoch, sequence,
+`SessionId` values, a nonzero membership revision, and briefing preferences
+and completed-brief membership state. Feed epoch, sequence,
 messages, delivery results, and cursor state are process-memory only and reset
 on restart. Corrupt, structurally invalid, or unknown catalog versions fail
 startup without rewrite.
@@ -100,7 +102,7 @@ items. UI emission is never a model receipt.
 Room membership belongs to the durable session definition, not to one live
 run: closed members remain members, while delivery requires every selected
 recipient to have a compatible live run at whole-message preflight. Zero- and
-one-member rooms are ordinary workspaces (Rooms B1, 2026-08-30): operator
+one-member rooms are ordinary workspaces: operator
 delivery needs at least one member — an empty room refuses with the plain
 reason — and a pane's `all` needs at least one other member. Every room
 member can read an addressed message from the shared feed even when only one
@@ -115,9 +117,10 @@ only within their current room, always as themselves.
   closed-only delete, lifecycle, input, inventory, resize, native cwd selection,
   typed Prime Linux cwd selection, and typed permission changes.
 - In-process room actions own room catalog/membership mutations, operator feed
-  posts, and explicit one-member / Send All delivery for admitted native drivers.
+  posts, and explicit one-member / Send All delivery for supported recipients.
 - The pane-local sideband owns self `ping`, `wait_quiet`, `send_input`,
-  `send_key`, plus membership-derived `room_read` and feed-only `room_post`.
+  `send_key`, plus membership-derived `room_read`, feed-only `room_post`, and
+  `room_deliver` through the same delivery path as the operator.
 - Runtime telemetry owns structured session/room catalog, room feed, lifecycle,
   delivery, heartbeat, alert, and metadata-only dispatch events.
 
@@ -127,125 +130,106 @@ kind requires a new explicit contract and authority model.
 
 ## 6. Visible injection contract
 
-When a routed message is injected into a Claude, Codex, or Grok PTY, it must be
-visibly stamped inside its logical bracketed submission. Claude/Codex use one
-frame; Grok minimal mode uses one fused buffer of per-line frames. Generic Terminal is the
-deliberate exception: the PTY receives only the validated printable single-line
-source command, while PRIM displays provenance in its feed and route receipts
-and retains provenance metadata in the audit. Prefixing a generic shell command
-with human display text would change or invalidate the command.
+Claude Code, Codex, and Grok receive a visible provenance header inside one
+bracketed-paste payload. Grok's active driver launches full-screen; historical
+minimal-mode framing remains an internal tested path, not the current launch
+or delivery contract.
 
-The operator should be able to distinguish:
+A bare Generic Terminal receives only the source command, raw and single-line.
+A natural-language header would change executable shell syntax. When a supported
+harness is detected inside that terminal, the supervisor selects its framing
+and header instead. This process-image heuristic does not provide the typed
+driver's complete work-state tracking. Prime accepts raw terminal input only
+and is rejected before synthetic route events or writes.
 
-- normal agent output
-- supervisor-routed message injection
-- system notification
+Validation and writer boundaries:
 
-V1 rule:
+- Message bodies have a 1 MiB limit. C0, C1, and DEL controls other than tab and
+  source line endings fail validation. Bare-shell delivery further requires a
+  printable single-line command.
+- The supervisor does not trim, flatten, or silently truncate source bytes
+  received at its request boundary. This does not establish clipboard-to-WebView
+  fidelity or final-child interpretation.
+- Whole-message preflight resolves every selected recipient before any route
+  message is committed or any PTY is written.
+- One logical message holds one exact run's FIFO input permit through paste
+  and submission. Other input cannot interleave inside that operation.
+- Before the paste, the supervisor revalidates session, run, generation, PTY,
+  input gate, enabled bracketed-paste mode, and observed work state. Known
+  blocked/error-loop states and unobserved Codex state refuse delivery.
+- Driver trackers consume the unshed output stream. Their state is reset for
+  each run; a replacement cannot inherit readiness or paste-mode authority.
+- After a complete paste, submission waits at least one second plus 500 ms per
+  MiB of framed input, then for an output-quiet window of 400 ms, bounded at
+  ten seconds. Quiet is a pacing hint, not paste acknowledgement.
+- Before submission, exact run/PTY/gate and safe work state are checked again.
+  Paste mode need not still be enabled: a harness may disable it after consuming
+  the frame.
+- Claude and Grok submit with Enter. Codex uses Right-arrow followed by Enter
+  to cross its pasted-content guard. If no subsequent output is observed within
+  three seconds, the submit gesture can be repeated, up to three attempts total.
+  Only the gesture is repeated, never the message body. Output advancement is
+  not proof of semantic acceptance.
+- A partial or failed initial payload write records the accepted prefix and
+  sends no submit gesture or automatic body replay. Later failures produce
+  per-recipient results; successful deliveries cannot be rolled back.
+- A `written` receipt proves the PTY writer's outcome, not model understanding,
+  task completion, or byte-exact final-child receipt. Inspect the response or
+  resulting artifact for those outcomes.
 
-- injections must be explicit and human-readable
-- hidden control messages are not acceptable in the visible room
-- one logical message holds one run-scoped FIFO input permit until its harness submit is complete; semantic chunking is forbidden, but a driver may use multiple serialized PTY calls when its measured TUI protocol requires a boundary
-- for Claude and Codex, the Rust supervisor requires enabled paste mode before writing one complete bracketed-paste frame; Grok always launches in measured `--minimal` mode and instead receives one complete fused buffer containing one bracketed frame per LF-separated logical line with `ESC CR` (Alt+Enter) between frames, preserving empty and trailing lines without per-line host waits
-- Grok minimal delivery rejects any source carriage return, body above 13 KiB, or more than 256 source lines during whole-route preflight; these bounds stay below the Grok Build 1.0.0 receiver-proven 261-line / 14,333-byte GREEN while a preserved 4,095-line / 114,780-byte neighbor remains RED, and a partial/error/short first write reports exact progress but sends no Enter or retry
-- after the complete first input, Claude, Codex, and Grok wait from that successful write boundary for a one-second base interval plus a proportional 500 milliseconds per MiB of framed input, revalidate the exact run and safe observed work state, then write one Enter under the same permit; the exact final-child oracle observed approximately 10/19/174 milliseconds of parser lag at 1 KiB/64 KiB/1 MiB, while 500 milliseconds per MiB is the deliberately conservative stability margin
-- PTY output is not treated as paste acknowledgement because a multiline paste may remain intentionally invisible until Enter; another operator, pane-sideband, or routed input cannot interleave during the interval, and an uncertain outcome is never followed by an automatic Enter or message retry
-- bracketed delivery is admitted only after the exact active run's incrementally decoded, unshed PTY stream has enabled DEC private mode 2004 and its last driver-observed work state is not `blocked` or `error_loop`; Codex also requires an observed work state, and its bounded per-run classifier begins before PTY installation, recognizes measured modal prompts across arbitrary output chunks, latches a modal block (workspace trust, approval, plan chooser) until a later trusted clean screen that no longer shows the modal, treats transient notices (stream disconnect, rate/usage limit, auth) as fresh-output-only observations cleared by the next clean prompt or later activity — never re-derived from a rescan of transcript text — and applies a pre-install block before Ready/routability; the shared bounded viewport establishes Idle from Unknown only when Codex 0.147.0's trusted current screen has a visible column-3 cursor on an input row that is exactly `›` or begins `› `, followed by an indented non-empty footer row whose final ` · ` separates a non-empty model from a path-like cwd; those facts may be composed across multiple synchronized or ordinary paints, never from incomplete evidence and never while a modal remains on the screen; well-formed terminal strings are consumed without exposing printable payload as text or cursor evidence, while ESC and C1 global transitions follow the shipped xterm parser and malformed or unterminated controls fail closed; a future repaint shape therefore remains Unknown rather than being generalized into a second terminal emulator; UTF-8 code points split across PTY reads are carried intact so the scanners and renderer receive the same character stream, the bounded trackers reset for every `RunId`, the terminal-mode scanner follows the shipped terminal's relevant control transitions and returns to unknown on parser overflow, and preflight refuses unknown/disabled mode, unobserved Codex state, or a known unsafe work state before route metadata or PTY writes
-- the supervisor revalidates `SessionId`, `RunId`, generation, PTY, input gate, enabled paste mode, and safe observed work state together before the paste frame; before Enter it revalidates the same exact run/gate/PTY and safe work state but does not require paste mode to remain enabled because Codex legitimately emits DECRST after consuming a completed frame; this proves the state observed at those writer boundaries, not the child's interpretation during or after them, and raw operator or pane-sideband typing remains available when addressed delivery is refused
-- within that proven Rust boundary, supervisor framing does not trim, flatten, or silently truncate source-content UTF-8 bytes; Grok accepts LF-only source and fails closed on CR rather than normalizing it
-- final-child byte fidelity and receiver receipt remain Gate 3 RED; `PtySession::send_input` success and `route_delivery.phase = "written"` prove only the PTY-writer outcome
-- clipboard-to-WebView textarea CRLF fidelity before the backend request boundary remains unclaimed until a packaged WebView receipt proves it
-- Claude/Codex logical message bodies up to and including 1 MiB pass size validation, subject to exact-run mode preflight; Grok uses the smaller measured bound above, and larger bodies fail before PTY-writer admission
-- C0, C1, and DEL control characters other than tab and source line endings fail before PTY-writer admission because they cannot be injected as ordinary terminal text safely
-- generic-terminal delivery is the unprefixed source command, raw and single-line only, until a concrete driver proves a safe provenance/framing strategy; route/feed/audit metadata remains provenance-authoritative
-- Prime routed delivery is not admitted in this release. Prime accepts raw
-  operator terminal input only; the rejection occurs before route-family events,
-  audit records, or PTY writes.
-- pane-sideband `send_input` and `send_key` have a 20-second server-side write budget. On expiry the supervisor first cancels only that PTY input operation for up to 5 seconds while a per-run barrier prevents a late cancellation from touching its successor. The live conversation is preserved when the writer stops. If isolated cancellation fails or does not stop the writer, the supervisor invalidates and terminates only that exact run (up to 5 seconds), then waits up to 5 more seconds for the writer. Every over-budget response sets `timed_out: true`; `ok: true` is possible only when the full write completed after the deadline and warns the caller not to retry. The PowerShell client allows 45 seconds so it can receive this truthful terminal response.
-- pane-sideband `wait_quiet` accepts a quiet window of 1–60 seconds and a total timeout of 1–300 seconds, with the quiet window no greater than the timeout. The server validates these bounds before dispatch metadata or connection-long waiting.
+Raw operator and pane-sideband input remain available when synthetic delivery
+is refused, so a person can resolve trust, authentication, or approval prompts.
+
+Pane-sideband `send_input` and `send_key` have a 20-second server write budget.
+On expiry, isolated PTY-input cancellation gets up to five seconds under a
+per-run barrier. If the writer cannot be stopped in isolation, only that exact
+run is invalidated and terminated (up to five seconds), followed by up to five
+seconds to join the writer. Every over-budget response sets `timed_out: true`.
+`ok: true` is possible if the complete write finished after the deadline and
+warns against retry. The PowerShell client allows 45 seconds for the response.
+
+`wait_quiet` accepts a quiet window of 1–60 seconds and a timeout of 1–300 seconds,
+with the quiet window no greater than the timeout. Silence is not completion.
 
 ## 7. Lifecycle contract
 
-Allowed states:
+Lifecycle states are `starting`, `ready`, `busy`, `idle`, `stalled`, `restarting`,
+`failed`, and `closed`.
 
-- `starting`
-- `ready`
-- `busy`
-- `idle`
-- `stalled`
-- `restarting`
-- `failed`
-- `closed`
+Work-state observations are separate: `idle`, `thinking`, `tool_call`, `blocked`,
+and `error_loop`. Unknown state is not a positive idle observation.
 
-V1 liveness rule:
-
-- passive output-based liveness per driver
-
-Meaning:
-
-- output implies liveness
-- lack of output while busy implies stall risk
-
-Work-state events:
-
-- `session_work_state` captures semantic pane activity separately from lifecycle state
-- allowed work states: `idle`, `thinking`, `tool_call`, `blocked`, `error_loop`
-- each event carries a nested `RunEventIdentity` (`SessionId`, `RunId`, generation, monotonic sequence), the current session label, state, optional detail, optional previous state, and timestamp
-- the first explicit observation is emitted even when it is `idle`, with no previous state; later repeated output in the same observed work state updates supervisor memory but does not emit another audit event
-- output quiescence can transition Claude and Generic Terminal sessions back to
-  lifecycle/work-state `idle`; for Codex it changes lifecycle only and never
-  establishes semantic work state or routed-input authority, which require a
-  trusted current-screen observation
-- each Grok launch receives native `--minimal`, a fresh native `--session-id`, and remains lifecycle
-  `starting` while the exact run is on the launcher or still producing its
-  startup repaint; those states reject synthetic delivery while raw terminal
-  input remains available
-- Grok startup admission is structural, never temporal: the shared bounded
-  driver-internal fixed-grid viewport follows only the measured cursor, erase,
-  scroll, terminal-string, mode, and decoded-text subset across completed
-  cursor-hide/show frames, with Unicode cell widths derived from Unicode
-  Standard Annex #11; it is not a general terminal emulator, and it
-  first requires a trusted current screen containing `Starting session…`, then
-  a later trusted current screen with the launcher absent, the interactive
-  composer and exact `minimal · /help` chrome present, and DEC private mode
-  2004 enabled; minimal mode can leave the earlier startup row visible, so the
-  ordered exact minimal marker—not absence of that stale row—establishes readiness
-- replacement runs start with a fresh tracker; resize, malformed, unsupported,
-  or over-limit control state fails closed until known output reconstructs the
-  screen; no timeout grants readiness, and readiness is not a model-turn receipt
-- a repeated resize request with dimensions already applied to the exact run is
-  a no-op; only a changed size reaches the PTY and invalidates the tracked screen
-- Codex 0.147.0 prompt admission uses the same bounded viewport with Codex-only
-  policy: Idle requires one trusted current screen with a visible column-3 cursor
-  on an input row exactly `›` or beginning `› `, followed by an indented non-empty
-  footer row whose final ` · ` separates a non-empty model from a path-like cwd,
-  even when those facts were composed across several synchronized and ordinary
-  paints; `▌` and `esc to interrupt` never grant Idle
-- a measured Codex blocker remains latched until a later trusted current screen
-  contains the clean prompt and no measured blocker; unfamiliar layouts and
-  incomplete, malformed, unsupported, resized-but-unreconstructed, or over-limit
-  state remain Unknown, while raw input remains available for modal resolution
-- after that one-shot admission, minimal mode publishes finalized response blocks
-  instead of relying on Grok's suppressible full-screen response repaint; the
-  completing startup frame makes initial `idle` pending exactly once; event
-  admission publishes it unless a later admitted output carries a newer
-  semantic marker, which supersedes it. Every later Grok output returns to the semantic
-  classifier rather than being coerced to `idle`; measured Grok 1.0.3
-  `Thinking`/`Responding`, tool, and `Worked for` markers report subsequent
-  `idle`, `thinking`, or `tool_call`
-- repeated blocked observations with the same detail can escalate to `error_loop`
-- process exit is never inferred from terminal text; PTY closure/error, OS process state, and job membership own process lifecycle truth
-- `closed` means the exact per-run owned process job was proved empty; PTY EOF,
-  process disappearance, or handle drop alone is not sufficient
-- start, stop, restart, natural EOF/error retirement, liveness retirement, and
-  delete serialize through one per-session lifecycle reservation
-- a failed or bounded-out termination proof retains the exact run ownership in
-  `failed`/termination-uncertain state and blocks start, restart, and delete; only a
-  later reserved termination attempt that proves the job empty may transition it
-  to `closed`
-- shutdown has bounded per-run cleanup and returns failure if any owned scope cannot
-  be proved terminated; process-exit job cleanup is a backstop, not an in-process
-  termination receipt
+- `session_work_state` carries a nested `RunEventIdentity` (session, run,
+  generation, monotonic sequence), label, current/previous state, optional
+  detail, and timestamp. The first explicit observation emits an event;
+  repeated identical observations update memory without another audit event.
+- Output quiescence can return Claude and Generic Terminal to idle. For Codex,
+  it cannot establish semantic idle or routed-input authority. Grok uses
+  recognized semantic markers rather than ordinary silence.
+- Grok launches with `--fullscreen` and a new or resumed conversation ID. It
+  stays starting through launcher/startup output. Readiness requires recognized
+  composer/footer output and bracketed-paste support, from the bounded viewport
+  or the raw-stream readiness tracker. No timeout grants readiness.
+- Codex's bounded viewport recognizes a trusted prompt and model/cwd footer
+  across output chunks and repaint transactions. Modal blocks remain latched
+  until a clean prompt; transient notices are detected from fresh output and
+  clear on a later clean prompt or activity. Stale transcript text is not
+  repeatedly reclassified as a new notice.
+- Incomplete or unfamiliar terminal layouts can remain unknown. Resizing
+  invalidates tracked screen evidence until output reconstructs it; a resize
+  to dimensions already applied is a no-op.
+- Repeated blocked observations with the same detail can escalate to an error
+  loop. Work-state hints do not establish process exit or task completion.
+- PTY status, OS process state, and owned process scopes determine lifecycle.
+  `closed` requires proof that the exact run's Job is empty; EOF, disappearance,
+  or handle drop alone is insufficient.
+- Start, stop, restart, retirement, and delete serialize through a per-session
+  lifecycle reservation. Failed or timed-out termination retains exact ownership
+  in a failed/termination-uncertain state and blocks start, restart, and delete.
+  A later termination attempt must prove the scope empty before closure.
+- Shutdown has bounded per-run cleanup and returns failure when any owned scope
+  cannot be proved terminated. Exit-time Job cleanup is a backstop, not an
+  in-process termination receipt.
 
 Prime lifecycle adds a second ownership proof:
 
@@ -299,11 +283,21 @@ not claim hostile same-user OS isolation.
 
 Restart flow:
 
-1. agent or operator issues request
+1. operator issues a request, or an enabled bounded auto-restart policy triggers
 2. supervisor validates policy
 3. supervisor logs request
 4. supervisor performs restart
 5. supervisor emits resulting lifecycle/system events
+
+Creating a session launches it. On later desktop launches, **Continue where I
+left off** is enabled by default and relaunches previously running sessions as
+their room or lobby is entered. A new PTY uses a stored harness conversation
+reference where supported; it never reattaches a previous process. **Start fresh
+session** clears the reference. Room feed contents are not restored.
+
+Automatic room briefing is optional, once per membership, and waits until the
+member can accept it. Completed briefing state survives relaunch. **Brief now**
+is an explicit repeat, not an automatic restart action.
 
 ## 9. Permission contract
 
@@ -323,13 +317,13 @@ Current pane authority is deliberately narrower than operator room authority:
   non-Prime pane has the same surface through `PRIM1_CLI --prim1-room …`; the
   MCP/CLI layer contributes no authority and every call is re-authorized
   through the named pipe
-- Claude's three fully qualified pane-MCP tool names are allowed only for that
+- Claude's four fully qualified pane-MCP tool names are allowed only for that
   process; no wildcard or persistent user/workspace permission is installed,
   and all non-pane tools retain the selected harness permission policy
-- Grok Build 1.0.0 receives no model-facing pane tool: its TUI lacks a
-  privacy-safe session-scoped plugin/config seam and its shell-tool children do
-  not satisfy Job membership. Operator sends/raw input remain available, with
-  no bearer, ancestry, global-config, or redirected-history fallback
+- Grok receives no MCP configuration. Its shell tools can use the executable's
+  room CLI and inherited per-run secret when outside all pane Jobs. No global
+  plugin configuration or redirected harness-history directory is required.
+
 - Prime/WSL callers have no pane-sideband surface; the native Job-derived caller
   proof cannot identify Linux tasks and no bearer fallback exists
 - operator lifecycle, input, resize, and routing authority remains inside the desktop process and targets stable `SessionId` values
@@ -359,17 +353,14 @@ Content-retention rules:
   timestamps; room-feed message content is replaced with `[content omitted]`
   while membership and per-recipient delivery status remain metadata
 - `session_work_state.detail` is omitted from the durable projection
-- `desktop-events.jsonl` contains desktop-process diagnostics, not terminal or conversation content
+- `desktop-events.jsonl` contains desktop-process diagnostics rather than a terminal transcript; failure diagnostics may quote harness error text and should be inspected before sharing
 - desktop diagnostic appends are serialized across command and event threads so each JSONL record remains an independent parseable line
 - a PTY-write or route-delivery receipt proves runtime handling only; model understanding and task completion require an independent live or artifact-based oracle
 
-The pane-local sideband supports `ping`, `wait_quiet`, `send_input`, `send_key`,
-`room_read`, and `room_post`. Its endpoint and a successful connection are
-transport facts, not credentials. On Windows, caller authority is derived by
-pinning the kernel-reported named-pipe client process and verifying its live
-pane job and generation, never from a bearer or info file. Room read/post then
-derive membership and sender under the same lock; lifecycle, inventory,
-membership, and recipient delivery remain in-process desktop actions.
+The pane-local sideband uses the authorization paths in section 9. Its endpoint
+and a successful connection are transport facts, not credentials. Room read,
+post, and delivery derive membership and sender from the authenticated live run.
+Lifecycle, inventory, and membership mutations remain desktop actions.
 
 `dispatch_attempt` records the pre-write target state for pane input/key requests and in-process operator delivery/routing that passed whole-request validation and recipient preflight. It is diagnostic metadata, not an idle gate, model-reaction ACK, or completion signal.
 
@@ -418,15 +409,11 @@ Auto-restart-on-stall rules:
 - the restart flow emits `session_exit` with `reason: "restart_stop"` for the old process and `session_state: ready` for the new process when start succeeds
 - the cap is 3 auto-restarts per session per 30-minute wrapper-lifetime window; the 4th eligible stall emits a critical `supervisor_alert`, disables further auto-restarts for that session until wrapper restart, and leaves the pane for manual intervention
 
-## 11. Cost telemetry contract
+## 11. Cost telemetry
 
-Supervisor must have a hook for:
-
-- token usage capture
-- cost accumulation per session
-- surfaced cost in system log or status output
-
-Budget enforcement may come later, but the capture hook must exist early.
+Usage capture, per-session cost totals, and budget enforcement are future work.
+The current runtime does not supply a cost meter; attached CLIs use their own
+providers and accounts.
 
 ## 12. Failure contract
 
@@ -435,6 +422,6 @@ The runtime must never treat malformed input as a fatal crash by default.
 Rules:
 
 - malformed sideband message -> log and drop
-- UI crash -> supervisor keeps running
-- reconnect -> UI reattaches to supervisor state
+- renderer reload -> UI can recover live supervisor state while the desktop process remains alive
+- desktop exit -> managed process scopes are shut down; later launch creates new runs
 - child crash -> lifecycle transition, restart policy applies

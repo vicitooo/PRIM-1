@@ -2,7 +2,7 @@
 
 PTY ownership and transport.
 
-Expected responsibilities:
+Responsibilities:
 
 - create PTYs
 - spawn child processes into PTYs
@@ -12,4 +12,3 @@ Expected responsibilities:
 - close/cleanup
 
 This crate should stay focused on terminal/process mechanics, not supervisor policy.
-

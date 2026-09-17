@@ -1,13 +1,12 @@
 # crates/control-plane
 
-Local control plane transport.
+JSON codec and shared frame limit for the local control protocol.
 
-Expected responsibilities:
+Responsibilities:
 
-- named pipe server on Windows
-- Unix socket server on POSIX
-- sideband message ingress
-- validation and normalization into shared runtime events
+- encode and decode typed requests and responses
+- define the maximum frame size used by the transport
+- reject malformed protocol input
 
-This crate is the reliable command/control path, separate from PTY-visible output.
-
+The Windows named-pipe server and caller authorization live in
+`crates/supervisor`. This crate does not implement a POSIX socket server.

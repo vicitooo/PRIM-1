@@ -3,7 +3,8 @@
 PRIM-1 is desktop-first. Lifecycle, ordered session inventory, native directory
 selection, and session-definition management are available only through the
 desktop UI and its in-process Tauri commands. Room creation, membership,
-recipient delivery, and the visible composer are desktop actions. There is no
+and the visible composer are desktop actions. Room members can also request
+delivery to fellow members through the pane-local protocol. There is no
 master credential file or external operator backdoor.
 
 ## Pane-local control helper
@@ -17,6 +18,7 @@ authorized supervised pane. Its complete action set is:
 - `key`
 - `room_read`
 - `room_post`
+- `room_deliver`
 
 The endpoint must be a nonblank `PRIM1_CONTROL_PLANE_ENDPOINT`. The explicit
 `-Endpoint` parameter exists only so isolated named-pipe tests can supply a fake
@@ -24,10 +26,10 @@ endpoint. If neither is present, the script fails with a stable direction to use
 the desktop UI.
 
 Use the supervisor-injected `PRIM1_PANE_IDENTITY` as `-Session`. User-facing
-labels are not pane authority.
+labels are not pane authority. Run these examples inside a supervised non-Prime
+pane from the checkout root; the endpoint and pane identity are already injected.
 
 ```powershell
-$env:PRIM1_CONTROL_PLANE_ENDPOINT = '\\.\pipe\<pane-endpoint>'
 .\scripts\control-plane.ps1 -Action ping -Quiet
 .\scripts\control-plane.ps1 -Action input -Session $env:PRIM1_PANE_IDENTITY -Content 'status'
 .\scripts\control-plane.ps1 -Action input -Session $env:PRIM1_PANE_IDENTITY -ContentFile 'D:\tmp\prompt.txt'
@@ -35,6 +37,7 @@ $env:PRIM1_CONTROL_PLANE_ENDPOINT = '\\.\pipe\<pane-endpoint>'
 .\scripts\control-plane.ps1 -Action wait_quiet -Session $env:PRIM1_PANE_IDENTITY -QuietSec 2 -TimeoutSec 10
 .\scripts\control-plane.ps1 -Action room_read -Quiet -PassThruJson
 .\scripts\control-plane.ps1 -Action room_post -Content 'Status from this pane'
+.\scripts\control-plane.ps1 -Action room_deliver -Recipient 'Reviewer' -Content 'Please review the change.'
 ```
 
 `input` writes raw text and does not press Enter. Use a following `key` action
@@ -51,7 +54,8 @@ shell runs outside the Job. They accept no `RoomId`, sender, or peer authority;
 session id, or `all`) and is gated like the operator's Send. A room post writes
 no PTY; a newly joined pane reads only its join event and later traffic, with
 explicit gaps after eviction/restart. The same requests are available without
-PowerShell through `"$env:PRIM1_CLI" --prim1-room ping|read|post|deliver …`.
+the source checkout through the executable's `--prim1-room` commands; see
+[CONTROL-SURFACE.md](../CONTROL-SURFACE.md) for working examples.
 
 The helper never reads `control-plane.json` or `PRIM1_PANE_CREDENTIALS`. It
 does not implement list, lifecycle, arbitrary routing, signals, or
@@ -79,7 +83,8 @@ not call the control plane and does not read terminal output or message content.
 
 ```powershell
 . .\scripts\runtime-paths.ps1
-$auditLog = Join-Path (Resolve-Prim1RuntimeDirectory) 'audit\2026-05-17.jsonl'
+$auditName = (Get-Date -Format 'yyyy-MM-dd') + '.jsonl'
+$auditLog = Join-Path (Join-Path (Resolve-Prim1RuntimeDirectory) 'audit') $auditName
 python .\scripts\agent-events-summary.py --audit-log $auditLog
 python .\scripts\agent-events-summary.py --audit-log $auditLog --fail-on alert,blocked,failed,timeout
 ```

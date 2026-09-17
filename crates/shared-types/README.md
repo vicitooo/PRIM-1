@@ -2,7 +2,7 @@
 
 Shared runtime contracts.
 
-Expected responsibilities:
+Responsibilities:
 
 - message envelopes
 - lifecycle enums
@@ -11,4 +11,3 @@ Expected responsibilities:
 - permission and capability config shapes
 
 This crate exists to prevent contract drift across supervisor, drivers, and UI.
-

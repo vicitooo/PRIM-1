@@ -13,7 +13,7 @@ The desktop owns:
 - native Windows workspace and per-session working-directory selection, plus a
   backend-qualified absolute Ubuntu path for Prime
 - visible `Normal` / `Unsafe` permission profiles, with `Normal` as the default
-- ordered `RoomId` create, rename, reorder, membership, and closed-room delete
+- ordered `RoomId` create, rename, reorder, membership, and delete
 - a bounded visible room feed whose **Post** action writes no PTY, plus explicit
   one-member / **Send All** delivery with per-recipient status
 - visible runtime diagnostics
@@ -25,8 +25,9 @@ The operator schemas reject unknown fields. Lifecycle/input requests carry one
 `session_id`; room actions carry opaque `room_id` / `session_id` values and
 typed recipient selection.
 The Rust boundary derives operator provenance. Mutable labels are never
-authority. Create accepts only a driver, optional label, and typed permission
-profile. Prime create may additionally carry one typed absolute Ubuntu working
+authority. Create accepts a driver, optional label, typed permission profile,
+and an optional room ID for initial membership. Prime create may additionally
+carry one typed absolute Ubuntu working
 directory; the backend canonicalizes and identity-binds it, and the UI prefills
 the qualified Ubuntu home. Launch accepts no renderer-controlled command,
 arguments, environment, or native working-directory path. A launch miss on PATH
@@ -34,21 +35,24 @@ is shown on the pane; `search: true` asks the backend to walk the usual install
 locations (the renderer still cannot supply a program path). Windows folder paths
 enter through the native Rust picker. Room definitions and membership persist;
 room content remains bounded process-memory state and does not survive restart.
+Deleting a room is refused during an in-flight delivery; otherwise it removes
+the room and feed while leaving its sessions in the lobby.
 
 Visible terminal shortcuts:
 
 - `Ctrl+Tab` / `Ctrl+Shift+Tab` — select the next / previous session tab
-- `Ctrl+Shift+T` — open New Session
+- `Ctrl+Shift+T` — open Attach a harness
 - `Ctrl+Shift+W` — close the active fully stopped session after confirmation
 - `Ctrl+Shift+Left` / `Ctrl+Shift+Right` — move the focused tab
 - `Ctrl+Shift+C` — copy the DOM selection, or the last active terminal selection
-- `Ctrl+Shift+V` — paste into the focused running pane
-- `Ctrl+C` — pass through to the terminal session
+- `Ctrl+V` / `Ctrl+Shift+V` / `Shift+Insert` — paste into the focused running pane
+- `Ctrl+C` — copy a selection; otherwise pass through to the terminal session
+- `F1` — open help
 - `F11` — toggle fullscreen
 
 ## Pane-local PowerShell helper
 
-`scripts/control-plane.ps1` supports exactly six actions:
+`scripts/control-plane.ps1` supports seven actions:
 
 | Action | Required fields | Wire kind |
 |---|---|---|
@@ -74,7 +78,7 @@ When no endpoint is available, the stable failure is:
 PRIM1_CONTROL_PLANE_ENDPOINT is not set. External operator control is unavailable; use the PRIM-1 desktop UI.
 ```
 
-Examples from an authorized supervised OS process that remains in the pane Job:
+Examples from a supervised pane with its injected environment, from the checkout root:
 
 ```powershell
 .\scripts\control-plane.ps1 -Action ping -Quiet
@@ -84,6 +88,7 @@ Examples from an authorized supervised OS process that remains in the pane Job:
 .\scripts\control-plane.ps1 -Action wait_quiet -Session $env:PRIM1_PANE_IDENTITY -QuietSec 2 -TimeoutSec 10
 .\scripts\control-plane.ps1 -Action room_read -Quiet -PassThruJson
 .\scripts\control-plane.ps1 -Action room_post -Content 'Status from this pane'
+.\scripts\control-plane.ps1 -Action room_deliver -Recipient 'Reviewer' -Content 'Please review the change.'
 ```
 
 Behavior:
@@ -110,40 +115,46 @@ Behavior:
 - `timed_out: true` prints `TIMED OUT: <message>` and exits `124`
 - ordinary failures exit `1`
 
-The helper does not accept list, lifecycle, recipient delivery, arbitrary route,
+The helper does not accept list, lifecycle, arbitrary cross-room route,
 signal, or session/room-management actions. It never reads `control-plane.json`,
 `PRIM1_PANE_CREDENTIALS`, or any bearer token.
 
-Model shell tools are not assumed to preserve that Job membership. Production
-receipts show Claude Code and Grok Build shell-tool PowerShell processes can be
-outside the pane Job and are therefore rejected before request decoding.
+Model shell tools are not assumed to preserve Job membership. Processes outside
+all pane Jobs can authenticate with their inherited per-run pane secret. An
+unaffiliated process with only the endpoint name is rejected.
 
 ## Model-facing MCP bridge
 
 Claude Code and Codex are launched with one session-scoped `prim1_pane` stdio
 MCP server. The server is the PRIM-1 executable in a dedicated no-UI mode and
-is created by the harness inside the pane Job. It exposes exactly `ping`,
-`room_read`, and `room_post`; the schemas accept no `RoomId`, sender, peer,
-recipient, lifecycle, or delivery authority. Each tool call opens the existing
+is created by the harness. It exposes `ping`, `room_read`, `room_post`, and
+`room_deliver`. The delivery tool accepts a member label, session ID, or `all`
+(every other member); none accepts a caller-supplied `RoomId`, sender, or
+lifecycle authority. Each tool call opens the existing
 named pipe, pins and verifies the expected desktop server process, and then
-uses the same kernel-derived caller/run/membership checks as the PowerShell
+uses the same caller/run/membership checks as the PowerShell
 helper. MCP frames and control-plane frames are both bounded and fail closed.
-Codex forwards only the four injected transport and desktop-server identity
-environment variables to this child; none carries caller, room, or sender
-authority.
-Claude receives an ephemeral, process-local allowlist for exactly these three
+Codex forwards the required injected transport, desktop-server identity, and
+per-run pane-secret variables to this child. The supervisor still derives room
+and sender from the authenticated live run.
+Claude receives an ephemeral, process-local allowlist for exactly these four
 fully qualified MCP tools. That makes the safe pane tools autonomous without a
 per-call approval or persistent harness setting; every other Claude tool keeps
 the selected Normal/Unsafe permission policy, and newly added MCP tools remain
 unapproved by default.
 
-Grok Build 1.0.0 exposes session-scoped plugins only through its non-interactive
-agent protocol, not the TUI used by PRIM-1. `GROK_HOME` also owns Grok's
-sessions and logs, so PRIM-1 does not redirect it to inject configuration.
-Grok therefore receives no model-facing pane tool in this release. Prime and
-Generic Terminal are likewise unchanged. Operator room Post/Send and raw
-terminal input remain available; no bearer, ancestry, global-plugin, or
-workspace-config fallback exists.
+Grok receives no MCP configuration from PRIM-1. It and other non-Prime panes can
+use the same executable's room CLI through a shell tool, without a source checkout:
+
+```powershell
+& "$env:PRIM1_CLI" --prim1-room ping
+& "$env:PRIM1_CLI" --prim1-room read
+& "$env:PRIM1_CLI" --prim1-room post 'Status from this pane'
+& "$env:PRIM1_CLI" --prim1-room deliver 'Reviewer' 'Please review the change.'
+```
+
+The CLI uses the pane's injected environment and the same authorization checks.
+Prime has neither this sideband nor synthetic delivery; use its raw terminal.
 
 ## Thin pane wrappers
 
@@ -160,15 +171,17 @@ Both use the same endpoint rule.
 ## Metadata audit
 
 The durable audit remains a direct, read-only metadata surface at
-`<runtime-dir>/audit/YYYY-MM-DD.jsonl`. It contains no terminal output or routed
-message content. A delivery or write receipt is not proof that a model understood
-or completed work.
+`<runtime-dir>/audit/YYYY-MM-DD.jsonl`. Raw terminal-output events are omitted and
+room/routed-message bodies are redacted. Failure diagnostics may contain harness
+error text; inspect logs before sharing them. A delivery or write receipt is not
+proof that a model understood or completed work.
 
 `agent-events-summary.py` reads that JSONL directly:
 
 ```powershell
 . .\scripts\runtime-paths.ps1
-$auditLog = Join-Path (Resolve-Prim1RuntimeDirectory) 'audit\2026-05-17.jsonl'
+$auditName = (Get-Date -Format 'yyyy-MM-dd') + '.jsonl'
+$auditLog = Join-Path (Join-Path (Resolve-Prim1RuntimeDirectory) 'audit') $auditName
 python .\scripts\agent-events-summary.py --audit-log $auditLog
 ```
 
@@ -182,14 +195,15 @@ Leading-slash arguments can be rewritten by MSYS. Wrap the PowerShell invocation
 as one command when sending slash input:
 
 ```bash
-powershell -Command "& '.\scripts\agent-slash.ps1' -Session claude -Slash compact"
+powershell -NoProfile -Command '& ".\scripts\agent-slash.ps1" -Session $env:PRIM1_PANE_IDENTITY -Slash compact'
 ```
 
 ## Authority boundary
 
-An endpoint name is routing metadata, not authority. The supervisor must derive
-the native caller from the kernel and bind it to one live pane process job and
-generation when a mutating request is handled. Bearer files are not a fallback.
+An endpoint name is routing metadata, not authority. The supervisor binds the
+caller to one live run through kernel Job membership, or through its per-run
+pane secret when the caller is outside all pane Jobs. A secret for another run
+cannot override a kernel-attributed pane. Bearer files are not a fallback.
 Prime/WSL sideband access is deliberately disabled. The native named-pipe policy
 cannot derive a Linux task identity from Windows Job membership, and there is no
 bearer or compatibility fallback. Prime uses raw desktop terminal input; routed

@@ -4,9 +4,14 @@
 
 **Date:** 2026-08-10
 
+Historical decision record, with the dated membership amendment below. Its
+first-slice pane permissions have since expanded to explicit member delivery;
+current authority and delivery behavior are in
+[RUNTIME-CONTRACTS.md](../../RUNTIME-CONTRACTS.md).
+
 ## Context
 
-Victor described a room as a visible group conversation that every member can read, not as an instruction to inject every post into every harness. Ordinary terminal conversations that predate or happen outside the room remain private. Current PRIM-1 instead maps a name-derived pair to recipient PTYs and treats a room route as prompt fan-out; unknown/supervisor senders may fall back to every running pair.
+Victor described a room as a visible group conversation that every member can read, not as an instruction to inject every post into every harness. Ordinary terminal conversations that predate or happen outside the room remain private. At the time, PRIM-1 mapped a name-derived pair to recipient PTYs and treated a room route as prompt fan-out; unknown/supervisor senders could fall back to every running pair.
 
 PRIM-1 already has a native local sideband for explicit harness communication. Agent Bus remains an independent collaboration tool and is not the room transport.
 

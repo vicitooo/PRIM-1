@@ -8,16 +8,25 @@ python -m venv .runtime\test-venv
 .\.runtime\test-venv\Scripts\python.exe -m pip install -r requirements-test.txt
 ```
 
-The complete production gate is being consolidated separately; the existing
-`tests/run-all.ps1` command covers only deterministic control-script suites and
-deliberately identifies that narrower scope.
+`tests/run-all.ps1` covers the deterministic control-script suites below. It
+does not run the Rust workspace, frontend tests, or real harness interaction.
 
-Expected v1 test mix:
+From the repository root:
 
-- unit tests for lifecycle, routing, registry, and policy
-- integration tests using synthetic child processes
-- opt-in real Claude/Codex tests
-- explicit stall/restart tests using controlled fixtures
+```powershell
+.\tests\run-all.ps1
+```
+
+Frontend tests live in `apps/desktop` and run with `npm test`. Rust tests live
+beside their modules and run with `cargo test --release --workspace --features tauri/custom-protocol`
+after building the frontend as described in
+[README.md](../README.md). Real CLI interaction requires installed, authenticated
+harnesses and separate desktop verification; deterministic tests do not establish
+provider compatibility.
+
+The known Windows descendant-containment test failure is recorded in
+[known issues](../docs/KNOWN_ISSUES.md#test-environment-note). Its cause is not
+established.
 
 Current script-level coverage:
 
@@ -34,7 +43,7 @@ Current script-level coverage:
   - validates `scripts/control-plane.ps1 -ContentFile`
   - checks mutual exclusion with `-Content`
   - checks missing-file failure
-  - checks non-`input` action rejection
+  - checks that actions without content support reject `-ContentFile`
   - captures the named-pipe request payload and asserts strict UTF-8 Unicode, embedded CRLF, a trailing newline, and shell-hostile characters survive exactly
   - verifies the request contains no token or legacy idle field
 

@@ -1,6 +1,6 @@
 # Desktop App
 
-This app is the first real UI shell for `PRIM-1`.
+The Windows Tauri desktop for PRIM-1. Start with the [first-room quickstart](../../README.md#your-first-room) for normal use.
 
 ## Stack
 
@@ -13,6 +13,7 @@ This app is the first real UI shell for `PRIM-1`.
 - renders a backend-ordered, `SessionId`-keyed tab set for Claude Code, Codex,
   Grok, Prime Agent (Ubuntu WSL), and Generic Terminal sessions
 - retains inactive xterm buffers while showing one active terminal
+- groups sessions into rooms and an unassigned lobby; changing context leaves sessions running
 - renders a system log pane
 - exposes native Windows workspace/cwd pickers, a backend-qualified Ubuntu cwd
   field for Prime, visible permission profiles, and create/rename/reorder/closed-only-delete controls
@@ -21,19 +22,26 @@ This app is the first real UI shell for `PRIM-1`.
   bounded active-room feed, feed-only Post, and explicit one-member / Send All
   delivery
 - listens to the supervisor event bus in real time
-- writes process diagnostics to `<runtime-dir>/desktop-events.jsonl`; this file is not a terminal transcript or message-content record
+- optionally relaunches previously running sessions on context entry and resumes stored harness conversations
+- writes process diagnostics to `<runtime-dir>/desktop-events.jsonl`; errors may include harness text, so inspect before sharing
 
-## Run
+## Development
 
 ```powershell
 cd apps/desktop
-npm install
+npm ci
 npm run tauri dev
 ```
 
-## Build
+## Production build
 
 ```powershell
 cd apps/desktop
+npm ci
+npm run build
 npm run tauri build
 ```
+
+The executable is `target/release/cli-master-wrapper-desktop.exe` relative to
+the repository root. Plain Cargo builds without Tauri's production protocol can
+still point at the development server; use the command above for normal use.

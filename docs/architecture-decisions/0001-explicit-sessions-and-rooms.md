@@ -4,9 +4,13 @@
 
 **Date:** 2026-08-10
 
+Historical decision record. The context and options describe the implementation
+at that date. Current behavior is in [ARCHITECTURE.md](../../ARCHITECTURE.md)
+and [RUNTIME-CONTRACTS.md](../../RUNTIME-CONTRACTS.md).
+
 ## Context
 
-Current main derives a Claude/Codex pair from display-name suffixes. Pair creation spawns new fixed slots, an existing session cannot join, a third member cannot exist, and an unknown/supervisor room sender can resolve to every running pane. The frontend independently repeats grouping rules.
+At the time of this decision, main derived a Claude/Codex pair from display-name suffixes. Pair creation spawned new fixed slots, an existing session could not join, a third member could not exist, and an unknown/supervisor room sender could resolve to every running pane. The frontend independently repeated grouping rules.
 
 Victor's required workflow is to begin with excellent native terminal sessions and later select already-running sessions into a visible isolated room without importing their earlier private histories.
 

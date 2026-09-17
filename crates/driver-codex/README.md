@@ -2,15 +2,14 @@
 
 Codex CLI driver.
 
-Expected responsibilities:
+Responsibilities:
 
 - launch Codex
 - resume Codex sessions
-- normalize Codex session metadata
-- define Codex-specific output parsing hooks
-- expose Codex-specific interrupt/close behavior
+- select permission flags and validate direct executable launch
+- classify Codex output with bounded prompt, modal, and work-state tracking
 
-This crate should not own general lifecycle logic; that belongs to the supervisor.
+General lifecycle and routed-input policy belong to the supervisor.
 
 Prompt detection accepts freshly repainted prompt and footer rows after a resize
 and treats Codex's Braille decoration as spaces. Modal blockers still require

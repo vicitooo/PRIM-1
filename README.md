@@ -8,10 +8,11 @@ The app itself runs on your machine. It is not a hosted agent platform and does 
 
 ## Run
 
-You need Rust **1.95.0**, MSVC C++ Build Tools, WebView2, Node.js 20+, the Tauri 2 CLI, and **the CLI(s) you actually want to run**, already installed and logged in (`claude`, `codex`, `grok`, and/or `prime-agent`). Prime also needs Ubuntu WSL with a working user `systemd`. Then:
+You need Git, Rust **1.95.0** with the MSVC toolchain, MSVC C++ Build Tools, WebView2, Node.js 20+, and **the CLI(s) you actually want to run**, already installed and logged in (`claude`, `codex`, `grok`, and/or `prime-agent`). Prime also needs Ubuntu WSL with a working user `systemd`. The Tauri CLI is installed by `npm ci`.
 
-```bash
-cd apps/desktop
+```powershell
+git clone https://github.com/vicitooo/PRIM-1.git
+cd PRIM-1/apps/desktop
 npm ci
 npm run build
 npm run tauri build
@@ -19,7 +20,24 @@ npm run tauri build
 
 Build the frontend **before** any `cargo test` / `cargo build`. Use `npm run tauri build` for the exe — a plain `cargo build --release` of the desktop crate is a dev-mode binary that talks to Vite on `localhost:1420` and will look broken.
 
-The exe lands at `target/release/cli-master-wrapper-desktop.exe`. On first launch: system log + **New session**. Nothing starts until you press Start.
+From the repository root, the executable is `target/release/cli-master-wrapper-desktop.exe`. A fresh install has no sessions. Creating a session launches its CLI.
+
+## Your first room
+
+Use two installed harnesses for this walkthrough, for example Claude Code and Codex. They use your existing accounts and provider usage.
+
+1. Open PRIM-1, click **Rooms**, then **New room**. Name it `First room`, leave **Brief members automatically** checked, and click **Create room**. You can create the room before adding any sessions.
+2. In the room, click **+** (**Attach a harness**) → **Custom…**. Choose your first harness, give it a label, keep **Normal** permissions, and use **Browse…** to choose a project folder. Click **Create session** to launch it. Repeat for the second harness.
+3. Open each session tab and resolve any CLI trust, sign-in, or approval prompts. Wait for the harness to be ready. The automatic room brief explains how to read and post to the shared feed; it is delivered once per membership when the session can accept it.
+4. Click the room-name chip to open its feed. Enter the following message, select **Send to all 2 members**, and click **Send**:
+
+    > Each of you: introduce yourself in one sentence, post it to the room feed, then wait. Do not change files.
+
+5. Watch the session tabs for the responses and the room feed for their posts. **Send** puts the message into the selected terminals. **Post to feed** only adds a bulletin for members to read; it does not prompt them.
+
+If a member is still starting or waiting on a question, Send is refused before delivery begins; the error names the member. Resolve its prompt in the terminal and try again. Prime is currently raw-terminal-only, so use Claude Code, Codex, or Grok for this room walkthrough.
+
+Room definitions and membership survive app restarts; the shared feed does not. Switching rooms leaves sessions running. **Settings → Continue where I left off** is on by default and relaunches previously running sessions as you re-enter their room or lobby, resuming stored conversations where supported. Closing the app stops its managed processes. Press **F1** for controls and shortcuts, or see [known limitations](docs/KNOWN_ISSUES.md).
 
 ## Docs
 

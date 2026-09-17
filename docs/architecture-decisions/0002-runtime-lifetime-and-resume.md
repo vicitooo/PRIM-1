@@ -4,9 +4,13 @@
 
 **Date:** 2026-08-10
 
+Historical decision record. The context and options describe the implementation
+at that date. Current startup and resume behavior is in
+[RUNTIME-CONTRACTS.md](../../RUNTIME-CONTRACTS.md#8-restart-contract).
+
 ## Context
 
-Current Tauri and supervisor state share one process; full UI/app close shuts down PTYs. Existing architecture documentation describes a daemon that can outlive the UI, but the implementation does not provide one. PTY byte-stream reattachment cannot be claimed after its owning process dies. Installed harnesses expose different logical resume/attach capabilities, and Prime runs across the WSL boundary.
+Tauri and supervisor state shared one process; full UI/app close shut down PTYs. Architecture documentation at the time described a daemon that could outlive the UI, but the implementation did not provide one. PTY byte-stream reattachment cannot be claimed after its owning process dies. Installed harnesses expose different logical resume/attach capabilities, and Prime runs across the WSL boundary.
 
 ## Options
 
@@ -21,7 +25,7 @@ Current Tauri and supervisor state share one process; full UI/app close shuts do
 
 **Recommended minimum.** It avoids a service rewrite while making every lifecycle promise honest.
 
-If approved, this first-slice decision explicitly supersedes the daemon/reconnect promise in the current `ARCHITECTURE.md`. That documentation must be updated with the implementation rather than left as a contradictory promise. It does not forbid a later persistent host if measured daily-driver demand earns one.
+This accepted decision superseded the earlier daemon/reconnect promise in `ARCHITECTURE.md`. It does not forbid a later persistent host if measured daily-driver demand earns one.
 
 ### B. Split a persistent native session host now
 
@@ -41,7 +45,7 @@ This makes Windows-native Claude/Codex/Grok dependent on WSL and confuses host p
 
 - `SessionId` represents logical continuity; the internal `RunId` and PTY handle do not survive process death.
 - Resume always creates a fresh run/PTY unless a driver proves a distinct native attach-client capability.
-- Prime resume/attach remains unavailable in product UI until Gate 3 empirically proves its advertised CLI semantics. If a native attach-client capability is later proven, it creates a new client PTY and closing that client does not imply target termination.
+- Prime resume/attach requires verification of its advertised CLI semantics before being exposed in the product UI. If a native attach-client capability is later proven, it creates a new client PTY and closing that client does not imply target termination.
 - Process and terminal survival, logical resume, transcript replay, and archived output are separately labeled capabilities.
 - No silent restart or fallback from failed resume to a new conversation.
 - UI close, app quit, backend crash, WSL shutdown, harness exit, attachment close, and target stop are distinct events.

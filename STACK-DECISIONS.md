@@ -1,183 +1,46 @@
 # PRIM-1 — Stack Decisions
 
-**Status:** Locked unless explicitly changed
-**Date:** 2026-04-14
+The implemented Windows stack and its rationale. Future product work is in [ROADMAP.md](ROADMAP.md).
 
-## 1. Core stack
+## Core stack
 
-The implementation direction for v1 is:
+- **Rust** owns the supervisor, PTYs, process lifecycle, authorization, routing, and audit.
+- **Tauri 2** provides the desktop shell, window controls, packaging, and the bridge to Rust.
+- **xterm.js** renders terminal output, scrollback, cursor movement, and alternate screens.
+- **Windows named pipes** carry the pane-local protocol. Unix sockets remain a possible transport for future native POSIX ports.
 
-- **Rust** for supervisor/runtime/process ownership
-- **Tauri** for desktop packaging and app shell
-- **xterm.js** for terminal rendering
-- **named pipes on Windows / Unix sockets on POSIX** for the local control plane
+## Why this stack
 
-## 2. Why this stack
+Rust keeps process ownership and the desktop backend in one runtime. Tauri integrates that backend with a webview UI. xterm.js supplies an established terminal renderer instead of a custom emulator. Local IPC keeps the pane control surface off a network listener.
 
-### Rust
+## Platform strategy
 
-Use Rust for:
+The desktop is Windows-only and uses ConPTY through the PTY layer. Prime Agent is a specific Ubuntu WSL integration with separate Windows and Linux process scopes; it is not a general fallback PTY backend or a Linux desktop port.
 
-- process management
-- PTY ownership
-- lifecycle state machine
-- restart/backoff logic
-- control plane
-- cost telemetry hooks
-- audit logging
+## Product shape
 
-Reason:
+A local desktop app with an ordered set of sessions, rooms and an unassigned lobby, one visible terminal at a time, and one supervisor. The app itself is local; attached CLIs use their own model providers.
 
-- long-lived local runtime
-- better fit than Python for a durable Tauri-backed desktop system
-- avoids a probable rewrite after MVP
+## Current scope
 
-### Tauri
+- Repeated Claude Code, Codex, Grok, Prime, and Generic Terminal sessions.
+- Stable session/run/room identity and persistent definitions.
+- Stored conversation references and configurable session relaunch on app startup.
+- Feed-only posts and explicit recipient delivery from operators or room members.
+- Supervisor-owned restart and shutdown, lifecycle/work-state tracking, and metadata audit.
 
-Use Tauri for:
+Remote operation, multi-machine federation, usage billing, and a background service are outside the current product.
 
-- desktop shell
-- window management
-- local app packaging
-- secure bridge between UI and Rust backend
+## Primary use case
 
-Reason:
+Local work with several CLI agents: visible terminals, explicit teams, and shared messages without automatically sharing private terminal history.
 
-- lighter than Electron
-- natural fit with a Rust backend
-- supports the product shape directly
+## Security decisions
 
-### xterm.js
+Working directories are qualified by the backend. The desktop owns lifecycle authority. Pane actions are allowlisted and bound to a live run through native Job membership or the per-run pane secret. Room access is derived from membership.
 
-Use xterm.js for:
+Normal permissions are the default. PRIM-1 does not supply hostile same-user isolation or an additional OS sandbox.
 
-- ANSI rendering
-- cursor movement
-- colors
-- scrollback
-- alternate screen behavior
-- resize handling
+## Open product decisions
 
-Reason:
-
-- avoid building a terminal renderer
-- battle-tested
-- fits naturally inside Tauri webview
-
-### Named pipes / Unix sockets
-
-Use local IPC by default, not localhost TCP.
-
-Reason:
-
-- lower attack surface
-- local-only by default
-- avoids accidental browser access
-- better fit for supervisor-local communication
-
-## 3. Platform strategy
-
-### V1 platform
-
-- **Windows first**
-
-Primary PTY backend:
-
-- **ConPTY**
-
-Fallback if ConPTY is not good enough for a required flow:
-
-- **WSL2 + POSIX PTY backend**, while keeping the same supervisor and UI architecture
-
-## 4. Product shape
-
-V1 is a **local desktop app/runtime**, not:
-
-- a hosted SaaS
-- a shell-only tool
-- a browser-only dashboard
-- a remote-control service
-
-V1 should feel like:
-
-- one local app
-- an ordered set of explicit terminal sessions
-- one active terminal surface with retained inactive buffers
-- zero or more explicit rooms, with at most one active room membership per session
-- one supervisor in charge
-
-## 5. V1 scope lock
-
-V1 includes:
-
-- repeated supervised Claude, Codex, Grok, Prime, or Generic Terminal sessions
-- stable `SessionId` / `RunId` / `RoomId` authority
-- feed-only room posts
-- explicit one-member or Send All room delivery
-- supervisor-controlled restart/close
-- metadata-only audit log
-- basic health/liveness
-
-V1 excludes:
-
-- external notification
-- remote operator mode
-- multi-machine federation
-- agent trees / sub-agent orchestration
-- production-grade external sandboxing for Claude
-- support for every future CLI on day one
-
-## 6. First use case lock
-
-The first real use case is:
-
-- **Victor's local multi-harness daily-driver environment**
-
-That means:
-
-- the operator works in one or more faithful native harness terminals
-- selected sessions join explicit rooms without exposing private terminal history
-- feed posts and recipient delivery are distinct visible actions
-- all room traffic and delivery state is visible in real time
-
-This is the first product shape to optimize for.
-
-## 7. Security decisions for v1
-
-Mandatory in early implementation:
-
-- backend-qualified, identity-revalidated working-directory selection
-- per-agent capability whitelist
-- IPC access control
-- supervisor-only lifecycle authority
-
-Deferred:
-
-- strong external sandboxing for long-running Claude
-- remote auth
-- multi-user permissions
-
-## 8. External collaboration boundary
-
-Agent Bus remains an independent advisory/collaboration tool. It is not embedded
-as PRIM-1 transport and cannot substitute for native room, PTY, or receiver
-evidence. PRIM-1 sessions use only the supervisor-owned runtime paths.
-
-## 9. Open decisions that remain
-
-These remain later product decisions rather than implementation defaults:
-
-1. supported logical resume semantics across desktop restart
-2. cost budget ceiling and surfaced telemetry
-3. user-extensible driver packaging and trust model
-4. richer simultaneous-pane layouts
-5. native Linux/macOS product support
-
-## 10. Decision guardrail
-
-Do not change the locked decisions above casually.
-
-A decision should only be changed if:
-
-- Phase 0 proves it unworkable, or
-- the replacement clearly reduces total project risk and rewrite cost
+User-extensible driver packaging, richer simultaneous-pane layouts, usage telemetry, and native Linux/macOS support remain future work. Conversation resumption is already implemented; its upstream CLI compatibility remains an ongoing maintenance concern.
