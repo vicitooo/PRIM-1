@@ -4,11 +4,13 @@ A **Windows** desktop app that runs terminal-first AI agents (Claude Code, Codex
 
 The app itself runs on your machine. It is not a hosted agent platform and does not run models locally — the CLIs you attach still use their own providers and accounts.
 
-**License:** Apache-2.0 · **OS:** Windows 10/11 · macOS/Linux are planned, not in this tree.
+**Status:** Alpha, build from source · **License:** Apache-2.0 · **OS:** Windows 10/11. Linux is the next platform priority; macOS is also planned. Neither port is in this tree.
 
 ## Run
 
 You need Git, Rust **1.95.0** with the MSVC toolchain, MSVC C++ Build Tools, WebView2, Node.js 20+, and **the CLI(s) you actually want to run**, already installed and logged in (`claude`, `codex`, `grok`, and/or `prime-agent`). Prime also needs Ubuntu WSL with a working user `systemd`. The Tauri CLI is installed by `npm ci`.
+
+For Prime Agent, follow the [upstream quickstart](https://github.com/PrimeIntellect-ai/prime-agent/blob/main/packages/coding-agent/docs/quickstart.md) inside Ubuntu WSL. Prime is optional and currently supports raw terminal interaction only in PRIM-1; use Claude Code, Codex, or Grok for room messaging.
 
 ```powershell
 git clone https://github.com/vicitooo/PRIM-1.git
@@ -46,6 +48,12 @@ Room definitions and membership survive app restarts; the shared feed does not. 
 | Humans | this file, then [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) and [ROADMAP.md](ROADMAP.md) |
 | Agents | [README-AI.md](README-AI.md) (also [AGENTS.md](AGENTS.md)) |
 | Deeper | [ARCHITECTURE.md](ARCHITECTURE.md), [RUNTIME-CONTRACTS.md](RUNTIME-CONTRACTS.md), [CONTROL-SURFACE.md](CONTROL-SURFACE.md) |
+
+## Feedback and contributions
+
+Bug reports, questions, and feature requests are welcome in [Issues](https://github.com/vicitooo/PRIM-1/issues). For a bug, include your PRIM-1 commit, Windows and CLI versions, reproduction steps, and expected versus actual behaviour. Remove tokens, private paths, and conversation content from logs or screenshots before sharing them.
+
+For a larger change, open an issue first to discuss the approach. Small fixes can go directly to a pull request. Report security vulnerabilities privately using [SECURITY.md](SECURITY.md).
 
 ## Contributors
 

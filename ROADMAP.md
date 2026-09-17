@@ -34,6 +34,8 @@ The desktop and native drivers are Windows-only. Prime's Ubuntu WSL integration 
 
 Linux and macOS support need native PTY/process ownership, local IPC, packaging, and complete user-flow verification on each platform.
 
+Linux is the next platform priority. There is no release date yet.
+
 ### Terminal control and recovery
 
 Improve compatibility as upstream CLIs change their terminal interfaces, including prompt detection, submission, and conversation resumption. Keep raw terminal input available when automated delivery cannot safely proceed.
