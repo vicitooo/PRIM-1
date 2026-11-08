@@ -8348,6 +8348,14 @@ function wireRoomUi(): void {
   roomAddMemberButton.addEventListener("click", () => void addSelectedRoomMember());
   roomPostButton.addEventListener("click", () => void postActiveRoomMessage());
   roomSendButton.addEventListener("click", () => void deliverActiveRoomMessage());
+  // Enter sends, Shift+Enter makes a new line. IME composition keeps its Enter:
+  // WebKit can report keyCode 229 with isComposing false on the confirming key.
+  roomMessage.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" || event.shiftKey || event.ctrlKey || event.altKey || event.metaKey) return;
+    if (event.isComposing || event.keyCode === 229) return;
+    event.preventDefault();
+    if (roomMessage.value.trim()) roomSendButton.click();
+  });
   roomFeed.dataset.view = roomFeedView;
   syncRoomMembersPanel();
   roomMembersCloseButton.addEventListener("click", () => setRoomMembersPanelOpen(false));
