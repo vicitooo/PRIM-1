@@ -81,6 +81,7 @@ import {
   type HarnessKeyTranslation,
 } from "./harness-keys";
 import { planPaste } from "./paste";
+import { droppedPathsText } from "./file-drop";
 
 import {
   resolveCopySelection,
@@ -1359,6 +1360,16 @@ class SessionTerminal {
    * characters removed; a clipboard holding only an image sends the harness
    * its own paste-image key.
    */
+  /** Text from a file dropped on the window, as a paste. */
+  pasteDropped(text: string): void {
+    if (!this.snapshot?.running || this.snapshot.output_draining) {
+      writeSystem("warn", `${this.label} is not accepting input; dropped file skipped`);
+      return;
+    }
+    this.terminal.paste(text);
+    this.terminal.focus();
+  }
+
   private paste(event: ClipboardEvent): void {
     event.preventDefault();
     event.stopPropagation();
@@ -3090,6 +3101,20 @@ async function browsePersonalRepo(): Promise<void> {
   } catch (error) {
     showPersonalRepoResult(errorText(error), "error");
   }
+}
+
+/** A file dropped on the window goes where the operator is typing. */
+function handleFileDrop(paths: readonly string[]): void {
+  const text = droppedPathsText(paths);
+  if (!text) return;
+  if (shellView === "rooms" && roomsViewMode === "panel" && !roomMessage.disabled) {
+    roomMessage.setRangeText(text, roomMessage.selectionStart, roomMessage.selectionEnd, "end");
+    roomMessage.dispatchEvent(new Event("input", { bubbles: true }));
+    focusWithinActiveWindow(roomMessage);
+    return;
+  }
+  const pane = tabState.activeId ? paneMap.get(tabState.activeId) : undefined;
+  if (shellView === "sessions" && pane) pane.pasteDropped(text);
 }
 
 function wirePersonalRepo(): void {
@@ -8348,6 +8373,7 @@ function wireRoomUi(): void {
   roomAddMemberButton.addEventListener("click", () => void addSelectedRoomMember());
   roomPostButton.addEventListener("click", () => void postActiveRoomMessage());
   roomSendButton.addEventListener("click", () => void deliverActiveRoomMessage());
+  void listen<{ paths?: string[] }>("tauri://drag-drop", ({ payload }) => handleFileDrop(payload.paths ?? []));
   // Enter sends, Shift+Enter makes a new line. IME composition keeps its Enter:
   // WebKit can report keyCode 229 with isComposing false on the confirming key.
   roomMessage.addEventListener("keydown", (event) => {
