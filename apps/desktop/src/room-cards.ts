@@ -9,6 +9,11 @@ const bytesCache = new WeakMap<CardEvent, number>();
 const signatureCache = new WeakMap<CardEvent, { label: string; signature: string }>();
 export const isCardEvent = (event: RoomFeedEvent): event is CardEvent => event.item.kind === "card";
 export const cardKey = (event: CardEvent): string => `typed:${JSON.stringify([event.item.author, event.item.card.key])}`;
+/** A card as a person reads it: title, summary, then the body. */
+export function cardText(card: Pick<RoomCardContent, "title" | "summary" | "body">): string {
+  return [card.title, card.summary, card.body].filter((part) => part?.trim()).join("\n\n");
+}
+
 export const pinnedCard = (event: CardEvent): boolean => event.item.card.kind === "decision" && event.item.card.state === "open";
 
 export function selectionTouchesNode(node: Node, selection: Selection | null): boolean {

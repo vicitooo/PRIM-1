@@ -1,4 +1,5 @@
 import { RoomCardIndex, cardKey, cardReply, typedCardSignature, selectionTouchesNode, buildTypedCard, updateTypedCard, disposeTypedCard, type CardEvent } from "./room-cards";
+import { cardText } from "./room-cards";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -5172,6 +5173,11 @@ function invitedGuestIds(): ReadonlySet<string> | null {
 function roomFeedEntry(event: RoomFeedEvent, canRetry: boolean): HTMLElement {
   const entry = document.createElement("article");
   entry.className = `room-feed-entry room-feed-${event.item.kind}`;
+  // Plumbing that worked is hidden; a held or failed wake stays visible.
+  if (event.item.kind === "submit_attempt" || event.item.kind === "input_observed"
+    || (event.item.kind === "delivery" && ["stored", "pending", "written", "woken", "fetched"].includes(event.item.status))) {
+    entry.classList.add("room-feed-routine");
+  }
   entry.dataset.sequence = String(event.cursor.sequence);
   const meta = document.createElement("div");
   meta.className = "room-feed-meta";
@@ -5197,7 +5203,7 @@ function roomFeedEntry(event: RoomFeedEvent, canRetry: boolean): HTMLElement {
   } else if (event.item.kind === "card") {
     meta.textContent = `${sequence} ${paneLabel(event.item.author)} · ${event.item.card.kind} · ${event.item.card_id}`;
     const body = document.createElement("pre");
-    body.textContent = JSON.stringify(event.item.card, null, 2);
+    body.textContent = cardText(event.item.card);
     entry.append(meta, body);
   } else if (event.item.kind === "membership") {
     meta.textContent = `${sequence} ${paneLabel(event.item.session_id)} ${event.item.action} · revision ${event.item.membership_revision}`;
