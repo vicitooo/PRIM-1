@@ -1360,6 +1360,7 @@ fn choosing_a_folder_after_an_unusable_one_starts_the_register() {
     assert_eq!(record(&supervisor, id).holder.install_id, install_id(root.path()));
 }
 
+#[cfg(windows)]
 #[test]
 fn transcript_hints_follow_each_harness_layout() {
     let row = |driver, rollout: Option<(&str, &str)>| {

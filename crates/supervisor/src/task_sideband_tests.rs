@@ -260,6 +260,7 @@ fn default_folder_opens_at_start_and_a_chosen_folder_persists_across_restart() {
     assert_eq!(default_task_folder(&runtime, &work), work.join("tasks"));
 }
 
+#[cfg(windows)]
 #[test]
 fn choosing_the_open_folder_again_is_a_no_op_without_a_second_lock() {
     let (root, supervisor) = fixture(None);

@@ -268,12 +268,14 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn the_task_name_follows_the_launcher_root() {
         assert_eq!(launcher_task_name(Path::new(&format!(r"{ROOT}\runtime"))).as_deref(), Some(NAME));
         assert_eq!(launcher_task_name(Path::new(r"C:\")), None);
     }
 
+    #[cfg(windows)]
     #[test]
     fn the_launcher_moves_from_the_replaced_build_to_the_candidate_with_its_hash() {
         let sha = "c".repeat(64);
@@ -333,6 +335,7 @@ mod tests {
         assert!(parse_query("not json").is_err());
     }
 
+    #[cfg(windows)]
     #[test]
     fn the_hidden_command_carries_the_script_as_utf16_base64() {
         // "A" is 0x41 0x00 in UTF-16LE.
