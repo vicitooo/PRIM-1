@@ -2233,7 +2233,8 @@ fn pick_directory(app: &AppHandle, title: &str, start: Option<PathBuf>) -> Resul
         .transpose()
 }
 
-#[tauri::command]
+// `async`: a blocking dialog must not run on the main thread, or macOS deadlocks.
+#[tauri::command(async)]
 fn choose_workspace_directory(
     app: AppHandle,
     state: State<'_, DesktopState>,
@@ -2256,7 +2257,8 @@ fn choose_workspace_directory(
     Ok(Some(state.supervisor.snapshot()))
 }
 
-#[tauri::command]
+// `async`: a blocking dialog must not run on the main thread, or macOS deadlocks.
+#[tauri::command(async)]
 fn choose_session_working_directory(
     app: AppHandle,
     state: State<'_, DesktopState>,
@@ -2336,7 +2338,8 @@ async fn set_task_folder(
 /// Settings → Task folder → Browse…: the native folder picker only; the
 /// choice is then made through `set_task_folder`. A held trial refuses
 /// before the picker opens.
-#[tauri::command]
+// `async`: a blocking dialog must not run on the main thread, or macOS deadlocks.
+#[tauri::command(async)]
 fn choose_task_folder(app: AppHandle, state: State<'_, DesktopState>) -> Result<Option<String>, String> {
     if state.supervisor.trial_admission_held() {
         return Err(TRIAL_ADMISSION_HELD.into());
@@ -2377,7 +2380,8 @@ async fn set_personal_repo(
 /// Settings → Personal repository → Browse…: the native folder picker only;
 /// the choice is then made through `set_personal_repo`. A held trial refuses
 /// before the picker opens.
-#[tauri::command]
+// `async`: a blocking dialog must not run on the main thread, or macOS deadlocks.
+#[tauri::command(async)]
 fn choose_personal_repo(app: AppHandle, state: State<'_, DesktopState>) -> Result<Option<String>, String> {
     if state.supervisor.trial_admission_held() {
         return Err(TRIAL_ADMISSION_HELD.into());
@@ -2406,7 +2410,8 @@ async fn confirm_action(app: AppHandle, message: String, ok_label: String) -> Re
 
 /// Rooms → Save…: the native save dialog only; `export_room` then writes.
 /// A held trial refuses before the dialog opens.
-#[tauri::command]
+// `async`: a blocking dialog must not run on the main thread, or macOS deadlocks.
+#[tauri::command(async)]
 fn choose_room_save_path(app: AppHandle, state: State<'_, DesktopState>, label: String) -> Result<Option<String>, String> {
     if state.supervisor.trial_admission_held() {
         return Err(TRIAL_ADMISSION_HELD.into());
@@ -2427,7 +2432,8 @@ fn choose_room_save_path(app: AppHandle, state: State<'_, DesktopState>, label: 
 
 /// Rooms → Load room…: the native open dialog only, for a room file or a
 /// copied runtime's room catalog; `inspect_room_source` and `import_room` act.
-#[tauri::command]
+// `async`: a blocking dialog must not run on the main thread, or macOS deadlocks.
+#[tauri::command(async)]
 fn choose_room_source(app: AppHandle, state: State<'_, DesktopState>) -> Result<Option<String>, String> {
     if state.supervisor.trial_admission_held() {
         return Err(TRIAL_ADMISSION_HELD.into());
