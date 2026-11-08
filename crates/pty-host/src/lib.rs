@@ -13,11 +13,22 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use shared_types::{DriverKind, EnvVar, LaunchSpec};
 
 mod job;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(windows)]
 mod usage;
+#[cfg(not(target_os = "macos"))]
 pub use job::ProcessJob;
+#[cfg(any(windows, target_os = "macos"))]
+pub use job::ProcessAlreadyExited;
 #[cfg(windows)]
-pub use job::{PinnedProcess, ProcessAlreadyExited, app_job, register_app_job};
+pub use job::{PinnedProcess, app_job, register_app_job};
+#[cfg(target_os = "macos")]
+pub use macos::{
+    ORPHAN_GUARD_ARGUMENT, PROCESS_SCOPE_ENV, PinnedProcess, ProcessJob, current_process_usage,
+    is_claude_versioned_install, logical_processor_count, parent_process_id, process_image_path,
+    process_started_filetime, processes_holding_path, run_orphan_guard, start_orphan_guard,
+};
 #[cfg(windows)]
 pub use usage::{current_process_usage, logical_processor_count};
 
@@ -299,8 +310,8 @@ pub trait PtySession: Send + Sync {
             "PTY session does not expose process-job membership"
         ))
     }
-    /// Authoritative Windows job-membership check using a pinned process handle.
-    #[cfg(windows)]
+    /// Authoritative job/scope membership check for one pinned process.
+    #[cfg(any(windows, target_os = "macos"))]
     fn contains_process(&self, _process: &PinnedProcess) -> anyhow::Result<bool> {
         Err(anyhow!(
             "PTY session does not expose pinned-process job membership"
@@ -331,8 +342,10 @@ pub struct ConcretePtySession {
     process_id: Option<u32>,
     agent_seen: Arc<AtomicBool>,
     agent_pids_seen: Arc<Mutex<HashSet<u32>>>,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     job: ProcessJob,
+    #[cfg(target_os = "macos")]
+    writer_control: Arc<macos::WriteControl>,
 }
 
 impl ConcretePtySession {
@@ -362,6 +375,14 @@ impl ConcretePtySession {
         let mut command = CommandBuilder::new(&spec.program);
         command.args(&spec.args);
         command.cwd(&spec.working_dir);
+
+        #[cfg(target_os = "macos")]
+        let job = ProcessJob::new().context("failed to create the run's process scope")?;
+        #[cfg(target_os = "macos")]
+        {
+            macos::apply_terminal_environment(&mut command);
+            command.env(macos::PROCESS_SCOPE_ENV, job.marker());
+        }
 
         apply_launch_environment(&mut command, &spec.env)?;
 
@@ -395,6 +416,20 @@ impl ConcretePtySession {
         drop(pair.slave);
         let process_id = child.process_id();
 
+        #[cfg(target_os = "macos")]
+        job.bind_root(process_id.ok_or_else(|| anyhow!("spawned PTY child has no process id"))?)
+            .context("failed to bind the run's process scope")?;
+
+        #[cfg(target_os = "macos")]
+        let master_fd = pair
+            .master
+            .as_raw_fd()
+            .ok_or_else(|| anyhow!("PTY master exposes no file descriptor"))?;
+        // A non-blocking master lets the writer stay cancellable; the reader
+        // below polls for that reason.
+        #[cfg(target_os = "macos")]
+        macos::set_nonblocking(master_fd).context("failed to prepare the PTY master")?;
+
         let reader = pair
             .master
             .try_clone_reader()
@@ -404,7 +439,16 @@ impl ConcretePtySession {
             .master
             .take_writer_with_raw_handle()
             .context("failed to take interruptible PTY writer")?;
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        let writer_control = Arc::new(macos::WriteControl::default());
+        #[cfg(target_os = "macos")]
+        let writer: Box<dyn Write + Send> = Box::new(macos::PtyMasterWriter::new(
+            macos::dup_cloexec(master_fd).context("failed to duplicate PTY writer")?,
+            Arc::clone(&writer_control),
+        ));
+        #[cfg(target_os = "macos")]
+        let reader_poll_fd = macos::dup_cloexec(master_fd).context("failed to duplicate PTY reader")?;
+        #[cfg(not(any(windows, target_os = "macos")))]
         let writer = pair
             .master
             .take_writer()
@@ -431,6 +475,10 @@ impl ConcretePtySession {
                             reader_handler(PtyEvent::Output(output));
                         }
                     }
+                    #[cfg(target_os = "macos")]
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        macos::wait_readable(reader_poll_fd, 250);
+                    }
                     Err(error) => {
                         if let Some(output) = decoder.finish() {
                             reader_handler(PtyEvent::Output(output));
@@ -439,6 +487,11 @@ impl ConcretePtySession {
                         break;
                     }
                 }
+            }
+            #[cfg(target_os = "macos")]
+            // SAFETY: this thread owns the duplicate it polled.
+            unsafe {
+                libc::close(reader_poll_fd);
             }
         });
 
@@ -451,15 +504,22 @@ impl ConcretePtySession {
             process_id,
             agent_seen: Arc::new(AtomicBool::new(false)),
             agent_pids_seen: Arc::new(Mutex::new(HashSet::new())),
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             job,
+            #[cfg(target_os = "macos")]
+            writer_control,
         })
     }
 
     fn kill_immediate_child(&self) -> Result<()> {
-        self.child
-            .lock()
-            .expect("pty child poisoned")
+        let mut child = self.child.lock().expect("pty child poisoned");
+        // The child may have been reaped already; a second kill must not turn
+        // that known exit into a failed termination proof.
+        #[cfg(target_os = "macos")]
+        if let Ok(Some(_)) = child.try_wait() {
+            return Ok(());
+        }
+        child
             .kill()
             .context("failed to kill PTY child")?;
         Ok(())
@@ -519,7 +579,12 @@ impl ConcretePtySession {
                 .map(|process_ids| process_identities_for_ids(&process_ids))
         }
 
-        #[cfg(unix)]
+        #[cfg(target_os = "macos")]
+        {
+            self.job.live_identities()
+        }
+
+        #[cfg(all(unix, not(target_os = "macos")))]
         {
             let Some(process_id) = self.process_id else {
                 return Ok(Vec::new());
@@ -574,7 +639,12 @@ impl ConcretePtySession {
 impl PtySession for ConcretePtySession {
     fn send_input(&self, input: &str) -> PtyWriteResult {
         let mut writer = self.writer.lock().expect("pty writer poisoned");
-        write_pty_input(writer.as_mut(), input.as_bytes())
+        #[cfg(target_os = "macos")]
+        self.writer_control.begin();
+        let result = write_pty_input(writer.as_mut(), input.as_bytes());
+        #[cfg(target_os = "macos")]
+        self.writer_control.end();
+        result
     }
 
     fn cancel_input_write(&self) -> anyhow::Result<()> {
@@ -583,7 +653,13 @@ impl PtySession for ConcretePtySession {
             self.interrupt_writer()
         }
 
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        {
+            self.writer_control.request_cancel();
+            Ok(())
+        }
+
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             Err(anyhow!(
                 "PTY session does not support isolated input-write cancellation"
@@ -638,6 +714,8 @@ impl PtySession for ConcretePtySession {
         if let Err(error) = self.interrupt_writer() {
             first_error = Some(error);
         }
+        #[cfg(target_os = "macos")]
+        self.writer_control.request_cancel();
         self.close_master();
 
         #[cfg(windows)]
@@ -645,6 +723,16 @@ impl PtySession for ConcretePtySession {
             .job
             .terminate()
             .context("failed to terminate PTY process job")
+        {
+            first_error = Some(error);
+        }
+
+        // The proof for macOS: the whole scope is gone, not just the root.
+        #[cfg(target_os = "macos")]
+        if let Err(error) = self
+            .job
+            .terminate()
+            .context("failed to terminate the run's process scope")
         {
             first_error = Some(error);
         }
@@ -675,19 +763,19 @@ impl PtySession for ConcretePtySession {
     }
 
     fn contains_process_id(&self, process_id: u32) -> anyhow::Result<bool> {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             self.job.contains_process_id(process_id)
         }
 
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             let _ = process_id;
             Ok(false)
         }
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     fn contains_process(&self, process: &PinnedProcess) -> anyhow::Result<bool> {
         self.job.contains_process(process)
     }
@@ -708,12 +796,12 @@ impl PtySession for ConcretePtySession {
     }
 
     fn scope_accounting(&self) -> anyhow::Result<Option<ScopeAccounting>> {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             self.job.accounting(false).map(Some)
         }
 
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             Ok(None)
         }
@@ -751,9 +839,11 @@ impl Drop for ConcretePtySession {
     fn drop(&mut self) {
         #[cfg(windows)]
         let _ = self.interrupt_writer();
+        #[cfg(target_os = "macos")]
+        self.writer_control.request_cancel();
         self.close_master();
 
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         let _ = self.job.terminate();
 
         let _ = self.kill_immediate_child();
@@ -762,6 +852,12 @@ impl Drop for ConcretePtySession {
 }
 
 pub fn expected_agent_image_name(driver: DriverKind, image_name: &str) -> bool {
+    // The native Claude install on macOS is `…/claude/versions/<version>`:
+    // its file name is only a number, so the full image path decides.
+    #[cfg(target_os = "macos")]
+    if driver == DriverKind::Claude && macos::is_claude_versioned_install(image_name) {
+        return true;
+    }
     let lowered = process_image_basename(image_name).to_ascii_lowercase();
     let base = without_updater_rename(&lowered).to_owned();
     if matches!(
@@ -828,6 +924,7 @@ fn process_image_basename(image_name: &str) -> &str {
         .unwrap_or(image_name)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn process_identities_for_ids(process_ids: &[u32]) -> Vec<ProcessIdentity> {
     process_ids
         .iter()
@@ -887,7 +984,7 @@ fn process_group_process_identities(process_id: u32) -> Vec<ProcessIdentity> {
     process_identities_for_ids(&process_ids)
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos")))]
 fn process_group_process_identities(process_id: u32) -> Vec<ProcessIdentity> {
     process_identities_for_ids(&[process_id])
 }
@@ -902,7 +999,7 @@ fn linux_process_group_id(process_id: u32) -> Option<i32> {
     fields.next()?.parse::<i32>().ok()
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn process_image_name(process_id: u32) -> Option<String> {
     #[cfg(target_os = "linux")]
     {

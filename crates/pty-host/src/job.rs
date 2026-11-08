@@ -531,10 +531,10 @@ pub fn app_job() -> Option<&'static ProcessJob> {
     APP_JOB.get()
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub struct ProcessJob;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 impl ProcessJob {
     pub fn new() -> anyhow::Result<Self> {
         Ok(Self)
