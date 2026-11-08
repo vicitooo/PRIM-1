@@ -1367,7 +1367,7 @@ class SessionTerminal {
       return;
     }
     this.terminal.paste(text);
-    this.terminal.focus();
+    focusWithinActiveWindow(this.terminal);
   }
 
   private paste(event: ClipboardEvent): void {
