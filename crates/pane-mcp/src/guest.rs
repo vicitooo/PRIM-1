@@ -19,6 +19,7 @@ const GUEST_SERVER_NAME: &str = "prim1-room-guest";
 const GUEST_WAIT_DEFAULT_MS: u64 = 25_000;
 const GUEST_WAIT_MAX_MS: u64 = 25_000;
 /// The desktop's identifier (`tauri.conf.json`) under %LOCALAPPDATA%.
+#[cfg(not(target_os = "macos"))]
 const DEFAULT_RUNTIME_SUBDIR: &str = r"io.prim1.v2\runtime";
 
 pub(crate) trait GuestClient {
@@ -273,15 +274,25 @@ impl<G: GuestClient> McpTools for GuestTools<G> {
     }
 }
 
-/// `%LOCALAPPDATA%\io.prim1.v2\runtime` unless `PRIM1_RUNTIME_DIR` names
-/// the runtime PRIM-1 was started with.
+/// `%LOCALAPPDATA%\io.prim1.v2\runtime` (on macOS `~/Library/Application
+/// Support/io.prim1.v2/runtime`) unless `PRIM1_RUNTIME_DIR` names the runtime
+/// PRIM-1 was started with.
 pub(crate) fn guest_runtime_dir() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("PRIM1_RUNTIME_DIR").filter(|dir| !dir.to_string_lossy().trim().is_empty()) {
         return Ok(PathBuf::from(dir));
     }
-    let local = std::env::var_os("LOCALAPPDATA")
-        .ok_or_else(|| anyhow!("LOCALAPPDATA is not set; set PRIM1_RUNTIME_DIR to PRIM-1's runtime folder"))?;
-    Ok(PathBuf::from(local).join(DEFAULT_RUNTIME_SUBDIR))
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME")
+            .ok_or_else(|| anyhow!("HOME is not set; set PRIM1_RUNTIME_DIR to PRIM-1's runtime folder"))?;
+        Ok(PathBuf::from(home).join("Library/Application Support/io.prim1.v2/runtime"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let local = std::env::var_os("LOCALAPPDATA")
+            .ok_or_else(|| anyhow!("LOCALAPPDATA is not set; set PRIM1_RUNTIME_DIR to PRIM-1's runtime folder"))?;
+        Ok(PathBuf::from(local).join(DEFAULT_RUNTIME_SUBDIR))
+    }
 }
 
 fn guest_token() -> Result<String> {
@@ -294,14 +305,14 @@ fn guest_token() -> Result<String> {
     Ok(token)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) struct PipeGuestClient {
     runtime: tokio::runtime::Runtime,
     runtime_dir: PathBuf,
     token: String,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 impl PipeGuestClient {
     pub(crate) fn from_environment() -> Result<Self> {
         Ok(Self {
@@ -321,14 +332,14 @@ impl PipeGuestClient {
             self.runtime_dir.display(), shared_types::GUEST_ENDPOINT_FILE_NAME))?;
         let endpoint: shared_types::GuestEndpoint = serde_json::from_slice(&bytes)
             .with_context(|| format!("{} is not a PRIM-1 guest endpoint", path.display()))?;
-        if !endpoint.endpoint.starts_with(r"\\.\pipe\") || endpoint.server_pid == 0 || endpoint.server_started == 0 {
-            bail!("{} names no PRIM-1 named pipe", path.display());
+        if !super::endpoint_is_native(&endpoint.endpoint) || endpoint.server_pid == 0 || endpoint.server_started == 0 {
+            bail!("{} names no PRIM-1 socket", path.display());
         }
         Ok(endpoint)
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 impl GuestClient for PipeGuestClient {
     fn send(&mut self, request: GuestRequest) -> Result<GuestResponse> {
         let endpoint = self.endpoint()?;
@@ -348,10 +359,10 @@ impl GuestClient for PipeGuestClient {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub(crate) struct PipeGuestClient;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 impl PipeGuestClient {
     pub(crate) fn from_environment() -> Result<Self> {
         let _ = (guest_runtime_dir(), guest_token());
@@ -359,7 +370,7 @@ impl PipeGuestClient {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 impl GuestClient for PipeGuestClient {
     fn send(&mut self, _request: GuestRequest) -> Result<GuestResponse> {
         bail!("PRIM-1 guest access is unavailable on this platform")

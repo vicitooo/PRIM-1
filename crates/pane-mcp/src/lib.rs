@@ -2005,7 +2005,7 @@ fn read_frame<R: BufRead>(reader: &mut R, max_bytes: usize) -> Result<Option<Fra
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 struct EnvironmentSidebandClient {
     runtime: tokio::runtime::Runtime,
     endpoint: String,
@@ -2016,16 +2016,16 @@ struct EnvironmentSidebandClient {
     pane_secret: Option<String>,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 impl EnvironmentSidebandClient {
     fn from_environment() -> Result<Self> {
         let transport = required_environment("PRIM1_CONTROL_PLANE_TRANSPORT")?;
-        if transport != "named_pipe" {
+        if transport != NATIVE_CONTROL_PLANE_TRANSPORT {
             bail!("unsupported PRIM-1 control-plane transport '{transport}'");
         }
         let endpoint = required_environment("PRIM1_CONTROL_PLANE_ENDPOINT")?;
-        if !endpoint.starts_with(r"\\.\pipe\") {
-            bail!("PRIM-1 control-plane endpoint is not a Windows named pipe");
+        if !endpoint_is_native(&endpoint) {
+            bail!("PRIM-1 control-plane endpoint is not this platform's local socket");
         }
         let expected_server_pid = required_environment("PRIM1_CONTROL_PLANE_SERVER_PID")?
             .parse::<u32>()
@@ -2198,7 +2198,7 @@ async fn pipe_round_trip(
     String::from_utf8(response).map_err(|_| anyhow!("PRIM-1 sideband response is not valid UTF-8"))
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 impl SidebandClient for EnvironmentSidebandClient {
     fn send(&mut self, request: SidebandRequest) -> Result<SidebandResponse> {
         self.runtime.block_on(Self::send_async(
@@ -2211,24 +2211,162 @@ impl SidebandClient for EnvironmentSidebandClient {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 struct EnvironmentSidebandClient;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 impl EnvironmentSidebandClient {
     fn from_environment() -> Result<Self> {
         bail!("PRIM-1 pane MCP is unavailable on this platform")
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 impl SidebandClient for EnvironmentSidebandClient {
     fn send(&mut self, _request: SidebandRequest) -> Result<SidebandResponse> {
         bail!("PRIM-1 pane MCP is unavailable on this platform")
     }
 }
 
+/// The control-plane transport this platform's supervisor announces.
 #[cfg(windows)]
+pub(crate) const NATIVE_CONTROL_PLANE_TRANSPORT: &str = "named_pipe";
+#[cfg(target_os = "macos")]
+pub(crate) const NATIVE_CONTROL_PLANE_TRANSPORT: &str = "unix_socket";
+
+/// A named pipe path on Windows; an absolute socket path on macOS.
+#[cfg(windows)]
+pub(crate) fn endpoint_is_native(endpoint: &str) -> bool {
+    endpoint.starts_with(r"\\.\pipe\")
+}
+#[cfg(target_os = "macos")]
+pub(crate) fn endpoint_is_native(endpoint: &str) -> bool {
+    endpoint.starts_with('/')
+}
+
+/// One request/response over the PRIM-1 Unix socket, with the checks the
+/// named-pipe client makes: the peer is the expected server process at its
+/// expected start time, the frame is bounded, and that process outlives the
+/// response. (`GetNamedPipeServerProcessId`'s counterpart is the socket's
+/// peer credentials; the socket's directory already admits only this user.)
+#[cfg(target_os = "macos")]
+async fn pipe_round_trip(
+    endpoint: &str,
+    expected_server_pid: u32,
+    expected_server_creation_time: u64,
+    request_line: &str,
+    frames: &str,
+) -> Result<String> {
+    use std::time::Duration;
+
+    use pty_host::PinnedProcess;
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        net::UnixStream,
+        time::{Instant, sleep, timeout},
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut client = loop {
+        match UnixStream::connect(endpoint).await {
+            Ok(client) => break client,
+            Err(error)
+                if matches!(error.raw_os_error(), Some(code) if code == libc_codes::ENOENT || code == libc_codes::ECONNREFUSED)
+                    && Instant::now() < deadline =>
+            {
+                sleep(Duration::from_millis(25)).await;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to connect to PRIM-1 socket {endpoint}"));
+            }
+        }
+    };
+
+    let credentials = client
+        .peer_cred()
+        .context("failed to identify PRIM-1 socket server process")?;
+    let actual_server_pid = credentials
+        .pid()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .ok_or_else(|| anyhow!("PRIM-1 socket reports no server process"))?;
+    if actual_server_pid != expected_server_pid {
+        bail!("connected socket server process does not match the injected PRIM-1 server");
+    }
+    if credentials.uid() != libc_codes::effective_uid() {
+        bail!("connected socket server belongs to another user");
+    }
+    let pinned_server = PinnedProcess::open(actual_server_pid)
+        .context("failed to pin PRIM-1 socket server process")?;
+    if pinned_server.creation_time_filetime() != expected_server_creation_time {
+        bail!("connected socket server creation time does not match the injected PRIM-1 server");
+    }
+
+    if request_line.len() > control_plane::MAX_FRAME_BYTES {
+        bail!(
+            "encoded sideband request exceeds {}-byte frame limit",
+            control_plane::MAX_FRAME_BYTES
+        );
+    }
+    timeout(Duration::from_secs(5), async {
+        client.write_all(frames.as_bytes()).await?;
+        client.flush().await
+    })
+    .await
+    .map_err(|_| anyhow!("timed out writing PRIM-1 sideband request"))?
+    .context("failed to write PRIM-1 sideband request")?;
+
+    let mut reader = BufReader::new(client);
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(45), async {
+        loop {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                bail!("unterminated PRIM-1 sideband response");
+            }
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let take = newline.map_or(available.len(), |index| index + 1);
+            if response.len().saturating_add(take) > control_plane::MAX_FRAME_BYTES {
+                bail!(
+                    "PRIM-1 sideband response exceeds {}-byte frame limit",
+                    control_plane::MAX_FRAME_BYTES
+                );
+            }
+            response.extend_from_slice(&available[..take]);
+            reader.consume(take);
+            if newline.is_some() {
+                response.pop();
+                if response.last() == Some(&b'\r') {
+                    response.pop();
+                }
+                break Ok::<(), anyhow::Error>(());
+            }
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("timed out reading PRIM-1 sideband response"))??;
+    if !pinned_server.is_alive()? {
+        bail!("PRIM-1 socket server exited before its response was verified");
+    }
+    String::from_utf8(response).map_err(|_| anyhow!("PRIM-1 sideband response is not valid UTF-8"))
+}
+
+/// The two connect errors that mean "not listening yet" and the caller's
+/// effective user id, without a libc dependency for two constants.
+#[cfg(target_os = "macos")]
+mod libc_codes {
+    pub(super) const ENOENT: i32 = 2;
+    pub(super) const ECONNREFUSED: i32 = 61;
+    pub(super) fn effective_uid() -> u32 {
+        // SAFETY: geteuid has no failure mode and takes no arguments.
+        unsafe extern "C" {
+            safe fn geteuid() -> u32;
+        }
+        geteuid()
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
 fn required_environment(name: &str) -> Result<String> {
     let value = std::env::var(name).with_context(|| format!("{name} is required"))?;
     if value.trim().is_empty() {

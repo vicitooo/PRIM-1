@@ -14,9 +14,11 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, NaiveDate, Utc};
-use control_plane::{DEFAULT_ENDPOINT, MAX_FRAME_BYTES, decode_request, encode_response};
+use control_plane::{MAX_FRAME_BYTES, decode_request, encode_response};
+#[cfg(not(target_os = "macos"))]
+use control_plane::DEFAULT_ENDPOINT;
 use parking_lot::{Condvar, Mutex, RwLock};
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use pty_host::PinnedProcess;
 use pty_host::{
     AgentLiveness, ConcretePtySession, PtyEvent, PtyEventHandler, PtyExitStatus, PtySession,
@@ -82,6 +84,8 @@ pub use rebuild::closed_checkpoint::{
 mod room_guests;
 mod feed_wait;
 mod pane_ancestry;
+#[cfg(target_os = "macos")]
+mod macos_sideband;
 mod member_lifecycle;
 mod room_admin;
 mod operator_entry;
@@ -118,6 +122,8 @@ use rooms::{
 use session::RecoveryReference;
 use room_guests::{GUEST_FROM_PANE_REFUSAL, GuestRegistry, guest_sender_label, guest_typed_content};
 pub use room_guests::{guest_agent_invitation, guest_cli_example, guest_mcp_config_json};
+#[cfg(target_os = "macos")]
+pub use harness_executable::macos_child_path;
 
 type EventSink = Arc<dyn Fn(RuntimeEvent) + Send + Sync>;
 
@@ -188,10 +194,11 @@ fn hosted_agent(driver: DriverKind) -> bool {
 /// codex.exe, grok.exe), not a shell wrapper or a Node launcher, so the PTY
 /// child's exit is the agent's exit even while Node tools it started live on.
 fn native_agent_program(driver: DriverKind, program: &Path) -> bool {
-    let Some(name) = program.file_name().and_then(|name| name.to_str()) else { return false };
+    // The whole path: on macOS a native Claude's file name is only its version.
+    let Some(image) = program.to_str() else { return false };
     hosted_agent(driver)
-        && pty_host::expected_agent_image_name(driver, name)
-        && !matches!(pty_host::process_image_file_name(name).as_str(), "node.exe" | "node")
+        && pty_host::expected_agent_image_name(driver, image)
+        && !matches!(pty_host::process_image_file_name(image).as_str(), "node.exe" | "node")
 }
 const AUTO_RESTART_WINDOW: Duration = Duration::from_secs(30 * 60);
 const AUTO_RESTART_MAX_PER_WINDOW: usize = 3;
@@ -199,11 +206,11 @@ const RECENT_ROUTE_OVERLAP_WINDOW: Duration = Duration::from_secs(3);
 const SESSION_LABEL_MAX_CHARS: usize = 128;
 const SESSION_CATALOG_SCHEMA_VERSION: u32 = 1;
 const SESSION_CATALOG_FILE_NAME: &str = "session-catalog-v1.json";
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 const PANE_MCP_SERVER_NAME: &str = "prim1_pane";
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 const PANE_MCP_MODE_ARGUMENT: &str = "--prim1-pane-mcp";
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 const PANE_MCP_ENVIRONMENT_VARIABLES: &[&str] = &[
     "PRIM1_CONTROL_PLANE_TRANSPORT",
     "PRIM1_CONTROL_PLANE_ENDPOINT",
@@ -211,7 +218,7 @@ const PANE_MCP_ENVIRONMENT_VARIABLES: &[&str] = &[
     "PRIM1_CONTROL_PLANE_SERVER_STARTED_FILETIME",
     "PRIM1_PANE_SECRET",
 ];
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 const PANE_MCP_CLAUDE_ALLOWED_TOOLS: &[&str] = &[
     "mcp__prim1_pane__ping",
     "mcp__prim1_pane__room_read",
@@ -258,14 +265,14 @@ const PANE_MCP_CLAUDE_ALLOWED_TOOLS: &[&str] = &[
     "mcp__prim1_pane__telemetry",
 ];
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PaneMcpClient {
     Claude,
     Codex,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 impl PaneMcpClient {
     fn for_driver(driver: DriverKind) -> Option<Self> {
         match driver {
@@ -1056,11 +1063,15 @@ fn prime_enabled_from(value: Option<&str>) -> bool {
 }
 
 pub fn prime_enabled() -> bool {
-    cfg!(test) || prime_enabled_from(std::env::var("PRIM1_ENABLE_PRIME").ok().as_deref())
+    cfg!(test) || (cfg!(windows) && prime_enabled_from(std::env::var("PRIM1_ENABLE_PRIME").ok().as_deref()))
 }
 
+#[cfg(not(target_os = "macos"))]
 const PRIME_PARKED_REASON: &str =
     "Prime/WSL is parked in PRIM-1 v2; set PRIM1_ENABLE_PRIME=1 to use it. No WSL command was run.";
+#[cfg(target_os = "macos")]
+const PRIME_PARKED_REASON: &str =
+    "Prime needs Windows WSL and is unavailable on macOS. No WSL command was run.";
 
 /// Startup check of every catalog row's working directory. While Prime is
 /// parked a WSL row stays in the catalog and carries the parked reason; no
@@ -1232,7 +1243,7 @@ impl PtySession for WslScopedPtySession {
         Ok(false)
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     fn contains_process(&self, _process: &PinnedProcess) -> Result<bool> {
         Ok(false)
     }
@@ -3235,6 +3246,11 @@ fn closed_session_slot(definition: SessionDefinition) -> SessionSlot {
 fn harness_from_process_images<'a>(
     images: impl IntoIterator<Item = &'a str>,
 ) -> Option<DriverKind> {
+    let images: Vec<&str> = images.into_iter().collect();
+    #[cfg(target_os = "macos")]
+    if images.iter().any(|image| pty_host::is_claude_versioned_install(image)) {
+        return Some(DriverKind::Claude);
+    }
     let names: Vec<String> = images
         .into_iter()
         .map(pty_host::process_image_file_name)
@@ -3918,7 +3934,7 @@ struct SupervisorInner {
     operator_input: Mutex<HashMap<SessionId, OperatorInputQueue>>,
     #[cfg(test)]
     operator_input_workers_started: AtomicUsize,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     control_plane_listener: Mutex<Option<ControlPlaneListener>>,
     pty_spawner: RwLock<Arc<dyn PtySpawner>>,
     executable_resolver: RwLock<Arc<dyn DriverExecutableResolver>>,
@@ -4170,6 +4186,19 @@ fn audit_event_projection(event: &RuntimeEvent, _inner: &SupervisorInner) -> Opt
     Some(event)
 }
 
+/// The per-user local application data folder: `%LOCALAPPDATA%` on Windows
+/// and `~/Library/Application Support` on macOS.
+pub(crate) fn local_app_data_root() -> Option<std::ffi::OsString> {
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Library/Application Support").into_os_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::env::var_os("LOCALAPPDATA")
+    }
+}
+
 fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
     if metadata.file_type().is_symlink() {
         return true;
@@ -4188,6 +4217,10 @@ fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
 }
 
 fn ensure_existing_path_chain_has_no_reparse_points(path: &Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let resolved = resolve_macos_system_prefix(path);
+    #[cfg(target_os = "macos")]
+    let path = resolved.as_path();
     let mut cursor = Some(path);
     while let Some(candidate) = cursor {
         match fs::symlink_metadata(candidate) {
@@ -4213,6 +4246,21 @@ fn ensure_existing_path_chain_has_no_reparse_points(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// macOS keeps `/var`, `/tmp` and `/etc` as links into `/private`; every user
+/// path (the temp folder included) goes through them, so they are the
+/// operating system's fixed layout rather than a link anyone placed. Using
+/// the real location for those prefixes keeps the no-symlink rule meaningful
+/// for everything below them.
+#[cfg(target_os = "macos")]
+fn resolve_macos_system_prefix(path: &Path) -> PathBuf {
+    for prefix in ["/var", "/tmp", "/etc"] {
+        if let Ok(rest) = path.strip_prefix(prefix) {
+            return Path::new("/private").join(prefix.trim_start_matches('/')).join(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
 fn canonical_destination_without_reparse_points(path: &Path) -> Result<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -4221,6 +4269,8 @@ fn canonical_destination_without_reparse_points(path: &Path) -> Result<PathBuf> 
             .context("failed to resolve the current directory for runtime storage")?
             .join(path)
     };
+    #[cfg(target_os = "macos")]
+    let absolute = resolve_macos_system_prefix(&absolute);
     ensure_existing_path_chain_has_no_reparse_points(&absolute)?;
 
     let mut cursor = absolute.as_path();
@@ -4954,7 +5004,7 @@ impl SupervisorHandle {
 
     pub fn new_with_startup_admission(mut config: SupervisorConfig, startup_admission: StartupAdmission) -> Result<Self> {
         startup_admission.validate_config(&config)?;
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         if let Some(executable) = config.pane_mcp_executable.as_deref() {
             validate_pane_mcp_executable(executable)?;
         }
@@ -5115,7 +5165,7 @@ impl SupervisorHandle {
                 operator_input: Mutex::new(HashMap::new()),
                 #[cfg(test)]
                 operator_input_workers_started: AtomicUsize::new(0),
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "macos"))]
                 control_plane_listener: Mutex::new(None),
                 pty_spawner: RwLock::new(Arc::new(ConcretePtySpawner {
                     wsl: Arc::clone(&wsl_control),
@@ -5444,7 +5494,7 @@ impl SupervisorHandle {
     /// D9 step 1: one thread per run waits on its pinned root process and runs
     /// the liveness sweep once it exits, so an exit no longer waits for the
     /// next keystroke, resize or snapshot to be found.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     fn start_run_exit_watcher(&self, session_id: SessionId, run_id: Uuid, process_id: u32) {
         if !self.inner.exit_watch_enabled.load(Ordering::Acquire) {
             return;
@@ -5494,7 +5544,7 @@ impl SupervisorHandle {
         }
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     fn start_run_exit_watcher(&self, _session_id: SessionId, _run_id: Uuid, _process_id: u32) {}
 
     #[cfg(test)]
@@ -7094,9 +7144,9 @@ impl SupervisorHandle {
                     || slot.termination_uncertain
             });
             drop(slots);
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             let listener_cleanup_pending = self.inner.control_plane_listener.lock().is_some();
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, target_os = "macos")))]
             let listener_cleanup_pending = false;
             if !cleanup_pending && !listener_cleanup_pending {
                 // A previous close may have cleaned up processes but failed
@@ -7106,7 +7156,7 @@ impl SupervisorHandle {
             }
         }
 
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         let listener = {
             let _lifecycle = self.inner.control_plane_lifecycle.lock();
             self.inner.control_plane.write().take();
@@ -7114,13 +7164,13 @@ impl SupervisorHandle {
             self.inner.control_plane_listener.lock().take()
         };
 
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             let _lifecycle = self.inner.control_plane_lifecycle.lock();
             self.inner.control_plane.write().take();
         }
 
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         if let Some(listener) = listener.as_ref() {
             listener.cancel();
         }
@@ -7294,7 +7344,7 @@ impl SupervisorHandle {
             }
         }
 
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             if let Some(listener) = listener {
                 match listener.join_until(deadline) {
@@ -11108,7 +11158,7 @@ impl SupervisorHandle {
             return Ok(existing);
         }
 
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             let _ = endpoint_override;
             Err(anyhow!(
@@ -11116,9 +11166,15 @@ impl SupervisorHandle {
             ))
         }
 
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
+            #[cfg(windows)]
             let endpoint = endpoint_override.unwrap_or_else(control_plane_endpoint);
+            #[cfg(target_os = "macos")]
+            let endpoint = match endpoint_override {
+                Some(endpoint) => endpoint,
+                None => macos_sideband::private_socket_endpoint()?,
+            };
             let status = ControlPlaneStatus {
                 transport: control_plane_transport().into(),
                 endpoint,
@@ -14185,7 +14241,7 @@ impl SupervisorHandle {
                 key: "PRIM1_CONTROL_PLANE_TRANSPORT".into(),
                 value: status.transport,
             });
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             {
                 let server = PinnedProcess::open(std::process::id())
                     .context("failed to identify the control-plane server process")?;
@@ -14294,7 +14350,7 @@ impl SupervisorHandle {
     }
 
     fn pane_mcp_launch_inputs(&self, driver: DriverKind) -> Result<Option<SessionPaneMcpInputs>> {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         if self.inner.control_plane.read().is_some()
             && let Some(client) = PaneMcpClient::for_driver(driver)
             && let Some(executable) = self.inner.pane_mcp_executable.as_deref()
@@ -14305,7 +14361,7 @@ impl SupervisorHandle {
             };
             return augment_launch_spec_with_pane_mcp(&mut spec, client, executable).map(Some);
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         let _ = driver;
         Ok(None)
     }
@@ -14446,24 +14502,35 @@ fn process_id_is_running(process_id: u32) -> bool {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn process_id_is_running(process_id: u32) -> bool {
-    unsafe { libc::kill(process_id as i32, 0) == 0 }
+    // A zombie waiting to be reaped has exited; only a live start time counts.
+    pty_host::process_started_filetime(process_id).is_some()
 }
 
-#[cfg(windows)]
+#[cfg(all(unix, not(target_os = "macos")))]
+fn process_id_is_running(process_id: u32) -> bool {
+    match i32::try_from(process_id) {
+        Ok(pid) if pid > 0 => unsafe {
+            libc::kill(pid, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        },
+        _ => false,
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
 struct ControlPlaneListener {
     shutdown: tokio::sync::watch::Sender<bool>,
     thread: Option<thread::JoinHandle<Result<()>>>,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 enum ControlPlaneJoinOutcome {
     Joined(Result<()>),
     TimedOut(ControlPlaneListener),
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 impl ControlPlaneListener {
     fn cancel(&self) {
         self.shutdown.send_replace(true);
@@ -14500,13 +14567,13 @@ impl ControlPlaneListener {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 struct PreparedControlPlaneListener {
     activation: mpsc::SyncSender<()>,
     listener: ControlPlaneListener,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 impl PreparedControlPlaneListener {
     fn activate(self) -> Result<ControlPlaneListener> {
         let Self {
@@ -14521,7 +14588,7 @@ impl PreparedControlPlaneListener {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn prepare_control_plane_thread(
     handle: SupervisorHandle,
     status: ControlPlaneStatus,
@@ -14545,7 +14612,16 @@ fn prepare_control_plane_thread(
             }
         };
 
+        #[cfg(windows)]
         let result = runtime.block_on(run_windows_pipe_server(
+            handle,
+            status,
+            ready_tx,
+            activation_rx,
+            shutdown_rx,
+        ));
+        #[cfg(target_os = "macos")]
+        let result = runtime.block_on(macos_sideband::run_unix_socket_server(
             handle,
             status,
             ready_tx,
@@ -14649,7 +14725,7 @@ fn launch_inputs(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn validate_pane_mcp_executable(path: &Path) -> Result<()> {
     if !path.is_absolute() {
         return Err(anyhow!(
@@ -14668,7 +14744,7 @@ fn validate_pane_mcp_executable(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn augment_launch_spec_with_pane_mcp(
     spec: &mut LaunchSpec,
     client: PaneMcpClient,
@@ -15464,6 +15540,7 @@ fn control_plane_transport() -> &'static str {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn control_plane_endpoint() -> String {
     #[cfg(windows)]
     {
@@ -32421,6 +32498,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn prime_catalog_and_launch_plan_are_typed_shell_free_and_sideband_free() {
         let root = tempfile::tempdir().expect("create Prime catalog root");
@@ -32652,6 +32730,7 @@ mod tests {
         assert_eq!(control.qualifications.load(Ordering::SeqCst), 1);
     }
 
+    #[cfg(windows)]
     #[test]
     fn prime_start_revalidation_releases_registry_and_rejects_a_concurrent_cwd_change() {
         let supervisor = empty_test_supervisor();

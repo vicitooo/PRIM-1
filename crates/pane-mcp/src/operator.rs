@@ -15,7 +15,7 @@ use shared_types::{OperatorIntro, OperatorPreamble, SidebandRequest, SidebandRes
 pub const OPERATOR_CLI_USAGE: &str = "usage: --prim1-operator [--runtime <dir>] [--actor <label>] [--token-file <path>] <command…>
   commands (as --prim1-room): ping | rooms | members | member … | room … | guests … | settings … | conversations … | fallbacks … | deliver --room <room id> <member|all> <text> | dispose --room <room id> <message id> <member, or guest label or id> (--next|--decline) <text> | cancel --room <room id> <message id> --reason <text>
   fallbacks get --room <room id> | fallbacks set <revision> <settings-json> --room <room id>: the entry has no room of its own
-  --runtime: PRIM-1's runtime folder (default PRIM1_RUNTIME_DIR, else %LOCALAPPDATA%\\io.prim1.v2\\runtime)
+  --runtime: PRIM-1's runtime folder (default PRIM1_RUNTIME_DIR, else %LOCALAPPDATA%\\io.prim1.v2\\runtime, or on macOS ~/Library/Application Support/io.prim1.v2/runtime)
   --actor: how the room feed names you, beside this process id (display only)
   --token-file: required by guests invite; the token and its MCP config are written there (a new file) and never printed
   Refused from inside a PRIM-1 pane, also from anything a pane started: a pane uses its own member tools and grants.
@@ -133,7 +133,7 @@ fn runtime_dir(cli: &OperatorCli) -> Result<PathBuf> {
     super::guest::guest_runtime_dir()
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn send_operator_request(cli: &OperatorCli) -> Result<SidebandResponse> {
     let runtime_dir = runtime_dir(cli)?;
     let path = runtime_dir.join(shared_types::GUEST_ENDPOINT_FILE_NAME);
@@ -142,8 +142,8 @@ fn send_operator_request(cli: &OperatorCli) -> Result<SidebandResponse> {
         runtime_dir.display(), shared_types::GUEST_ENDPOINT_FILE_NAME))?;
     let endpoint: shared_types::GuestEndpoint = serde_json::from_slice(&bytes)
         .with_context(|| format!("{} is not a PRIM-1 endpoint file", path.display()))?;
-    if !endpoint.endpoint.starts_with(r"\\.\pipe\") || endpoint.server_pid == 0 || endpoint.server_started == 0 {
-        bail!("{} names no PRIM-1 named pipe", path.display());
+    if !super::endpoint_is_native(&endpoint.endpoint) || endpoint.server_pid == 0 || endpoint.server_started == 0 {
+        bail!("{} names no PRIM-1 socket", path.display());
     }
     if let Some(refusal) = own_pane_refusal(std::env::var("PRIM1_CONTROL_PLANE_SERVER_PID").ok().as_deref(), &endpoint) {
         bail!(refusal);
@@ -171,7 +171,7 @@ fn own_pane_refusal(pane_server_pid: Option<&str>, endpoint: &shared_types::Gues
         "this shell belongs to a pane of this PRIM-1: use your member tools (members_list, member_*, room_*) and your grants; the operator entry is for processes PRIM-1 did not start")
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn send_operator_request(cli: &OperatorCli) -> Result<SidebandResponse> {
     let _ = runtime_dir(cli);
     bail!("the PRIM-1 operator entry is unavailable on this platform")

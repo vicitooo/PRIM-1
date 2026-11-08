@@ -1044,7 +1044,7 @@ impl SupervisorHandle {
     }
 
     /// After the pipe accepts. Grants nothing; the token is the authority.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     pub(super) fn write_guest_endpoint(&self, endpoint: &str) {
         let written = PinnedProcess::open(std::process::id())
             .context("failed to identify the control-plane server process")
