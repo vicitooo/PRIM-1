@@ -51,9 +51,14 @@ Termination sends SIGTERM, waits briefly, then SIGKILL, and only succeeds after 
 
 **This is weaker than a Job.** A process that both daemonizes and scrubs its environment before PRIM-1 looks can escape. PRIM-1 was never a sandbox for hostile programs running as the same user (see [SECURITY.md](../SECURITY.md)); on macOS, keep that in mind for anything an agent starts.
 
+## Verified on this machine
+
+Apple Silicon, macOS 26.6: the `.app` started through LaunchServices and from a shell with a bare `PATH`; rooms, sessions and live terminals; Claude Code (2.1.319) receiving a room message and replying through the room tools; Codex (0.158.0) launching and reporting its folder-trust question; Stop, Restart, app close and `kill -9`/SIGTERM leaving no process behind. A Codex reply to a room message has not been exercised yet, because its first-run folder-trust question was left for the user to answer.
+
 ## Known gaps
 
 - `PATH` is not read from your login shell, so a CLI installed somewhere only your shell profile knows (nvm, pyenv shims) won't be found. Set it in `PRIM1_ENV_FILE` or start the app from a terminal.
+- SIGTERM (`kill <pid>`) is not a graceful close: the crash guard still clears the agents, but the app does not get to save anything first. Closing the window or Quit is graceful.
 - First use of a protected folder (Documents, Desktop, Downloads) from a Finder-launched app is expected to show macOS's privacy prompt; approve it once. (Testing so far started the app from a terminal, which uses that terminal's access instead.)
 - Claude and Codex show their own folder-trust prompt the first time they run in a new folder; answer it in the session's terminal.
 - Windows-only tests are compiled out: the Prime paths, the Windows-path fixtures, and the upgrade launcher tests.
