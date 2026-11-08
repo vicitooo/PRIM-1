@@ -4,7 +4,7 @@ A **Windows** desktop app that runs terminal-first AI agents (Claude Code, Codex
 
 The app itself runs on your machine. It is not a hosted agent platform and does not run models locally — the CLIs you attach still use their own providers and accounts.
 
-**Status:** Alpha, build from source · **License:** Apache-2.0 · **OS:** Windows 10/11. Linux is the next platform priority; macOS is also planned. Neither port is in this tree.
+**Status:** Alpha, build from source · **License:** Apache-2.0 · **OS:** Windows 10/11; an experimental macOS port is described in [docs/MACOS.md](docs/MACOS.md). Linux is the next platform priority.
 
 ## Run
 
