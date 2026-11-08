@@ -2,6 +2,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
+    // macOS: the crash-guard helper the desktop starts for itself. Runs alone,
+    // before anything else, and never returns.
+    #[cfg(target_os = "macos")]
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(pty_host::ORPHAN_GUARD_ARGUMENT)) {
+        pty_host::run_orphan_guard();
+    }
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--prim1-identify")) {
         let args: Vec<std::ffi::OsString> = std::env::args_os().skip(2).collect();
         match pane_mcp::run_identify_cli(&args) {
@@ -74,6 +80,14 @@ fn main() {
         pane_mcp::print_error_line(format!("unknown PRIM-1 mode {}; modes: --prim1-room, --prim1-operator, --prim1-guest, --prim1-guest-mcp, --prim1-pane-mcp, --prim1-identify",
             mode.to_string_lossy()));
         std::process::exit(2);
+    }
+
+    // macOS: a Finder launch gives only /usr/bin:/bin:/usr/sbin:/sbin, so the
+    // CLIs and everything they run would be missing. Still single-threaded.
+    #[cfg(target_os = "macos")]
+    {
+        let path = supervisor::macos_child_path(std::env::var_os("PATH").as_deref());
+        unsafe { std::env::set_var("PATH", path) };
     }
 
     let startup = cli_master_wrapper_desktop_lib::load_startup_config().unwrap_or_else(|error| {

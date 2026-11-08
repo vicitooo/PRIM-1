@@ -144,12 +144,31 @@ function usageRow(
   };
 }
 
+/** The webview row. macOS: WebKit's processes are launchd's children and
+    are not attributed to PRIM-1, so the row says not measured rather than 0. */
+function webviewRow(snapshot: TelemetrySnapshot): TelemetryRow {
+  if (snapshot.webview.processes > 0) {
+    return usageRow("app", "WebView2 (UI)", snapshot.webview);
+  }
+  return {
+    kind: "app",
+    name: "Webview (UI), not measured on this platform",
+    harness: "",
+    cpuNow: "—",
+    cpuPeak: "",
+    memoryNow: "—",
+    memoryPeak: "",
+    processes: "—",
+  };
+}
+
 /** PRIM-1's three groups, then one row per live agent run. */
 export function telemetryRows(snapshot: TelemetrySnapshot): TelemetryRow[] {
+  const helpers = snapshot.helpers.processes > 0 ? [usageRow("app", "Console hosts & helpers", snapshot.helpers)] : [];
   return [
     usageRow("app", "PRIM-1 core", snapshot.core),
-    usageRow("app", "WebView2 (UI)", snapshot.webview),
-    usageRow("app", "Console hosts & helpers", snapshot.helpers),
+    webviewRow(snapshot),
+    ...helpers,
     ...snapshot.sessions.map((session): TelemetryRow => ({
       kind: "agent",
       name: session.label,

@@ -324,6 +324,12 @@ fn effective_webview_profile(app: &AppHandle) -> Result<PathBuf, String> {
 
 /// Not for a held trial. An unavailable upgrade store leaves PRIM-1 working.
 fn install_upgrade(app: &AppHandle, diagnostics: &DesktopDiagnostics, startup: &StartupConfig) {
+    // Self-upgrade stages a build and hands over through Windows Task
+    // Scheduler; on macOS it is off and `upgrade_request` says it is unavailable.
+    if cfg!(target_os = "macos") {
+        diagnostics.log("info", "upgrade_unavailable", "self-upgrade is not available on macOS");
+        return;
+    }
     let Some(state) = app.try_state::<DesktopState>() else {
         return;
     };
@@ -2741,7 +2747,7 @@ fn resolve_agent_working_root_from(
 ) -> Result<PathBuf, String> {
     let selected = non_empty_path(env_root)
         .map(|path| resolve_against(&path, startup_cwd))
-        .unwrap_or_else(|| startup_cwd.to_path_buf());
+        .unwrap_or_else(|| default_agent_working_root(startup_cwd));
     if !selected.is_dir() {
         return Err(format!(
             "agent working root is not a directory: {}",
@@ -2755,6 +2761,22 @@ fn resolve_agent_working_root_from(
         )
     })?;
     Ok(normalize_path_for_child_processes(canonical))
+}
+
+/// The workspace when nothing chose one: the folder PRIM-1 was started in.
+/// A Finder launch starts in `/`, and the home folder holds PRIM-1's runtime
+/// (under Library), so neither can be the workspace on macOS; `~/PRIM-1` is.
+fn default_agent_working_root(startup_cwd: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+        && (startup_cwd == Path::new("/") || startup_cwd == home)
+    {
+        let workspace = home.join("PRIM-1");
+        // Failure is reported by the is_dir check right after.
+        let _ = std::fs::create_dir_all(&workspace);
+        return workspace;
+    }
+    startup_cwd.to_path_buf()
 }
 
 fn resolve_runtime_dir_override(value: Option<OsString>, startup_cwd: &Path) -> Option<PathBuf> {
@@ -2791,6 +2813,16 @@ fn operator_restored(focused: bool, minimized: bool) -> bool {
     focused && !minimized
 }
 
+/// How the main window fills the screen. Windows runs kiosk-style fullscreen.
+/// macOS fullscreen would open a new Space and hide the Dock, so the window is
+/// maximized instead; the corner menu still offers real fullscreen.
+fn fill_screen(window: &WebviewWindow) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    return window.maximize().map_err(|error| error.to_string());
+    #[cfg(not(target_os = "macos"))]
+    window.set_fullscreen(true).map_err(|error| error.to_string())
+}
+
 fn present_main_window(window: &WebviewWindow, start_minimized: bool) -> Result<(), String> {
     // Show through Tauri so its window layer (tao) records the window as
     // visible. The previous raw Win32 `ShowWindow` bypassed that state: tao
@@ -2803,9 +2835,7 @@ fn present_main_window(window: &WebviewWindow, start_minimized: bool) -> Result<
     if start_minimized {
         window.minimize().map_err(|error| error.to_string())?;
     } else {
-        window
-            .set_fullscreen(true)
-            .map_err(|error| error.to_string())?;
+        fill_screen(window)?;
     }
     Ok(())
 }
@@ -2838,7 +2868,19 @@ fn show_startup_refusal(text: &str) {
     unsafe { MessageBoxW(std::ptr::null_mut(), body.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING); }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn show_startup_refusal(text: &str) {
+    // No window exists yet. osascript is on every Mac and needs no entitlement.
+    let script = format!("display alert \"PRIM-1\" message {}", applescript_literal(text));
+    let _ = std::process::Command::new("/usr/bin/osascript").args(["-e", &script]).status();
+}
+
+#[cfg(target_os = "macos")]
+fn applescript_literal(text: &str) -> String {
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn show_startup_refusal(_text: &str) {}
 
 fn validate_and_lock_desktop_runtime(
@@ -3263,6 +3305,14 @@ pub fn run(startup: StartupConfig) {
                 &requested_runtime_dir,
                 &setup_startup.agent_working_root,
             )?;
+            // macOS: what `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` gives on
+            // Windows, before the first run can start.
+            #[cfg(target_os = "macos")]
+            if let Err(error) = std::env::current_exe().map_err(anyhow::Error::from)
+                .and_then(|exe| pty_host::start_orphan_guard(&exe))
+            {
+                setup_diagnostics.log("warn", "orphan_guard_unavailable", format!("{error:#}"));
+            }
             // v3 W7: before anything writes, keep a verified copy of a runtime an
             // earlier build wrote; a v2 build cannot read room history v3 writes.
             // A refusal is shown, and the build this one replaced starts again.
@@ -3341,7 +3391,11 @@ pub fn run(startup: StartupConfig) {
                     "main window presented minimized without activation; fullscreen deferred until operator restore",
                 );
             } else {
-                setup_diagnostics.log("info", "window_ready", "main window presented fullscreen");
+                setup_diagnostics.log("info", "window_ready", if cfg!(target_os = "macos") {
+                    "main window presented maximized"
+                } else {
+                    "main window presented fullscreen"
+                });
             }
             Ok(())
         })
@@ -3459,7 +3513,7 @@ pub fn run(startup: StartupConfig) {
                     .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
             {
-                match window.set_fullscreen(true) {
+                match fill_screen(&window) {
                     Ok(()) => state.diagnostics.log(
                         "info",
                         "window_restored",
@@ -3468,7 +3522,7 @@ pub fn run(startup: StartupConfig) {
                     Err(error) => {
                         state
                             .diagnostics
-                            .log("error", "window_restore_failed", error.to_string())
+                            .log("error", "window_restore_failed", error)
                     }
                 }
             }

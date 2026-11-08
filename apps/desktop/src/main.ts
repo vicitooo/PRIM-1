@@ -269,6 +269,9 @@ if (!(app instanceof HTMLDivElement)) {
 
 /** Decided once at boot from the webview's platform hints (see keymap.ts). */
 const keyPlatform: Platform = detectPlatform();
+const telemetryPageHint = keyPlatform === "macos"
+  ? "Each process is counted once: PRIM-1 itself, then each live agent's whole process tree. PRIM-1's WebKit webview runs in processes macOS owns, so it is not measured here. CPU is the share of the whole Mac since the previous sample. Memory is each process's physical footprint (Activity Monitor › Memory). Peaks run from each agent's start; CPU peaks are sampled only while telemetry is on screen."
+  : "Each process is counted once: PRIM-1 itself, its WebView2 window, the console host beside each terminal, then each live agent's whole process tree. CPU is the share of the whole PC since the previous sample (Task Manager › Processes). Memory is private bytes (Task Manager › Details › Commit size). Peaks run from each agent's start; CPU peaks are sampled only while telemetry is on screen.";
 
 /** Settings → Keys: the user's explicit bindings, validated on load
     (keymap.ts parseUserBindings). One localStorage key. */
@@ -805,7 +808,7 @@ app.innerHTML = `
           <button type="button" class="ghost view-back" data-corner="telemetry">Back to sessions</button>
         </div>
         <div class="view-body">
-          <p class="view-hint">Each process is counted once: PRIM-1 itself, its WebView2 window, the console host beside each terminal, then each live agent's whole process tree. CPU is the share of the whole PC since the previous sample (Task Manager › Processes). Memory is private bytes (Task Manager › Details › Commit size). Peaks run from each agent's start; CPU peaks are sampled only while telemetry is on screen.</p>
+          <p class="view-hint">${telemetryPageHint}</p>
           <table class="telemetry-table">
             <thead>
               <tr>
@@ -4922,7 +4925,9 @@ async function createGuestInvitation(): Promise<void> {
 function copyGuestInvite(text: string, what: string): void {
   void navigator.clipboard.writeText(text).then(
     // The webview clipboard cannot opt out of Windows clipboard history.
-    () => { guestInviteCopied.textContent = `${what} copied; the token stays in Windows clipboard history (Win+V) until you clear it there`; },
+    () => { guestInviteCopied.textContent = keyPlatform === "macos"
+      ? `${what} copied; the token stays on the clipboard until something else replaces it`
+      : `${what} copied; the token stays in Windows clipboard history (Win+V) until you clear it there`; },
     (error: unknown) => { guestInviteCopied.textContent = `Copy failed (${errorText(error)}); select the text and copy it`; },
   );
 }
