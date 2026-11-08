@@ -53,7 +53,7 @@ Termination sends SIGTERM, waits briefly, then SIGKILL, and only succeeds after 
 
 ## Verified on this machine
 
-Apple Silicon, macOS 26.6: the `.app` started through LaunchServices and from a shell with a bare `PATH`; rooms, sessions and live terminals; Claude Code (2.1.319) receiving a room message and replying through the room tools; Codex (0.158.0) launching and reporting its folder-trust question; Stop, Restart, app close and `kill -9`/SIGTERM leaving no process behind. A Codex reply to a room message has not been exercised yet, because its first-run folder-trust question was left for the user to answer.
+Apple Silicon, macOS 26.6: the `.app` started through LaunchServices and from a shell with a bare `PATH`; rooms, sessions and live terminals; Claude Code (2.1.319) receiving a room message and replying through the room tools; Codex (0.158.0) doing the same: receiving a room message, acknowledging it and replying in the feed; Stop, Restart, window close and `kill -9`/SIGTERM leaving no process behind.
 
 ## Known gaps
 
