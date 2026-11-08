@@ -60,9 +60,10 @@ impl HarnessHomes {
     fn from_vars(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Self {
         // An override that is set but not absolute disables that follower.
         let home = |variable: &str, default: &str| {
+            let profile = var("USERPROFILE").or_else(|| cfg!(target_os = "macos").then(|| var("HOME")).flatten());
             match var(variable) {
                 Some(value) => Some(PathBuf::from(value)),
-                None => var("USERPROFILE").map(|profile| PathBuf::from(profile).join(default)),
+                None => profile.map(|profile| PathBuf::from(profile).join(default)),
             }
             .filter(|path| path.is_absolute())
         };
@@ -71,7 +72,8 @@ impl HarnessHomes {
             claude: home("CLAUDE_CONFIG_DIR", ".claude"),
             codex: home("CODEX_HOME", ".codex"),
             grok: home("GROK_HOME", ".grok"),
-            pid_domain: format!("win32:{}", computer.to_lowercase()),
+            // Claude Code's own label for this machine's pid namespace.
+            pid_domain: if cfg!(target_os = "macos") { "darwin".to_owned() } else { format!("win32:{}", computer.to_lowercase()) },
         }
     }
 }
@@ -92,7 +94,7 @@ pub(crate) trait ProcessProbe: Send {
 pub(crate) struct NativeProcessProbe;
 
 impl ProcessProbe for NativeProcessProbe {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     fn harness_start(&self, pty: &dyn PtySession, pid: u32, driver: DriverKind) -> Result<u64> {
         let process = PinnedProcess::open(pid)?;
         if !pty.contains_process(&process)? {
@@ -104,7 +106,7 @@ impl ProcessProbe for NativeProcessProbe {
         Ok(process.creation_time_filetime())
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     fn harness_start(&self, _pty: &dyn PtySession, _pid: u32, _driver: DriverKind) -> Result<u64> {
         bail!("exact-ID following needs Windows process identity")
     }
@@ -113,7 +115,7 @@ impl ProcessProbe for NativeProcessProbe {
     /// a deeper descendant and never the member's. A child is created after
     /// its parent, so one whose recorded parent pid now names the harness
     /// only by reuse started earlier and is refused.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     fn codex_children(&self, pty: &dyn PtySession, pid: u32, started: u64) -> Vec<(u32, u64)> {
         let Ok(members) = pty.live_processes() else { return Vec::new() };
         members.into_iter()
@@ -133,11 +135,14 @@ impl ProcessProbe for NativeProcessProbe {
 }
 
 /// `codex.exe` or a variant of it, by file name.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn is_codex_image(path: &str) -> bool {
     let name = path.rsplit(['\\', '/']).next().unwrap_or(path).to_ascii_lowercase();
-    name.starts_with("codex") && name.ends_with(".exe")
+    name.starts_with("codex") && (name.ends_with(".exe") || (cfg!(target_os = "macos") && !name.contains('.')))
 }
+
+#[cfg(target_os = "macos")]
+pub(super) use pty_host::parent_process_id;
 
 /// The process that created `pid`, as Windows recorded it at creation.
 #[cfg(windows)]
@@ -234,9 +239,19 @@ impl LockHolders for OpenFileHolders {
         }
     }
 
-    #[cfg(not(windows))]
+    /// The processes with `path` open, as the kernel lists them, each with
+    /// its start time.
+    #[cfg(target_os = "macos")]
+    fn holders(&self, path: &Path) -> Result<Vec<(u32, u64)>> {
+        Ok(pty_host::processes_holding_path(path)?
+            .into_iter()
+            .filter_map(|pid| PinnedProcess::open(pid).ok().map(|process| (pid, process.creation_time_filetime())))
+            .collect())
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
     fn holders(&self, _path: &Path) -> Result<Vec<(u32, u64)>> {
-        bail!("listing a file's holders needs Windows")
+        bail!("listing a file's holders is not available on this platform")
     }
 }
 
@@ -752,19 +767,49 @@ fn claude_step(home: &Path, pid_domain: &str, member: &Member, track: &mut RunTr
 
 /// Accepts `sessions\<pid>.json` only for this exact process on this machine,
 /// in the member's folder, as an interactive session.
+/// Does this per-process file's start time name the launched process?
+/// Windows: FILETIME ticks, as text or a number. macOS: Claude writes the
+/// `ps -o lstart` form in local time ("Sat Nov  7 07:22:22 2026"), good to one
+/// second, and a future `procStartFt` is taken when present.
+#[cfg(not(target_os = "macos"))]
+fn claude_proc_start_matches(value: &serde_json::Value, started: u64) -> bool {
+    match &value["procStart"] {
+        serde_json::Value::String(text) => text.parse::<u64>().ok() == Some(started),
+        serde_json::Value::Number(number) => number.as_u64() == Some(started),
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn claude_proc_start_matches(value: &serde_json::Value, started: u64) -> bool {
+    if let Some(ticks) = value["procStartFt"].as_str().and_then(|text| text.parse::<u64>().ok()) {
+        return ticks == started;
+    }
+    // A number or a numeric string is the FILETIME form (test fixtures, or a
+    // file written by a Windows build); the lstart text is Claude's own here.
+    match &value["procStart"] {
+        serde_json::Value::Number(number) => return number.as_u64() == Some(started),
+        serde_json::Value::String(text) if text.parse::<u64>().is_ok() => {
+            return text.parse::<u64>().ok() == Some(started);
+        }
+        _ => {}
+    }
+    let Some(text) = value["procStart"].as_str() else { return false };
+    let Ok(naive) = chrono::NaiveDateTime::parse_from_str(text.trim(), "%a %b %e %H:%M:%S %Y") else { return false };
+    let Some(at) = naive.and_local_timezone(chrono::Local).earliest() else { return false };
+    let started_seconds = started.saturating_sub(FILETIME_UNIX_EPOCH) / 10_000_000;
+    u64::try_from(at.timestamp()).is_ok_and(|seconds| seconds.abs_diff(started_seconds) <= 1)
+}
+
 fn read_claude_pid_file(home: &Path, pid_domain: &str, member: &Member) -> Option<(String, Option<String>)> {
     let bytes = read_bounded(&home.join("sessions").join(format!("{}.json", member.pid)), PID_FILE_MAX_BYTES).ok()?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let proc_start = match &value["procStart"] {
-        serde_json::Value::String(text) => text.parse::<u64>().ok()?,
-        serde_json::Value::Number(number) => number.as_u64()?,
-        _ => return None,
-    };
+    let start_matches = claude_proc_start_matches(&value, member.started);
     let same_folder = value["cwd"].as_str().is_some_and(|cwd| {
         session::normalize_windows_path(cwd) == session::normalize_windows_path(&member.working_dir)
     });
     if value["pid"].as_u64() != Some(u64::from(member.pid))
-        || proc_start != member.started
+        || !start_matches
         || value["pidDomain"].as_str() != Some(pid_domain)
         || value["kind"].as_str() != Some("interactive")
         || !same_folder
@@ -1442,6 +1487,7 @@ mod tests {
         fs::write(path, text).unwrap();
     }
 
+    #[cfg(windows)]
     #[test]
     fn claude_transcript_lookup_is_absent_only_after_a_complete_clean_scan() {
         let id = "0f1c7f0e-5a52-4b8e-9d3e-2f6a1b9c8d70";
@@ -2051,6 +2097,7 @@ mod tests {
         assert!(image.to_string().contains("not the pane's harness"), "{image:#}");
     }
 
+    #[cfg(windows)]
     #[test]
     fn harness_homes_follow_their_overrides() {
         let vars = HashMap::from([

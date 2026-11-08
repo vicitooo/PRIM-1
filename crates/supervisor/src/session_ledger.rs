@@ -629,7 +629,7 @@ fn machine_name() -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn process_start_time(pid: u32) -> Option<String> {
     // FILETIME: 100 ns ticks since 1601-01-01 UTC.
     const UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
@@ -638,7 +638,7 @@ fn process_start_time(pid: u32) -> Option<String> {
     Some(at.to_rfc3339_opts(SecondsFormat::Millis, true))
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn process_start_time(_pid: u32) -> Option<String> {
     None
 }

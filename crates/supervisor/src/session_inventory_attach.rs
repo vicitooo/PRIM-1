@@ -209,6 +209,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let work = dir.path().join("work");
         fs::create_dir_all(&work).unwrap();
+        // The personal-repo scope is canonical; a macOS temp path goes through
+        // the /var link, so the recorded cwd must be canonical too.
+        #[cfg(target_os = "macos")]
+        let work = fs::canonicalize(&work).unwrap();
         let roots = [dir.path().join("codex"), dir.path().join("claude"), dir.path().join("grok")];
         for root in &roots { fs::create_dir_all(root).unwrap(); }
         let id = Uuid::new_v4().to_string();

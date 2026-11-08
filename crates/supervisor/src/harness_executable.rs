@@ -5,6 +5,12 @@
 //! 2. Follow `{name}.cmd` on PATH to a real `.exe`, or to `node.exe` + the
 //!    `.js` the shim names. Never spawn the `.cmd` itself.
 //! 3. If `search` is set: walk a bounded set of usual install locations.
+//!
+//! macOS: a CLI found on PATH may be an npm `.js` script with a node shebang
+//! (`codex` is); it runs as `node <script>` so the program is the same on
+//! every launch and no shell `env` search decides it. The PATH itself is
+//! completed once at app startup (`macos_child_path`), because a Finder
+//! launch gets only `/usr/bin:/bin:/usr/sbin:/sbin`.
 
 use std::{
     env, fs,
@@ -92,7 +98,7 @@ fn bins_for(driver: DriverKind) -> Option<DriverBins> {
             path_names: if cfg!(windows) {
                 &["powershell.exe", "pwsh.exe"]
             } else {
-                &["bash"]
+                &["zsh", "bash"]
             },
             cmd_name: None,
         }),
@@ -129,10 +135,7 @@ fn resolve_driver_executable_on_path_with(
     };
 
     if let Ok(program) = find_direct_executable_on_path(bins.path_names, search_path) {
-        return Ok(ResolvedLaunchProgram {
-            program,
-            prefix_args: Vec::new(),
-        });
+        return Ok(resolved_direct_program(program, search_path));
     }
 
     if let Some(cmd_name) = bins.cmd_name
@@ -158,6 +161,34 @@ fn resolve_driver_executable_on_path_with(
         searched: search,
     }
     .into())
+}
+
+/// A direct executable as launched: the file itself, or on macOS `node` plus
+/// the script when the file is an npm JS shim.
+fn resolved_direct_program(program: String, search_path: &std::ffi::OsStr) -> ResolvedLaunchProgram {
+    #[cfg(target_os = "macos")]
+    if let Some(script) = macos_node_script(&program)
+        && let Ok(node) = find_direct_executable_on_path(&["node"], search_path)
+    {
+        return ResolvedLaunchProgram { program: node, prefix_args: vec![script] };
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = search_path;
+    ResolvedLaunchProgram { program, prefix_args: Vec::new() }
+}
+
+/// The script path, when `program` is a JavaScript file run through a node
+/// shebang (`#!/usr/bin/env node`). A native binary is never read past its
+/// first bytes.
+#[cfg(target_os = "macos")]
+fn macos_node_script(program: &str) -> Option<String> {
+    use std::io::Read as _;
+    let path = Path::new(program);
+    let mut first = [0_u8; 128];
+    let read = fs::File::open(path).and_then(|mut file| file.read(&mut first)).ok()?;
+    let head = std::str::from_utf8(first.get(..read)?).ok()?;
+    let line = head.lines().next()?;
+    (line.starts_with("#!") && line.contains("node")).then(|| program.to_owned())
 }
 
 pub(crate) fn find_direct_executable(names: &[&str]) -> Result<String> {
@@ -326,10 +357,7 @@ fn search_usual_places(
     }
     for candidate in &places {
         if let Some(program) = qualify_direct_file(candidate) {
-            return Some(ResolvedLaunchProgram {
-                program,
-                prefix_args: Vec::new(),
-            });
+            return Some(resolved_direct_program(program, search_path));
         }
     }
     if let Some(cmd_name) = cmd_name {
@@ -386,6 +414,8 @@ fn user_install_roots() -> Vec<PathBuf> {
         roots.push(home.join(".local").join("bin"));
         roots.push(home.join(".grok").join("bin"));
     }
+    #[cfg(target_os = "macos")]
+    roots.extend(macos_usual_cli_directories());
     if let Some(appdata) = env::var_os("APPDATA") {
         roots.push(PathBuf::from(appdata).join("npm"));
     }
@@ -399,6 +429,57 @@ fn user_install_roots() -> Vec<PathBuf> {
         roots.push(PathBuf::from(program_files).join("nodejs"));
     }
     roots
+}
+
+/// Where a CLI usually lives on a Mac; the app's child PATH starts with these
+/// (see `macos_child_path`).
+#[cfg(target_os = "macos")]
+pub fn macos_usual_cli_directories() -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    if let Some(home) = home_dir() {
+        for relative in [".local/bin", ".local/node/bin", ".npm-global/bin", ".bun/bin", ".cargo/bin", ".grok/bin"] {
+            directories.push(home.join(relative));
+        }
+    }
+    for system in ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/local/sbin"] {
+        directories.push(PathBuf::from(system));
+    }
+    directories
+}
+
+/// The PATH a GUI launch should give every child: the usual CLI directories,
+/// then whatever PATH the app was started with, then the system's own
+/// (`/etc/paths`, `/etc/paths.d/*`), without duplicates.
+#[cfg(target_os = "macos")]
+pub fn macos_child_path(inherited: Option<&std::ffi::OsStr>) -> std::ffi::OsString {
+    let mut seen = std::collections::HashSet::new();
+    let mut entries = Vec::new();
+    let mut add = |directory: PathBuf| {
+        if !directory.as_os_str().is_empty() && seen.insert(directory.clone()) {
+            entries.push(directory);
+        }
+    };
+    for directory in macos_usual_cli_directories() {
+        add(directory);
+    }
+    if let Some(inherited) = inherited {
+        for directory in env::split_paths(inherited) {
+            add(directory);
+        }
+    }
+    for file in std::iter::once(PathBuf::from("/etc/paths")).chain(
+        fs::read_dir("/etc/paths.d").into_iter().flatten().flatten().map(|entry| entry.path()),
+    ) {
+        if let Ok(text) = fs::read_to_string(&file) {
+            for line in text.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')) {
+                add(PathBuf::from(line));
+            }
+        }
+    }
+    for system in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+        add(PathBuf::from(system));
+    }
+    env::join_paths(entries).unwrap_or_else(|_| std::ffi::OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"))
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -608,6 +689,49 @@ endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\node_
                 assert!(!missing.searched);
             }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_node_script_cli_launches_as_node_plus_the_script_and_a_binary_as_itself() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let root = tempfile::tempdir().unwrap();
+        let root_path = fs::canonicalize(root.path()).unwrap();
+        let make = |path: &Path, bytes: &[u8]| {
+            write_file(path, bytes);
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        // The npm layout: a symlink onto bin/codex.js with a node shebang.
+        let script = root_path.join("node/lib/node_modules/@openai/codex/bin/codex.js");
+        make(&script, b"#!/usr/bin/env node\nimport './cli.js';\n");
+        fs::create_dir_all(root_path.join("node/bin")).unwrap();
+        make(&root_path.join("node/bin/node"), b"\xcf\xfa\xed\xfe fake node binary");
+        symlink("../lib/node_modules/@openai/codex/bin/codex.js", root_path.join("node/bin/codex")).unwrap();
+        // A native binary whose first bytes are not a shebang.
+        make(&root_path.join("bin/claude"), b"\xcf\xfa\xed\xfe fake claude binary");
+        let search = env::join_paths([root_path.join("node/bin"), root_path.join("bin")]).unwrap();
+        let codex = resolve_driver_executable_on_path(DriverKind::Codex, &search, false).unwrap();
+        assert_eq!(PathBuf::from(&codex.program), root_path.join("node/bin/node"));
+        assert_eq!(codex.prefix_args, vec![script.to_string_lossy().into_owned()]);
+        let claude = resolve_driver_executable_on_path(DriverKind::Claude, &search, false).unwrap();
+        assert_eq!(PathBuf::from(&claude.program), root_path.join("bin/claude"));
+        assert!(claude.prefix_args.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_gui_child_path_keeps_the_usual_places_first_without_duplicates() {
+        let inherited = OsString::from("/usr/bin:/bin:/custom/tools:/usr/bin");
+        let path = macos_child_path(Some(inherited.as_os_str()));
+        let entries: Vec<PathBuf> = env::split_paths(&path).collect();
+        let position = |wanted: &str| entries.iter().position(|entry| entry == Path::new(wanted));
+        assert!(position("/custom/tools").is_some(), "the inherited PATH is kept: {path:?}");
+        assert!(position("/opt/homebrew/bin").unwrap() < position("/usr/bin").unwrap());
+        let unique: std::collections::HashSet<&PathBuf> = entries.iter().collect();
+        assert_eq!(unique.len(), entries.len(), "no duplicates: {path:?}");
+        // A launch with no PATH at all still finds the system tools.
+        let bare: Vec<PathBuf> = env::split_paths(&macos_child_path(None)).collect();
+        assert!(bare.contains(&PathBuf::from("/usr/bin")) && bare.contains(&PathBuf::from("/bin")));
     }
 
     #[cfg(windows)]

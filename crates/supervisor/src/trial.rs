@@ -113,7 +113,7 @@ impl TrialStartup {
         let root = canonical_destination_without_reparse_points(root)?;
         rebuild::reject_live_overlap(&root)?;
         let local =
-            std::env::var_os("LOCALAPPDATA").ok_or_else(|| anyhow!("LOCALAPPDATA is required"))?;
+            crate::local_app_data_root().ok_or_else(|| anyhow!("LOCALAPPDATA is required"))?;
         let local = canonical_destination_without_reparse_points(Path::new(&local))?;
         if paths_overlap(&root, &local.join("io.prim1.v2")) {
             bail!("trial root must be separate from the shared v2 profile/runtime");

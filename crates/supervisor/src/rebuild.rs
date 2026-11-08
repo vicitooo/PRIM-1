@@ -25,7 +25,7 @@ pub(crate) fn maintenance_directory(runtime: &Path) -> Result<PathBuf> {
 }
 
 pub(crate) fn reject_live_overlap(path: &Path) -> Result<()> {
-    let local = std::env::var_os("LOCALAPPDATA")
+    let local = crate::local_app_data_root()
         .ok_or_else(|| anyhow!("LOCALAPPDATA is required to protect live maintenance paths"))?;
     reject_live_overlap_under(path, Path::new(&local))
 }

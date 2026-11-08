@@ -94,6 +94,7 @@ fn discovery_scope(status: &crate::PersonalRepoStatus) -> Result<String, String>
 
 pub fn discover(workspace: &str) -> Inventory {
     let home = std::env::var_os("USERPROFILE")
+        .or_else(|| cfg!(target_os = "macos").then(|| std::env::var_os("HOME")).flatten())
         .map(PathBuf::from)
         .unwrap_or_default();
     let codex = std::env::var_os("CODEX_HOME")
@@ -941,6 +942,7 @@ mod tests {
             assert_eq!(error.contains("Remove PRIM1_PERSONAL_REPO=off"), source == PersonalRepoSource::Environment);
         }
     }
+    #[cfg(windows)]
     #[test]
     fn metadata_only_exact_workspace_and_provider_errors_are_independent() {
         let dir = tempfile::tempdir().unwrap();
@@ -1112,6 +1114,7 @@ mod tests {
         write(&path, &("{}\n".repeat(CLAUDE_PREFIX_RECORDS - 1) + &header));
         assert!(jsonl_metadata(&path, true).is_ok(), "the sixteenth complete metadata record is admitted");
     }
+    #[cfg(windows)]
     #[test]
     fn claude_skips_a_giant_first_record_without_retaining_its_body() {
         let dir = tempfile::tempdir().unwrap();

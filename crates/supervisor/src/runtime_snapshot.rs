@@ -196,9 +196,24 @@ pub fn disk_free_bytes(path: &Path) -> Result<u64> {
     Ok(free)
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+pub fn disk_free_bytes(path: &Path) -> Result<u64> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let bytes = path.as_os_str().as_bytes();
+    let c_path = std::ffi::CString::new(bytes).context("the runtime path contains a NUL")?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+    // SAFETY: a NUL-terminated path and a writable statvfs.
+    if unsafe { libc::statvfs(c_path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        bail!("cannot read the free space of {}: {}", path.display(), std::io::Error::last_os_error());
+    }
+    // SAFETY: statvfs succeeded and filled the structure.
+    let stats = unsafe { stats.assume_init() };
+    Ok(u64::from(stats.f_bavail).saturating_mul(u64::from(stats.f_frsize)))
+}
+
+#[cfg(not(any(windows, unix)))]
 pub fn disk_free_bytes(_path: &Path) -> Result<u64> {
-    bail!("free space is read on Windows only")
+    bail!("free space is not read on this platform")
 }
 
 #[cfg(test)]

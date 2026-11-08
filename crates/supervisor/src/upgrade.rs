@@ -235,7 +235,7 @@ impl UpgradeStore {
             "upgrade runtime must already exist"
         );
         let runtime = canonical_destination_without_reparse_points(runtime)?;
-        let local = std::env::var_os("LOCALAPPDATA")
+        let local = crate::local_app_data_root()
             .context("LOCALAPPDATA is required for upgrade isolation")?;
         reject_installed_v2_overlap(&runtime, Path::new(&local))?;
         let directory = maintenance_directory(&runtime)?.join("upgrades");

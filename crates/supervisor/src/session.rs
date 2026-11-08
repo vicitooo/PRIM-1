@@ -276,6 +276,8 @@ pub(crate) fn codex_sessions_root() -> Result<PathBuf> {
     let home = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("USERPROFILE").map(|path| PathBuf::from(path).join(".codex")))
+        .or_else(|| cfg!(target_os = "macos").then(|| std::env::var_os("HOME")).flatten()
+            .map(|path| PathBuf::from(path).join(".codex")))
         .context("Codex data directory is unavailable")?;
     if !home.is_absolute() {
         bail!("Codex data directory must be absolute");

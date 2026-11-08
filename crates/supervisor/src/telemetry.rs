@@ -372,9 +372,61 @@ pub(crate) fn read(runs: &[LiveRun]) -> anyhow::Result<Readings> {
     read_from(app_job, runs)
 }
 
-#[cfg(not(windows))]
+/// macOS: PRIM-1's own process and each run's scope. The WebKit helper
+/// processes are children of launchd rather than of PRIM-1 and cannot be
+/// attributed without a private API, so the webview group is left empty and
+/// the UI says it was not measured instead of showing a zero.
+#[cfg(target_os = "macos")]
+pub(crate) fn read(runs: &[LiveRun]) -> anyhow::Result<Readings> {
+    use anyhow::Context;
+
+    let at = Instant::now();
+    let at_filetime = filetime_now();
+    let sampled_at = shared_types::now_rfc3339();
+    let logical_cpus = pty_host::logical_processor_count();
+    let core = pty_host::current_process_usage().context("failed to read PRIM-1's own process")?;
+    let mut unreadable = HashSet::new();
+    let mut run_readings = Vec::with_capacity(runs.len());
+    for run in runs {
+        let Some(scope) = run
+            .pty
+            .scope_accounting()
+            .with_context(|| format!("failed to read the process scope of session '{}'", run.label))?
+        else {
+            continue;
+        };
+        unreadable.extend(scope.unreadable.iter().copied());
+        run_readings.push(RunReading {
+            session_id: run.session_id,
+            run_id: run.run_id,
+            label: run.label.clone(),
+            driver: run.driver,
+            cpu_time_100ns: scope.cpu_time_100ns,
+            peak_job_memory_bytes: scope.peak_memory_bytes,
+            private_bytes: scope
+                .members
+                .iter()
+                .map(|member| member.private_bytes)
+                .fold(0, u64::saturating_add),
+            processes: u32::try_from(scope.members.len()).unwrap_or(u32::MAX),
+        });
+    }
+    Ok(Readings {
+        at,
+        at_filetime,
+        sampled_at,
+        logical_cpus,
+        core: ProcessReading::from(&core),
+        webview: Vec::new(),
+        helpers: Vec::new(),
+        runs: run_readings,
+        unreadable_processes: u32::try_from(unreadable.len()).unwrap_or(u32::MAX),
+    })
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub(crate) fn read(_runs: &[LiveRun]) -> anyhow::Result<Readings> {
-    anyhow::bail!("resource telemetry is unsupported on this platform; it is Windows-only")
+    anyhow::bail!("resource telemetry is unsupported on this platform")
 }
 
 /// Reads PRIM-1's own process, then `app_job`, then each live run's Job.
