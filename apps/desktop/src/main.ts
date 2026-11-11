@@ -5918,7 +5918,9 @@ function renderReadableRoomFeed(events: RoomFeedEvent[]): void {
   const index = activeRoomId ? roomCardIndexes.get(activeRoomId) : undefined;
   const board = index?.page(roomCardPage);
   if (board) roomCardPage = board.page;
-  const feed = readableRoomFeed(events, readableMemberLabel, (board?.total ?? 0) > 0);
+  // Georgi themes read the room as a chat: members' own messages always show
+  // as bubbles, even when the room also has typed cards.
+  const feed = readableRoomFeed(events, readableMemberLabel, !georgiActive() && (board?.total ?? 0) > 0);
   const retryable = retryableRoomDeliveryEvents(activeRoomId ?? "", events);
   const now = new Date();
   const selection = document.getSelection();
