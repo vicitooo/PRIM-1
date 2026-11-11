@@ -400,3 +400,53 @@ export function roomFolder(room: RoomSnapshot, sessions: Map<string, SessionSnap
   const first = room.member_ids.map((id) => sessions.get(id)?.working_dir).find(Boolean);
   return first ?? "";
 }
+
+/* ── Rooms overview cards ── */
+
+export interface GeorgiRoomCardData {
+  id: string;
+  label: string;
+  members: GeorgiMember[];
+  last: string;
+  folder: string;
+  current: boolean;
+}
+
+function roomCounts(members: GeorgiMember[]): string {
+  if (members.length === 0) return "No agents yet";
+  const order: GeorgiStatus[] = ["busy", "needs", "error", "starting", "ready", "stopped"];
+  const words: Record<GeorgiStatus, string> = {
+    busy: "busy", needs: "needs you", error: "error", starting: "starting", ready: "ready", stopped: "stopped",
+  };
+  return order
+    .map((status) => [status, members.filter((m) => m.status === status).length] as const)
+    .filter(([, n]) => n > 0)
+    .map(([status, n]) => `${n} ${words[status]}`)
+    .join(" · ");
+}
+
+export function georgiRoomCard(room: GeorgiRoomCardData, open: () => void): HTMLElement {
+  const card = el("button", "g-room-card g-only");
+  card.type = "button";
+  const needs = room.members.filter((m) => m.status === "needs").length;
+  if (needs > 0) card.dataset.needs = "true";
+  if (room.current) card.dataset.current = "true";
+  const head = el("div", "g-room-card-head");
+  const tile = el("span", "g-room-tile g-room-tile-md", roomInitials(room.label));
+  tile.dataset.hue = String(roomHueSlot(room.id));
+  head.append(tile, el("span", "g-room-card-name", room.label));
+  if (needs > 0) head.append(el("span", "g-room-card-badge", `${needs} needs you`));
+  const faces = el("div", "g-room-card-faces");
+  for (const member of room.members) {
+    const face = avatar(member, "md");
+    face.title = `${member.label} · ${STATUS_LABEL[member.status]}`;
+    faces.append(face);
+  }
+  const allStopped = room.members.length > 0 && room.members.every((m) => m.status === "stopped");
+  const last = el("p", "g-room-card-last", room.last || (allStopped ? "All members stopped" : room.members.length ? "No messages yet" : "Add agents to start working together"));
+  const foot = el("div", "g-room-card-foot");
+  foot.append(el("span", "", roomCounts(room.members)), el("span", "g-mono g-room-card-folder", room.folder));
+  card.append(head, faces, last, foot);
+  card.addEventListener("click", open);
+  return card;
+}

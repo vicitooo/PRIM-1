@@ -194,6 +194,7 @@ import "./georgi.css";
 import {
   avatar as georgiAvatar,
   georgiMember,
+  georgiRoomCard,
   harnessName,
   isGeorgiTheme,
   renderMemberChips,
@@ -588,6 +589,11 @@ app.innerHTML = `
           <div class="card-title">
             <span class="card-icon icon-room" aria-hidden="true"></span>
             <h2>Rooms</h2>
+            <span class="g-only g-rooms-sub">A room is a team of sessions with a shared feed.</span>
+          </div>
+          <div class="g-only g-rooms-actions">
+            <button type="button" class="g-btn g-btn-ghost" id="g-rooms-load" title="Load a saved .prim1room file as a new room; nothing starts">Load room…</button>
+            <button type="button" class="g-btn g-btn-primary" id="g-rooms-new">New room</button>
           </div>
         </div>
         <div id="rooms-overview-grid" class="rooms-overview-grid"></div>
@@ -625,6 +631,11 @@ app.innerHTML = `
             <button type="button" class="g-btn g-btn-secondary" id="g-room-tools" title="Room settings: rename, save, delete, brief, fallbacks" aria-expanded="false">···</button>
           </div>
           <div class="g-chips" id="g-room-chips"></div>
+          <div class="g-focus" id="g-focus" hidden>
+            <span class="g-focus-text">Chat with <strong id="g-focus-name"></strong> · only this agent's messages and yours to it</span>
+            <button type="button" class="g-btn g-btn-ghost" id="g-focus-all">Show everyone</button>
+            <button type="button" class="g-btn g-btn-secondary" id="g-focus-terminal">Terminal</button>
+          </div>
         </div>
         <form id="room-create-form" class="room-create-form" hidden>
           <label><span>Room label <small>optional</small></span><input id="room-label" maxlength="128" autocomplete="off" /></label>
@@ -3721,6 +3732,8 @@ const gDrop = must<HTMLElement>("#g-drop");
 const gJump = must<HTMLInputElement>("#g-jump");
 const gJumpList = must<HTMLElement>("#g-jump-list");
 const gThemeToggle = must<HTMLButtonElement>("#g-theme-toggle");
+const gFocusBar = must<HTMLElement>("#g-focus");
+const gFocusName = must<HTMLElement>("#g-focus-name");
 const GEORGI_MODE_KEY = "prim1-georgi-mode";
 const legacyRoomPlaceholder = roomMessage.placeholder;
 let georgiMode: "send" | "post" = localStorage.getItem(GEORGI_MODE_KEY) === "post" ? "post" : "send";
@@ -3796,14 +3809,19 @@ function renderGeorgiChrome(): void {
   if (signature !== georgiSidebarSignature) {
     georgiSidebarSignature = signature;
     renderSidebar(gSidebar, data, {
-      openRoom: openGeorgiRoom,
+      openRoom: (roomId) => openGeorgiRoom(roomId, null),
       openSession: openGeorgiSession,
       newRoom: () => {
         roomsViewMode = "panel";
         setShellView("rooms");
         openRoomCreateForm();
       },
-      newSession: (anchor) => toggleAttachMenu(anchor),
+      newSession: (anchor) => {
+        // "Single sessions" means outside every room: a new session is born
+        // into the context you stand in, so stand in the lobby first.
+        if (workContext.kind !== "lobby") enterWorkContext({ kind: "lobby" });
+        toggleAttachMenu(anchor);
+      },
       showRooms: openRoomsOverview,
       footer: runCornerAction,
     });
@@ -3815,6 +3833,7 @@ function renderGeorgiChrome(): void {
     });
     renderSummary(gSummary, everyone, openGeorgiSession);
   }
+  if (shellView === "rooms" && roomsViewMode === "overview") renderGeorgiRoomsOverview();
   for (const item of gSidebar.querySelectorAll<HTMLElement>("[data-g-footer]")) {
     const kind = item.dataset.gFooter;
     const current = kind === "log" ? appShell.dataset.log === "open" : shellView === kind;
@@ -3833,12 +3852,52 @@ function openGeorgiSession(sessionId: string): void {
   scheduleGeorgiChrome();
 }
 
-function openGeorgiRoom(roomId: string): void {
+/** Chat with one agent: the room feed narrowed to that member's
+    conversation (its messages, yours to it or to everyone, its receipts). */
+let georgiFocusMember: string | null = null;
+
+function openGeorgiRoom(roomId: string, focus: string | null | undefined = undefined): void {
   if (!(workContext.kind === "room" && workContext.roomId === roomId)) {
     enterWorkContext({ kind: "room", roomId });
   }
+  const before = georgiFocusMember;
+  if (focus !== undefined) georgiFocusMember = focus;
   openRoomPanel(roomId);
+  if (georgiFocusMember && !activeRoom()?.member_ids.includes(georgiFocusMember)) georgiFocusMember = null;
+  if (georgiFocusMember) {
+    setGeorgiMode("send");
+    gRecipient.value = georgiFocusMember;
+    syncGeorgiComposer();
+  }
+  if (before !== georgiFocusMember) rebuildGeorgiFeed();
   scheduleGeorgiChrome();
+}
+
+function rebuildGeorgiFeed(): void {
+  readableFeedRoomId = null;
+  readableFeedFollow = true;
+  replaceRoomFeedChildren();
+  renderRoomFeed(roomFeedEvents.get(activeRoomId ?? "") ?? []);
+}
+
+function georgiFocusKeeps(item: ReadableFeedItem): boolean {
+  const focus = georgiFocusMember;
+  if (!focus) return true;
+  if (item.kind === "note") return false;
+  if (item.kind === "problem") return item.problem.recipientId === focus;
+  if (item.senderId === focus) return true;
+  if (item.author === "you") {
+    return item.recipients.length === 0 || item.states.some((state) => state.recipientId === focus)
+      || item.recipients.includes(readableMemberLabel(focus));
+  }
+  return item.states.some((state) => state.recipientId === focus);
+}
+
+function renderGeorgiFocusBar(): void {
+  const focus = georgiFocusMember && activeRoom()?.member_ids.includes(georgiFocusMember) ? georgiFocusMember : null;
+  gFocusBar.hidden = focus === null;
+  if (!focus) return;
+  gFocusName.textContent = paneLabel(focus);
 }
 
 function renderGeorgiRoomHead(): void {
@@ -3859,6 +3918,61 @@ function renderGeorgiRoomHead(): void {
   path.textContent = folder;
   gRoomSub.replaceChildren(`Room · ${count} member${count === 1 ? "" : "s"}${folder ? " · " : ""}`, ...(folder ? [path] : []));
   renderMemberChips(gRoomChips, room.member_ids.map(georgiMemberOf), openGeorgiSession);
+  renderGeorgiFocusBar();
+}
+
+const GEORGI_LAST_KEY = "prim1-georgi-last-messages";
+const georgiLastMessages: Record<string, string> = (() => {
+  try {
+    return JSON.parse(localStorage.getItem(GEORGI_LAST_KEY) ?? "{}") as Record<string, string>;
+  } catch {
+    return {};
+  }
+})();
+
+/** The rooms page shows each room's latest message; reading a whole feed
+    per room would be costly, so remember the latest one as it goes by. */
+function noteGeorgiLastMessage(event: RoomFeedEvent): void {
+  const item = event.item;
+  if (item.kind !== "message") return;
+  const sender = item.sender;
+  const who = sender.kind === "operator" ? "You"
+    : sender.kind === "session" ? paneLabel(sender.session_id)
+      : sender.kind === "guest" ? sender.label
+        : sender.kind === "prim1" ? "PRIM-1" : sender.label;
+  const text = splitAttachments(item.content).text
+    .replace(/^>\s*[^\n]*\n+/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const line = `${who}: ${text}`.slice(0, 220);
+  if (georgiLastMessages[event.room_id] === line) return;
+  georgiLastMessages[event.room_id] = line;
+  try {
+    localStorage.setItem(GEORGI_LAST_KEY, JSON.stringify(georgiLastMessages));
+  } catch {
+    /* preference only */
+  }
+}
+
+function renderGeorgiRoomsOverview(): void {
+  const cards = roomSnapshots.map((room) => georgiRoomCard({
+    id: room.room_id,
+    label: room.label,
+    members: room.member_ids.map(georgiMemberOf),
+    last: georgiLastMessages[room.room_id] ?? "",
+    folder: roomFolder(room, snapshotById),
+    current: workContext.kind === "room" && workContext.roomId === room.room_id,
+  }, () => openGeorgiRoom(room.room_id, null)));
+  const create = document.createElement("button");
+  create.type = "button";
+  create.className = "g-room-card g-room-card-new g-only";
+  create.textContent = "+ New room";
+  create.addEventListener("click", () => {
+    roomsViewMode = "panel";
+    setShellView("rooms");
+    openRoomCreateForm();
+  });
+  roomsOverviewGrid.replaceChildren(...cards, create);
 }
 
 function setGeorgiRoomTools(open: boolean): void {
@@ -4038,7 +4152,7 @@ function wireGeorgi(): void {
     applyTheme(currentThemeName() === "georgi-white" ? "georgi-black" : "georgi-white", true);
   });
   wireJump(gJump, gJumpList, jumpTargets, (target) => {
-    if (target.kind === "room") openGeorgiRoom(target.id);
+    if (target.kind === "room") openGeorgiRoom(target.id, null);
     else openGeorgiSession(target.id);
   });
   document.addEventListener(
@@ -4116,11 +4230,26 @@ function wireGeorgi(): void {
   });
   document.addEventListener("click", (event) => {
     if (!(event.target instanceof Element)) return;
+    const chat = event.target.closest<HTMLButtonElement>("[data-g-chat]");
     const button = event.target.closest<HTMLButtonElement>("[data-g-room-feed]");
-    const sessionId = button?.dataset.gRoomFeed;
+    const sessionId = chat?.dataset.gChat ?? button?.dataset.gRoomFeed;
     if (!sessionId) return;
     const roomId = sessionRoomIdPure(roomSnapshots, sessionId);
-    if (roomId) openGeorgiRoom(roomId);
+    if (roomId) openGeorgiRoom(roomId, chat ? sessionId : null);
+  });
+  must<HTMLButtonElement>("#g-rooms-new").addEventListener("click", () => {
+    roomsViewMode = "panel";
+    setShellView("rooms");
+    openRoomCreateForm();
+  });
+  must<HTMLButtonElement>("#g-rooms-load").addEventListener("click", () => void loadRoomFromFile());
+  must<HTMLButtonElement>("#g-focus-all").addEventListener("click", () => {
+    if (activeRoomId) openGeorgiRoom(activeRoomId, null);
+    gRecipient.value = "all";
+    syncGeorgiComposer();
+  });
+  must<HTMLButtonElement>("#g-focus-terminal").addEventListener("click", () => {
+    if (georgiFocusMember) openGeorgiSession(georgiFocusMember);
   });
 }
 
@@ -4856,6 +4985,7 @@ function discardInactiveRoomFeedState(): void {
 }
 
 function acceptLiveRoomFeedEvent(event: RoomFeedEvent): void {
+  noteGeorgiLastMessage(event);
   if (event.schema_version !== 1) {
     writeSystem(
       "warn",
@@ -5082,6 +5212,10 @@ function enterWorkContext(context: WorkContext): void {
 }
 
 function renderRoomsOverview(): void {
+  if (georgiActive()) {
+    renderGeorgiRoomsOverview();
+    return;
+  }
   const fragment = document.createDocumentFragment();
   fragment.appendChild(buildContextCard(null));
   for (const room of roomSnapshots) {
@@ -5603,6 +5737,12 @@ function replaceRoomFeedChildren(...nodes: (Node | string)[]): void {
 }
 
 function renderRoomFeed(events: RoomFeedEvent[]): void {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    if (events[index].item.kind === "message") {
+      noteGeorgiLastMessage(events[index]);
+      break;
+    }
+  }
   roomFeed.dataset.view = roomFeedView;
   const recovery = roomRecoveryMessage(activeRoom());
   if (recovery) {
@@ -5941,9 +6081,13 @@ function renderReadableRoomFeed(events: RoomFeedEvent[]): void {
       now,
     ));
   }
-  for (const card of board?.cards ?? []) wanted.push(typedCardChild(card));
-  if (board && board.pages > 1) wanted.push(typedCardPager(board.page, board.pages, board.total));
+  const focused = georgiActive() && georgiFocusMember !== null;
+  for (const card of board?.cards ?? []) {
+    if (!focused || card.item.author === georgiFocusMember) wanted.push(typedCardChild(card));
+  }
+  if (board && board.pages > 1 && !focused) wanted.push(typedCardPager(board.page, board.pages, board.total));
   for (const item of feed.items) {
+    if (focused && !georgiFocusKeeps(item)) continue;
     wanted.push(readableItemChild(item, now));
   }
   const parent = readableChildren(roomFeed);
@@ -6647,6 +6791,10 @@ function buildSessionCard(session: SessionSnapshot): HTMLElement {
     '<button type="button" data-action="restart" data-session="' + session.session_id + '">Restart</button>',
     '<button type="button" data-action="stop" data-session="' + session.session_id + '">Stop</button>',
     '<button type="button" class="ghost" data-edit-session="' + session.session_id + '">Edit</button>',
+    '<div class="g-segmented g-only g-view-switch" data-g-view-switch="' + session.session_id + '" role="radiogroup" aria-label="View" hidden>',
+    '<button type="button" role="radio" aria-checked="false" data-g-chat="' + session.session_id + '">Chat</button>',
+    '<button type="button" role="radio" aria-checked="true">Terminal</button>',
+    "</div>",
     '<button type="button" class="ghost g-only" data-g-room-feed="' + session.session_id + '" hidden>Room feed</button>',
     "</div>",
     '<div class="session-meta">',
@@ -6685,7 +6833,10 @@ function updateSessionCard(
   card.title = sessionTabDescription(session);
   card.dataset.driver = session.driver;
   const roomFeedButton = card.querySelector<HTMLButtonElement>("[data-g-room-feed]");
-  if (roomFeedButton) roomFeedButton.hidden = sessionRoomIdPure(roomSnapshots, session.session_id) === null;
+  const inRoom = sessionRoomIdPure(roomSnapshots, session.session_id) !== null;
+  if (roomFeedButton) roomFeedButton.hidden = !inRoom;
+  const viewSwitch = card.querySelector<HTMLElement>("[data-g-view-switch]");
+  if (viewSwitch) viewSwitch.hidden = !inRoom;
 
   const launch = card.querySelector<HTMLButtonElement>('[data-action="start"]');
   const restart = card.querySelector<HTMLButtonElement>('[data-action="restart"]');
