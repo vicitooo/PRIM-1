@@ -39,6 +39,7 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use supervisor::output_credit::{OutputCredit, OutputCreditLedger, OutputCreditMetrics, RendererReset, TOTAL_ITEMS};
 use supervisor::trial::{TRIAL_ADMISSION_HELD, TrialChallenge, TrialHealthReceipt, TrialStartup};
 use supervisor::upgrade_flow::{UpgradeEnvironment, UpgradeHost, UpgradeStartup};
+mod attachments;
 mod trial_desktop;
 mod upgrade_launcher;
 pub use trial_desktop::WEBVIEW_PROFILE_ENV;
@@ -3346,6 +3347,8 @@ pub fn run(startup: StartupConfig) {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            attachments::save_room_attachment,
+            attachments::read_room_attachment,
             automation_mode,
             trial_status,
             trial_renderer_acknowledged,

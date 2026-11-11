@@ -86,6 +86,8 @@ export type ReadableFeedItem =
           "guest" is an invited outside agent: its name is shown with a badge. */
       author: "you" | "member" | "prim1" | "guest";
       sender: string;
+      /** The member who wrote it, when a member did (Georgi themes' avatar). */
+      senderId?: string;
       recipients: string[];
       body: string;
       preview: ReadablePreview;
@@ -225,6 +227,7 @@ export function readableRoomFeed(
         key: item.message_id,
         author: nativeSender !== null || automatic ? "prim1" : readableAuthor(item.sender),
         sender: nativeSender ?? (automatic ? "PRIM-1" : readableSender(item.sender, labelFor)),
+        ...(item.sender.kind === "session" && nativeSender === null && !automatic ? { senderId: item.sender.session_id } : {}),
         recipients: item.recipient_ids.map(labelFor),
         ...displayBody(event, item.content, automatic),
         timestamp: event.timestamp,

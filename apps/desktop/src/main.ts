@@ -188,6 +188,31 @@ import {
 import { loadRoomFlow, roomSaveSummary } from "./room-package";
 import { afterConfirm, closeSessionConfirmText, deleteRoomConfirmText, resumeHereConfirmText, startFreshConfirmText } from "./confirm-gate";
 import "./styles.css";
+import "@fontsource-variable/geist";
+import "@fontsource-variable/geist-mono";
+import "./georgi.css";
+import {
+  avatar as georgiAvatar,
+  georgiMember,
+  harnessName,
+  isGeorgiTheme,
+  renderMemberChips,
+  renderSidebar,
+  renderSummary,
+  roomFolder,
+  roomHueSlot,
+  roomInitials,
+  wireJump,
+  type GeorgiMember,
+  type JumpTarget,
+} from "./georgi-ui";
+import {
+  ComposerAttachments,
+  attachmentGrid,
+  joinAttachments,
+  splitAttachments,
+  type SavedAttachment,
+} from "./georgi-attachments";
 import { RoomDraftStore } from "./room-drafts";
 import { installRoomFallbacks } from "./room-fallbacks";
 import { abandonUpgradeConfirmText, upgradeBannerView, upgradeResumeMembers } from "./upgrade-banner";
@@ -389,6 +414,19 @@ app.innerHTML = `
         <h1 data-tauri-drag-region>PRIM-1</h1>
         <span class="topbar-active-tag" id="brand-active-tag" data-tauri-drag-region>Sessions</span>
       </div>
+      <div class="g-brand g-only" data-tauri-drag-region>
+        <span class="g-diamond" aria-hidden="true"></span>
+        <span class="g-wordmark" data-tauri-drag-region>PRIM-1</span>
+      </div>
+      <span class="g-sep g-only" aria-hidden="true"></span>
+      <div class="g-summary g-only" id="g-summary" aria-label="Session summary"></div>
+      <div class="g-spacer g-only" data-tauri-drag-region></div>
+      <div class="g-jump g-only">
+        <input id="g-jump" type="text" autocomplete="off" spellcheck="false" placeholder="Jump to session or room…" aria-label="Jump to session or room" />
+        <kbd class="g-kbd">Ctrl K</kbd>
+        <div class="g-jump-list" id="g-jump-list" role="listbox" hidden></div>
+      </div>
+      <button type="button" class="g-theme-toggle g-only" id="g-theme-toggle" title="Switch between Georgi Black and Georgi White">White</button>
       <nav class="session-tabs-shell" aria-label="Terminal sessions">
         <button type="button" class="context-chip" id="context-rooms-chip" title="All rooms — pick a room or the lobby">&#8962; Rooms</button>
         <button type="button" class="context-chip context-chip-name" id="context-name-chip"></button>
@@ -416,6 +454,8 @@ app.innerHTML = `
         </button>
       </div>
     </header>
+
+    <aside class="g-sidebar g-only" id="g-sidebar" aria-label="Rooms and sessions"></aside>
 
     <section class="workspace-shell">
       <section class="session-editor panel" id="session-editor" hidden aria-labelledby="session-editor-title">
@@ -574,6 +614,18 @@ app.innerHTML = `
             </label>
           </div>
         </div>
+        <div class="g-room-head g-only" id="g-room-head">
+          <div class="g-room-head-row">
+            <span class="g-room-tile g-room-tile-lg" id="g-room-tile"></span>
+            <div class="g-room-title">
+              <h1 id="g-room-name"></h1>
+              <span id="g-room-sub"></span>
+            </div>
+            <button type="button" class="g-btn g-btn-secondary" id="g-add-member">+ Add member</button>
+            <button type="button" class="g-btn g-btn-secondary" id="g-room-tools" title="Room settings: rename, save, delete, brief, fallbacks" aria-expanded="false">···</button>
+          </div>
+          <div class="g-chips" id="g-room-chips"></div>
+        </div>
         <form id="room-create-form" class="room-create-form" hidden>
           <label><span>Room label <small>optional</small></span><input id="room-label" maxlength="128" autocomplete="off" /></label>
           <fieldset>
@@ -647,7 +699,24 @@ app.innerHTML = `
           <button type="button" class="ghost room-members-reopen" id="room-members-open" hidden title="Show room settings">Room settings</button>
           <div id="room-feed" class="room-feed" role="log" aria-live="polite"></div>
           <label class="room-composer-label" for="room-message">Message</label>
+          <div class="g-composer-warn g-only" id="g-composer-warn" hidden></div>
+          <div class="g-att-strip g-only" id="g-att-strip" hidden></div>
           <textarea id="room-message" rows="3" maxlength="1048576" placeholder="Post to the shared feed or deliver explicitly…"></textarea>
+          <div class="g-composer-bar g-only" id="g-composer-bar">
+            <button type="button" class="g-icon-btn g-attach-btn" id="g-attach" title="Attach images (or paste / drop them)">+</button>
+            <input type="file" id="g-attach-input" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden />
+            <div class="g-segmented" role="radiogroup" aria-label="Delivery">
+              <button type="button" role="radio" data-g-mode="send" aria-checked="true">Send now</button>
+              <button type="button" role="radio" data-g-mode="post" aria-checked="false">Post to feed</button>
+            </div>
+            <span class="g-to" id="g-to-label">to</span>
+            <select id="g-recipient" aria-label="Recipients"></select>
+            <span class="g-flex"></span>
+            <kbd class="g-kbd">Ctrl Enter</kbd>
+            <button type="button" class="g-btn g-btn-primary" id="g-submit">Send</button>
+          </div>
+          <p class="g-composer-explain g-only" id="g-composer-explain"></p>
+          <div class="g-drop g-only" id="g-drop" hidden><strong>Drop images to attach</strong><span>PNG, JPG, GIF or WebP · up to 10 MB each</span></div>
           <div class="room-composer-actions">
             <button type="button" id="room-post">Post to feed</button>
             <select id="room-recipient" aria-label="Room delivery recipients"></select>
@@ -1157,7 +1226,7 @@ class SessionTerminal {
       // 8 ghost rows, false → 0).
       convertEol: false,
       cursorBlink: true,
-      fontFamily: '"JetBrains Mono", "Cascadia Code", Consolas, monospace',
+      fontFamily: isGeorgiTheme(currentThemeName()) ? GEORGI_TERMINAL_FONT : DEFAULT_TERMINAL_FONT,
       fontSize: 13,
       // The pane is fed by ConPTY, which re-emits a re-wrapped repaint of its
       // own buffer on every resize. Without declaring the backend, xterm ALSO
@@ -1167,7 +1236,7 @@ class SessionTerminal {
       // New panes start in the active theme; applyTheme() keeps them in sync.
       theme: TERMINAL_THEMES[currentThemeName()].session,
       // Keep explicit pale ANSI/RGB text readable on Light's white background.
-      minimumContrastRatio: currentThemeName() === "light" ? 4.5 : 1,
+      minimumContrastRatio: isLightTheme(currentThemeName()) ? 4.5 : 1,
     });
     this.fitAddon = new FitAddon();
     this.terminal.loadAddon(this.fitAddon);
@@ -2267,13 +2336,80 @@ const TERMINAL_THEMES = {
       white: "#fafafa", brightWhite: "#ffffff",
     },
   },
+  /* Georgi Black / Georgi White: the calm, status-first redesign (sidebar,
+     chat-style room feed, Send/Post composer, image attachments). The layout
+     changes apply only under these two themes; see georgi.css. */
+  "georgi-black": {
+    session: {
+      background: "#090B0D",
+      foreground: "#D3D7DD",
+      cursor: "#E9C64A",
+      cursorAccent: "#090B0D",
+      selectionBackground: "rgba(98, 198, 217, 0.28)",
+      black: "#1C2026", brightBlack: "#6B727D",
+      red: "#EF6461", brightRed: "#F49A97",
+      green: "#5BC489", brightGreen: "#8FDCAE",
+      yellow: "#E9C64A", brightYellow: "#F2D466",
+      blue: "#8DB3F2", brightBlue: "#B3CCF7",
+      magenta: "#C6A2EA", brightMagenta: "#DAC2F1",
+      cyan: "#62C6D9", brightCyan: "#8FD8E6",
+      white: "#C3C8D0", brightWhite: "#E9EBEE",
+    },
+    system: {
+      background: "#090B0D",
+      foreground: "#C3C8D0",
+      cursor: "#E9C64A",
+      cursorAccent: "#090B0D",
+      selectionBackground: "rgba(98, 198, 217, 0.24)",
+      black: "#1C2026", brightBlack: "#6B727D",
+      red: "#EF6461", brightRed: "#F49A97",
+      green: "#5BC489", brightGreen: "#8FDCAE",
+      yellow: "#E9C64A", brightYellow: "#F2D466",
+      blue: "#8DB3F2", brightBlue: "#B3CCF7",
+      magenta: "#C6A2EA", brightMagenta: "#DAC2F1",
+      cyan: "#62C6D9", brightCyan: "#8FD8E6",
+      white: "#C3C8D0", brightWhite: "#E9EBEE",
+    },
+  },
+  "georgi-white": {
+    session: {
+      background: "#FBFAF7",
+      foreground: "#2A2E35",
+      cursor: "#2A2E35",
+      cursorAccent: "#FBFAF7",
+      selectionBackground: "rgba(14, 124, 143, 0.20)",
+      black: "#2A2E35", brightBlack: "#6A707A",
+      red: "#C93B37", brightRed: "#B3261E",
+      green: "#1F8A4C", brightGreen: "#2E7D4F",
+      yellow: "#8A6400", brightYellow: "#806200",
+      blue: "#2F62C4", brightBlue: "#3563BF",
+      magenta: "#7B45B8", brightMagenta: "#9446A3",
+      cyan: "#0E7C8F", brightCyan: "#0A6676",
+      white: "#C3C0B6", brightWhite: "#FFFFFF",
+    },
+    system: {
+      background: "#FBFAF7",
+      foreground: "#2A2E35",
+      cursor: "#2A2E35",
+      cursorAccent: "#FBFAF7",
+      selectionBackground: "rgba(14, 124, 143, 0.18)",
+      black: "#2A2E35", brightBlack: "#6A707A",
+      red: "#C93B37", brightRed: "#B3261E",
+      green: "#1F8A4C", brightGreen: "#2E7D4F",
+      yellow: "#8A6400", brightYellow: "#806200",
+      blue: "#2F62C4", brightBlue: "#3563BF",
+      magenta: "#7B45B8", brightMagenta: "#9446A3",
+      cyan: "#0E7C8F", brightCyan: "#0A6676",
+      white: "#C3C0B6", brightWhite: "#FFFFFF",
+    },
+  },
 } as const;
 
 type ThemeName = keyof typeof TERMINAL_THEMES;
 
 /** The Themes page lists these, in this order, each with a real screenshot of
     the app in that theme (public/textures/themes/<name>.png). */
-const THEME_ORDER: ThemeName[] = ["dark", "light", "prim1", "prim1-deep"];
+const THEME_ORDER: ThemeName[] = ["dark", "light", "prim1", "prim1-deep", "georgi-black", "georgi-white"];
 const DEFAULT_THEME: ThemeName = "dark";
 const THEME_META: Record<ThemeName, { label: string; blurb: string }> = {
   dark: {
@@ -2292,7 +2428,22 @@ const THEME_META: Record<ThemeName, { label: string; blurb: string }> = {
     label: "PRIM-1 Deep",
     blurb: "The HUD look with everything in magenta, plus the dissolve effects.",
   },
+  "georgi-black": {
+    label: "Georgi Black",
+    blurb: "Calm and status-first: a sidebar of rooms and agents, a chat-style room feed, Send or Post in one composer, and images you can paste or drop.",
+  },
+  "georgi-white": {
+    label: "Georgi White",
+    blurb: "Georgi Black's layout on a warm white ground.",
+  },
 };
+
+function isLightTheme(name: ThemeName): boolean {
+  return name === "light" || name === "georgi-white";
+}
+
+const GEORGI_TERMINAL_FONT = '"Geist Mono Variable", "Cascadia Mono", Consolas, monospace';
+const DEFAULT_TERMINAL_FONT = '"JetBrains Mono", "Cascadia Code", Consolas, monospace';
 
 const themeMotionPreference = window.matchMedia("(prefers-reduced-motion: reduce)");
 
@@ -2323,14 +2474,17 @@ function applyTheme(name: ThemeName, chosen = false): void {
   }
 
   const themes = TERMINAL_THEMES[name];
-  const minimumContrastRatio = name === "light" ? 4.5 : 1;
+  const minimumContrastRatio = isLightTheme(name) ? 4.5 : 1;
+  const fontFamily = isGeorgiTheme(name) ? GEORGI_TERMINAL_FONT : DEFAULT_TERMINAL_FONT;
   for (const pane of paneMap.values()) {
     pane.terminal.options.theme = themes.session;
     pane.terminal.options.minimumContrastRatio = minimumContrastRatio;
+    if (pane.terminal.options.fontFamily !== fontFamily) pane.terminal.options.fontFamily = fontFamily;
   }
   systemTerminal.options.theme = themes.system;
   systemTerminal.options.minimumContrastRatio = minimumContrastRatio;
   markCurrentThemeCard(name);
+  georgiThemeApplied(name);
 }
 
 function currentThemeName(): ThemeName {
@@ -2354,6 +2508,14 @@ function wireThemesPage(): void {
       shot.src = `/textures/themes/${name}.png`;
       shot.alt = `${meta.label} theme`;
       shot.loading = "lazy";
+      shot.addEventListener("error", () => {
+        // No screenshot yet (Georgi themes): a swatch of the theme instead.
+        const swatch = document.createElement("span");
+        swatch.className = "theme-card-shot theme-card-swatch";
+        swatch.dataset.swatch = name;
+        swatch.textContent = meta.label;
+        shot.replaceWith(swatch);
+      }, { once: true });
       const title = document.createElement("span");
       title.className = "theme-card-title";
       const label = document.createElement("span");
@@ -2437,6 +2599,7 @@ function setShellView(view: ShellView): void {
   telemetryPoller.sync();
   syncContextChipCurrent();
   terminalLayout.request();
+  scheduleGeorgiChrome();
 }
 
 function setLogDrawer(open: boolean): void {
@@ -3530,6 +3693,438 @@ function loadSavedTheme(): ThemeName {
   if (chosen && raw !== null && raw in TERMINAL_THEMES) return raw as ThemeName;
   return DEFAULT_THEME;
 }
+
+/* ── Georgi themes (Georgi Black / Georgi White) ──
+   The calm, status-first shell: a sidebar of rooms and agents, a live status
+   summary, a room header with member chips, a chat-style feed and one
+   composer with Send now / Post to feed and image attachments. All of it is
+   presentation over the same state and commands as every other theme; the
+   other themes never show it (.g-only, georgi.css). */
+const gSidebar = must<HTMLElement>("#g-sidebar");
+const gSummary = must<HTMLElement>("#g-summary");
+const gRoomTile = must<HTMLElement>("#g-room-tile");
+const gRoomName = must<HTMLElement>("#g-room-name");
+const gRoomSub = must<HTMLElement>("#g-room-sub");
+const gRoomChips = must<HTMLElement>("#g-room-chips");
+const gAddMember = must<HTMLButtonElement>("#g-add-member");
+const gRoomTools = must<HTMLButtonElement>("#g-room-tools");
+const gComposerWarn = must<HTMLElement>("#g-composer-warn");
+const gAttStrip = must<HTMLElement>("#g-att-strip");
+const gComposerBar = must<HTMLElement>("#g-composer-bar");
+const gAttach = must<HTMLButtonElement>("#g-attach");
+const gAttachInput = must<HTMLInputElement>("#g-attach-input");
+const gRecipient = must<HTMLSelectElement>("#g-recipient");
+const gToLabel = must<HTMLElement>("#g-to-label");
+const gSubmit = must<HTMLButtonElement>("#g-submit");
+const gExplain = must<HTMLElement>("#g-composer-explain");
+const gDrop = must<HTMLElement>("#g-drop");
+const gJump = must<HTMLInputElement>("#g-jump");
+const gJumpList = must<HTMLElement>("#g-jump-list");
+const gThemeToggle = must<HTMLButtonElement>("#g-theme-toggle");
+const GEORGI_MODE_KEY = "prim1-georgi-mode";
+const legacyRoomPlaceholder = roomMessage.placeholder;
+let georgiMode: "send" | "post" = localStorage.getItem(GEORGI_MODE_KEY) === "post" ? "post" : "send";
+let georgiChromeScheduled = false;
+let georgiSidebarSignature = "";
+let georgiSubmitting = false;
+
+const georgiAttachments = new ComposerAttachments(
+  gAttStrip,
+  () => activeRoomId,
+  (roomId, fileName, dataBase64) => command<SavedAttachment>("save_room_attachment", { roomId, fileName, dataBase64 }),
+  () => syncGeorgiComposer(),
+);
+
+function readRoomAttachment(path: string): Promise<string> {
+  return command<string>("read_room_attachment", { path });
+}
+
+function georgiActive(): boolean {
+  return isGeorgiTheme(currentThemeName());
+}
+
+/** Called by applyTheme: the Georgi themes read the room as a conversation
+    (the Readable feed); every other theme keeps PRIM-1's own Raw feed. */
+function georgiThemeApplied(name: ThemeName): void {
+  const georgi = isGeorgiTheme(name);
+  gThemeToggle.textContent = name === "georgi-white" ? "Black" : "White";
+  if (!georgi) roomMessage.placeholder = legacyRoomPlaceholder;
+  const wanted: RoomFeedView = georgi ? "readable" : "raw";
+  georgiSidebarSignature = "";
+  if (roomFeedView !== wanted || georgi) {
+    roomFeedView = wanted;
+    // After startup has finished defining everything the feed renderer uses.
+    requestAnimationFrame(() => {
+      readableFeedRoomId = null;
+      replaceRoomFeedChildren();
+      renderRoomFeed(roomFeedEvents.get(activeRoomId ?? "") ?? []);
+    });
+  }
+  scheduleGeorgiChrome();
+}
+
+function scheduleGeorgiChrome(): void {
+  if (georgiChromeScheduled || !georgiActive()) return;
+  georgiChromeScheduled = true;
+  requestAnimationFrame(() => {
+    georgiChromeScheduled = false;
+    if (georgiActive()) renderGeorgiChrome();
+  });
+}
+
+function georgiMemberOf(sessionId: string): GeorgiMember {
+  const session = snapshotById.get(sessionId);
+  return georgiMember(sessionId, session, sessionReadiness(session, wasRunningAtShutdown(session)), paneLabel(sessionId));
+}
+
+function renderGeorgiChrome(): void {
+  const inRoom = new Set(roomSnapshots.flatMap((room) => room.member_ids));
+  const rooms = roomSnapshots.map((room) => ({
+    id: room.room_id,
+    label: room.label,
+    members: room.member_ids.map(georgiMemberOf),
+  }));
+  const order = [...tabState.order, ...[...snapshotById.keys()].filter((id) => !tabState.order.includes(id))];
+  const loose = order.filter((id) => !inRoom.has(id) && snapshotById.has(id)).map(georgiMemberOf);
+  const data = {
+    rooms,
+    loose,
+    activeSessionId: shellView === "sessions" ? tabState.activeId : null,
+    activeRoomId: shellView === "rooms" && roomsViewMode === "panel" ? activeRoomId : null,
+  };
+  const signature = JSON.stringify(data);
+  if (signature !== georgiSidebarSignature) {
+    georgiSidebarSignature = signature;
+    renderSidebar(gSidebar, data, {
+      openRoom: openGeorgiRoom,
+      openSession: openGeorgiSession,
+      newRoom: () => {
+        roomsViewMode = "panel";
+        setShellView("rooms");
+        openRoomCreateForm();
+      },
+      newSession: (anchor) => toggleAttachMenu(anchor),
+      showRooms: openRoomsOverview,
+      footer: runCornerAction,
+    });
+    const seen = new Set<string>();
+    const everyone = [...rooms.flatMap((room) => room.members), ...loose].filter((member) => {
+      if (seen.has(member.id)) return false;
+      seen.add(member.id);
+      return true;
+    });
+    renderSummary(gSummary, everyone, openGeorgiSession);
+  }
+  for (const item of gSidebar.querySelectorAll<HTMLElement>("[data-g-footer]")) {
+    const kind = item.dataset.gFooter;
+    const current = kind === "log" ? appShell.dataset.log === "open" : shellView === kind;
+    item.toggleAttribute("aria-current", current);
+  }
+  renderGeorgiRoomHead();
+  syncGeorgiComposer();
+}
+
+function openGeorgiSession(sessionId: string): void {
+  const roomId = sessionRoomIdPure(roomSnapshots, sessionId);
+  const context: WorkContext = roomId ? { kind: "room", roomId } : { kind: "lobby" };
+  if (contextKey(context) !== contextKey(workContext)) enterWorkContext(context);
+  setShellView("sessions");
+  setActiveSession(sessionId, true);
+  scheduleGeorgiChrome();
+}
+
+function openGeorgiRoom(roomId: string): void {
+  if (!(workContext.kind === "room" && workContext.roomId === roomId)) {
+    enterWorkContext({ kind: "room", roomId });
+  }
+  openRoomPanel(roomId);
+  scheduleGeorgiChrome();
+}
+
+function renderGeorgiRoomHead(): void {
+  const room = activeRoom();
+  if (!room) {
+    gRoomName.textContent = "";
+    gRoomSub.textContent = "";
+    gRoomChips.replaceChildren();
+    return;
+  }
+  gRoomTile.textContent = roomInitials(room.label);
+  gRoomTile.dataset.hue = String(roomHueSlot(room.room_id));
+  gRoomName.textContent = room.label;
+  const count = room.member_ids.length;
+  const folder = roomFolder(room, snapshotById);
+  const path = document.createElement("span");
+  path.className = "g-mono";
+  path.textContent = folder;
+  gRoomSub.replaceChildren(`Room · ${count} member${count === 1 ? "" : "s"}${folder ? " · " : ""}`, ...(folder ? [path] : []));
+  renderMemberChips(gRoomChips, room.member_ids.map(georgiMemberOf), openGeorgiSession);
+}
+
+function setGeorgiRoomTools(open: boolean): void {
+  roomCard.dataset.gTools = open ? "open" : "closed";
+  gRoomTools.setAttribute("aria-expanded", String(open));
+}
+
+function syncGeorgiRecipients(): void {
+  const previous = gRecipient.value || roomRecipient.value;
+  const count = activeRoom()?.member_ids.length ?? 0;
+  gRecipient.replaceChildren(
+    ...Array.from(roomRecipient.options).map((source) => {
+      const option = document.createElement("option");
+      option.value = source.value;
+      option.textContent = source.value === "all"
+        ? count === 1 ? "the only member" : `all ${count} members`
+        : (source.textContent ?? "").replace(/^Send to /, "");
+      return option;
+    }),
+  );
+  if (Array.from(gRecipient.options).some((option) => option.value === previous)) gRecipient.value = previous;
+}
+
+function georgiRecipientIds(): string[] {
+  const room = activeRoom();
+  if (!room) return [];
+  return gRecipient.value && gRecipient.value !== "all" ? [gRecipient.value] : room.member_ids;
+}
+
+function syncGeorgiComposer(): void {
+  if (!georgiActive()) return;
+  const room = activeRoom();
+  const count = room?.member_ids.length ?? 0;
+  const send = georgiMode === "send";
+  gComposerBar.dataset.mode = georgiMode;
+  for (const button of gComposerBar.querySelectorAll<HTMLButtonElement>("[data-g-mode]")) {
+    button.setAttribute("aria-checked", String(button.dataset.gMode === georgiMode));
+  }
+  gRecipient.hidden = !send;
+  gToLabel.hidden = !send;
+  const one = gRecipient.value !== "" && gRecipient.value !== "all";
+  const target = one ? gRecipient.selectedOptions[0]?.textContent ?? "member" : String(count);
+  gSubmit.textContent = send ? `Send to ${target} ↑` : "Post to feed ↑";
+  gSubmit.dataset.mode = georgiMode;
+  const empty = !roomMessage.value.trim() && georgiAttachments.count === 0;
+  const blocked = send ? roomSendButton.disabled : roomPostButton.disabled;
+  gSubmit.disabled = georgiSubmitting || empty || blocked;
+  gSubmit.title = blocked ? (send ? roomSendButton.title : roomPostButton.title) : "Ctrl Enter";
+  gAttach.disabled = room === null;
+  gExplain.textContent = (send
+    ? "Typed into each agent's terminal as a prompt. They act on it right away."
+    : "Saved in the feed for everyone to read. Nobody is interrupted.") + " Paste or drop images.";
+  roomMessage.placeholder = !room
+    ? legacyRoomPlaceholder
+    : !send
+      ? "Post a note to the feed…"
+      : count === 0
+        ? "Add a member to send messages…"
+        : one ? `Message ${target}…` : "Message all members…";
+  const textOnly = georgiAttachments.count > 0 && send
+    ? georgiRecipientIds().filter((id) => {
+        const driver = snapshotById.get(id)?.driver;
+        return driver === "generic_terminal" || driver === "prime";
+      })
+    : [];
+  gComposerWarn.hidden = textOnly.length === 0;
+  gComposerWarn.textContent = textOnly.length
+    ? `${textOnly.map(paneLabel).join(", ")} ${textOnly.length === 1 ? "is a plain terminal and can't" : "are plain terminals and can't"} read images. ${textOnly.length === 1 ? "It" : "They"} will get the file path as text.`
+    : "";
+}
+
+function setGeorgiMode(mode: "send" | "post"): void {
+  georgiMode = mode;
+  try {
+    localStorage.setItem(GEORGI_MODE_KEY, mode);
+  } catch {
+    /* preference only */
+  }
+  syncGeorgiComposer();
+}
+
+async function submitGeorgi(mode: "send" | "post" = georgiMode): Promise<void> {
+  const room = activeRoom();
+  if (!room || georgiSubmitting) return;
+  const blocking = georgiAttachments.blocking;
+  if (blocking) {
+    setRoomStatus(blocking, "warn");
+    return;
+  }
+  const original = roomMessage.value;
+  const paths = georgiAttachments.paths;
+  let text = original;
+  if (!text.trim() && paths.length) text = paths.length === 1 ? "Please look at this image." : "Please look at these images.";
+  if (!text.trim()) return;
+  const composed = joinAttachments(text, paths);
+  roomMessage.value = composed;
+  if (mode === "send") roomRecipient.value = gRecipient.value || "all";
+  georgiSubmitting = true;
+  syncGeorgiComposer();
+  try {
+    if (mode === "send") await deliverActiveRoomMessage();
+    else await postActiveRoomMessage();
+  } finally {
+    georgiSubmitting = false;
+    if (roomMessage.value === "") {
+      georgiAttachments.clear();
+    } else if (roomMessage.value === composed) {
+      // Not stored: give the operator their own words back; the images stay attached.
+      roomMessage.value = original;
+    }
+    syncGeorgiComposer();
+  }
+}
+
+function georgiCardActions(item: Extract<ReadableFeedItem, { kind: "message" }>, text: string): HTMLElement {
+  const row = document.createElement("div");
+  row.className = "g-only g-card-actions";
+  const action = (label: string, run: () => void) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = label;
+    button.addEventListener("click", run);
+    row.append(button);
+    return button;
+  };
+  const copy = action("Copy", () => {
+    void navigator.clipboard.writeText(text).then(() => {
+      copy.textContent = "Copied";
+      setTimeout(() => (copy.textContent = "Copy"), 1400);
+    });
+  });
+  if (item.author === "you") {
+    action("Reuse", () => {
+      roomMessage.value = text;
+      syncGeorgiComposer();
+      focusWithinActiveWindow(roomMessage);
+    });
+  } else if (item.senderId && activeRoom()?.member_ids.includes(item.senderId)) {
+    const senderId = item.senderId;
+    action(`Reply to ${item.sender}`, () => {
+      setGeorgiMode("send");
+      gRecipient.value = senderId;
+      const quote = text.split(/\r?\n/).find((line) => line.trim()) ?? "";
+      const prefix = `${item.sender}: > ${quote.length > 140 ? quote.slice(0, 140) + "…" : quote}\n\n`;
+      if (!roomMessage.value.startsWith(prefix)) roomMessage.value = prefix + roomMessage.value;
+      syncGeorgiComposer();
+      focusWithinActiveWindow(roomMessage);
+      roomMessage.setSelectionRange(roomMessage.value.length, roomMessage.value.length);
+    });
+  }
+  return row;
+}
+
+function jumpTargets(): JumpTarget[] {
+  const rooms: JumpTarget[] = roomSnapshots.map((room) => ({
+    kind: "room",
+    id: room.room_id,
+    label: room.label,
+    detail: `${room.member_ids.length} member${room.member_ids.length === 1 ? "" : "s"}`,
+  }));
+  const sessions: JumpTarget[] = [...snapshotById.values()].map((session) => {
+    const roomId = sessionRoomIdPure(roomSnapshots, session.session_id);
+    const room = roomSnapshots.find((candidate) => candidate.room_id === roomId);
+    const status = georgiMemberOf(session.session_id).status;
+    return {
+      kind: "session",
+      id: session.session_id,
+      label: session.label,
+      detail: `${harnessName(session.driver)}${room ? ` · ${room.label}` : ""} · ${status === "needs" ? "needs you" : status}`,
+    };
+  });
+  return [...rooms, ...sessions];
+}
+
+function wireGeorgi(): void {
+  gThemeToggle.addEventListener("click", () => {
+    applyTheme(currentThemeName() === "georgi-white" ? "georgi-black" : "georgi-white", true);
+  });
+  wireJump(gJump, gJumpList, jumpTargets, (target) => {
+    if (target.kind === "room") openGeorgiRoom(target.id);
+    else openGeorgiSession(target.id);
+  });
+  document.addEventListener(
+    "keydown",
+    (event) => {
+      if (!georgiActive()) return;
+      if (event.ctrlKey && !event.shiftKey && !event.altKey && (event.key === "k" || event.key === "K")) {
+        event.preventDefault();
+        event.stopPropagation();
+        focusWithinActiveWindow(gJump);
+        gJump.select();
+      }
+    },
+    true,
+  );
+  gAddMember.addEventListener("click", () => {
+    setGeorgiRoomTools(true);
+    must<HTMLDetailsElement>("#room-members-section").open = true;
+    focusWithinActiveWindow(roomAddMemberSelect);
+  });
+  gRoomTools.addEventListener("click", () => setGeorgiRoomTools(roomCard.dataset.gTools !== "open"));
+  setGeorgiRoomTools(false);
+  for (const button of gComposerBar.querySelectorAll<HTMLButtonElement>("[data-g-mode]")) {
+    button.addEventListener("click", () => setGeorgiMode(button.dataset.gMode === "post" ? "post" : "send"));
+  }
+  gRecipient.addEventListener("change", syncGeorgiComposer);
+  gSubmit.addEventListener("click", () => void submitGeorgi());
+  roomMessage.addEventListener("input", syncGeorgiComposer);
+  roomMessage.addEventListener("keydown", (event) => {
+    if (!georgiActive() || !event.ctrlKey || event.key !== "Enter") return;
+    event.preventDefault();
+    const mode = event.shiftKey ? (georgiMode === "send" ? "post" : "send") : georgiMode;
+    void submitGeorgi(mode);
+  });
+  roomMessage.addEventListener("paste", (event) => {
+    if (!georgiActive()) return;
+    const files = Array.from(event.clipboardData?.files ?? []).filter((file) => file.type.startsWith("image/"));
+    if (files.length === 0) return;
+    event.preventDefault();
+    georgiAttachments.add(files);
+  });
+  gAttach.addEventListener("click", () => gAttachInput.click());
+  gAttachInput.addEventListener("change", () => {
+    georgiAttachments.add(Array.from(gAttachInput.files ?? []));
+    gAttachInput.value = "";
+    focusWithinActiveWindow(roomMessage);
+  });
+  // Files dropped anywhere must never navigate the window; inside the room
+  // view (Georgi themes) they become attachments.
+  const hasFiles = (event: DragEvent) => Array.from(event.dataTransfer?.types ?? []).includes("Files");
+  let dragDepth = 0;
+  document.addEventListener("dragover", (event) => {
+    if (hasFiles(event)) event.preventDefault();
+  });
+  document.addEventListener("drop", (event) => {
+    if (hasFiles(event)) event.preventDefault();
+  });
+  roomContent.addEventListener("dragenter", (event) => {
+    if (!georgiActive() || !hasFiles(event)) return;
+    dragDepth += 1;
+    gDrop.hidden = false;
+  });
+  roomContent.addEventListener("dragleave", (event) => {
+    if (!hasFiles(event)) return;
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) gDrop.hidden = true;
+  });
+  roomContent.addEventListener("drop", (event) => {
+    dragDepth = 0;
+    gDrop.hidden = true;
+    if (!georgiActive() || !hasFiles(event)) return;
+    event.preventDefault();
+    georgiAttachments.add(Array.from(event.dataTransfer?.files ?? []));
+    focusWithinActiveWindow(roomMessage);
+  });
+  document.addEventListener("click", (event) => {
+    if (!(event.target instanceof Element)) return;
+    const button = event.target.closest<HTMLButtonElement>("[data-g-room-feed]");
+    const sessionId = button?.dataset.gRoomFeed;
+    if (!sessionId) return;
+    const roomId = sessionRoomIdPure(roomSnapshots, sessionId);
+    if (roomId) openGeorgiRoom(roomId);
+  });
+}
+
+wireGeorgi();
 
 applyTheme(loadSavedTheme());
 document.addEventListener("visibilitychange", syncThemeEffects);
@@ -4633,6 +5228,7 @@ function renderRoomUi(): void {
   renderRoomGuests(selected);
   renderRoomRecipientOptions(selected);
   renderRoomFeed(roomFeedEvents.get(selected.room_id) ?? []);
+  scheduleGeorgiChrome();
 }
 
 function renderRoomComposerAvailability(): void {
@@ -4651,6 +5247,7 @@ function renderRoomComposerAvailability(): void {
   roomSendButton.title = recovery ?? ((selected?.member_ids.length ?? 0) < 1
     ? "Add a member before sending"
     : "Store the message and type it into each member's terminal (queued while a member is stopped, starting or on a prompt)");
+  syncGeorgiComposer();
   if (recovery) {
     setRoomStatus(recovery, "error");
   } else if (roomStatus.dataset.recoveryRoomId !== undefined) {
@@ -4997,6 +5594,7 @@ function renderRoomRecipientOptions(room: RoomSnapshot): void {
   if (Array.from(roomRecipient.options).some((option) => option.value === previous)) {
     roomRecipient.value = previous;
   }
+  syncGeorgiRecipients();
 }
 
 function replaceRoomFeedChildren(...nodes: (Node | string)[]): void {
@@ -5531,6 +6129,21 @@ function buildReadableMeta(item: Extract<ReadableFeedItem, { kind: "message" }>,
   sender.className = "room-readable-sender";
   sender.textContent = item.sender;
   meta.append(sender);
+  if (item.author === "you") {
+    // Georgi themes name the delivery instead of "You".
+    const mode = document.createElement("span");
+    mode.className = "g-only room-readable-mode";
+    mode.dataset.mode = item.recipients.length ? "send" : "post";
+    mode.textContent = item.recipients.length === 0
+      ? "Posted to feed"
+      : item.recipients.length === 1 ? `Sent to ${item.recipients[0]}` : `Sent to all ${item.recipients.length}`;
+    meta.prepend(mode);
+  } else if (item.senderId) {
+    const harness = document.createElement("span");
+    harness.className = "g-only room-readable-harness";
+    harness.textContent = harnessName(snapshotById.get(item.senderId)?.driver);
+    sender.after(harness);
+  }
   if (item.author === "prim1") {
     // Only PRIM-1's own posts get this; a member named "PRIM-1" never does.
     const system = document.createElement("span");
@@ -5569,13 +6182,24 @@ function buildReadableCard(
   const meta = buildReadableMeta(item, now);
   const body = document.createElement("div");
   body.className = "room-readable-body";
-  card.append(meta, body);
+  // Georgi themes: images shared as paths show as thumbnails, not as text.
+  const georgi = isGeorgiTheme(currentThemeName());
+  const attached = georgi ? splitAttachments(item.body) : { text: item.body, paths: [] as string[] };
+  const fullText = attached.text;
+  const previewText = georgi ? splitAttachments(item.preview.text).text : item.preview.text;
+  const sender = item.senderId ? snapshotById.get(item.senderId) : undefined;
+  if (sender) card.dataset.driver = sender.driver;
+  const face = georgiAvatar({ driver: sender?.driver, status: "ready" }, "lg", false);
+  face.classList.add("g-only", "room-readable-avatar");
+  if (item.author === "prim1") face.textContent = "◆";
+  if (item.author === "guest") face.textContent = "↗";
+  card.append(face, meta, body);
   if (item.preview.collapsed) {
     const toggle = document.createElement("button");
     toggle.type = "button";
     toggle.className = "room-readable-more";
     const show = (expanded: boolean) => {
-      body.textContent = expanded ? item.body : item.preview.text;
+      body.textContent = expanded ? fullText : previewText;
       toggle.textContent = expanded ? "Show less" : "Show all";
       toggle.setAttribute("aria-expanded", String(expanded));
     };
@@ -5591,8 +6215,12 @@ function buildReadableCard(
     });
     card.append(toggle);
   } else {
-    body.textContent = item.body;
+    body.textContent = fullText;
   }
+  if (attached.paths.length) {
+    card.append(attachmentGrid(attached.paths, readRoomAttachment));
+  }
+  if (georgi) card.append(georgiCardActions(item, fullText));
   // v3 W6: where each recipient stands, one line.
   const states = document.createElement("div");
   states.className = "room-readable-states";
@@ -5821,6 +6449,7 @@ function applySessionSnapshotToUi(snapshot: SessionSnapshot, authoritative = fal
   updateRoomMemberUsage();
   setActiveSession(tabState.activeId, false);
   syncSessionForm();
+  scheduleGeorgiChrome();
 }
 
 function refreshSnapshotFromEvent(preferredSessionId?: string): void {
@@ -6016,6 +6645,7 @@ function buildSessionCard(session: SessionSnapshot): HTMLElement {
     '<button type="button" data-action="restart" data-session="' + session.session_id + '">Restart</button>',
     '<button type="button" data-action="stop" data-session="' + session.session_id + '">Stop</button>',
     '<button type="button" class="ghost" data-edit-session="' + session.session_id + '">Edit</button>',
+    '<button type="button" class="ghost g-only" data-g-room-feed="' + session.session_id + '" hidden>Room feed</button>',
     "</div>",
     '<div class="session-meta">',
     '<span class="state-pill" data-session-state="' + session.session_id + '">closed</span>',
@@ -6051,6 +6681,9 @@ function updateSessionCard(
     cwd.title = session.working_dir;
   }
   card.title = sessionTabDescription(session);
+  card.dataset.driver = session.driver;
+  const roomFeedButton = card.querySelector<HTMLButtonElement>("[data-g-room-feed]");
+  if (roomFeedButton) roomFeedButton.hidden = sessionRoomIdPure(roomSnapshots, session.session_id) === null;
 
   const launch = card.querySelector<HTMLButtonElement>('[data-action="start"]');
   const restart = card.querySelector<HTMLButtonElement>('[data-action="restart"]');
