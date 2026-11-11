@@ -1314,6 +1314,63 @@
     font-size: 14px;
     line-height: 22px;
   }
+  /* Markdown inside bubbles: bold stands out, lists breathe, code is mono. */
+  & .room-readable-body.g-md {
+    white-space: normal;
+    max-width: 720px;
+    padding: 12px 16px;
+  }
+  & .g-md > * { margin: 0; }
+  & .g-md > * + * { margin-top: 10px; }
+  & .g-md p { line-height: 22px; }
+  & .g-md strong { color: var(--g-text); font-weight: 650; }
+  & .g-md em { font-style: italic; color: var(--g-text-body); }
+  & .g-md .g-md-h { font-weight: 650; color: var(--g-text); line-height: 1.35; }
+  & .g-md .g-md-h1 { font-size: 16px; }
+  & .g-md .g-md-h2 { font-size: 15px; }
+  & .g-md .g-md-h3 { font-size: 14px; }
+  & .g-md > .g-md-h + * { margin-top: 6px; }
+  & .g-md ul,
+  & .g-md ol { padding-left: 22px; }
+  & .g-md li { line-height: 22px; padding-left: 2px; }
+  & .g-md li + li { margin-top: 4px; }
+  & .g-md li > ul,
+  & .g-md li > ol { margin-top: 4px; }
+  & .g-md ul > li::marker { color: var(--g-text-3); }
+  & .g-md ol > li::marker { color: var(--g-text-3); font-variant-numeric: tabular-nums; }
+  & .g-md code {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    padding: 1px 5px;
+    border-radius: 5px;
+    background: color-mix(in srgb, var(--g-text) 8%, transparent);
+    color: var(--g-text);
+    overflow-wrap: anywhere;
+  }
+  & .g-md pre {
+    padding: 10px 12px;
+    border-radius: 8px;
+    background: var(--g-bg-terminal);
+    border: 1px solid var(--g-line);
+    overflow-x: auto;
+    white-space: pre;
+  }
+  & .g-md pre code { padding: 0; background: transparent; font-size: 12.5px; line-height: 19px; overflow-wrap: normal; }
+  & .g-md blockquote {
+    padding-left: 10px;
+    border-left: 2px solid var(--g-frame-strong);
+    color: var(--g-text-3);
+    font-size: 12.5px;
+  }
+  & .g-md blockquote p { line-height: 19px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  & .g-md blockquote strong { color: var(--g-text-2); }
+  & .g-md hr { border: 0; border-top: 1px solid var(--g-line); }
+  & .g-md .g-md-link { color: var(--g-signal); text-decoration: underline; text-underline-offset: 3px; cursor: text; }
+  & .g-md-table { overflow-x: auto; }
+  & .g-md table { border-collapse: collapse; font-size: 13px; }
+  & .g-md th,
+  & .g-md td { padding: 6px 10px; border: 1px solid var(--g-line); text-align: left; vertical-align: top; }
+  & .g-md th { font-weight: 600; color: var(--g-text); background: color-mix(in srgb, var(--g-text) 4%, transparent); }
   & .room-readable-card[data-author="you"] { grid-template-columns: minmax(0, 1fr); }
   & .room-readable-card[data-author="you"] > * { grid-column: 1; justify-self: end; }
   & .room-readable-card[data-author="you"] > .room-readable-avatar { display: none; }

@@ -214,6 +214,7 @@ import {
   splitAttachments,
   type SavedAttachment,
 } from "./georgi-attachments";
+import { renderMarkdownInto } from "./georgi-markdown";
 import { RoomDraftStore } from "./room-drafts";
 import { installRoomFallbacks } from "./room-fallbacks";
 import { abandonUpgradeConfirmText, upgradeBannerView, upgradeResumeMembers } from "./upgrade-banner";
@@ -6332,7 +6333,14 @@ function buildReadableCard(
   const georgi = isGeorgiTheme(currentThemeName());
   const attached = georgi ? splitAttachments(item.body) : { text: item.body, paths: [] as string[] };
   const fullText = attached.text;
-  const previewText = georgi ? splitAttachments(item.preview.text).text : item.preview.text;
+  // A chat shows every message in full: no Show all / Show less.
+  const collapsed = georgi ? false : item.preview.collapsed;
+  const previewText = georgi ? fullText : item.preview.text;
+  // Georgi themes render the message's Markdown (bold, lists, code, tables).
+  const setBody = (text: string) => {
+    if (georgi) renderMarkdownInto(body, text);
+    else body.textContent = text;
+  };
   const sender = item.senderId ? snapshotById.get(item.senderId) : undefined;
   if (sender) card.dataset.driver = sender.driver;
   const face = georgiAvatar({ driver: sender?.driver, status: "ready" }, "lg", false);
@@ -6340,12 +6348,12 @@ function buildReadableCard(
   if (item.author === "prim1") face.textContent = "◆";
   if (item.author === "guest") face.textContent = "↗";
   card.append(face, meta, body);
-  if (item.preview.collapsed) {
+  if (collapsed) {
     const toggle = document.createElement("button");
     toggle.type = "button";
     toggle.className = "room-readable-more";
     const show = (expanded: boolean) => {
-      body.textContent = expanded ? fullText : previewText;
+      setBody(expanded ? fullText : previewText);
       toggle.textContent = expanded ? "Show less" : "Show all";
       toggle.setAttribute("aria-expanded", String(expanded));
     };
@@ -6361,7 +6369,7 @@ function buildReadableCard(
     });
     card.append(toggle);
   } else {
-    body.textContent = fullText;
+    setBody(fullText);
   }
   if (attached.paths.length) {
     card.append(attachmentGrid(attached.paths, readRoomAttachment));
