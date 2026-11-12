@@ -2420,3 +2420,20 @@
   & .g-pf-label-row[draggable="true"], & .g-pf-project-head[draggable="true"] { cursor: grab; }
   & .g-pf-menu-sep { height: 1px; margin: 4px 6px; background: var(--g-line); }
 }
+:root[data-theme^="georgi"] {
+  /* Composer bar: Send now / Post to feed never wrap; the recipient picker,
+     the gauge text and the shortcut hint give way first. */
+  & .g-composer-bar { container-type: inline-size; min-width: 0; }
+  & .g-composer-bar .g-segmented { flex: none; }
+  & .g-composer-bar .g-segmented button { white-space: nowrap; flex: none; }
+  & .g-composer-bar #g-recipient { flex: 0 1 auto; min-width: 90px; max-width: 220px; text-overflow: ellipsis; }
+  & .g-composer-bar #g-submit { flex: 0 1 auto; min-width: 0; max-width: 260px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  & .g-composer-bar .g-to, & .g-composer-bar .g-attach-btn, & .g-composer-bar .g-ctx-gauges { flex: none; }
+  & .g-ctx-compact, & .g-ctx-gauge { flex: none; }
+  @container (max-width: 860px) {
+    & .g-composer-bar .g-kbd { display: none; }
+  }
+  @container (max-width: 760px) {
+    & .g-composer-bar .g-ctx-text { display: none; }
+  }
+}
