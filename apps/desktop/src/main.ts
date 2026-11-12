@@ -733,6 +733,7 @@ app.innerHTML = `
           <label class="room-composer-label" for="room-message">Message</label>
           <div class="g-nosup g-only" id="g-nosup" hidden></div>
           <div class="g-composer-warn g-only" id="g-composer-warn" hidden></div>
+          <div class="g-reply g-only" id="g-reply" hidden></div>
           <div class="g-att-strip g-only" id="g-att-strip" hidden></div>
           <textarea id="room-message" rows="3" maxlength="1048576" placeholder="Post to the shared feed or deliver explicitly…"></textarea>
           <div class="g-composer-bar g-only" id="g-composer-bar">
@@ -746,7 +747,7 @@ app.innerHTML = `
             <select id="g-recipient" aria-label="Recipients"></select>
             <span class="g-ctx-gauges" id="g-ctx-gauges"></span>
             <span class="g-flex"></span>
-            <kbd class="g-kbd">Ctrl Enter</kbd>
+            <kbd class="g-kbd">Enter</kbd>
             <button type="button" class="g-btn g-btn-primary" id="g-submit">Send</button>
           </div>
           <p class="g-composer-explain g-only" id="g-composer-explain"></p>
@@ -3740,6 +3741,7 @@ const gRoomTile = must<HTMLElement>("#g-room-tile");
 const gOrgSlot = must<HTMLElement>("#g-org-slot");
 const gMine = must<HTMLElement>("#g-mine");
 const gCtxGauges = must<HTMLElement>("#g-ctx-gauges");
+const gReply = must<HTMLElement>("#g-reply");
 const gNoSup = must<HTMLElement>("#g-nosup");
 const gInbox = must<HTMLElement>("#g-inbox");
 const gRoomName = must<HTMLElement>("#g-room-name");
@@ -3918,6 +3920,7 @@ function openGeorgiSession(sessionId: string): void {
 let georgiFocusMember: string | null = null;
 
 function openGeorgiRoom(roomId: string, focus: string | null | undefined = undefined): void {
+  if (georgiReplyTo && georgiReplyTo.roomId !== roomId) setGeorgiReply(null);
   if (!(workContext.kind === "room" && workContext.roomId === roomId)) {
     enterWorkContext({ kind: "room", roomId });
   }
@@ -5539,11 +5542,11 @@ function syncGeorgiComposer(): void {
   const empty = !roomMessage.value.trim() && georgiAttachments.count === 0;
   const blocked = send ? roomSendButton.disabled : roomPostButton.disabled;
   gSubmit.disabled = georgiSubmitting || empty || blocked;
-  gSubmit.title = blocked ? (send ? roomSendButton.title : roomPostButton.title) : "Ctrl Enter";
+  gSubmit.title = blocked ? (send ? roomSendButton.title : roomPostButton.title) : "Enter to send · Shift+Enter for a new line";
   gAttach.disabled = room === null;
   gExplain.textContent = (send
     ? "Typed into each agent's terminal as a prompt. They act on it right away."
-    : "Saved in the feed for everyone to read. Nobody is interrupted.") + " Paste or drop images.";
+    : "Saved in the feed for everyone to read. Nobody is interrupted.") + " Enter sends, Shift+Enter adds a line. Paste or drop images.";
   roomMessage.placeholder = !room
     ? legacyRoomPlaceholder
     : !send
@@ -5586,7 +5589,8 @@ async function submitGeorgi(mode: "send" | "post" = georgiMode): Promise<void> {
   let text = original;
   if (!text.trim() && paths.length) text = paths.length === 1 ? "Please look at this image." : "Please look at these images.";
   if (!text.trim()) return;
-  const composed = joinAttachments(text, paths);
+  const reply = georgiReplyTo && georgiReplyTo.roomId === room.room_id ? georgiReplyTo : null;
+  const composed = joinAttachments(reply ? georgiReplyQuote(reply) + text : text, paths);
   roomMessage.value = composed;
   if (mode === "send") roomRecipient.value = gRecipient.value || "all";
   georgiSubmitting = true;
@@ -5598,12 +5602,71 @@ async function submitGeorgi(mode: "send" | "post" = georgiMode): Promise<void> {
     georgiSubmitting = false;
     if (roomMessage.value === "") {
       georgiAttachments.clear();
+      if (reply) setGeorgiReply(null);
     } else if (roomMessage.value === composed) {
       // Not stored: give the operator their own words back; the images stay attached.
       roomMessage.value = original;
     }
     syncGeorgiComposer();
   }
+}
+
+/* ── Reply to one specific message ──
+   The reply bar shows which message you answer; on send the message starts
+   with a quote of it (sender, time, opening lines), so the agent knows
+   exactly which of its messages you mean. */
+interface GeorgiReply { roomId: string; key: string; sender: string; senderId: string | null; time: string; excerpt: string }
+let georgiReplyTo: GeorgiReply | null = null;
+
+function georgiExcerpt(text: string): string {
+  const lines = text.replace(/\r\n?/g, "\n").split("\n")
+    .filter((line) => line.trim() && !line.trim().startsWith(">") && !/^```/.test(line.trim()));
+  const plain = lines.slice(0, 2).map((line) => line.trim().replace(/^[-*+•]\s+|^\d+[.)]\s+|^#+\s+/, "").replace(/\*\*|__|`/g, ""));
+  const joined = plain.join(" · ").replace(/\s+/g, " ").trim();
+  return joined.length > 220 ? `${joined.slice(0, 220)}…` : joined;
+}
+
+function georgiReplyQuote(reply: GeorgiReply): string {
+  return `> Replying to ${reply.sender} (${reply.time}): ${reply.excerpt}\n\n`;
+}
+
+function setGeorgiReply(reply: GeorgiReply | null): void {
+  georgiReplyTo = reply;
+  gReply.hidden = reply === null;
+  for (const card of roomFeed.querySelectorAll<HTMLElement>(".room-readable-card[data-g-replying]")) delete card.dataset.gReplying;
+  if (!reply) {
+    gReply.replaceChildren();
+    return;
+  }
+  roomFeed.querySelector<HTMLElement>(`.room-readable-card[data-key="${CSS.escape(reply.key)}"]`)?.setAttribute("data-g-replying", "true");
+  const text = georgiEl("button", "g-reply-text");
+  text.type = "button";
+  text.title = "Show this message";
+  text.append(georgiEl("span", "g-reply-label", `Replying to ${reply.sender} · ${reply.time}`), georgiEl("span", "g-reply-excerpt", reply.excerpt));
+  text.addEventListener("click", () => revealGeorgiMessage(reply.roomId, reply.key));
+  const cancel = georgiButton("g-reply-cancel", "×", () => setGeorgiReply(null));
+  cancel.title = "Cancel the reply";
+  gReply.replaceChildren(georgiEl("span", "g-reply-bar"), text, cancel);
+}
+
+function startGeorgiReply(item: Extract<ReadableFeedItem, { kind: "message" }>, text: string, senderId: string | null): void {
+  const room = activeRoom();
+  if (!room) return;
+  setGeorgiReply({
+    roomId: room.room_id,
+    key: item.key,
+    sender: item.sender,
+    senderId,
+    time: readableTime(item.timestamp, new Date()),
+    excerpt: georgiExcerpt(text),
+  });
+  if (senderId) {
+    setGeorgiMode("send");
+    gRecipient.value = senderId;
+    rememberGeorgiRecipient();
+  }
+  syncGeorgiComposer();
+  focusWithinActiveWindow(roomMessage);
 }
 
 function georgiCardActions(item: Extract<ReadableFeedItem, { kind: "message" }>, text: string): HTMLElement {
@@ -5631,16 +5694,7 @@ function georgiCardActions(item: Extract<ReadableFeedItem, { kind: "message" }>,
     });
   } else if (item.senderId && activeRoom()?.member_ids.includes(item.senderId)) {
     const senderId = item.senderId;
-    action(`Reply to ${item.sender}`, () => {
-      setGeorgiMode("send");
-      gRecipient.value = senderId;
-      const quote = text.split(/\r?\n/).find((line) => line.trim()) ?? "";
-      const prefix = `${item.sender}: > ${quote.length > 140 ? quote.slice(0, 140) + "…" : quote}\n\n`;
-      if (!roomMessage.value.startsWith(prefix)) roomMessage.value = prefix + roomMessage.value;
-      syncGeorgiComposer();
-      focusWithinActiveWindow(roomMessage);
-      roomMessage.setSelectionRange(roomMessage.value.length, roomMessage.value.length);
-    });
+    action(`Reply to ${item.sender}`, () => startGeorgiReply(item, text, senderId));
   }
   return row;
 }
@@ -5709,10 +5763,15 @@ function wireGeorgi(): void {
   gSubmit.addEventListener("click", () => void submitGeorgi());
   roomMessage.addEventListener("input", syncGeorgiComposer);
   roomMessage.addEventListener("keydown", (event) => {
-    if (!georgiActive() || !event.ctrlKey || event.key !== "Enter") return;
+    if (!georgiActive() || event.key !== "Enter" || event.isComposing || event.altKey) return;
+    if (event.shiftKey && !event.ctrlKey) return; // Shift+Enter: a new line
     event.preventDefault();
-    const mode = event.shiftKey ? (georgiMode === "send" ? "post" : "send") : georgiMode;
+    event.stopImmediatePropagation();
+    const mode = event.ctrlKey && event.shiftKey ? (georgiMode === "send" ? "post" : "send") : georgiMode;
     void submitGeorgi(mode);
+  });
+  roomMessage.addEventListener("keydown", (event) => {
+    if (georgiActive() && event.key === "Escape" && georgiReplyTo) setGeorgiReply(null);
   });
   roomMessage.addEventListener("paste", (event) => {
     if (!georgiActive()) return;
@@ -7917,6 +7976,16 @@ function buildReadableCard(
     card.append(attachmentGrid(attached.paths, readRoomAttachment));
   }
   if (georgi) {
+    card.addEventListener("contextmenu", (event) => {
+      if ((event.target as HTMLElement).closest("a, button, .g-md-copy")) return;
+      const selected = document.getSelection()?.toString() ?? "";
+      event.preventDefault();
+      const senderId = item.senderId && activeRoom()?.member_ids.includes(item.senderId) ? item.senderId : null;
+      showContextMenu(event.clientX, event.clientY, [
+        ...(item.author !== "you" ? [{ label: `Reply to this message`, hint: item.sender, run: () => startGeorgiReply(item, fullText, senderId) }] : []),
+        { label: selected ? "Copy selection" : "Copy message", run: () => void navigator.clipboard.writeText(selected || fullText) },
+      ], `${item.sender} · ${readableTime(item.timestamp, new Date())}`);
+    });
     const actions = georgiCardActions(item, fullText);
     if (forYou) {
       const done = document.createElement("button");

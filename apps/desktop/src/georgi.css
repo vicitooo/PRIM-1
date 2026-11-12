@@ -2437,3 +2437,41 @@
     & .g-composer-bar .g-ctx-text { display: none; }
   }
 }
+
+:root[data-theme^="georgi"] {
+  /* Reply to one message: a bar at the top of the composer box. */
+  & .rooms-view .room-content {
+    grid-template-rows: auto auto minmax(0, 1fr) auto auto auto auto auto auto auto auto auto;
+    grid-template-areas:
+      "note mine"
+      "brief mine"
+      "feed mine"
+      "history mine"
+      "gsup mine"
+      "gwarn mine"
+      "greply mine"
+      "gatt mine"
+      "composer mine"
+      "gbar mine"
+      "gexplain mine"
+      "status mine";
+  }
+  & .rooms-view .room-content::before { grid-row: greply-start / gbar-end; }
+  & .rooms-view .room-content > .g-reply { grid-area: greply; }
+  & .g-reply { position: relative; z-index: 1; display: flex; align-items: stretch; gap: 10px; padding: 10px 10px 2px 14px; }
+  & .g-reply[hidden] { display: none; }
+  & .g-reply-bar { width: 3px; flex: none; border-radius: 2px; background: var(--g-signal); }
+  & .g-reply-text {
+    flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; padding: 2px 0; border: 0; background: transparent;
+    text-align: left; cursor: pointer; color: var(--g-text-2);
+  }
+  & .g-reply-label { font-size: 12px; font-weight: 600; color: var(--g-signal); }
+  & .g-reply-excerpt { font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  & .g-reply-text:hover .g-reply-excerpt { color: var(--g-text); }
+  & .g-reply-cancel {
+    align-self: flex-start; width: 24px; height: 24px; flex: none; border: 0; border-radius: 6px;
+    background: transparent; color: var(--g-text-3); font-size: 15px; cursor: pointer;
+  }
+  & .g-reply-cancel:hover { background: var(--g-bg-hover); color: var(--g-text); }
+  & .room-readable-card[data-g-replying] { box-shadow: inset 3px 0 0 var(--g-signal); background: color-mix(in srgb, var(--g-signal) 6%, transparent); border-radius: 10px; }
+}
