@@ -40,6 +40,7 @@ use supervisor::output_credit::{OutputCredit, OutputCreditLedger, OutputCreditMe
 use supervisor::trial::{TRIAL_ADMISSION_HELD, TrialChallenge, TrialHealthReceipt, TrialStartup};
 use supervisor::upgrade_flow::{UpgradeEnvironment, UpgradeHost, UpgradeStartup};
 mod attachments;
+mod georgi;
 mod trial_desktop;
 mod upgrade_launcher;
 pub use trial_desktop::WEBVIEW_PROFILE_ENV;
@@ -3349,6 +3350,11 @@ pub fn run(startup: StartupConfig) {
         .invoke_handler(tauri::generate_handler![
             attachments::save_room_attachment,
             attachments::read_room_attachment,
+            georgi::georgi_request_attention,
+            georgi::georgi_copy_session_folder,
+            georgi::georgi_take_layout,
+            georgi::georgi_finish_layout,
+            georgi::georgi_context_usage,
             automation_mode,
             trial_status,
             trial_renderer_acknowledged,

@@ -76,6 +76,8 @@ export interface GeorgiMember {
   driver: DriverKind | undefined;
   status: GeorgiStatus;
   reason: string;
+  /** Designated Supervisor (all three grants): receives Post to feed. */
+  supervisor?: boolean;
 }
 
 export interface GeorgiRoom {
@@ -100,6 +102,8 @@ export interface GeorgiShellHandlers {
   newSession(anchor: HTMLElement): void;
   showRooms(): void;
   footer(kind: string): void;
+  /** Right-click on an agent: launch, stop, restart, remove… */
+  agentMenu?(event: MouseEvent, sessionId: string): void;
 }
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, className?: string, text?: string): HTMLElementTagNameMap[K] {
@@ -107,6 +111,112 @@ function el<K extends keyof HTMLElementTagNameMap>(tag: K, className?: string, t
   if (className) node.className = className;
   if (text !== undefined) node.textContent = text;
   return node;
+}
+
+export interface MenuItem {
+  label: string;
+  run(): void;
+  danger?: boolean;
+  disabled?: boolean;
+  hint?: string;
+}
+
+let openMenu: { node: HTMLElement; close(): void } | null = null;
+
+/** A small right-click menu at the pointer; "-" draws a separator. Closes on
+    a click elsewhere, Escape, scroll or window blur. */
+export function showContextMenu(x: number, y: number, items: (MenuItem | "-")[], title?: string): void {
+  openMenu?.close();
+  const menu = el("div", "g-ctx");
+  menu.setAttribute("role", "menu");
+  if (title) menu.append(el("div", "g-ctx-title", title));
+  for (const item of items) {
+    if (item === "-") {
+      menu.append(el("div", "g-ctx-sep"));
+      continue;
+    }
+    const row = el("button", `g-ctx-item${item.danger ? " g-ctx-danger" : ""}`);
+    row.type = "button";
+    row.setAttribute("role", "menuitem");
+    row.disabled = Boolean(item.disabled);
+    row.append(el("span", "", item.label));
+    if (item.hint) row.append(el("span", "g-ctx-hint", item.hint));
+    row.addEventListener("click", () => {
+      close();
+      item.run();
+    });
+    menu.append(row);
+  }
+  document.body.append(menu);
+  const box = menu.getBoundingClientRect();
+  menu.style.left = `${Math.max(4, Math.min(x, window.innerWidth - box.width - 4))}px`;
+  menu.style.top = `${Math.max(4, Math.min(y, window.innerHeight - box.height - 4))}px`;
+  const outside = (event: Event) => {
+    if (!menu.contains(event.target as Node)) close();
+  };
+  const key = (event: KeyboardEvent) => {
+    if (event.key === "Escape") close();
+  };
+  function close(): void {
+    menu.remove();
+    document.removeEventListener("mousedown", outside, true);
+    document.removeEventListener("keydown", key, true);
+    window.removeEventListener("blur", close);
+    window.removeEventListener("wheel", close, true);
+    if (openMenu?.node === menu) openMenu = null;
+  }
+  setTimeout(() => {
+    document.addEventListener("mousedown", outside, true);
+    document.addEventListener("keydown", key, true);
+    window.addEventListener("blur", close);
+    window.addEventListener("wheel", close, true);
+  });
+  openMenu = { node: menu, close };
+  (menu.querySelector("button:not(:disabled)") as HTMLButtonElement | null)?.focus({ preventScroll: true });
+}
+
+/** A small dialog asking for one name; resolves null on Cancel or Escape. */
+export function askText(title: string, options: { initial?: string; placeholder?: string; action?: string; note?: string } = {}): Promise<string | null> {
+  return new Promise((resolve) => {
+    document.querySelector(".g-modal-back")?.remove();
+    const back = el("div", "g-modal-back");
+    const form = el("form", "g-modal g-ask");
+    const input = el("input", "g-org-input");
+    input.value = options.initial ?? "";
+    input.placeholder = options.placeholder ?? "";
+    const done = (value: string | null) => {
+      back.remove();
+      resolve(value);
+    };
+    const cancel = el("button", "g-btn g-btn-ghost", "Cancel");
+    cancel.type = "button";
+    cancel.addEventListener("click", () => done(null));
+    const ok = el("button", "g-btn g-btn-primary", options.action ?? "Save");
+    ok.type = "submit";
+    const actions = el("div", "g-org-actions");
+    actions.append(el("span", "g-flex"), cancel, ok);
+    const head = el("div", "g-modal-head");
+    head.append(el("h2", "", title));
+    form.append(head, input);
+    if (options.note) form.append(el("p", "g-org-note", options.note));
+    form.append(actions);
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const value = input.value.trim();
+      if (value) done(value);
+      else input.focus({ preventScroll: true });
+    });
+    form.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") done(null);
+    });
+    back.addEventListener("mousedown", (event) => {
+      if (event.target === back) done(null);
+    });
+    back.append(form);
+    document.body.append(back);
+    input.focus({ preventScroll: true });
+    input.select();
+  });
 }
 
 export function avatar(member: Pick<GeorgiMember, "driver" | "status">, size: "sm" | "md" | "lg", dot = true): HTMLElement {
@@ -162,6 +272,11 @@ function memberRow(member: GeorgiMember, active: boolean, nested: boolean, handl
   if (active) row.setAttribute("aria-current", "true");
   row.append(avatar(member, "sm"), el("span", "g-side-label", member.label), el("span", "g-side-state", STATUS_LABEL[member.status]));
   row.addEventListener("click", () => handlers.openSession(member.id));
+  row.addEventListener("contextmenu", (event) => {
+    if (!handlers.agentMenu) return;
+    event.preventDefault();
+    handlers.agentMenu(event, member.id);
+  });
   return row;
 }
 
@@ -175,13 +290,20 @@ function roomSummary(room: GeorgiRoom): string {
   return agents;
 }
 
-export function renderSidebar(container: HTMLElement, data: GeorgiShellData, handlers: GeorgiShellHandlers): void {
+export function renderSidebar(
+  container: HTMLElement,
+  data: GeorgiShellData,
+  handlers: GeorgiShellHandlers,
+  /** The portfolio tree, when grouping is on; replaces the flat room list. */
+  roomsSection?: HTMLElement,
+): void {
   const scroll = container.querySelector<HTMLElement>(".g-side-scroll");
   const keepScroll = scroll?.scrollTop ?? 0;
   const collapsed = collapsedRooms();
   const body = el("div", "g-side-scroll");
 
-  const roomsGroup = el("section", "g-side-group");
+  const roomsGroup = roomsSection ?? el("section", "g-side-group");
+  if (!roomsSection) {
   const roomsHead = el("div", "g-side-head");
   const roomsTitle = el("button", "g-side-title", "Rooms");
   roomsTitle.type = "button";
@@ -238,6 +360,7 @@ export function renderSidebar(container: HTMLElement, data: GeorgiShellData, han
     }
     roomsGroup.append(wrap);
   }
+  }
 
   const looseGroup = el("section", "g-side-group");
   const looseHead = el("div", "g-side-head");
@@ -282,8 +405,20 @@ export function renderSummary(
   container: HTMLElement,
   members: GeorgiMember[],
   jumpTo: (sessionId: string) => void,
+  /** Open @Georgi asks and question/decision cards across rooms. */
+  asks = 0,
+  openInbox?: () => void,
 ): void {
   const parts: HTMLElement[] = [];
+  if (asks > 0 && openInbox) {
+    const chip = el("button", "g-summary-chip g-summary-asks");
+    chip.type = "button";
+    chip.dataset.status = "needs";
+    chip.title = "Agents are waiting on you — open Needs you";
+    chip.append(el("span", "g-pill-dot"), document.createTextNode(`${asks} for you`));
+    chip.addEventListener("click", openInbox);
+    parts.push(chip);
+  }
   const groups: [GeorgiStatus, string][] = [
     ["needs", "needs you"],
     ["error", "error"],
@@ -308,14 +443,32 @@ export function renderSummary(
 }
 
 /** The room header's member chips; a click opens that member's terminal. */
-export function renderMemberChips(container: HTMLElement, members: GeorgiMember[], open: (sessionId: string) => void): void {
+export function renderMemberChips(
+  container: HTMLElement,
+  members: GeorgiMember[],
+  open: (sessionId: string) => void,
+  menu?: (event: MouseEvent, sessionId: string) => void,
+): void {
   const chips = members.map((member) => {
     const chip = el("button", "g-chip");
     chip.type = "button";
     chip.dataset.status = member.status;
     chip.title = `${member.reason} — open terminal`;
-    chip.append(avatar(member, "sm", false), el("span", "g-chip-label", member.label), statusPill(member.status));
+    chip.append(avatar(member, "sm", false), el("span", "g-chip-label", member.label));
+    if (member.supervisor) {
+      const crown = el("span", "g-crown", "♛");
+      crown.title = "Supervisor: receives Post to feed";
+      chip.append(crown);
+    }
+    chip.append(statusPill(member.status));
     chip.addEventListener("click", () => open(member.id));
+    if (menu) {
+      chip.title = `${member.reason} — click: terminal · right-click: launch, stop, remove…`;
+      chip.addEventListener("contextmenu", (event) => {
+        event.preventDefault();
+        menu(event, member.id);
+      });
+    }
     return chip;
   });
   container.replaceChildren(...chips);
@@ -393,7 +546,10 @@ export function georgiMember(
   readiness: SessionReadiness,
   label: string,
 ): GeorgiMember {
-  return { id: sessionId, label, driver: session?.driver, status: georgiStatus(readiness, session), reason: readiness.reason };
+  const grants = session?.permissions;
+  const supervisor = Boolean(grants?.roam && grants?.maintain && grants?.manage);
+  return { id: sessionId, label, driver: session?.driver, status: georgiStatus(readiness, session), reason: readiness.reason,
+    ...(supervisor ? { supervisor } : {}) };
 }
 
 export function roomFolder(room: RoomSnapshot, sessions: Map<string, SessionSnapshot>): string {

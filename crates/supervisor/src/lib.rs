@@ -93,6 +93,8 @@ mod room_package_tests;
 mod rooms;
 mod session;
 mod submit_confirm;
+mod context_usage;
+pub use context_usage::ContextUsage;
 pub mod session_inventory;
 pub mod trial;
 pub mod upgrade;
@@ -6520,6 +6522,24 @@ impl SupervisorHandle {
     fn run_sideband_after_initial_authorization_for_tests(&self) {
         let hook = self.inner.sideband_after_initial_authorization.lock().take();
         if let Some(hook) = hook { hook(); }
+    }
+
+    /// Georgi themes: how full each listed agent's context window is, read
+    /// from its own conversation record. Read only; agents without a bound
+    /// conversation (or not Claude/Codex) are left out.
+    pub fn context_usage(&self, session_ids: &[SessionId]) -> Vec<ContextUsage> {
+        let home = self.inner.identity_tracker.claude_home();
+        let targets: Vec<(SessionId, DriverKind, Option<String>, String)> = {
+            let slots = self.inner.slots.lock();
+            session_ids.iter().filter_map(|id| {
+                let slot = slots.get_by_id(*id)?;
+                Some((*id, slot.definition.driver, slot.harness_session_id.clone(), slot.definition.working_dir.clone()))
+            }).collect()
+        };
+        targets.into_iter().filter_map(|(id, driver, harness, working_dir)| {
+            let path = submit_confirm::record_path(driver, home.as_deref(), harness.as_deref(), false, &working_dir).ok()?;
+            context_usage::read_usage(id, driver, &path)
+        }).collect()
     }
 
     pub fn snapshot(&self) -> RuntimeSnapshot {

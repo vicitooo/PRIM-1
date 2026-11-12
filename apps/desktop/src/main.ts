@@ -163,6 +163,7 @@ import {
   readableRoomFeed,
   readableTime,
   type ReadableFeedItem,
+  type ReadableRecipientState,
   type ReadableProblem,
   type RoomFeedView,
 } from "./readable-feed";
@@ -200,6 +201,8 @@ import {
   renderMemberChips,
   renderSidebar,
   renderSummary,
+  showContextMenu,
+  askText,
   roomFolder,
   roomHueSlot,
   roomInitials,
@@ -214,7 +217,21 @@ import {
   splitAttachments,
   type SavedAttachment,
 } from "./georgi-attachments";
-import { renderMarkdownInto } from "./georgi-markdown";
+import { appendInline, renderMarkdownInto } from "./georgi-markdown";
+import { OPERATOR_HANDLE, openAsks, operatorRequest, stripOperatorMention, type Ask } from "./georgi-attention";
+import {
+  ALL_PORTFOLIOS,
+  ROOM_TYPES,
+  addPortfolio,
+  type RoomType,
+  buildTree,
+  loadGrouping,
+  organizeChip,
+  renamePortfolio,
+  renderPortfolioRooms,
+  saveGrouping,
+  seedGrouping,
+} from "./georgi-portfolio";
 import { RoomDraftStore } from "./room-drafts";
 import { installRoomFallbacks } from "./room-fallbacks";
 import { abandonUpgradeConfirmText, upgradeBannerView, upgradeResumeMembers } from "./upgrade-banner";
@@ -584,6 +601,7 @@ app.innerHTML = `
          or the active room's panel (feed, members, composer — today's in-room UI).
          The workspace top bar shows only the entered context's sessions. -->
     <section class="rooms-view" id="rooms-view" hidden aria-label="Rooms">
+      <article class="g-inbox g-only" id="g-inbox" aria-label="Needs you"></article>
       <article class="rooms-overview panel" id="rooms-overview">
         <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
         <div class="card-head">
@@ -628,6 +646,7 @@ app.innerHTML = `
               <h1 id="g-room-name"></h1>
               <span id="g-room-sub"></span>
             </div>
+            <div class="g-org-slot" id="g-org-slot"></div>
             <button type="button" class="g-btn g-btn-secondary" id="g-add-member">+ Add member</button>
             <button type="button" class="g-btn g-btn-secondary" id="g-room-tools" title="Room settings: rename, save, delete, brief, fallbacks" aria-expanded="false">···</button>
           </div>
@@ -710,7 +729,9 @@ app.innerHTML = `
           </div>
           <button type="button" class="ghost room-members-reopen" id="room-members-open" hidden title="Show room settings">Room settings</button>
           <div id="room-feed" class="room-feed" role="log" aria-live="polite"></div>
+          <aside class="g-mine g-only" id="g-mine" aria-label="Your messages"></aside>
           <label class="room-composer-label" for="room-message">Message</label>
+          <div class="g-nosup g-only" id="g-nosup" hidden></div>
           <div class="g-composer-warn g-only" id="g-composer-warn" hidden></div>
           <div class="g-att-strip g-only" id="g-att-strip" hidden></div>
           <textarea id="room-message" rows="3" maxlength="1048576" placeholder="Post to the shared feed or deliver explicitly…"></textarea>
@@ -723,6 +744,7 @@ app.innerHTML = `
             </div>
             <span class="g-to" id="g-to-label">to</span>
             <select id="g-recipient" aria-label="Recipients"></select>
+            <span class="g-ctx-gauges" id="g-ctx-gauges"></span>
             <span class="g-flex"></span>
             <kbd class="g-kbd">Ctrl Enter</kbd>
             <button type="button" class="g-btn g-btn-primary" id="g-submit">Send</button>
@@ -3715,6 +3737,11 @@ function loadSavedTheme(): ThemeName {
 const gSidebar = must<HTMLElement>("#g-sidebar");
 const gSummary = must<HTMLElement>("#g-summary");
 const gRoomTile = must<HTMLElement>("#g-room-tile");
+const gOrgSlot = must<HTMLElement>("#g-org-slot");
+const gMine = must<HTMLElement>("#g-mine");
+const gCtxGauges = must<HTMLElement>("#g-ctx-gauges");
+const gNoSup = must<HTMLElement>("#g-nosup");
+const gInbox = must<HTMLElement>("#g-inbox");
 const gRoomName = must<HTMLElement>("#g-room-name");
 const gRoomSub = must<HTMLElement>("#g-room-sub");
 const gRoomChips = must<HTMLElement>("#g-room-chips");
@@ -3804,11 +3831,37 @@ function renderGeorgiChrome(): void {
     rooms,
     loose,
     activeSessionId: shellView === "sessions" ? tabState.activeId : null,
-    activeRoomId: shellView === "rooms" && roomsViewMode === "panel" ? activeRoomId : null,
+    activeRoomId: shellView === "rooms" && roomsViewMode === "panel" && !roomsView.dataset.gInbox ? activeRoomId : null,
   };
-  const signature = JSON.stringify(data);
+  ensureGeorgiRoomEvents();
+  georgiPlaceNewRooms();
+  maybeOfferGeorgiLayout();
+  computeGeorgiAsks();
+  const needsByRoom = new Map<string, number>();
+  for (const ask of georgiUnseenAsks) needsByRoom.set(ask.roomId, (needsByRoom.get(ask.roomId) ?? 0) + 1);
+  const activity = georgiRoomActivity();
+  // The room you stand in stays highlighted (with its agents listed) also
+  // while one of its terminals is on screen.
+  const sidebarRoom = data.activeRoomId ?? (shellView === "sessions" && workContext.kind === "room" ? workContext.roomId : null);
+  appShell.toggleAttribute("data-g-rail", georgiGrouping.rail);
+  const signature = JSON.stringify([data, sidebarRoom, georgiGrouping, georgiUnseenAsks.map((ask) => ask.key), roomsView.dataset.gInbox ?? "",
+    georgiPageKey(), [...activity]]);
   if (signature !== georgiSidebarSignature) {
     georgiSidebarSignature = signature;
+    const tree = buildTree(rooms, georgiGrouping, needsByRoom, activity);
+    const totalNeeds = georgiUnseenAsks.length + rooms.flatMap((room) => room.members).filter((m) => m.status === "needs").length;
+    const roomsSection = renderPortfolioRooms({ tree, grouping: georgiGrouping, activeRoomId: sidebarRoom, activeSessionId: data.activeSessionId, totalNeeds }, {
+      openRoom: (roomId) => openGeorgiRoom(roomId, null),
+      newRoom: (project) => openGeorgiTemplate(project),
+      openInbox: openGeorgiInbox,
+      openProject: (portfolio, project) => openGeorgiPage({ kind: "project", portfolio, project }),
+      openPortfolio: (name) => openGeorgiPage({ kind: "portfolio", name }),
+      newProject: georgiNewProject,
+      openSession: openGeorgiSession,
+      agentMenu: georgiAgentMenu,
+      changed: georgiGroupingChanged,
+    });
+    roomsSection.querySelector(".g-pf-inbox")?.toggleAttribute("aria-current", georgiPage.kind === "inbox" && roomsView.dataset.gInbox === "open" && shellView === "rooms");
     renderSidebar(gSidebar, data, {
       openRoom: (roomId) => openGeorgiRoom(roomId, null),
       openSession: openGeorgiSession,
@@ -3825,16 +3878,23 @@ function renderGeorgiChrome(): void {
       },
       showRooms: openRoomsOverview,
       footer: runCornerAction,
-    });
+      agentMenu: georgiAgentMenu,
+    }, roomsSection);
     const seen = new Set<string>();
     const everyone = [...rooms.flatMap((room) => room.members), ...loose].filter((member) => {
       if (seen.has(member.id)) return false;
       seen.add(member.id);
       return true;
     });
-    renderSummary(gSummary, everyone, openGeorgiSession);
+    renderSummary(gSummary, everyone, openGeorgiSession, georgiUnseenAsks.length, openGeorgiInbox);
   }
-  if (shellView === "rooms" && roomsViewMode === "overview") renderGeorgiRoomsOverview();
+  if (shellView === "rooms" && roomsView.dataset.gInbox === "open") renderGeorgiPage();
+  else if (shellView === "rooms" && roomsViewMode === "overview") renderGeorgiRoomsOverview();
+  if (shellView === "rooms" && roomsViewMode === "panel") {
+    renderGeorgiMine();
+    renderGeorgiNoSupervisor();
+    markGeorgiAskCards();
+  }
   for (const item of gSidebar.querySelectorAll<HTMLElement>("[data-g-footer]")) {
     const kind = item.dataset.gFooter;
     const current = kind === "log" ? appShell.dataset.log === "open" : shellView === kind;
@@ -3871,7 +3931,29 @@ function openGeorgiRoom(roomId: string, focus: string | null | undefined = undef
     syncGeorgiComposer();
   }
   if (before !== georgiFocusMember) rebuildGeorgiFeed();
+  pinGeorgiFeedToBottom();
   scheduleGeorgiChrome();
+}
+
+/* Opening a room always lands on its latest message, like any chat. The
+   feed loads (and images and code boxes size themselves) over a moment
+   after the click, so hold the bottom for a short while, and let go the
+   moment you scroll, click or type in the feed yourself. */
+let georgiPinBottomUntil = 0;
+
+function pinGeorgiFeedToBottom(): void {
+  georgiPinBottomUntil = performance.now() + 2500;
+  readableFeedFollow = true;
+  const step = () => {
+    if (performance.now() > georgiPinBottomUntil) return;
+    roomFeed.scrollTop = roomFeed.scrollHeight;
+    requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+
+function releaseGeorgiFeedPin(): void {
+  georgiPinBottomUntil = 0;
 }
 
 function rebuildGeorgiFeed(): void {
@@ -3918,8 +4000,20 @@ function renderGeorgiRoomHead(): void {
   path.className = "g-mono";
   path.textContent = folder;
   gRoomSub.replaceChildren(`Room · ${count} member${count === 1 ? "" : "s"}${folder ? " · " : ""}`, ...(folder ? [path] : []));
-  renderMemberChips(gRoomChips, room.member_ids.map(georgiMemberOf), openGeorgiSession);
+  renderMemberChips(gRoomChips, room.member_ids.map(georgiMemberOf), openGeorgiSession, georgiAgentMenu);
   renderGeorgiFocusBar();
+  // Re-rendered only when the room or its placement changes, so an open
+  // popover is not wiped by live updates.
+  const orgSignature = JSON.stringify([room.room_id, room.label, georgiGrouping.rooms[room.room_id] ?? null, Object.keys(georgiGrouping.rooms).length]);
+  if (gOrgSlot.dataset.sig !== orgSignature) {
+    gOrgSlot.dataset.sig = orgSignature;
+    gOrgSlot.replaceChildren(organizeChip({
+      roomId: room.room_id,
+      label: room.label,
+      grouping: georgiGrouping,
+      changed: georgiGroupingChanged,
+    }));
+  }
 }
 
 const GEORGI_LAST_KEY = "prim1-georgi-last-messages";
@@ -3976,13 +4070,1436 @@ function renderGeorgiRoomsOverview(): void {
   roomsOverviewGrid.replaceChildren(...cards, create);
 }
 
+/* ── Georgi: portfolios, @Georgi asks, Needs you, Your messages ── */
+
+function readStored<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? (JSON.parse(raw) as T) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeStored(key: string, value: unknown): void {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    /* preference only */
+  }
+}
+
+const georgiGrouping = loadGrouping();
+let georgiPendingPlacement: { portfolio: string; project: string } | null = null;
+let georgiKnownRooms: Set<string> | null = null;
+
+function georgiGroupingChanged(): void {
+  saveGrouping(georgiGrouping);
+  georgiSidebarSignature = "";
+  delete gOrgSlot.dataset.sig;
+  scheduleGeorgiChrome();
+}
+
+/** Place rooms by their label the first time they are seen, and put a room
+    created from a project's "+ New room" into that project. */
+function georgiPlaceNewRooms(): void {
+  const ids = roomSnapshots.map((room) => room.room_id);
+  let changed = false;
+  if (georgiKnownRooms === null) {
+    georgiKnownRooms = new Set(ids);
+  } else {
+    for (const room of roomSnapshots) {
+      if (georgiKnownRooms.has(room.room_id)) continue;
+      georgiKnownRooms.add(room.room_id);
+      if (georgiPendingPlacement && !georgiGrouping.rooms[room.room_id]) {
+        georgiGrouping.rooms[room.room_id] = { ...georgiPendingPlacement, type: "dev" };
+        georgiPendingPlacement = null;
+        changed = true;
+      }
+    }
+  }
+  if (seedGrouping(georgiGrouping, roomSnapshots.map((room) => ({ id: room.room_id, label: room.label })))) changed = true;
+  if (changed) saveGrouping(georgiGrouping);
+}
+
+/** Every room's recent events, so asks and your messages show across rooms
+    without opening each room. Loaded once per room, then kept current from
+    the live feed. */
+const georgiEvents = new Map<string, RoomFeedEvent[]>();
+const georgiEventsLoading = new Set<string>();
+/** Rooms whose history is loaded: asks found later are new and notify. */
+const georgiPrimedRooms = new Set<string>();
+
+function ensureGeorgiRoomEvents(): void {
+  for (const room of roomSnapshots) {
+    if (georgiEvents.has(room.room_id) || georgiEventsLoading.has(room.room_id)) continue;
+    void loadGeorgiRoomEvents(room.room_id);
+  }
+}
+
+async function loadGeorgiRoomEvents(roomId: string): Promise<void> {
+  georgiEventsLoading.add(roomId);
+  try {
+    let cursor: RoomFeedCursor | null = null;
+    const events: RoomFeedEvent[] = [];
+    for (let pages = 0; pages < 64; pages += 1) {
+      const page: RoomFeedPage = await command<RoomFeedPage>("read_room_feed", {
+        request: { room_id: roomId, cursor } satisfies ReadRoomFeedRequest,
+      });
+      events.push(...page.events, ...(page.cards ?? []).filter((card) => !events.includes(card)));
+      cursor = page.cursor;
+      if (!page.has_more) break;
+    }
+    events.sort((a, b) => a.cursor.sequence - b.cursor.sequence);
+    const seen = new Set<string>();
+    georgiEvents.set(roomId, retainRoomFeedWindow(events.filter((event) => {
+      const key = `${event.cursor.epoch}:${event.cursor.sequence}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })));
+  } catch (error) {
+    georgiEvents.set(roomId, []);
+    writeSystem("warn", `Georgi: could not read room ${shortSessionId(roomId)} for Needs you: ${String(error)}`);
+  } finally {
+    georgiEventsLoading.delete(roomId);
+  }
+  for (const ask of openAsks(roomId, georgiEventsFor(roomId), readableMemberLabel, new Set())) georgiNotified.add(ask.key);
+  georgiPrimedRooms.add(roomId);
+  georgiSidebarSignature = "";
+  scheduleGeorgiChrome();
+}
+
+function georgiNoteEvent(event: RoomFeedEvent): void {
+  if (!georgiActive()) return;
+  const list = georgiEvents.get(event.room_id);
+  if (!list) return;
+  const last = list[list.length - 1];
+  if (last && last.cursor.epoch !== event.cursor.epoch) {
+    georgiEvents.delete(event.room_id);
+    georgiPrimedRooms.delete(event.room_id);
+  } else if (!last || event.cursor.sequence > last.cursor.sequence) {
+    georgiEvents.set(event.room_id, retainRoomFeedWindow([...list, event]));
+  }
+  scheduleGeorgiChrome();
+}
+
+/** The open room's own feed is authoritative; other rooms use the cache. */
+function georgiEventsFor(roomId: string): RoomFeedEvent[] {
+  const live = roomId === activeRoomId ? roomFeedEvents.get(roomId) : undefined;
+  const cached = georgiEvents.get(roomId) ?? [];
+  if (!live || live.length === 0) return cached;
+  const lastLive = live[live.length - 1].cursor.sequence;
+  const lastCached = cached.length ? cached[cached.length - 1].cursor.sequence : -1;
+  return lastCached > lastLive ? cached : live;
+}
+
+const GEORGI_DISMISSED_KEY = "prim1-georgi-dismissed-asks";
+const georgiDismissed = new Set<string>(readStored<string[]>(GEORGI_DISMISSED_KEY, []));
+const georgiNotified = new Set<string>();
+let georgiAsks: Ask[] = [];
+/** Open asks you have not looked at yet: these drive the yellow badges. */
+let georgiUnseenAsks: Ask[] = [];
+/* Like unread messages in a chat: opening the room marks its asks seen, and
+   the badges go. They stay listed in Needs you until you reply or press
+   Done, so nothing is lost. */
+const GEORGI_SEEN_KEY = "prim1-georgi-seen-asks";
+const georgiSeen = new Set<string>(readStored<string[]>(GEORGI_SEEN_KEY, []));
+
+function georgiViewingRoom(): string | null {
+  return georgiActive() && document.hasFocus() && shellView === "rooms" && roomsViewMode === "panel" && !roomsView.dataset.gInbox
+    ? activeRoomId : null;
+}
+
+function computeGeorgiAsks(): void {
+  const asks = roomSnapshots.flatMap((room) => openAsks(room.room_id, georgiEventsFor(room.room_id), readableMemberLabel, georgiDismissed));
+  for (const ask of asks) {
+    if (georgiNotified.has(ask.key) || !georgiPrimedRooms.has(ask.roomId)) continue;
+    georgiNotified.add(ask.key);
+    notifyGeorgiAsk(ask);
+  }
+  const viewing = georgiViewingRoom();
+  let newlySeen = false;
+  for (const ask of asks) {
+    if (ask.roomId === viewing && !georgiSeen.has(ask.key)) {
+      georgiSeen.add(ask.key);
+      newlySeen = true;
+    }
+  }
+  if (newlySeen) writeStored(GEORGI_SEEN_KEY, [...georgiSeen].slice(-1000));
+  georgiAsks = asks.sort((a, b) => Number(georgiSeen.has(a.key)) - Number(georgiSeen.has(b.key)) || b.timestamp.localeCompare(a.timestamp));
+  georgiUnseenAsks = georgiAsks.filter((ask) => !georgiSeen.has(ask.key));
+}
+
+function georgiRoomPath(roomId: string): string {
+  const room = roomSnapshots.find((candidate) => candidate.room_id === roomId);
+  const place = georgiGrouping.rooms[roomId];
+  if (!room) return "";
+  if (!place) return room.label;
+  if (!place.project) return `${place.portfolio} / Supervisor`;
+  const name = room.label.toLowerCase().startsWith(place.project.toLowerCase())
+    ? room.label.slice(place.project.length).replace(/^[\s\-–—·:/_]+/, "") || ROOM_TYPES[place.type].name
+    : room.label;
+  return `${place.project} / ${name}`;
+}
+
+/** A Windows notification and a taskbar flash, unless you are already
+    looking at that room. */
+function notifyGeorgiAsk(ask: Ask): void {
+  const looking = document.hasFocus() && shellView === "rooms" && roomsViewMode === "panel" && activeRoomId === ask.roomId;
+  if (looking) return;
+  void command("georgi_request_attention").catch(() => undefined);
+  if (!("Notification" in window)) return;
+  const show = () => {
+    try {
+      const note = new Notification(`${ask.sender} needs you`, {
+        body: `${georgiRoomPath(ask.roomId)}: ${ask.text}`,
+        tag: ask.key,
+      });
+      note.onclick = () => {
+        openGeorgiAsk(ask);
+      };
+    } catch {
+      /* notifications unavailable: the taskbar flash still shows */
+    }
+  };
+  if (Notification.permission === "granted") show();
+  else if (Notification.permission !== "denied") void Notification.requestPermission().then((answer) => answer === "granted" && show());
+}
+
+function dismissGeorgiAsk(key: string): void {
+  georgiDismissed.add(key);
+  writeStored(GEORGI_DISMISSED_KEY, [...georgiDismissed].slice(-500));
+  georgiSidebarSignature = "";
+  scheduleGeorgiChrome();
+}
+
+/** Open a room and bring one message into view, briefly highlighted. */
+function revealGeorgiMessage(roomId: string, messageKey: string | null): void {
+  openGeorgiRoom(roomId, null);
+  if (!messageKey) return;
+  let tries = 0;
+  const find = () => {
+    const card = roomFeed.querySelector<HTMLElement>(`.room-readable-card[data-key="${CSS.escape(messageKey)}"]`);
+    if (card) {
+      releaseGeorgiFeedPin();
+      card.scrollIntoView({ block: "center" });
+      card.classList.remove("g-flash");
+      void card.offsetWidth;
+      card.classList.add("g-flash");
+      readableFeedFollow = false;
+    } else if (tries++ < 20) {
+      setTimeout(find, 100);
+    }
+  };
+  requestAnimationFrame(find);
+}
+
+function openGeorgiAsk(ask: Ask): void {
+  revealGeorgiMessage(ask.roomId, ask.messageId);
+}
+
+function replyGeorgiAsk(ask: Ask): void {
+  openGeorgiRoom(ask.roomId, null);
+  setGeorgiMode("send");
+  if (ask.senderId && Array.from(gRecipient.options).some((option) => option.value === ask.senderId)) {
+    gRecipient.value = ask.senderId;
+  }
+  syncGeorgiComposer();
+  focusWithinActiveWindow(roomMessage);
+}
+
+type GeorgiPage = { kind: "inbox" } | { kind: "project"; portfolio: string; project: string } | { kind: "portfolio"; name: string };
+let georgiPage: GeorgiPage = { kind: "inbox" };
+
+function georgiPageKey(): string {
+  return roomsView.dataset.gInbox === "open" ? JSON.stringify(georgiPage) : "";
+}
+
+function openGeorgiInbox(): void {
+  openGeorgiPage({ kind: "inbox" });
+}
+
+function renderGeorgiPage(): void {
+  if (georgiPage.kind === "inbox") renderGeorgiInbox();
+  else if (georgiPage.kind === "project") renderGeorgiProjectPage(georgiPage.portfolio, georgiPage.project);
+  else renderGeorgiPortfolioPage(georgiPage.name);
+}
+
+/** The Needs you inbox, a project overview or a portfolio overview: one
+    page host in the rooms view, in place of the room. */
+function openGeorgiPage(page: GeorgiPage): void {
+  georgiPage = page;
+  georgiPageSignature = "";
+  roomsView.dataset.gInbox = "open";
+  setShellView("rooms");
+  roomsOverviewCard.hidden = true;
+  roomCard.hidden = true;
+  georgiSidebarSignature = "";
+  scheduleGeorgiChrome();
+}
+
+function georgiEl<K extends keyof HTMLElementTagNameMap>(tag: K, className: string, text?: string): HTMLElementTagNameMap[K] {
+  const node = document.createElement(tag);
+  node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function georgiButton(className: string, text: string, onClick: () => void): HTMLButtonElement {
+  const node = georgiEl("button", className, text);
+  node.type = "button";
+  node.addEventListener("click", (event) => {
+    event.stopPropagation();
+    onClick();
+  });
+  return node;
+}
+
+const ASK_KIND_LABEL = { mention: "Asked you", question: "Question", decision: "Decision" } as const;
+
+function renderGeorgiInbox(): void {
+  roomsOverviewCard.hidden = true;
+  roomCard.hidden = true;
+  const now = new Date();
+  const head = georgiEl("header", "g-inbox-head");
+  const title = georgiEl("div", "g-inbox-title");
+  title.append(georgiEl("h1", "", "Needs you"), georgiEl("span", "g-inbox-sub",
+    georgiAsks.length === 0
+      ? "Nothing is waiting on you."
+      : `${georgiAsks.length} thing${georgiAsks.length === 1 ? "" : "s"} waiting on your answer${georgiUnseenAsks.length ? ` (${georgiUnseenAsks.length} new)` : ""}. Reply to the agent, or press Done when it's handled.`));
+  head.append(title);
+  const list = georgiEl("div", "g-inbox-list");
+  if (georgiAsks.length === 0) {
+    const empty = georgiEl("div", "g-inbox-empty");
+    empty.append(georgiEl("strong", "", "All clear."), georgiEl("span", "",
+      `When an agent starts a message with @${OPERATOR_HANDLE}, or posts a question or decision card, it shows up here and the room gets a yellow badge.`));
+    list.append(empty);
+  }
+  const groups = new Map<string, Ask[]>();
+  for (const ask of georgiAsks) {
+    const project = georgiGrouping.rooms[ask.roomId]?.project ?? roomSnapshots.find((r) => r.room_id === ask.roomId)?.label ?? "Room";
+    groups.set(project, [...(groups.get(project) ?? []), ask]);
+  }
+  for (const [project, asks] of groups) {
+    const group = georgiEl("section", "g-inbox-group");
+    group.append(georgiEl("h2", "g-inbox-group-name", project));
+    for (const ask of asks) {
+      const item = georgiEl("article", "g-inbox-item");
+      item.dataset.kind = ask.kind;
+      if (georgiSeen.has(ask.key)) item.dataset.seen = "true";
+      const sender = ask.senderId ? snapshotById.get(ask.senderId) : undefined;
+      const face = georgiAvatar({ driver: sender?.driver, status: "needs" }, "md", false);
+      const main = georgiEl("div", "g-inbox-main");
+      const meta = georgiEl("div", "g-inbox-meta");
+      meta.append(georgiEl("span", "g-inbox-kind", ASK_KIND_LABEL[ask.kind]), georgiEl("strong", "", ask.sender),
+        georgiEl("span", "g-inbox-where", `in ${georgiRoomPath(ask.roomId)}`), georgiEl("span", "g-inbox-time", readableTime(ask.timestamp, now)));
+      const text = georgiEl("p", "g-inbox-text");
+      appendInline(text, ask.text);
+      const actions = georgiEl("div", "g-inbox-actions");
+      actions.append(
+        georgiButton("g-btn g-btn-primary", ask.senderId ? `Reply to ${ask.sender}` : "Reply", () => replyGeorgiAsk(ask)),
+        georgiButton("g-btn g-btn-secondary", "Open in room", () => openGeorgiAsk(ask)),
+        georgiButton("g-btn g-btn-ghost", "Done", () => dismissGeorgiAsk(ask.key)),
+      );
+      main.append(meta, text, actions);
+      item.append(face, main);
+      item.addEventListener("click", () => openGeorgiAsk(ask));
+      group.append(item);
+    }
+    list.append(group);
+  }
+  gInbox.replaceChildren(head, list);
+}
+
+/* Your messages: what you sent or posted, newest first, with who has
+   answered — here or across every room. */
+const GEORGI_MINE_KEY = "prim1-georgi-mine";
+const georgiMineState = readStored<{ open: boolean; scope: "room" | "all" }>(GEORGI_MINE_KEY, { open: true, scope: "room" });
+let georgiMineSignature = "";
+
+interface GeorgiMineEntry {
+  roomId: string;
+  key: string;
+  text: string;
+  recipients: string[];
+  states: ReadableRecipientState[];
+  timestamp: string;
+  everyone: boolean;
+}
+
+function georgiMineEntries(): GeorgiMineEntry[] {
+  const rooms = georgiMineState.scope === "all" ? roomSnapshots : roomSnapshots.filter((room) => room.room_id === activeRoomId);
+  const entries: GeorgiMineEntry[] = [];
+  for (const room of rooms) {
+    const feed = readableRoomFeed(georgiEventsFor(room.room_id), readableMemberLabel, false);
+    for (const item of feed.items) {
+      if (item.kind !== "message" || item.author !== "you") continue;
+      entries.push({
+        roomId: room.room_id,
+        key: item.key,
+        text: splitAttachments(item.body).text,
+        recipients: item.recipients,
+        states: item.states,
+        timestamp: item.timestamp,
+        everyone: item.recipients.length === 0 || item.recipients.length === room.member_ids.length,
+      });
+    }
+  }
+  return entries.sort((a, b) => b.timestamp.localeCompare(a.timestamp)).slice(0, 40);
+}
+
+function setGeorgiMine(next: Partial<typeof georgiMineState>): void {
+  Object.assign(georgiMineState, next);
+  writeStored(GEORGI_MINE_KEY, georgiMineState);
+  georgiMineSignature = "";
+  renderGeorgiMine();
+}
+
+function renderGeorgiMine(): void {
+  const room = activeRoom();
+  roomContent.dataset.gMine = georgiMineState.open ? "open" : "closed";
+  const entries = room ? georgiMineEntries() : [];
+  const now = new Date();
+  const signature = JSON.stringify([georgiMineState, room?.room_id, entries.map((e) => [e.key, e.states.map((s) => s.state + s.detail), readableTime(e.timestamp, now)])]);
+  if (signature === georgiMineSignature) return;
+  georgiMineSignature = signature;
+  if (!georgiMineState.open) {
+    const tab = georgiButton("g-mine-tab", "", () => setGeorgiMine({ open: true }));
+    tab.title = "Show your messages";
+    tab.append(georgiEl("span", "g-mine-tab-arrow", "‹"), georgiEl("span", "g-mine-tab-text", `Your messages · ${entries.length}`));
+    gMine.replaceChildren(tab);
+    return;
+  }
+  const head = georgiEl("div", "g-mine-head");
+  head.append(georgiEl("span", "g-mine-title", "Your messages"), georgiEl("span", "g-mine-count", String(entries.length)),
+    georgiButton("g-mine-hide", "›", () => setGeorgiMine({ open: false })));
+  const scope = georgiEl("div", "g-mine-scope");
+  for (const [value, label] of [["room", "This room"], ["all", "All rooms"]] as const) {
+    const choice = georgiButton("g-mine-scope-btn", label, () => setGeorgiMine({ scope: value }));
+    choice.setAttribute("aria-pressed", String(georgiMineState.scope === value));
+    scope.append(choice);
+  }
+  const list = georgiEl("div", "g-mine-list");
+  if (entries.length === 0) {
+    list.append(georgiEl("span", "g-mine-empty", "Messages you send or post show up here, with who has replied."));
+  }
+  for (const entry of entries) {
+    const card = georgiEl("div", "g-mine-card");
+    if (georgiMineState.scope === "all") {
+      const path = georgiEl("span", "g-mine-path");
+      const roomLabel = roomSnapshots.find((r) => r.room_id === entry.roomId)?.label ?? "";
+      const tileNode = georgiEl("span", "g-room-tile g-mine-tile", roomInitials(georgiGrouping.rooms[entry.roomId]?.project ?? roomLabel));
+      tileNode.dataset.hue = String(roomHueSlot(entry.roomId));
+      path.append(tileNode, georgiEl("span", "g-ellipsis", georgiRoomPath(entry.roomId)));
+      card.append(path);
+    }
+    const meta = georgiEl("div", "g-mine-meta");
+    const post = entry.recipients.length === 0;
+    meta.dataset.mode = post ? "post" : "send";
+    meta.append(georgiEl("span", "g-mine-mark"),
+      georgiEl("span", "g-mine-mode", post ? "Posted to feed" : entry.everyone ? "Sent to all" : `Sent to ${entry.recipients.join(", ")}`),
+      georgiEl("span", "g-flex"), georgiEl("span", "g-mine-time", readableTime(entry.timestamp, now)));
+    const text = georgiEl("span", "g-mine-text", entry.text.replace(/^>\s?[^\n]*\n+/, ""));
+    card.append(meta, text);
+    if (entry.states.length) {
+      const states = georgiEl("div", "g-mine-states");
+      for (const state of entry.states) {
+        const chip = georgiEl("span", "g-mine-state");
+        chip.dataset.state = state.state.replace(/\s+/g, "-");
+        chip.title = state.title || `${state.recipient}: ${state.detail}`;
+        chip.append(georgiEl("span", "g-mine-state-who", roomInitials(state.recipient)),
+          georgiEl("span", "g-ellipsis", state.state === "acked" ? "ACK" : state.state === "declined" ? "declined" : state.detail));
+        states.append(chip);
+      }
+      card.append(states);
+    }
+    const actions = georgiEl("div", "g-mine-actions");
+    actions.append(
+      georgiButton("g-mine-action", "Reuse", () => {
+        if (entry.roomId !== activeRoomId) openGeorgiRoom(entry.roomId, null);
+        roomMessage.value = entry.text;
+        roomMessage.dispatchEvent(new Event("input", { bubbles: true }));
+        syncGeorgiComposer();
+        focusWithinActiveWindow(roomMessage);
+      }),
+      georgiButton("g-mine-action", entry.roomId === activeRoomId ? "Show in feed" : "Open room", () => revealGeorgiMessage(entry.roomId, entry.key)),
+    );
+    card.append(actions);
+    card.addEventListener("click", () => revealGeorgiMessage(entry.roomId, entry.key));
+    list.append(card);
+  }
+  gMine.replaceChildren(head, scope, list);
+}
+
+/** Post to feed reaches only a room's supervisors: say so when there is
+    none, with a one-click fix. */
+function renderGeorgiNoSupervisor(): void {
+  const room = activeRoom();
+  const members = room ? room.member_ids.map(georgiMemberOf) : [];
+  const agents = members.filter((m) => m.driver === "claude" || m.driver === "codex" || m.driver === "grok");
+  const missing = agents.length > 0 && !members.some((m) => m.supervisor);
+  const signature = missing ? agents.map((m) => m.id).join(",") : "";
+  if (gNoSup.dataset.sig === signature && gNoSup.hidden === !missing) return;
+  gNoSup.dataset.sig = signature;
+  gNoSup.hidden = !missing;
+  if (!missing) {
+    gNoSup.replaceChildren();
+    return;
+  }
+  const candidate = agents.find((m) => m.driver === "claude") ?? agents[0];
+  const make = georgiButton("g-btn g-btn-secondary g-nosup-btn", `♛ Make ${candidate.label} supervisor`, () => {
+    make.disabled = true;
+    void command<SessionSnapshot>("set_member_permissions", {
+      request: { session_id: candidate.id, roam: true, maintain: true, manage: true },
+    }).then(() => refreshSnapshot(tabState.activeId ?? undefined)).catch((error) => {
+      make.disabled = false;
+      setRoomStatus(`Could not make ${candidate.label} supervisor: ${String(error)}`, "error");
+    });
+  });
+  make.title = "Gives it all three grants (roam, maintain, manage) — the same as the Supervisor box";
+  gNoSup.replaceChildren(georgiEl("span", "g-nosup-mark", "i"),
+    georgiEl("span", "g-nosup-text", "No supervisor in this room. Post to feed reaches no one. Use Send now, or make an agent supervisor."), make);
+}
+
+/** @Georgi messages show "Done" while they are still open. */
+function markGeorgiAskCards(): void {
+  const open = new Set(georgiAsks.filter((ask) => ask.roomId === activeRoomId && ask.messageId).map((ask) => ask.messageId));
+  for (const card of roomFeed.querySelectorAll<HTMLElement>(".room-readable-card.g-for-you")) {
+    card.dataset.gAsk = open.has(card.dataset.key ?? "") ? "open" : "done";
+  }
+}
+
+/** Each room's latest feed event time, for chat-style ordering. */
+function georgiRoomActivity(): Map<string, string> {
+  const activity = new Map<string, string>();
+  for (const room of roomSnapshots) {
+    const events = georgiEventsFor(room.room_id);
+    for (let i = events.length - 1; i >= 0; i -= 1) {
+      const kind = events[i].item.kind;
+      if (kind === "message" || kind === "card" || kind === "ack") {
+        activity.set(room.room_id, events[i].timestamp);
+        break;
+      }
+    }
+  }
+  return activity;
+}
+
+/* Right-click on an agent anywhere (sidebar, room chips): the same
+   commands as its terminal tab and the room's member panel. */
+function georgiAgentMenu(event: MouseEvent, sessionId: string): void {
+  const session = snapshotById.get(sessionId);
+  if (!session) return;
+  const member = georgiMemberOf(sessionId);
+  const room = roomOfSession(sessionId);
+  const running = session.running;
+  const lifecycle = async (action: "stop" | "restart") => {
+    try {
+      const snapshot = await command<SessionSnapshot>(action === "stop" ? "stop_session" : "restart_session", {
+        request: { session_id: sessionId },
+      });
+      applyCommandSessionSnapshot(snapshot);
+    } catch (error) {
+      writeSystem("error", `${action} ${member.label} failed: ${String(error)}`);
+      setRoomStatus(`${action === "stop" ? "Stop" : "Restart"} ${member.label} failed: ${String(error)}`, "error");
+    }
+  };
+  const grants = async (on: boolean) => {
+    try {
+      await command<SessionSnapshot>("set_member_permissions", {
+        request: { session_id: sessionId, roam: on, maintain: on, manage: on },
+      });
+      await refreshSnapshot(tabState.activeId ?? undefined);
+    } catch (error) {
+      setRoomStatus(`Could not change ${member.label}: ${String(error)}`, "error");
+    }
+  };
+  const agent = session.driver === "claude" || session.driver === "codex" || session.driver === "grok";
+  showContextMenu(event.clientX, event.clientY, [
+    { label: "Open terminal", run: () => openGeorgiSession(sessionId) },
+    ...(room ? [{ label: `Chat with ${member.label}`, run: () => openGeorgiRoom(room.room_id, sessionId) }] : []),
+    "-",
+    running
+      ? { label: "Stop", run: () => void lifecycle("stop") }
+      : { label: "Launch", run: () => void launchSession(sessionId).catch((error) => writeSystem("error", `launch ${member.label} failed: ${String(error)}`)) },
+    { label: "Restart", disabled: !running, hint: "same conversation", run: () => void lifecycle("restart") },
+    ...(agent ? [{ label: "Compact", disabled: !running, hint: georgiContext.has(sessionId)
+      ? `${Math.round((georgiContext.get(sessionId)!.used_tokens / georgiContext.get(sessionId)!.window_tokens) * 100)}% used` : "free context",
+      run: () => void georgiCompact(sessionId) }] : []),
+    ...(agent ? ["-" as const, member.supervisor
+      ? { label: "Remove supervisor", run: () => void grants(false) }
+      : { label: "♛ Make supervisor", hint: "gets Post to feed", run: () => void grants(true) }] : []),
+    "-",
+    ...(room ? [{ label: `Remove from ${room.label}`, hint: "moves to Single sessions", run: () => void removeRoomMember(room.room_id, sessionId) }] : []),
+    { label: "Close session…", danger: true, run: () => void deleteSession(sessionId) },
+  ], `${member.label} · ${STATUS_TEXT[member.status]}`);
+}
+
+const STATUS_TEXT: Record<GeorgiMember["status"], string> = {
+  ready: "ready", busy: "working", needs: "needs you", error: "error", stopped: "stopped", starting: "starting",
+};
+
+/* ── Project and portfolio overview pages ── */
+
+let georgiPageSignature = "";
+
+function georgiProjectRooms(portfolio: string, project: string): RoomSnapshot[] {
+  return roomSnapshots.filter((room) => {
+    const place = georgiGrouping.rooms[room.room_id];
+    return place?.portfolio === portfolio && place.project === project;
+  });
+}
+
+function georgiLaunchRooms(rooms: RoomSnapshot[]): void {
+  for (const room of rooms) {
+    for (const id of room.member_ids) {
+      const session = snapshotById.get(id);
+      if (session && !session.running) void launchSession(id).catch((error) => writeSystem("error", `launch ${paneLabel(id)} failed: ${String(error)}`));
+    }
+  }
+}
+
+async function georgiStopRooms(rooms: RoomSnapshot[], what: string): Promise<void> {
+  const ids = rooms.flatMap((room) => room.member_ids).filter((id) => snapshotById.get(id)?.running);
+  if (ids.length === 0) return;
+  if (!(await confirmAction(`Stop all ${ids.length} running agent${ids.length === 1 ? "" : "s"} in ${what}? Their conversations are kept; Launch resumes them.`, "Stop all"))) return;
+  for (const id of ids) {
+    try {
+      applyCommandSessionSnapshot(await command<SessionSnapshot>("stop_session", { request: { session_id: id } }));
+    } catch (error) {
+      writeSystem("error", `stop ${paneLabel(id)} failed: ${String(error)}`);
+    }
+  }
+}
+
+function georgiAgentFaces(ids: string[]): HTMLElement {
+  const faces = georgiEl("div", "g-ov-faces");
+  for (const id of ids) {
+    const member = georgiMemberOf(id);
+    const face = georgiAvatar(member, "sm");
+    face.title = `${member.label} · ${STATUS_TEXT[member.status]}`;
+    faces.append(face);
+  }
+  return faces;
+}
+
+function renderGeorgiProjectPage(portfolio: string, project: string): void {
+  const rooms = georgiProjectRooms(portfolio, project);
+  const asks = georgiAsks.filter((ask) => rooms.some((room) => room.room_id === ask.roomId));
+  const now = new Date();
+  const signature = JSON.stringify(["project", portfolio, project, rooms.map((r) => [r.room_id, r.label, r.member_ids.map((id) => georgiMemberOf(id).status)]),
+    asks.map((a) => a.key), rooms.map((r) => georgiLastMessages[r.room_id] ?? ""), readableTime(new Date(now.getTime() - 60000).toISOString(), now)]);
+  if (signature === georgiPageSignature) return;
+  georgiPageSignature = signature;
+  const ids = rooms.flatMap((room) => room.member_ids);
+  const members = ids.map(georgiMemberOf);
+  const runningCount = members.filter((m) => m.status !== "stopped").length;
+  const lead = rooms.find((room) => georgiGrouping.rooms[room.room_id]?.type === "lead");
+  const folder = rooms.map((room) => roomFolder(room, snapshotById)).find(Boolean) ?? "";
+
+  const head = georgiEl("header", "g-ov-head");
+  const tileNode = georgiEl("span", "g-room-tile g-room-tile-lg", roomInitials(project));
+  tileNode.dataset.hue = String(roomHueSlot(project));
+  const title = georgiEl("div", "g-ov-title");
+  const crumbs = georgiButton("g-ov-crumb", `${portfolio} ›`, () => openGeorgiPage({ kind: "portfolio", name: portfolio }));
+  title.append(crumbs, georgiEl("h1", "", project), georgiEl("span", "g-ov-sub",
+    `${rooms.length} room${rooms.length === 1 ? "" : "s"} · ${ids.length} agent${ids.length === 1 ? "" : "s"} · ${runningCount ? `${runningCount} running` : "all stopped"}${folder ? ` · ${folder}` : ""}`));
+  const actions = georgiEl("div", "g-ov-actions");
+  actions.append(
+    georgiButton("g-btn g-btn-secondary", "+ New room", () => openGeorgiTemplate({ portfolio, project })),
+    georgiButton("g-btn g-btn-ghost", "Stop all", () => void georgiStopRooms(rooms, project)),
+    georgiButton("g-btn g-btn-primary", runningCount === ids.length && ids.length ? "All running" : "Launch project", () => georgiLaunchRooms(rooms)),
+  );
+  head.append(tileNode, title, actions);
+
+  const main = georgiEl("div", "g-ov-main");
+  if (lead) {
+    const leadCard = georgiEl("section", "g-ov-lead");
+    const leadSup = lead.member_ids.map(georgiMemberOf).find((m) => m.supervisor) ?? lead.member_ids.map(georgiMemberOf)[0];
+    const top = georgiEl("div", "g-ov-lead-top");
+    top.append(georgiEl("span", "g-lead-badge", "LEAD"), georgiEl("strong", "", leadSup?.label ?? lead.label),
+      georgiEl("span", "g-ov-muted", `watching ${Math.max(0, rooms.length - 1)} room${rooms.length - 1 === 1 ? "" : "s"} in ${project}`),
+      georgiEl("span", "g-flex"), georgiButton("g-btn g-btn-ghost", "Open lead room", () => openGeorgiRoom(lead.room_id, null)));
+    const last = georgiEl("p", "g-ov-lead-text");
+    appendInline(last, georgiLastMessages[lead.room_id] ?? "No summary yet. Ask the lead for a project status.");
+    leadCard.append(top, last);
+    main.append(leadCard);
+  }
+  const grid = georgiEl("div", "g-ov-grid");
+  for (const room of rooms) {
+    const place = georgiGrouping.rooms[room.room_id];
+    const type = place ? ROOM_TYPES[place.type] : ROOM_TYPES.custom;
+    const card = georgiEl("article", "g-ov-card");
+    const roomAsks = asks.filter((a) => a.roomId === room.room_id).length;
+    const cardHead = georgiEl("div", "g-ov-card-head");
+    cardHead.append(georgiEl("span", "g-pf-icon", type.icon), georgiEl("strong", "g-ellipsis", georgiRoomPath(room.room_id).split(" / ").pop() ?? room.label));
+    if (place?.type === "lead") cardHead.append(georgiEl("span", "g-lead-badge", "LEAD"));
+    cardHead.append(georgiEl("span", "g-flex"));
+    if (roomAsks) cardHead.append(georgiEl("span", "g-count", String(roomAsks)));
+    const roomMembers = room.member_ids.map(georgiMemberOf);
+    const summary = georgiEl("span", "g-ov-muted", roomMembers.length === 0 ? "no agents yet"
+      : `${roomMembers.length} agent${roomMembers.length === 1 ? "" : "s"} · ${roomMembers.filter((m) => m.status === "busy").length ? "working" : roomMembers.some((m) => m.status !== "stopped") ? "running" : "stopped"}`);
+    const lastLine = georgiEl("p", "g-ov-card-last", georgiLastMessages[room.room_id] ?? "No messages yet.");
+    const cardActions = georgiEl("div", "g-ov-card-actions");
+    cardActions.append(georgiButton("g-btn g-btn-secondary", "Open", () => openGeorgiRoom(room.room_id, null)));
+    if (roomMembers.some((m) => m.status === "stopped")) cardActions.append(georgiButton("g-btn g-btn-ghost", "Launch room", () => georgiLaunchRooms([room])));
+    card.append(cardHead, georgiAgentFaces(room.member_ids), summary, lastLine, cardActions);
+    card.addEventListener("click", () => openGeorgiRoom(room.room_id, null));
+    grid.append(card);
+  }
+  const add = georgiButton("g-ov-card g-ov-card-new", "+ New room from a template", () => openGeorgiTemplate({ portfolio, project }));
+  grid.append(add);
+  main.append(georgiEl("h2", "g-ov-h2", "Workstreams"), grid);
+
+  const side = georgiEl("aside", "g-ov-side");
+  const needs = georgiEl("section", "g-ov-box");
+  needs.append(georgiEl("h2", "g-ov-h2", `Needs you${asks.length ? ` · ${asks.length}` : ""}`));
+  if (asks.length === 0) needs.append(georgiEl("span", "g-ov-muted", "Nothing waiting on you in this project."));
+  for (const ask of asks) {
+    const row = georgiEl("button", "g-ov-ask");
+    row.type = "button";
+    row.append(georgiEl("strong", "", ask.sender), georgiEl("span", "", ask.text));
+    row.addEventListener("click", () => openGeorgiAsk(ask));
+    needs.append(row);
+  }
+  const decisions = georgiEl("section", "g-ov-box");
+  decisions.append(georgiEl("h2", "g-ov-h2", "Recent decisions and results"));
+  const cards = rooms.flatMap((room) => georgiEventsFor(room.room_id)
+    .filter((event) => event.item.kind === "card" && (event.item.card.kind === "decision" || event.item.card.kind === "result"))
+    .map((event) => ({ room, event })))
+    .sort((a, b) => b.event.timestamp.localeCompare(a.event.timestamp)).slice(0, 6);
+  if (cards.length === 0) decisions.append(georgiEl("span", "g-ov-muted", "Decision and result cards from this project's agents show here."));
+  for (const { room, event } of cards) {
+    if (event.item.kind !== "card") continue;
+    const row = georgiEl("div", "g-ov-decision");
+    row.append(georgiEl("span", "g-ov-muted", `${event.item.card.kind} · ${georgiRoomPath(room.room_id).split(" / ").pop()} · ${readableTime(event.timestamp, now)}`),
+      georgiEl("span", "", event.item.card.title));
+    decisions.append(row);
+  }
+  side.append(needs, decisions);
+  const body = georgiEl("div", "g-ov-body");
+  body.append(main, side);
+  gInbox.replaceChildren(head, body);
+}
+
+function renderGeorgiPortfolioPage(name: string): void {
+  const projects = new Map<string, RoomSnapshot[]>();
+  for (const room of roomSnapshots) {
+    const place = georgiGrouping.rooms[room.room_id];
+    if (place?.portfolio !== name) continue;
+    projects.set(place.project, [...(projects.get(place.project) ?? []), room]);
+  }
+  const signature = JSON.stringify(["portfolio", name, [...projects].map(([p, rooms]) => [p, rooms.map((r) => [r.room_id, r.member_ids.map((id) => georgiMemberOf(id).status)])]),
+    georgiAsks.map((a) => a.key)]);
+  if (signature === georgiPageSignature) return;
+  georgiPageSignature = signature;
+  const all = [...projects.values()].flat();
+  const ids = all.flatMap((room) => room.member_ids);
+  const running = ids.filter((id) => georgiMemberOf(id).status !== "stopped").length;
+  const needsTotal = georgiAsks.filter((ask) => all.some((room) => room.room_id === ask.roomId)).length;
+  const head = georgiEl("header", "g-ov-head");
+  const tileNode = georgiEl("span", "g-room-tile g-room-tile-lg", roomInitials(name));
+  tileNode.dataset.hue = String(roomHueSlot(name));
+  const title = georgiEl("div", "g-ov-title");
+  title.append(georgiEl("span", "g-ov-crumb-text", "Portfolio"), georgiEl("h1", "", name), georgiEl("span", "g-ov-sub",
+    `${projects.size} project${projects.size === 1 ? "" : "s"} · ${all.length} room${all.length === 1 ? "" : "s"} · ${ids.length} agents · ${running} running${needsTotal ? ` · ${needsTotal} need you` : ""}`));
+  const portfolioActions = georgiEl("div", "g-ov-actions");
+  portfolioActions.append(
+    georgiButton("g-btn g-btn-ghost", "Rename…", () => void askText("Rename portfolio", { initial: name }).then((next) => {
+      if (!next) return;
+      renamePortfolio(georgiGrouping, name, next);
+      georgiGroupingChanged();
+      openGeorgiPage({ kind: "portfolio", name: next });
+    })),
+    georgiButton("g-btn g-btn-primary", "+ Add project", () => georgiNewProject(name)),
+  );
+  head.append(tileNode, title, portfolioActions);
+  const grid = georgiEl("div", "g-ov-grid g-ov-grid-wide");
+  for (const [project, rooms] of [...projects].sort(([a], [b]) => a.localeCompare(b))) {
+    const members = rooms.flatMap((room) => room.member_ids).map(georgiMemberOf);
+    const asks = georgiAsks.filter((ask) => rooms.some((room) => room.room_id === ask.roomId)).length;
+    const lead = rooms.find((room) => georgiGrouping.rooms[room.room_id]?.type === "lead");
+    const card = georgiEl("article", "g-ov-card");
+    const cardHead = georgiEl("div", "g-ov-card-head");
+    const t = georgiEl("span", "g-room-tile g-pf-tile g-pf-tile-sm", roomInitials(project));
+    t.dataset.hue = String(roomHueSlot(project));
+    cardHead.append(t, georgiEl("strong", "g-ellipsis", project), georgiEl("span", "g-flex"));
+    if (asks) cardHead.append(georgiEl("span", "g-count", String(asks)));
+    const health = members.some((m) => m.status === "error") ? "error" : asks ? "needs you" : members.some((m) => m.status === "busy") ? "working"
+      : members.some((m) => m.status !== "stopped") ? "running" : "all stopped";
+    const sub = georgiEl("span", "g-ov-health", `${health} · ${members.length} agent${members.length === 1 ? "" : "s"}`);
+    sub.dataset.health = health.replace(/\s+/g, "-");
+    const roomList = georgiEl("div", "g-ov-rooms");
+    for (const room of rooms) {
+      const type = ROOM_TYPES[georgiGrouping.rooms[room.room_id]?.type ?? "custom"];
+      const chip = georgiButton("g-ov-room-chip", "", () => openGeorgiRoom(room.room_id, null));
+      chip.append(georgiEl("span", "g-pf-icon", type.icon), georgiEl("span", "", georgiRoomPath(room.room_id).split(" / ").pop() ?? room.label));
+      roomList.append(chip);
+    }
+    card.append(cardHead, sub, roomList);
+    if (lead) card.append(georgiEl("span", "g-ov-muted", `Lead: ${lead.member_ids.map(georgiMemberOf).find((m) => m.supervisor)?.label ?? lead.label}`));
+    card.addEventListener("click", () => openGeorgiPage({ kind: "project", portfolio: name, project }));
+    grid.append(card);
+  }
+  if (projects.size === 0) {
+    grid.append(georgiEl("div", "g-inbox-empty",
+      "No projects here yet. Use + Add project, or move an existing one in: right-click a project in the sidebar → Move to, or drag it onto this portfolio."));
+  }
+  gInbox.replaceChildren(head, grid);
+}
+
+/** "+ Add project": name it, then create its first room from a template. */
+function georgiNewProject(portfolio: string): void {
+  void askText(`New project in ${portfolio}`, {
+    placeholder: "e.g. ReelStudio",
+    action: "Next: first room",
+    note: "Next you choose its first room (Development, SEO, Marketing…) and its folder.",
+  }).then((project) => {
+    if (project) openGeorgiTemplate({ portfolio, project });
+  });
+}
+
+/* ── New room from a template ── */
+
+type TemplateKind = "dev" | "seo" | "mkt" | "legal" | "blank";
+const TEMPLATES: { kind: TemplateKind; name: string; icon: string; agents: DriverKind[]; note: string }[] = [
+  { kind: "dev", name: "Development", icon: "</>", agents: ["claude", "codex"], note: "Claude + Codex" },
+  { kind: "seo", name: "SEO", icon: "↗", agents: ["claude"], note: "1 Claude" },
+  { kind: "mkt", name: "Marketing", icon: "◎", agents: ["claude"], note: "1 Claude" },
+  { kind: "legal", name: "Legal", icon: "§", agents: ["claude"], note: "1 Claude" },
+  { kind: "blank", name: "Blank", icon: "+", agents: [], note: "No agents" },
+];
+
+function openGeorgiTemplate(target: { portfolio: string; project: string } | null): void {
+  document.querySelector(".g-modal-back")?.remove();
+  const back = georgiEl("div", "g-modal-back");
+  const modal = georgiEl("form", "g-modal");
+  back.append(modal);
+  const close = () => back.remove();
+  back.addEventListener("mousedown", (event) => {
+    if (event.target === back) close();
+  });
+  modal.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") close();
+  });
+  let kind: TemplateKind = "dev";
+  const projectRooms = target ? georgiProjectRooms(target.portfolio, target.project) : [];
+  const source = projectRooms.flatMap((room) => room.member_ids).map((id) => snapshotById.get(id))
+    .find((session) => session && (session.driver === "claude" || session.driver === "codex"));
+  // The new room's brief: copied from a room that already carries your
+  // formatting and @Georgi rules, this project's first.
+  const briefFrom = [...projectRooms, ...roomSnapshots.filter((room) => !projectRooms.includes(room))].map((room) => room.room_id);
+
+  const head = georgiEl("div", "g-modal-head");
+  head.append(georgiEl("h2", "", target ? `New room in ${target.project}` : "New room"), georgiButton("g-mine-hide", "×", close));
+  const portfolioInput = georgiEl("input", "g-org-input");
+  portfolioInput.value = target?.portfolio ?? "";
+  portfolioInput.placeholder = "Portfolio (e.g. Apps)";
+  const projectInput = georgiEl("input", "g-org-input");
+  projectInput.value = target?.project ?? "";
+  projectInput.placeholder = "Project (e.g. ReelStudio)";
+  const where = georgiEl("div", "g-modal-row");
+  where.append(portfolioInput, projectInput);
+  where.hidden = target !== null;
+
+  const types = georgiEl("div", "g-tpl-types");
+  const nameInput = georgiEl("input", "g-org-input");
+  const agentsBox = georgiEl("div", "g-tpl-agents");
+  const agentNames: HTMLInputElement[] = [];
+  const supervisorBoxes: HTMLInputElement[] = [];
+  const projectName = () => projectInput.value.trim() || "Project";
+  const repaint = () => {
+    for (const button of types.querySelectorAll<HTMLElement>("[data-kind]")) button.setAttribute("aria-pressed", String(button.dataset.kind === kind));
+    const template = TEMPLATES.find((t) => t.kind === kind)!;
+    const hasDev = projectRooms.some((room) => georgiGrouping.rooms[room.room_id]?.type === "dev");
+    nameInput.value = kind === "dev" && !hasDev ? projectName() : `${projectName()} ${kind === "blank" ? "" : template.name}`.trim();
+    agentsBox.replaceChildren();
+    agentNames.length = 0;
+    supervisorBoxes.length = 0;
+    if (template.agents.length === 0) agentsBox.append(georgiEl("span", "g-ov-muted", "An empty room. Add agents later with + Add member."));
+    template.agents.forEach((driver, index) => {
+      const row = georgiEl("label", "g-tpl-agent");
+      const face = georgiAvatar({ driver, status: "stopped" }, "sm", false);
+      const input = georgiEl("input", "g-org-input");
+      const suffix = kind === "dev" ? "" : `-${template.name.replace(/\s+/g, "")}`;
+      input.value = `${driver === "claude" ? "Claude" : "Codex"}-${projectName().replace(/\s+/g, "")}${suffix}`;
+      const sup = georgiEl("input", "");
+      sup.type = "checkbox";
+      sup.checked = index === 0;
+      const supLabel = georgiEl("span", "g-tpl-sup");
+      supLabel.append(sup, document.createTextNode(" ♛ Supervisor"));
+      row.append(face, input, supLabel);
+      agentNames.push(input);
+      supervisorBoxes.push(sup);
+      agentsBox.append(row);
+    });
+  };
+  for (const template of TEMPLATES) {
+    const button = georgiButton("g-tpl-type", "", () => {
+      kind = template.kind;
+      repaint();
+    });
+    button.dataset.kind = template.kind;
+    button.append(georgiEl("span", "g-pf-icon", template.icon), georgiEl("strong", "", template.name), georgiEl("span", "g-ov-muted", template.note));
+    types.append(button);
+  }
+  projectInput.addEventListener("change", repaint);
+
+  const folder = georgiEl("p", "g-tpl-folder");
+  folder.textContent = source
+    ? `Folder: ${source.working_dir} (the same as ${source.label}).`
+    : "Folder: you pick it right after Create (one Windows folder dialog); every agent here gets it.";
+  const bypass = georgiEl("input", "");
+  bypass.type = "checkbox";
+  bypass.checked = true;
+  const launch = georgiEl("input", "");
+  launch.type = "checkbox";
+  const options = georgiEl("div", "g-tpl-options");
+  const bypassLabel = georgiEl("label", "");
+  bypassLabel.append(bypass, document.createTextNode(" Bypass approvals (Unsafe profile, like your other agents)"));
+  const launchLabel = georgiEl("label", "");
+  launchLabel.append(launch, document.createTextNode(" Launch now (otherwise the agents wait, stopped)"));
+  options.append(bypassLabel, launchLabel);
+  const error = georgiEl("p", "g-tpl-error");
+  error.hidden = true;
+  const footer = georgiEl("div", "g-org-actions");
+  const create = georgiEl("button", "g-btn g-btn-primary", "Create room");
+  create.type = "submit";
+  footer.append(georgiButton("g-btn g-btn-ghost", "Cancel", close), georgiEl("span", "g-flex"), create);
+  const nameField = georgiEl("label", "g-org-field");
+  nameField.append(georgiEl("span", "", "Room name"), nameInput);
+  modal.append(head, where, georgiEl("span", "g-org-field", "Type"), types, nameField,
+    georgiEl("span", "g-org-field", "Agents"), agentsBox, folder, options, error, footer);
+  modal.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const portfolio = portfolioInput.value.trim() || target?.portfolio || "Projects";
+    const project = projectInput.value.trim();
+    if (!project) {
+      focusWithinActiveWindow(projectInput);
+      return;
+    }
+    create.disabled = true;
+    error.hidden = true;
+    const template = TEMPLATES.find((t) => t.kind === kind)!;
+    void createGeorgiTemplateRoom({
+      portfolio,
+      project,
+      kind,
+      label: nameInput.value.trim() || `${project} ${template.name}`,
+      agents: template.agents.map((driver, i) => ({ driver, label: agentNames[i].value.trim() || `${driver}-${project}`, supervisor: supervisorBoxes[i].checked })),
+      unsafe: bypass.checked,
+      launch: launch.checked,
+      briefFrom,
+      sourceSessionId: source?.session_id ?? null,
+    }).then(close).catch((reason) => {
+      create.disabled = false;
+      error.textContent = String(reason);
+      error.hidden = false;
+    });
+  });
+  document.body.append(back);
+  repaint();
+  focusWithinActiveWindow(target ? nameInput : projectInput);
+}
+
+async function createGeorgiTemplateRoom(plan: {
+  portfolio: string;
+  project: string;
+  kind: TemplateKind;
+  label: string;
+  agents: { driver: DriverKind; label: string; supervisor: boolean }[];
+  unsafe: boolean;
+  launch: boolean;
+  briefFrom: string[];
+  sourceSessionId: string | null;
+}): Promise<void> {
+  let brief: string | null = null;
+  for (const roomId of plan.briefFrom.slice(0, 20)) {
+    try {
+      const settings = await command<RoomBriefSettings>("read_room_brief", { request: { room_id: roomId } });
+      if (settings.brief_template?.includes("Formatting:")) {
+        // Keep the shared rules; leave out another room's own "Current task".
+        brief = settings.brief_template.split("\n\nCurrent task:")[0];
+        break;
+      }
+    } catch {
+      /* try the next room */
+    }
+  }
+  const room = await command<RoomSnapshot>("create_room", {
+    request: { label: plan.label, member_ids: [], brief_on_join: true, brief_template: brief } satisfies CreateRoomRequest,
+  });
+  georgiGrouping.rooms[room.room_id] = { portfolio: plan.portfolio, project: plan.project, type: plan.kind === "blank" ? "custom" : plan.kind };
+  georgiKnownRooms?.add(room.room_id);
+  saveGrouping(georgiGrouping);
+  const created: string[] = [];
+  for (const agent of plan.agents) {
+    const session = await command<SessionSnapshot>("create_session", {
+      request: {
+        label: agent.label,
+        driver: agent.driver,
+        permission_profile: plan.unsafe ? "unsafe" : "normal",
+        room_id: room.room_id,
+        ...(agent.supervisor ? { permissions: { roam: true, maintain: true, manage: true } } : {}),
+      },
+    });
+    created.push(session.session_id);
+  }
+  // A folder only enters PRIM-1 through the Windows folder dialog: copy it
+  // from an agent already in the project, or ask once for the first agent.
+  let from = plan.sourceSessionId;
+  if (!from && created.length) {
+    const chosen = await command<SessionSnapshot | null>("choose_session_working_directory", {
+      request: { session_id: created[0] } satisfies ChooseSessionWorkingDirectoryRequest,
+    });
+    if (chosen) from = created[0];
+  }
+  if (from) {
+    for (const id of created) {
+      if (id === from) continue;
+      await command<SessionSnapshot>("georgi_copy_session_folder", { fromSessionId: from, toSessionId: id });
+    }
+  }
+  await refreshSnapshot(tabState.activeId ?? undefined);
+  if (plan.launch) for (const id of created) void launchSession(id).catch((error) => writeSystem("error", `launch ${paneLabel(id)} failed: ${String(error)}`));
+  georgiGroupingChanged();
+  openGeorgiRoom(room.room_id, null);
+}
+
+/* ── Apply a prepared layout ──
+   A georgi-layout.json in PRIM-1's data folder lists portfolios, room files
+   to load (each with its agents and folders) and where existing rooms go.
+   Nothing happens until you press Apply; loading uses PRIM-1's own Load
+   room, so every agent arrives stopped. */
+
+interface GeorgiLayoutPlace { portfolio: string; project: string; type: RoomType }
+interface GeorgiLayout {
+  version: 1;
+  title?: string;
+  portfolios?: string[];
+  load?: (GeorgiLayoutPlace & { file: string; label: string })[];
+  existing?: (GeorgiLayoutPlace & { label: string })[];
+  /** Make the Claude in each listed room its supervisor. */
+  claudeSupervisors?: boolean;
+}
+
+let georgiLayoutChecked = false;
+
+function maybeOfferGeorgiLayout(): void {
+  if (georgiLayoutChecked || snapshotById.size === 0 && roomSnapshots.length === 0) return;
+  georgiLayoutChecked = true;
+  void command<string | null>("georgi_take_layout").then((text) => {
+    if (!text) return;
+    let layout: GeorgiLayout;
+    try {
+      layout = JSON.parse(text) as GeorgiLayout;
+      if (layout.version !== 1) throw new Error(`unknown layout version ${String(layout.version)}`);
+    } catch (error) {
+      writeSystem("warn", `Georgi layout ignored: ${String(error)}`);
+      return;
+    }
+    openGeorgiLayoutDialog(layout);
+  }).catch((error) => writeSystem("warn", `Georgi layout: ${String(error)}`));
+}
+
+function openGeorgiLayoutDialog(layout: GeorgiLayout): void {
+  document.querySelector(".g-modal-back")?.remove();
+  const back = georgiEl("div", "g-modal-back");
+  const modal = georgiEl("div", "g-modal g-layout");
+  back.append(modal);
+  const load = layout.load ?? [];
+  const existing = layout.existing ?? [];
+  const labels = new Set(roomSnapshots.map((room) => room.label));
+  const toLoad = load.filter((item) => !labels.has(item.label));
+  const head = georgiEl("div", "g-modal-head");
+  head.append(georgiEl("h2", "", layout.title ?? "Apply a prepared layout"));
+  const summary = georgiEl("div", "g-layout-summary");
+  const byPortfolio = new Map<string, string[]>();
+  for (const item of [...load, ...existing]) {
+    const name = item.project || "Supervisor";
+    const list = byPortfolio.get(item.portfolio) ?? [];
+    if (!list.includes(name)) list.push(name);
+    byPortfolio.set(item.portfolio, list);
+  }
+  for (const [portfolio, projects] of byPortfolio) {
+    const row = georgiEl("div", "g-layout-row");
+    row.append(georgiEl("strong", "", portfolio), georgiEl("span", "g-ov-muted", projects.join(" · ")));
+    summary.append(row);
+  }
+  const agents = toLoad.length * 2;
+  const note = georgiEl("p", "g-tpl-folder",
+    `Loads ${toLoad.length} new room${toLoad.length === 1 ? "" : "s"} (about ${agents} agents, all stopped, bypass approvals) and places ${existing.length} existing room${existing.length === 1 ? "" : "s"}. `
+    + (layout.claudeSupervisors ? "Each room's Claude becomes its ♛ supervisor. " : "")
+    + "Nothing is deleted; nothing starts.");
+  const progress = georgiEl("p", "g-layout-progress");
+  const actions = georgiEl("div", "g-org-actions");
+  const later = georgiButton("g-btn g-btn-ghost", "Not now", () => back.remove());
+  const never = georgiButton("g-btn g-btn-ghost", "Discard", () => {
+    void command("georgi_finish_layout", { outcome: "declined" }).finally(() => back.remove());
+  });
+  const apply = georgiButton("g-btn g-btn-primary", "Apply layout", () => {
+    apply.disabled = true;
+    later.disabled = true;
+    never.disabled = true;
+    void applyGeorgiLayout(layout, (text) => (progress.textContent = text)).then((problems) => {
+      progress.textContent = problems.length
+        ? `Done, with ${problems.length} problem${problems.length === 1 ? "" : "s"}: ${problems.join(" · ")}`
+        : "Done. Every room is in place.";
+      actions.replaceChildren(georgiEl("span", "g-flex"), georgiButton("g-btn g-btn-primary", "Close", () => back.remove()));
+    });
+  });
+  actions.append(never, georgiEl("span", "g-flex"), later, apply);
+  modal.append(head, summary, note, progress, actions);
+  document.body.append(back);
+}
+
+async function applyGeorgiLayout(layout: GeorgiLayout, say: (text: string) => void): Promise<string[]> {
+  const problems: string[] = [];
+  const touched = new Set<string>();
+  for (const name of layout.portfolios ?? []) addPortfolio(georgiGrouping, name);
+  const place = (roomId: string, item: GeorgiLayoutPlace) => {
+    georgiGrouping.rooms[roomId] = { portfolio: item.portfolio, project: item.project, type: item.type };
+    georgiGrouping.loose = georgiGrouping.loose.filter((id) => id !== roomId);
+    georgiKnownRooms?.add(roomId);
+    touched.add(roomId);
+  };
+  const load = layout.load ?? [];
+  for (const [index, item] of load.entries()) {
+    const already = roomSnapshots.find((room) => room.label === item.label);
+    if (already) {
+      place(already.room_id, item);
+      continue;
+    }
+    say(`Loading ${index + 1} of ${load.length}: ${item.label}…`);
+    try {
+      const report = await command<RoomImportReport>("import_room", { path: item.file, sourceRoomId: null });
+      place(report.room.room_id, item);
+      for (const warning of report.warnings) writeSystem("info", `Load ${item.label}: ${warning}`);
+    } catch (error) {
+      problems.push(`${item.label}: ${String(error)}`);
+    }
+  }
+  await refreshSnapshot(tabState.activeId ?? undefined);
+  for (const item of layout.existing ?? []) {
+    const room = roomSnapshots.find((candidate) => candidate.label === item.label);
+    if (room) place(room.room_id, item);
+    else problems.push(`no room named "${item.label}"`);
+  }
+  georgiGrouping.portfolio = ALL_PORTFOLIOS;
+  saveGrouping(georgiGrouping);
+  if (layout.claudeSupervisors) {
+    say("Making each room's Claude its supervisor…");
+    for (const room of roomSnapshots.filter((candidate) => touched.has(candidate.room_id))) {
+      const members = room.member_ids.map(georgiMemberOf);
+      if (members.some((m) => m.supervisor)) continue;
+      const claude = members.find((m) => m.driver === "claude");
+      if (!claude) continue;
+      try {
+        await command<SessionSnapshot>("set_member_permissions", {
+          request: { session_id: claude.id, roam: true, maintain: true, manage: true },
+        });
+      } catch (error) {
+        problems.push(`${claude.label} supervisor: ${String(error)}`);
+      }
+    }
+    await refreshSnapshot(tabState.activeId ?? undefined);
+  }
+  await command("georgi_finish_layout", { outcome: problems.length ? "partial" : "applied" }).catch((error) => {
+    problems.push(`could not set the layout file aside: ${String(error)}`);
+  });
+  georgiGroupingChanged();
+  return problems;
+}
+
+/* ── + Add member: one pop-up for a new agent, a single session, or an
+   outside agent ── */
+
+function openGeorgiAddMember(): void {
+  const room = activeRoom();
+  if (!room) return;
+  document.querySelector(".g-modal-back")?.remove();
+  const back = georgiEl("div", "g-modal-back");
+  const modal = georgiEl("form", "g-modal g-addm");
+  back.append(modal);
+  const close = () => back.remove();
+  back.addEventListener("mousedown", (event) => {
+    if (event.target === back) close();
+  });
+  modal.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") close();
+  });
+  const place = georgiGrouping.rooms[room.room_id];
+  const project = (place?.project ?? room.label).replace(/\s+/g, "");
+  const members = room.member_ids.map(georgiMemberOf);
+  const hasSupervisor = members.some((m) => m.supervisor);
+  const projectIds = place ? georgiProjectRooms(place.portfolio, place.project).flatMap((r) => r.member_ids) : [];
+  const source = [...room.member_ids, ...projectIds].map((id) => snapshotById.get(id))
+    .find((session) => session && (session.driver === "claude" || session.driver === "codex"));
+  const taken = new Set(members.map((m) => m.label.toLowerCase()));
+  const freeName = (base: string) => {
+    if (!taken.has(base.toLowerCase())) return base;
+    for (let n = 2; ; n += 1) if (!taken.has(`${base}-${n}`.toLowerCase())) return `${base}-${n}`;
+  };
+
+  const head = georgiEl("div", "g-modal-head");
+  head.append(georgiEl("h2", "", `Add to ${room.label}`), georgiButton("g-mine-hide", "×", close));
+
+  // 1. A new agent.
+  const fresh = georgiEl("section", "g-addm-section");
+  fresh.append(georgiEl("h3", "g-addm-title", "New agent"), georgiEl("p", "g-addm-sub", "Created in this room, ready to work in the project's folder."));
+  let driver: DriverKind = "claude";
+  const drivers = georgiEl("div", "g-addm-drivers");
+  const nameInput = georgiEl("input", "g-org-input");
+  const paintDriver = () => {
+    for (const button of drivers.querySelectorAll<HTMLElement>("[data-driver]")) button.setAttribute("aria-pressed", String(button.dataset.driver === driver));
+    nameInput.value = freeName(`${driver === "claude" ? "Claude" : "Codex"}-${project}`);
+  };
+  for (const [value, label, note] of [["claude", "Claude", "Claude Code"], ["codex", "Codex", "OpenAI Codex"]] as const) {
+    const button = georgiButton("g-tpl-type g-addm-driver", "", () => {
+      driver = value;
+      paintDriver();
+    });
+    button.dataset.driver = value;
+    button.append(georgiAvatar({ driver: value, status: "stopped" }, "md", false), georgiEl("strong", "", label), georgiEl("span", "g-ov-muted", note));
+    drivers.append(button);
+  }
+  const nameField = georgiEl("label", "g-org-field");
+  nameField.append(georgiEl("span", "", "Name"), nameInput);
+  const check = (text: string, on: boolean) => {
+    const box = georgiEl("input", "");
+    box.type = "checkbox";
+    box.checked = on;
+    const label = georgiEl("label", "");
+    label.append(box, document.createTextNode(` ${text}`));
+    return { box, label };
+  };
+  const sup = check("♛ Supervisor (receives Post to feed)", !hasSupervisor);
+  const bypass = check("Bypass approvals (Unsafe profile)", true);
+  const launch = check("Launch now", true);
+  const options = georgiEl("div", "g-tpl-options");
+  options.append(sup.label, bypass.label, launch.label);
+  const folder = georgiEl("p", "g-tpl-folder", source
+    ? `Folder: ${source.working_dir} (the same as ${source.label}).`
+    : "Folder: you pick it right after Create (one Windows folder dialog).");
+  const error = georgiEl("p", "g-tpl-error");
+  error.hidden = true;
+  const create = georgiEl("button", "g-btn g-btn-primary", "Create and add");
+  create.type = "submit";
+  const createRow = georgiEl("div", "g-org-actions");
+  createRow.append(georgiEl("span", "g-flex"), create);
+  fresh.append(drivers, nameField, options, folder, error, createRow);
+  modal.addEventListener("submit", (event) => {
+    event.preventDefault();
+    create.disabled = true;
+    error.hidden = true;
+    void (async () => {
+      const session = await command<SessionSnapshot>("create_session", {
+        request: {
+          label: nameInput.value.trim() || freeName(driver === "claude" ? "Claude" : "Codex"),
+          driver,
+          permission_profile: bypass.box.checked ? "unsafe" : "normal",
+          room_id: room.room_id,
+          ...(sup.box.checked ? { permissions: { roam: true, maintain: true, manage: true } } : {}),
+        },
+      });
+      if (source) {
+        await command<SessionSnapshot>("georgi_copy_session_folder", { fromSessionId: source.session_id, toSessionId: session.session_id });
+      } else {
+        await command<SessionSnapshot | null>("choose_session_working_directory", {
+          request: { session_id: session.session_id } satisfies ChooseSessionWorkingDirectoryRequest,
+        });
+      }
+      await refreshSnapshot(tabState.activeId ?? undefined);
+      if (launch.box.checked) await launchSession(session.session_id).catch((reason) => writeSystem("error", `launch failed: ${String(reason)}`));
+    })().then(close).catch((reason) => {
+      create.disabled = false;
+      error.textContent = String(reason);
+      error.hidden = false;
+    });
+  });
+
+  // 2. A session outside every room.
+  const inRoom = new Set(roomSnapshots.flatMap((r) => r.member_ids));
+  const loose = [...snapshotById.values()].filter((session) => !inRoom.has(session.session_id));
+  const existing = georgiEl("section", "g-addm-section");
+  existing.append(georgiEl("h3", "g-addm-title", "Add a single session"),
+    georgiEl("p", "g-addm-sub", "Sessions that are not in any room. It keeps its conversation and folder."));
+  const list = georgiEl("div", "g-addm-list");
+  if (loose.length === 0) list.append(georgiEl("span", "g-ov-muted", "None right now. To move an agent from another room, right-click it there → Remove from room first."));
+  for (const session of loose) {
+    const member = georgiMemberOf(session.session_id);
+    const row = georgiEl("div", "g-addm-row");
+    const text = georgiEl("div", "g-addm-row-text");
+    text.append(georgiEl("strong", "g-ellipsis", member.label), georgiEl("span", "g-ov-muted g-ellipsis", `${STATUS_TEXT[member.status]} · ${session.working_dir}`));
+    const add = georgiButton("g-btn g-btn-secondary", "Add", () => {
+      add.disabled = true;
+      void command<RoomSnapshot>("add_room_member", {
+        request: { room_id: room.room_id, session_id: session.session_id } satisfies AddRoomMemberRequest,
+      }).then(() => refreshSnapshot(tabState.activeId ?? undefined)).then(close).catch((reason) => {
+        add.disabled = false;
+        error.textContent = `Add failed: ${String(reason)}`;
+        error.hidden = false;
+      });
+    });
+    row.append(georgiAvatar(member, "md"), text, add);
+    list.append(row);
+  }
+  existing.append(list);
+
+  // 3. An agent outside PRIM-1.
+  const outside = georgiEl("section", "g-addm-section g-addm-outside");
+  const outsideText = georgiEl("div", "g-addm-row-text");
+  outsideText.append(georgiEl("h3", "g-addm-title", "Outside agent"),
+    georgiEl("span", "g-addm-sub", "An AI app on this PC (Claude Desktop, ChatGPT, Cursor…) that reads and posts here as a guest."));
+  outside.append(outsideText, georgiButton("g-btn g-btn-secondary", "Invite…", () => {
+    close();
+    must<HTMLButtonElement>("#room-invite-guest").click();
+  }));
+
+  modal.append(head, fresh, existing, outside);
+  document.body.append(back);
+  paintDriver();
+  focusWithinActiveWindow(nameInput);
+}
+
+/* ── Context gauge: how full each agent's context is, next to "to …" ── */
+
+interface ContextUsage { session_id: string; used_tokens: number; window_tokens: number; exact: boolean; model: string | null }
+const georgiContext = new Map<string, ContextUsage>();
+let georgiContextTimer: number | null = null;
+let georgiContextBusy = false;
+
+function georgiContextLoop(): void {
+  if (georgiContextTimer !== null) return;
+  const tick = () => {
+    georgiContextTimer = window.setTimeout(tick, 5000);
+    if (georgiContextBusy || !georgiActive() || document.visibilityState !== "visible") return;
+    if (!(shellView === "rooms" && roomsViewMode === "panel")) return;
+    const ids = activeRoom()?.member_ids ?? [];
+    if (ids.length === 0) return;
+    georgiContextBusy = true;
+    void command<ContextUsage[]>("georgi_context_usage", { sessionIds: ids }).then((list) => {
+      for (const usage of list) georgiContext.set(usage.session_id, usage);
+      renderGeorgiContextGauges();
+    }).catch(() => undefined).finally(() => {
+      georgiContextBusy = false;
+    });
+  };
+  tick();
+}
+
+const formatTokens = (n: number) => (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(n % 1_000_000 ? 1 : 0)}M` : n >= 1000 ? `${Math.round(n / 1000)}k` : String(n));
+
+function contextRing(percent: number, size = 18): SVGSVGElement {
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", "0 0 20 20");
+  svg.setAttribute("width", String(size));
+  svg.setAttribute("height", String(size));
+  svg.classList.add("g-ctx-ring");
+  svg.dataset.level = percent >= 85 ? "high" : percent >= 70 ? "warn" : "ok";
+  const track = document.createElementNS(ns, "circle");
+  track.setAttribute("cx", "10"); track.setAttribute("cy", "10"); track.setAttribute("r", "8");
+  track.classList.add("g-ctx-track");
+  const arc = document.createElementNS(ns, "circle");
+  arc.setAttribute("cx", "10"); arc.setAttribute("cy", "10"); arc.setAttribute("r", "8");
+  arc.classList.add("g-ctx-arc");
+  const circumference = 2 * Math.PI * 8;
+  arc.setAttribute("stroke-dasharray", `${(Math.min(100, percent) / 100) * circumference} ${circumference}`);
+  svg.append(track, arc);
+  return svg;
+}
+
+function georgiContextTitle(label: string, usage: ContextUsage): string {
+  const percent = Math.round((usage.used_tokens / usage.window_tokens) * 100);
+  return `${label}: ${formatTokens(usage.used_tokens)} of ${usage.exact ? "" : "~"}${formatTokens(usage.window_tokens)} tokens · ${percent}% used`
+    + `${usage.exact ? "" : " (window estimated)"}\nCompact summarises the conversation so far and frees space; the room feed keeps the full history.`;
+}
+
+/** Type /compact into an agent's terminal: Claude Code and Codex both
+    summarise their conversation and free context. */
+async function georgiCompact(sessionId: string): Promise<void> {
+  const session = snapshotById.get(sessionId);
+  if (!session?.running) {
+    setRoomStatus(`${paneLabel(sessionId)} is not running; launch it first to compact.`, "warn");
+    return;
+  }
+  if (!(await confirmAction(`Compact ${paneLabel(sessionId)}? It summarises its conversation so far to free context. If it is in the middle of a task, it compacts when the task step finishes.`, "Compact"))) return;
+  try {
+    await command<void>("send_input", { request: { session_id: sessionId, input: "/compact" } satisfies SendInputRequest });
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    await command<void>("send_input", { request: { session_id: sessionId, input: "\r" } satisfies SendInputRequest });
+    setRoomStatus(`Sent /compact to ${paneLabel(sessionId)}.`, "info");
+  } catch (error) {
+    setRoomStatus(`Compact ${paneLabel(sessionId)} failed: ${String(error)}`, "error");
+  }
+}
+
+function renderGeorgiContextGauges(): void {
+  const room = activeRoom();
+  if (!room || !georgiActive()) {
+    gCtxGauges.replaceChildren();
+    return;
+  }
+  const one = gRecipient.value && gRecipient.value !== "all" ? gRecipient.value : null;
+  const ids = one ? [one] : room.member_ids;
+  const parts: HTMLElement[] = [];
+  for (const id of ids) {
+    const usage = georgiContext.get(id);
+    if (!usage || usage.window_tokens <= 0) continue;
+    const percent = Math.round((usage.used_tokens / usage.window_tokens) * 100);
+    const label = paneLabel(id);
+    const gauge = document.createElement("button");
+    gauge.type = "button";
+    gauge.className = "g-ctx-gauge";
+    gauge.title = georgiContextTitle(label, usage);
+    gauge.append(contextRing(percent));
+    if (one) {
+      gauge.append(georgiEl("span", "g-ctx-text", `${usage.exact ? "" : "~"}${percent}% used`));
+      gauge.addEventListener("click", () => void georgiCompact(id));
+      gauge.title += "\nClick to compact.";
+      parts.push(gauge);
+      const compact = georgiButton("g-ctx-compact", "Compact", () => void georgiCompact(id));
+      compact.dataset.level = percent >= 85 ? "high" : percent >= 70 ? "warn" : "ok";
+      compact.title = `Type /compact into ${label}'s terminal`;
+      parts.push(compact);
+    } else {
+      gauge.append(georgiEl("span", "g-ctx-who", roomInitials(label)));
+      gauge.addEventListener("click", () => {
+        gRecipient.value = id;
+        gRecipient.dispatchEvent(new Event("change"));
+      });
+      gauge.title += "\nClick to message this agent.";
+      parts.push(gauge);
+    }
+  }
+  gCtxGauges.replaceChildren(...parts);
+}
+
 function setGeorgiRoomTools(open: boolean): void {
   roomCard.dataset.gTools = open ? "open" : "closed";
   gRoomTools.setAttribute("aria-expanded", String(open));
 }
 
+/* Each room remembers who you last chose to send to ("to Claude First"),
+   so coming back to the room keeps that choice instead of "all". */
+const GEORGI_RECIPIENT_KEY = "prim1-georgi-recipients";
+const georgiRecipientByRoom: Record<string, string> = readStored(GEORGI_RECIPIENT_KEY, {});
+let georgiRecipientRoom: string | null = null;
+
+function rememberGeorgiRecipient(): void {
+  const roomId = activeRoomId;
+  if (!roomId || !gRecipient.value) return;
+  georgiRecipientByRoom[roomId] = gRecipient.value;
+  writeStored(GEORGI_RECIPIENT_KEY, georgiRecipientByRoom);
+}
+
 function syncGeorgiRecipients(): void {
-  const previous = gRecipient.value || roomRecipient.value;
+  const roomChanged = georgiRecipientRoom !== activeRoomId;
+  georgiRecipientRoom = activeRoomId;
+  const remembered = activeRoomId ? georgiRecipientByRoom[activeRoomId] : undefined;
+  const previous = roomChanged ? (remembered ?? "all") : (gRecipient.value || remembered || roomRecipient.value);
   const count = activeRoom()?.member_ids.length ?? 0;
   gRecipient.replaceChildren(
     ...Array.from(roomRecipient.options).map((source) => {
@@ -4005,6 +5522,7 @@ function georgiRecipientIds(): string[] {
 
 function syncGeorgiComposer(): void {
   if (!georgiActive()) return;
+  renderGeorgiContextGauges();
   const room = activeRoom();
   const count = room?.member_ids.length ?? 0;
   const send = georgiMode === "send";
@@ -4149,6 +5667,15 @@ function jumpTargets(): JumpTarget[] {
 }
 
 function wireGeorgi(): void {
+  georgiContextLoop();
+  for (const kind of ["wheel", "mousedown", "keydown", "touchstart"] as const) {
+    roomFeed.addEventListener(kind, releaseGeorgiFeedPin, { passive: true });
+  }
+  // Coming back to PRIM-1 with a room open counts as looking at it.
+  window.addEventListener("focus", () => {
+    georgiSidebarSignature = "";
+    scheduleGeorgiChrome();
+  });
   gThemeToggle.addEventListener("click", () => {
     applyTheme(currentThemeName() === "georgi-white" ? "georgi-black" : "georgi-white", true);
   });
@@ -4169,17 +5696,16 @@ function wireGeorgi(): void {
     },
     true,
   );
-  gAddMember.addEventListener("click", () => {
-    setGeorgiRoomTools(true);
-    must<HTMLDetailsElement>("#room-members-section").open = true;
-    focusWithinActiveWindow(roomAddMemberSelect);
-  });
+  gAddMember.addEventListener("click", openGeorgiAddMember);
   gRoomTools.addEventListener("click", () => setGeorgiRoomTools(roomCard.dataset.gTools !== "open"));
   setGeorgiRoomTools(false);
   for (const button of gComposerBar.querySelectorAll<HTMLButtonElement>("[data-g-mode]")) {
     button.addEventListener("click", () => setGeorgiMode(button.dataset.gMode === "post" ? "post" : "send"));
   }
-  gRecipient.addEventListener("change", syncGeorgiComposer);
+  gRecipient.addEventListener("change", () => {
+    rememberGeorgiRecipient();
+    syncGeorgiComposer();
+  });
   gSubmit.addEventListener("click", () => void submitGeorgi());
   roomMessage.addEventListener("input", syncGeorgiComposer);
   roomMessage.addEventListener("keydown", (event) => {
@@ -4987,6 +6513,7 @@ function discardInactiveRoomFeedState(): void {
 
 function acceptLiveRoomFeedEvent(event: RoomFeedEvent): void {
   noteGeorgiLastMessage(event);
+  georgiNoteEvent(event);
   if (event.schema_version !== 1) {
     writeSystem(
       "warn",
@@ -5166,12 +6693,14 @@ function setChipCurrent(chip: HTMLButtonElement, current: boolean): void {
 }
 
 function openRoomsOverview(): void {
+  delete roomsView.dataset.gInbox;
   roomsViewMode = "overview";
   renderRoomsOverview();
   setShellView("rooms");
 }
 
 function openRoomPanel(roomId: string): void {
+  delete roomsView.dataset.gInbox;
   activeRoomId = roomId;
   roomsViewMode = "panel";
   renderRoomUi();
@@ -5755,6 +7284,10 @@ function renderRoomFeed(events: RoomFeedEvent[]): void {
   }
   if (roomFeedView === "readable") {
     renderReadableRoomFeed(events);
+    if (georgiActive()) {
+      markGeorgiAskCards();
+      scheduleGeorgiChrome();
+    }
     return;
   }
   readableReconcilePending = false;
@@ -6332,7 +7865,16 @@ function buildReadableCard(
   // Georgi themes: images shared as paths show as thumbnails, not as text.
   const georgi = isGeorgiTheme(currentThemeName());
   const attached = georgi ? splitAttachments(item.body) : { text: item.body, paths: [] as string[] };
-  const fullText = attached.text;
+  // @Georgi: a member asking you for something, not talking to the team.
+  const forYou = georgi && (item.author === "member" || item.author === "guest") && operatorRequest(attached.text) !== null;
+  const fullText = forYou ? stripOperatorMention(attached.text) : attached.text;
+  if (forYou) {
+    card.classList.add("g-for-you");
+    const chip = document.createElement("span");
+    chip.className = "g-for-you-chip";
+    chip.textContent = "For you";
+    meta.querySelector(".room-readable-sender")?.after(chip);
+  }
   // A chat shows every message in full: no Show all / Show less.
   const collapsed = georgi ? false : item.preview.collapsed;
   const previewText = georgi ? fullText : item.preview.text;
@@ -6374,7 +7916,19 @@ function buildReadableCard(
   if (attached.paths.length) {
     card.append(attachmentGrid(attached.paths, readRoomAttachment));
   }
-  if (georgi) card.append(georgiCardActions(item, fullText));
+  if (georgi) {
+    const actions = georgiCardActions(item, fullText);
+    if (forYou) {
+      const done = document.createElement("button");
+      done.type = "button";
+      done.className = "g-ask-done";
+      done.textContent = "✓ Done";
+      done.title = "Mark handled: clears it from Needs you";
+      done.addEventListener("click", () => dismissGeorgiAsk(item.key));
+      actions.prepend(done);
+    }
+    card.append(actions);
+  }
   // v3 W6: where each recipient stands, one line.
   const states = document.createElement("div");
   states.className = "room-readable-states";
@@ -6408,7 +7962,41 @@ function updateReadableCard(
   return true;
 }
 
+/** Georgi themes: one row per recipient — a mark, the name in bold, an ACK
+    or Declined chip, then the note — instead of one grey run-on line. */
+function georgiStateRow(state: ReadableRecipientState): HTMLElement {
+  const row = document.createElement("div");
+  row.className = "g-state";
+  row.dataset.state = state.state.replace(/\s+/g, "-");
+  const mark = document.createElement("span");
+  mark.className = "g-state-mark";
+  mark.textContent = state.state === "acked" ? "✓" : state.state === "declined" || state.state === "failed" ? "✕"
+    : state.state === "withdrawn" ? "–" : "•";
+  const name = document.createElement("strong");
+  name.className = "g-state-name";
+  name.textContent = state.recipient;
+  row.append(mark, name);
+  if (state.state === "acked" || state.state === "declined") {
+    const chip = document.createElement("span");
+    chip.className = "g-state-chip";
+    chip.textContent = state.state === "acked" ? "ACK" : "Declined";
+    row.append(chip);
+  }
+  const note = document.createElement("span");
+  note.className = "g-state-note";
+  appendInline(note, state.detail.replace(/^\s*[—-]\s*/, ""));
+  row.append(note);
+  if (state.title) row.title = state.title;
+  return row;
+}
+
 function fillReadableStates(container: HTMLElement, item: Extract<ReadableFeedItem, { kind: "message" }>): void {
+  if (isGeorgiTheme(currentThemeName())) {
+    container.replaceChildren(...item.states.map(georgiStateRow));
+    container.title = "";
+    container.hidden = item.states.length === 0;
+    return;
+  }
   container.textContent = readableStatesText(item.states);
   container.title = item.states.filter((state) => state.title).map((state) => `${state.recipient}: ${state.title}`).join("\n");
   container.hidden = item.states.length === 0;
