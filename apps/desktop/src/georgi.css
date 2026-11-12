@@ -1419,7 +1419,8 @@
   & .g-md blockquote p { line-height: 19px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
   & .g-md blockquote strong { color: var(--g-text-2); }
   & .g-md hr { border: 0; border-top: 1px solid var(--g-line); }
-  & .g-md .g-md-link { color: var(--g-signal); text-decoration: underline; text-underline-offset: 3px; cursor: text; }
+  & .g-md .g-md-link { color: var(--g-signal); text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
+  & .g-md .g-md-link:hover { filter: brightness(1.2); }
   & .g-md-table { overflow-x: auto; }
   & .g-md table { border-collapse: collapse; font-size: 13px; }
   & .g-md th,

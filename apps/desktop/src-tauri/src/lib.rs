@@ -3351,6 +3351,7 @@ pub fn run(startup: StartupConfig) {
             attachments::save_room_attachment,
             attachments::read_room_attachment,
             georgi::georgi_request_attention,
+            georgi::georgi_open_url,
             georgi::georgi_copy_session_folder,
             georgi::georgi_take_layout,
             georgi::georgi_finish_layout,

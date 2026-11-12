@@ -242,7 +242,11 @@ function renderInline(parent: HTMLElement, nodes: Inline[]): void {
       const link = document.createElement("span");
       link.className = "g-md-link";
       link.textContent = node.text;
-      link.title = node.href;
+      link.title = `${node.href}
+Click to open in your browser`;
+      link.dataset.href = node.href;
+      link.setAttribute("role", "link");
+      link.tabIndex = 0;
       parent.append(link);
     } else {
       const wrap = document.createElement(node.kind === "bold" ? "strong" : "em");

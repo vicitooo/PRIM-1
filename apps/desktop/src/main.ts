@@ -4246,6 +4246,24 @@ function georgiRoomPath(roomId: string): string {
   return `${place.project} / ${name}`;
 }
 
+/* Links in messages open in your default browser (Chrome: a new tab in the
+   window you already have open). Dragging to select text doesn't open. */
+function openGeorgiLink(target: EventTarget | null): boolean {
+  const link = (target as HTMLElement | null)?.closest?.<HTMLElement>(".g-md-link[data-href]");
+  if (!link || !georgiActive()) return false;
+  const url = link.dataset.href ?? "";
+  if (!/^https?:\/\//i.test(url)) return false;
+  void command("georgi_open_url", { url }).catch((error) => console.warn("open link failed", error));
+  return true;
+}
+document.addEventListener("click", (event) => {
+  if (event.button !== 0 || document.getSelection()?.toString()) return;
+  if (openGeorgiLink(event.target)) event.preventDefault();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && openGeorgiLink(event.target)) event.preventDefault();
+});
+
 /** A Windows notification and a taskbar flash, unless you are already
     looking at that room. */
 function notifyGeorgiAsk(ask: Ask): void {

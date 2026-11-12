@@ -93,3 +93,61 @@ pub async fn georgi_context_usage(
         .await
         .map_err(|error| error.to_string())
 }
+
+/// Open a web link from a message in the default browser (an existing Chrome
+/// window gets a new tab). Only plain http(s) URLs pass; anything else —
+/// file paths, other schemes, quotes, spaces or control characters — is
+/// refused, and the URL goes to the Windows URL handler as one argument, so
+/// no shell ever parses it.
+#[tauri::command]
+pub fn georgi_open_url(url: String) -> Result<(), String> {
+    if !is_web_url(&url) {
+        return Err("only http and https links can be opened".into());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        std::process::Command::new("rundll32.exe")
+            .args(["url.dll,FileProtocolHandler", &url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        std::process::Command::new(opener).arg(&url).spawn().map(|_| ()).map_err(|error| error.to_string())
+    }
+}
+
+fn is_web_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    let rest = match lower.strip_prefix("https://").or_else(|| lower.strip_prefix("http://")) {
+        Some(rest) => rest,
+        None => return false,
+    };
+    url.len() <= 4096
+        && !rest.is_empty()
+        && !rest.starts_with('/')
+        && url.chars().all(|c| c.is_ascii_graphic() && !matches!(c, '"' | '\'' | '<' | '>' | '\\' | '`' | '^' | '|' | '{' | '}'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_web_url;
+
+    #[test]
+    fn only_plain_web_links_open() {
+        assert!(is_web_url("https://dev.example.invalid/seo-preview?page=%2Fsample-page"));
+        assert!(is_web_url("http://localhost:5173/"));
+        assert!(!is_web_url("file:///C:/Windows/system32/calc.exe"));
+        assert!(!is_web_url("C:\\Users\\x"));
+        assert!(!is_web_url("https://"));
+        assert!(!is_web_url("https:///etc"));
+        assert!(!is_web_url("https://a.com/\" & calc"));
+        assert!(!is_web_url("https://a.com/ x"));
+        assert!(!is_web_url("javascript:alert(1)"));
+    }
+}
