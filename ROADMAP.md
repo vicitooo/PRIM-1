@@ -7,7 +7,7 @@ This is product direction, not a release schedule. Current limitations are in [d
 - A Windows desktop app with supervisor-owned PTYs and built-in Claude Code, Codex, Grok, Prime Agent (Ubuntu WSL), and Generic Terminal drivers.
 - Persistent, ordered sessions grouped into rooms or an unassigned lobby, with one visible terminal at a time.
 - Normal-by-default permission profiles, qualified working directories, and stored conversation references for supported harnesses.
-- Explicit room membership, a bounded in-memory feed, feed-only posts, and addressed delivery from the operator or a room member.
+- Explicit room membership, a durable feed with a bounded display window, feed-only posts, and addressed delivery from the operator or a room member.
 - A pane-local control surface; Prime currently supports raw terminal interaction only.
 
 ## Development themes

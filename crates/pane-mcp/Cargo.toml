@@ -9,6 +9,8 @@ control-plane = { path = "../control-plane" }
 pty-host = { path = "../pty-host" }
 serde.workspace = true
 serde_json.workspace = true
+# v3 W5 (Reviewer b1ecd212): the spool binds each envelope name to the digest of its bytes; same version as supervisor.
+sha2 = "0.10.9"
 shared-types = { path = "../shared-types" }
 tokio.workspace = true
 

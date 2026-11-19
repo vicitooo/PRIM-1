@@ -32,11 +32,22 @@ the narrow self-pane sideband and internal terminal provenance.
 
 The private version-1 catalog atomically persists one workspace preference plus
 ordered session intent: `SessionId`, label, driver, qualified cwd identity, and
-permission profile, plus stored conversation references and whether a session
-was running at shutdown. It does not persist a live `RunId`, PID, command/argument
-list, environment, terminal output, or message content. A fresh
-catalog contains zero sessions. Corrupt or unknown versions fail visibly without
-default replacement.
+permission profile, requested model/effort/brief choices, stored conversation
+references, full recovery history, and whether a session was running at shutdown.
+Custom brief text is stored privately for editing. Provisional Codex identity
+evidence includes its reported thread ID, attested run/generation, rollout path
+and report time. The last successful launch record retains its run/generation,
+resolved program and shim prefix, typed choices, and PRIM's injected MCP metadata.
+These are historical inputs, not live-run authority or observed effective settings.
+Launch records exclude the task prompt and environment values; the editable
+custom brief is a separate choice field. The catalog does not retain live PIDs,
+terminal output or room-message bodies. A fresh catalog contains zero sessions.
+Corrupt or unknown versions fail visibly without default replacement.
+
+The renderer may request typed model, effort, permission and brief choices;
+backend validation and driver code construct the launch. It cannot supply an
+arbitrary program, argument vector or environment. Native working-directory
+paths still enter through the backend picker.
 
 Qualified cwd identity is namespaced. Native sessions persist a Windows final
 path identity selected through the native chooser. Prime persists a canonical
@@ -58,17 +69,64 @@ authenticated live run and its current membership. Delivery accepts a member
 label, session ID, or `all` (every other member); ambiguous labels fail closed.
 Identity comes from native Job membership or, for callers outside all pane Jobs,
 the per-run pane secret. A supplied recipient never grants cross-room authority.
+Cross-room authority comes only from the operator's per-session `roam` grant
+(A109), checked on every request and again at its commit: the separate
+`room_deliver_to`, `rooms_list`, `room_peek`, `room_join` and `room_leave`
+requests carry a `RoomId` and are refused without it; the sender is still the
+authenticated pane; a `RoomId` needs roam even when it names the caller's own
+room. The one exception is an answer to a roaming sender: a `room_deliver`
+label or session ID (without `RoomId`) that matches no member of the caller's
+room, and is neither ambiguous there nor the caller, reaches a member that
+delivered to the caller across rooms within 24 hours (in-memory record; a
+restart ends it), in its current room, while it still exists and roams; these
+conditions are rechecked at commit. A `room_join` that leaves a room
+commits the leave and the join as one room-catalog write. An
+`upgrade_request` (A108) needs the caller's `maintain` grant; it names only the
+build and the caller's task checkpoint, and the supervisor captures the running
+set, conversations and rooms itself.
+A `member` request (A110) needs the operator's `manage` grant, and `roam`
+as well for a room other than the caller's; it names its target by session ID or
+a label unique in the caller's room, never the caller, carries a caller UUID
+`request_id` and no permission field, and is rechecked where its effect commits.
 
 ## 4. Room/feed envelope
 
 The private room catalog atomically persists ordered `RoomId`, label, member
-`SessionId` values, a nonzero membership revision, and briefing preferences
-and completed-brief membership state. Feed epoch, sequence,
-messages, delivery results, and cursor state are process-memory only and reset
-on restart. Corrupt, structurally invalid, or unknown catalog versions fail
-startup without rewrite.
+`SessionId` values, a nonzero membership revision, explicit restart selection, briefing preferences
+and per-member join floors. Legacy completed-brief membership marks remain
+readable for catalog compatibility; automatic PTY briefing is removed.
+A separate single-writer JSONL per room persists the feed epoch, monotonic
+sequence, messages and delivery receipts. Each complete record is synced before
+success; replay restores the bounded feed and idempotency horizon. Corrupt
+complete records or unknown schemas isolate the affected room without rewriting
+its log or blocking healthy rooms. `RoomSnapshot.recovery_error` exposes the
+reason; that room refuses feed reads and writes/wakes until recovery and reopen.
+Its validated header epoch is retained; an unreadable header has a nil (unknown)
+epoch, never a generated replacement. Member terminals remain available. Only
+an unterminated final record is quarantined and truncated before replay continues.
 
-Each room owns a random process-lifetime epoch and monotonic sequence. Its feed
+Room wake attempts sync a Pending receipt before any input write. An operator
+retry names the retained message, one original recipient and the latest receipt
+cursor; that cursor is compared under the room publication lock before replacing
+it with Pending. Repeated/stale cursors return the current result. Only Held with
+zero bytes or Failed with zero bytes plus `zero_write_confirmed: true` can retry;
+legacy zero-byte counts alone are not proof. Current membership/join floor and
+the previous run binding are rechecked. Room deletion and member removal refuse
+while an admitted delivery holds its lease. Receipt persistence failure never
+turns an uncertain attempt into a safe automatic retry.
+
+A per-run gate coalesces concurrent room wake attempts. It is claimed under the
+room publication lock before Pending is synced. A refused or unsynced claim
+releases the gate before any transport is attempted, while a complete uncertain
+Pending remains non-repeatable for its original intent. Once transport may have
+begun, only a durable final outcome releases the gate; an unknown attempt keeps
+the run held. Another message still
+commits its body and original targets, then records Held for that recipient.
+Other recipients proceed independently. The gate holds no payload and is
+independent of Fetched, feed eviction and the dedup horizon. Replacing a run
+creates a fresh gate without retargeting or replaying any old unknown attempt.
+
+Each room owns a persistent random log epoch and monotonic sequence. Its in-memory feed
 retains at most 512 events and 16 MiB; reads return at most 64 events and 2 MiB
 per page. A stale epoch or evicted range returns an explicit gap. The desktop
 retains only the active room's same-sized bounded display window and reloads an
@@ -83,6 +141,7 @@ Example:
   "cursor": { "epoch": "uuid", "sequence": 14 },
   "item": {
     "kind": "message",
+    "request_id": "caller-intent-id",
     "message_id": "uuid",
     "sender": { "kind": "session", "session_id": "uuid" },
     "content": "Please review the last change.",
@@ -96,12 +155,26 @@ Example:
 Feed events and pages carry `schema_version: 1`; an unsupported version fails
 closed rather than being interpreted as a known shape. `recipient_ids: []` is
 feed-only. An addressed message records the exact
-recipient snapshot plus separate `pending` then `written` / `failed` delivery
-items. UI emission is never a model receipt.
+recipient snapshot before any readiness check or wake. Each target then receives
+an independent `written`, `held` or `failed` outcome. `fetched` records inclusion
+of the addressed message in a recipient's read response, never cursor advancement
+alone or model acceptance. UI emission is never a model receipt.
+
+Optional caller `request_id` keys deduplicate the last 1024 posts or 16 MiB of
+retained post records, whichever is reached first. Each sender has its own key
+namespace within the room. The same sender and key with changed content or
+recipients conflicts; matching retries return the original message
+without another wake. Ordinary log growth stops at 252 MiB, leaving 4 MiB within
+the 256 MiB hard cap for admitted wake completions and private recovery receipts.
+Fetched and new claims cannot spend that reserve. Capacity refusal performs no
+new wake; an older log whose required repair cannot fit stays held without
+publishing the incomplete repair or silently deleting history. See README-AI.md for failure and retry
+boundaries, including uncertain wake receipts and renderer-local retry keys.
 
 Room membership belongs to the durable session definition, not to one live
-run: closed members remain members, while delivery requires every selected
-recipient to have a compatible live run at whole-message preflight. Zero- and
+run: closed members remain members. The authorized message is stored first;
+each wake independently requires a compatible live run. One held recipient does
+not block another. Zero- and
 one-member rooms are ordinary workspaces: operator
 delivery needs at least one member — an empty room refuses with the plain
 reason — and a pane's `all` needs at least one other member. Every room
@@ -120,15 +193,52 @@ only within their current room, always as themselves.
   posts, and explicit one-member / Send All delivery for supported recipients.
 - The pane-local sideband owns self `ping`, `wait_quiet`, `send_input`,
   `send_key`, plus membership-derived `room_read`, feed-only `room_post`, and
-  `room_deliver` through the same delivery path as the operator.
+  `room_deliver` through the same delivery path as the operator. Codex's
+  `identify_codex` request records provisional identity for the attested caller;
+  it grants no lifecycle or peer authority.
 - Runtime telemetry owns structured session/room catalog, room feed, lifecycle,
   delivery, heartbeat, alert, and metadata-only dispatch events.
+- Resource telemetry (`telemetry_snapshot`) is a read-only, pull-based sample
+  of the application Job, which holds every process PRIM-1 started. Each member
+  belongs to exactly one group: the PRIM-1 process, one live run's Job,
+  WebView2, or the remaining helpers. Members are read through handles
+  rechecked against their Job. Listed process IDs with a failed read in either
+  inventory are counted in `unreadable_processes`; memory/process counts may
+  be incomplete, while run Job CPU still includes unreadable members. Such
+  IDs are conservatively excluded from helper attribution, never treated as
+  proof of ownership. CPU is a share
+  of all logical CPUs since the previous sample and is null without a baseline
+  0.5 to 10 s old; memory is private bytes. Peaks belong to a run and end with
+  it.
 
 Spawn, restart, close, and arbitrary command execution are not pane messages.
 Room feed item kinds are `message`, `membership`, and `delivery`. Any additional
 kind requires a new explicit contract and authority model.
 
 ## 6. Visible injection contract
+
+Room notification is a separate adapter from the legacy direct routing below.
+The complete body stays in the durable room feed. A room wake contains an ASCII
+message-ID pointer, sender abbreviation and bounded preview fitting one input
+row. Only the measured Grok fullscreen composer currently has positive admission
+evidence. Claude, native Codex, Prime, Generic Terminal and unrecognized layouts
+remain held; there is no blind PTY fallback.
+
+The continuously maintained composer projection requires trusted geometry,
+an empty draft, visible cursor and completed synchronized redraw. Observed busy
+work stays held until explicit completion output, independent of quiescence
+timers. Raw input increments its per-run epoch before waiting for a writer and
+invalidates the pre-input projection. The room writer checks that epoch before
+paste and again before exactly one Enter, also revalidating run/paste mode and
+requiring an exact echo in a newer complete frame. Missing/changed echo or input
+after paste never causes a second Enter and is recorded as a non-repeatable
+partial write. A test mock echo is not real harness acceptance evidence.
+
+### Legacy direct routing
+
+The framing and writer boundaries below describe legacy direct routing. Its
+full-body framing and repeated submit gestures do not apply to room Send,
+Brief or Retry, which use the room pointer adapter above.
 
 Claude Code, Codex, and Grok receive a visible provenance header inside one
 bracketed-paste payload. Grok's active driver launches full-screen; historical
@@ -176,6 +286,8 @@ Validation and writer boundaries:
 - A `written` receipt proves the PTY writer's outcome, not model understanding,
   task completion, or byte-exact final-child receipt. Inspect the response or
   resulting artifact for those outcomes.
+
+### Raw input and quiet waits
 
 Raw operator and pane-sideband input remain available when synthetic delivery
 is refused, so a person can resolve trust, authentication, or approval prompts.
@@ -289,15 +401,38 @@ Restart flow:
 4. supervisor performs restart
 5. supervisor emits resulting lifecycle/system events
 
-Creating a session launches it. On later desktop launches, **Continue where I
-left off** is enabled by default and relaunches previously running sessions as
-their room or lobby is entered. A new PTY uses a stored harness conversation
-reference where supported; it never reattaches a previous process. **Start fresh
-session** clears the reference. Room feed contents are not restored.
+Creating a session launches it. The backend persists explicit per-room **Resume
+on restart**, default false; room visits and historical running flags do not
+select it. Frontend startup-policy integration remains tracked in S5. A new PTY
+uses a stored harness conversation reference where supported; it never reattaches
+a previous process. Codex resume and Restart remain held until root identity and
+current-conversation freshness are proven. While a member runs, the conversation
+follower records its proven current conversation (Claude pid file, Codex writer
+lock held by the member's own `codex.exe` plus a root rollout, Grok create/load
+log line plus `summary.json`, each bound to the launched pid and start time) in
+the catalog; a Codex proof releases only the launch and identify-report holds.
+Two held Codex roots are ambiguous and change nothing; a lone root waits while
+the process also holds this run's reported thread or an unwritten one. **Start fresh session** preserves
+superseded recovery references and their provenance in history. The durable
+room feed replays separately from conversation resumption; terminal buffers
+are not restored.
 
-Automatic room briefing is optional, once per membership, and waits until the
-member can accept it. Completed briefing state survives relaunch. **Brief now**
-is an explicit repeat, not an automatic restart action.
+A task brief is optional and belongs only to a new conversation: explicit
+`fresh=true`, or a launch with no stored resume reference. Actual resume passes
+no task prompt. The brief is one literal final argv operand after `--` and all
+driver/MCP flags; it is never shell code. Claude uses the ordinary user-prompt
+envelope `PRIM-1 initial brief:\n\n{text}` to avoid subcommand dispatch while
+preserving the supplied text. Brief source text is limited to 8192 bytes with
+no NUL; the fixed Claude prefix is additional.
+
+Room joins and idle transitions never inject a brief into a PTY. The legacy
+`brief_on_join` setting enables the RoomDefault choice for a new conversation;
+completed-membership fields do not control it. **Brief now** remains a separate
+explicit Send-path request with an actual delivery result. Terminal and Prime
+reject both initial and explicit briefing. None means no task brief; MCP
+initialization supplies room protocol where configured (Claude/Codex), without
+claiming verified Codex perception. Grok's room CLI adds no protocol text when
+None is selected.
 
 ## 9. Permission contract
 
@@ -306,10 +441,21 @@ Current pane authority is deliberately narrower than operator room authority:
 - the supervisor derives the caller from live process-job membership and run
   generation, or — only when the client process is in no pane Job — from the
   per-run pane secret (`PRIM1_PANE_SECRET`) presented as the connection preamble
-- the pane-local sideband action set is fixed to self `ping`, `wait_quiet`,
+- the pane-local sideband action set includes self `ping`, `wait_quiet`,
   `send_input`, `send_key`, membership-derived `room_read`, feed-only
   `room_post`, and `room_deliver` (recipient = member label / session id /
-  `all` = every other member; the sender is always the caller)
+  `all` = every other member; the sender is always the caller), plus the
+  Codex-only `identify_codex` identity report
+- `PRIM1_CLI --prim1-identify` accepts no arguments and reads its own
+  `CODEX_THREAD_ID`; there is no MCP identify tool or supported ID override.
+  The supervisor requires native Windows Job/run attestation and checks the
+  exact root rollout and directory. A pane secret alone is insufficient.
+  Accepted reports persist provisional run-bound evidence and full superseded
+  recovery history; a report alone never clears the freshness hold or enables
+  native wake, and is not proof that `/new` has not changed the active
+  conversation. The conversation follower releases resume when the reported
+  thread is also a root writer lock held by the member's own `codex.exe` and
+  the report postdates every other thread that process holds
 - pane callers cannot supply `RoomId`, sender, peer, inventory, membership, or
   lifecycle authority; a presented secret is proof of the caller's own pane only
 - Claude Code and Codex receive a session-scoped `prim1_pane` stdio MCP child
@@ -362,13 +508,13 @@ and a successful connection are transport facts, not credentials. Room read,
 post, and delivery derive membership and sender from the authenticated live run.
 Lifecycle, inventory, and membership mutations remain desktop actions.
 
-`dispatch_attempt` records the pre-write target state for pane input/key requests and in-process operator delivery/routing that passed whole-request validation and recipient preflight. It is diagnostic metadata, not an idle gate, model-reaction ACK, or completion signal.
+`dispatch_attempt` records the pre-write target state for pane input/key requests and legacy in-process direct routing that passed whole-request validation and recipient preflight. Room Send, Brief and Retry use room-feed delivery receipts instead. The event is diagnostic metadata, not an idle gate, model-reaction ACK, or completion signal.
 
-Unknown or disabled bracketed-paste mode, an unobserved Codex work state, or a driver-observed `blocked`/`error_loop` work state returns the command error and produces no route/message `dispatch_attempt`, `routed_message`, or `route_delivery` event or durable record, and no PTY write. Independent liveness reconciliation may still mutate and record a stale run's lifecycle before the rejection; desktop diagnostics may also record the visible command failure. After successful preflight, a mode, work-state, or partial write failure uses the existing failed/partial delivery receipt. An unrecognized modal appearing after an explicit safe observation remains a measured residual until its driver exposes a proved structured signal.
+For legacy direct routing only: unknown or disabled bracketed-paste mode, an unobserved Codex work state, or a driver-observed `blocked`/`error_loop` work state returns the command error and produces no route/message `dispatch_attempt`, `routed_message`, or `route_delivery` event or durable record, and no PTY write. Independent liveness reconciliation may still mutate and record a stale run's lifecycle before the rejection; desktop diagnostics may also record the visible command failure. After successful preflight, a mode, work-state, or partial write failure uses the existing failed/partial delivery receipt. An unrecognized modal appearing after an explicit safe observation remains a measured residual until its driver exposes a proved structured signal.
 
 Dispatch overlap rules:
 
-The `blocked` and `error_loop` overlap labels remain applicable to raw pane input/key diagnostics. Synthetic bracketed operator delivery rejects those observed states during preflight instead of emitting a route dispatch attempt.
+The `blocked` and `error_loop` overlap labels remain applicable to raw pane input/key diagnostics. Legacy direct routing rejects those observed states during preflight instead of emitting a route dispatch attempt. Room delivery stores the body first and records a Held receipt for a refused recipient.
 
 - `target_work_state_before: thinking` -> `overlap: true`, `reason: "target_thinking"`
 - `target_work_state_before: tool_call` -> `overlap: true`, `reason: "target_tool_call"`
@@ -389,14 +535,14 @@ In-process operator route requests expose delivery metadata:
 - a failed outcome records the PTY-writer-reported prefix byte count accepted
   before failure; no automatic retry is allowed after an uncertain partial write
 
-Room delivery first resolves one membership revision and preflights every
-selected exact run before appending the message or writing any PTY. The feed
-then records one immutable message, `pending` for every selected recipient, and
-one `written` or `failed` result per recipient. Membership changes after that
-commit affect the next message, not the pinned delivery plan. Delivery attempts
-are serialized through each exact run's FIFO input gate; room-feed append and
-publication are serialized so cursor order cannot differ from renderer/audit
-order. A room cannot be deleted while any of its deliveries is in flight.
+Room delivery commits one immutable message with its authorized recipient snapshot
+before independently planning each wake. Unsafe recipients get Held; admitted
+attempts sync Pending before a short pointer, then record Written or Failed.
+Fetched records the actual addressed message in a returned page, not acceptance.
+Uncertain Pending is never repeated. Retry wake uses the latest eligible receipt
+cursor for one original recipient and never targets a replacement run. Room-feed
+append/publication preserves cursor order; one pending wake per run coalesces
+concurrent requests. A room cannot be deleted while a delivery is in flight.
 
 Auto-restart-on-stall rules:
 

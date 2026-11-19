@@ -139,6 +139,7 @@ mod tests {
             driver: DriverKind::Prime,
             working_dir: CWD.into(),
             permission_profile: profile,
+            codex_transport: Default::default(),
         }
     }
 

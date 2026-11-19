@@ -154,7 +154,6 @@ impl PsuedoCon {
         let mut pi: PROCESS_INFORMATION = unsafe { mem::zeroed() };
 
         let (mut exe, mut cmdline) = cmd.cmdline()?;
-        let cmd_os = OsString::from_wide(&cmdline);
 
         let cwd = cmd.current_directory();
 
@@ -177,8 +176,8 @@ impl PsuedoCon {
         if res == 0 {
             let err = IoError::last_os_error();
             let msg = format!(
-                "CreateProcessW `{:?}` in cwd `{:?}` failed: {}",
-                cmd_os,
+                "CreateProcessW program `{:?}` in cwd `{:?}` failed: {}",
+                OsString::from_wide(&exe),
                 cwd.as_ref().map(|c| OsString::from_wide(c)),
                 err
             );

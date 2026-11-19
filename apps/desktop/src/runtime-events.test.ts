@@ -54,6 +54,9 @@ function sessionSnapshot(
     label: "Codex",
     driver: "codex",
     permission_profile: "normal",
+    launch_choices: { model: null, effort: null, brief: { mode: "room_default" } },
+    recovery: null,
+    recovery_history: [],
     lifecycle_state: "ready",
     working_dir: "C:\\work",
     generation: 7,
@@ -61,6 +64,7 @@ function sessionSnapshot(
     run_event_sequence: 1,
     process_id: 42,
     running: true,
+    output_draining: false,
     resume_available: false,
     was_running_at_shutdown: false,
     last_activity_at: "2026-08-10T00:00:00Z",
@@ -114,6 +118,30 @@ function makeContext(runEventsInitialized = true): RuntimeEventContext & {
 }
 
 describe("runtime-events exhaustiveness default arm", () => {
+  it("forwards room history transitions to the authoritative snapshot refresh path", () => {
+    const ctx = makeContext();
+    const handleRoomEvent = vi.fn();
+    ctx.handleRoomEvent = handleRoomEvent;
+    const event: RuntimeEvent = { event: "room_history_changed", schema_version: 1,
+      room_id: "33333333-3333-3333-3333-333333333333", timestamp: "2026-10-14T00:00:00Z" };
+    handleRuntimeEvent(event, ctx);
+    expect(handleRoomEvent).toHaveBeenCalledWith(event);
+    expect(ctx.writeSystem).not.toHaveBeenCalled();
+  });
+
+  it("forwards outside-agent changes to the room refresh path", () => {
+    const ctx = makeContext();
+    const handleRoomEvent = vi.fn();
+    ctx.handleRoomEvent = handleRoomEvent;
+    const event: RuntimeEvent = { event: "room_guests_changed", schema_version: 1,
+      room_id: "33333333-3333-3333-3333-333333333333", timestamp: "2026-10-19T00:00:00Z",
+      guests: [{ guest_id: "44444444-4444-4444-4444-444444444444", label: "ChatGPT",
+        room_id: "33333333-3333-3333-3333-333333333333", created_at: "2026-10-19T00:00:00Z", last_seen: null }] };
+    handleRuntimeEvent(event, ctx);
+    expect(handleRoomEvent).toHaveBeenCalledWith(event);
+    expect(ctx.writeSystem).not.toHaveBeenCalled();
+  });
+
   it("forwards room feed events to the dedicated ID-scoped room gate", () => {
     const ctx = makeContext();
     const handleRoomEvent = vi.fn();
@@ -130,6 +158,7 @@ describe("runtime-events exhaustiveness default arm", () => {
         item: {
           kind: "message",
           message_id: "55555555-5555-5555-5555-555555555555",
+          request_id: "room-post-request",
           sender: { kind: "operator" },
           content: "room content",
           recipient_ids: [],
@@ -144,6 +173,15 @@ describe("runtime-events exhaustiveness default arm", () => {
     expect(handleRoomEvent).toHaveBeenCalledOnce();
     expect(handleRoomEvent).toHaveBeenCalledWith(event);
     expect(ctx.writeSystem).not.toHaveBeenCalled();
+  });
+
+  it("forwards targeted fallback invalidation without requesting a generic snapshot", () => {
+    const ctx = makeContext();
+    ctx.handleRoomEvent = vi.fn();
+    const event: RuntimeEvent = { event: "room_fallbacks_changed", room_id: "room-a" };
+    handleRuntimeEvent(event, ctx);
+    expect(ctx.handleRoomEvent).toHaveBeenCalledWith(event);
+    expect(ctx.refreshSnapshotFromEvent).not.toHaveBeenCalled();
   });
 
   it("every supervisor telemetry variant is handled explicitly", () => {
@@ -290,6 +328,27 @@ describe("SessionId inventory lifecycle events", () => {
     );
   });
 
+  it("hands upgrade status to the banner and logs only final or held stages (A108)", () => {
+    const ctx = makeContext();
+    const showUpgradeStatus = vi.fn();
+    ctx.showUpgradeStatus = showUpgradeStatus;
+    const status = (stage: "notice" | "held"): RuntimeEvent => ({
+      event: "upgrade_status_changed",
+      status: {
+        attempt_id: "0b6b2b9e-7d55-4b1e-9b8a-1d2c3e4f5a6b", stage, candidate_sha256: "c".repeat(64),
+        requester_label: "Claude", notice_until: "2026-10-19T12:00:00Z", expires_at: "2026-10-19T12:15:00Z",
+        message: `stage ${stage}`, can_cancel: stage === "notice", can_abandon: stage === "held", member_session_ids: [SESSION_A],
+      },
+      timestamp: "2026-10-19T12:00:00Z",
+    });
+    handleRuntimeEvent(status("notice"), ctx);
+    expect(ctx.writeSystem).not.toHaveBeenCalled();
+    handleRuntimeEvent(status("held"), ctx);
+    expect(ctx.writeSystem).toHaveBeenCalledWith("warn", "stage held");
+    handleRuntimeEvent({ event: "upgrade_status_changed", status: null, timestamp: "2026-10-19T12:00:01Z" }, ctx);
+    expect(showUpgradeStatus.mock.calls.map(([value]) => value?.stage ?? null)).toEqual(["notice", "held", null]);
+  });
+
   it("refreshes every catalog mutation without replacing selection by label", () => {
     const ctx = makeContext();
     const events: RuntimeEvent[] = [
@@ -318,6 +377,14 @@ describe("SessionId inventory lifecycle events", () => {
         timestamp: "2026-08-10T00:00:02Z",
       },
       {
+        event: "session_member_permissions_changed",
+        schema_version: 1,
+        session_id: SESSION_A,
+        old_permissions: { roam: false, maintain: false },
+        new_permissions: { roam: true, maintain: false, manage: true },
+        timestamp: "2026-08-10T00:00:02Z",
+      },
+      {
         event: "session_working_directory_changed",
         schema_version: 1,
         session_id: SESSION_A,
@@ -336,7 +403,7 @@ describe("SessionId inventory lifecycle events", () => {
     for (const event of events) {
       handleRuntimeEvent(event, ctx);
     }
-    expect(ctx.refreshSnapshotFromEvent).toHaveBeenCalledTimes(5);
+    expect(ctx.refreshSnapshotFromEvent).toHaveBeenCalledTimes(6);
     for (const call of ctx.refreshSnapshotFromEvent.mock.calls) {
       expect(call).toEqual([]);
     }
@@ -345,6 +412,9 @@ describe("SessionId inventory lifecycle events", () => {
     expect(messages).toContain("session moved: 11111111 (1 -> 2)");
     expect(messages).toContain(
       "session permission changed: 11111111 (normal -> unsafe)",
+    );
+    expect(messages).toContain(
+      "member grants changed: 11111111 (roam on, upgrade off, manage on)",
     );
     expect(messages).toContain(
       "session working directory changed: 11111111",
@@ -1098,6 +1168,162 @@ describe("run-event provenance gate", () => {
       process_id: null,
       running: false,
     });
+  });
+
+  it("clears restart eligibility only for the accepted current-run exit", () => {
+    for (const exitCode of [0, 3]) {
+      const ctx = makeContext();
+      ctx.snapshotById.set(SESSION_A, sessionSnapshot({ was_running_at_shutdown: true }));
+      ctx.snapshotById.set(SESSION_B, sessionSnapshot({ session_id: SESSION_B, generation: 0,
+        run_id: null, running: false, lifecycle_state: "closed", was_running_at_shutdown: true }));
+      const exit: Extract<RuntimeEvent, { event: "session_exit" }> = {
+        event: "session_exit", identity: runIdentity(3), session: "codex", process_id: 42,
+        exit_code: exitCode, signal: null, success: exitCode === 0,
+        reason: exitCode === 0 ? "clean_exit" : "crash_exit", requested: false,
+        timestamp: "2026-08-10T00:00:03Z",
+      };
+      handleRuntimeEvent({ ...exit, identity: runIdentity(3, { generation: 6, run_id: RUN_B }) }, ctx);
+      expect(ctx.snapshotById.get(SESSION_A)?.was_running_at_shutdown).toBe(true);
+
+      handleRuntimeEvent(exit, ctx);
+
+      expect(ctx.snapshotById.get(SESSION_A)).toMatchObject({ running: false, was_running_at_shutdown: false });
+      expect(ctx.snapshotById.get(SESSION_B)?.was_running_at_shutdown).toBe(true);
+    }
+  });
+
+  it("re-reads the snapshot when a member enters or leaves a question, so its card and header say so", () => {
+    const workState = (
+      state: "blocked" | "error_loop" | "idle" | "thinking",
+      previous_state: "blocked" | "error_loop" | "idle" | "thinking" | null,
+      sequence: number,
+    ): Extract<RuntimeEvent, { event: "session_work_state" }> => ({
+      event: "session_work_state", identity: runIdentity(sequence), session: "claude",
+      state, detail: state === "blocked" ? "workspace_trust" : null, previous_state,
+      timestamp: "2026-10-19T14:43:20Z",
+    });
+    const refreshes = (events: Extract<RuntimeEvent, { event: "session_work_state" }>[]) => {
+      const ctx = makeContext();
+      ctx.snapshotById.set(SESSION_A, sessionSnapshot({ run_event_sequence: 1 }));
+      for (const event of events) handleRuntimeEvent(event, ctx);
+      return ctx.refreshSnapshotFromEvent.mock.calls;
+    };
+    expect(refreshes([workState("blocked", null, 2)])).toEqual([[]]);
+    expect(refreshes([workState("idle", "blocked", 2)])).toEqual([[]]);
+    expect(refreshes([workState("error_loop", "blocked", 2)])).toEqual([[]]);
+    expect(refreshes([workState("thinking", "idle", 2), workState("idle", "thinking", 3)])).toEqual([]);
+  });
+
+  it("keeps the observed work state on the snapshot and repaints when working starts or stops (A16 D5)", () => {
+    const ctx = makeContext();
+    ctx.snapshotById.set(SESSION_A, sessionSnapshot({ run_event_sequence: 1 }));
+    const workState = (state: "idle" | "thinking" | "tool_call", sequence: number, run_id = RUN_A) =>
+      handleRuntimeEvent({
+        event: "session_work_state", identity: runIdentity(sequence, { run_id }), session: "claude",
+        state, detail: null, previous_state: null, timestamp: "2026-10-20T21:00:00Z",
+      }, ctx);
+    workState("thinking", 2);
+    expect(ctx.snapshotById.get(SESSION_A)?.work_state).toBe("thinking");
+    expect(ctx.applyPaneSnapshot).toHaveBeenCalledTimes(1);
+    workState("tool_call", 3);
+    expect(ctx.snapshotById.get(SESSION_A)?.work_state).toBe("tool_call");
+    expect(ctx.applyPaneSnapshot, "still working: no repaint").toHaveBeenCalledTimes(1);
+    workState("idle", 4);
+    expect(ctx.applyPaneSnapshot).toHaveBeenCalledTimes(2);
+    workState("thinking", 5, RUN_B);
+    expect(ctx.snapshotById.get(SESSION_A)?.work_state, "another run's state is not this run's").toBe("idle");
+    handleRuntimeEvent({
+      event: "session_state", identity: runIdentity(6), session: "claude", state: "starting",
+      reason: "test", timestamp: "2026-10-20T21:00:01Z",
+    }, ctx);
+    expect(ctx.snapshotById.get(SESSION_A)?.work_state ?? null).toBeNull();
+  });
+
+  it("a quiet screen does not end a turn the member's own record shows open (v3 W2)", () => {
+    const ctx = makeContext();
+    ctx.snapshotById.set(SESSION_A, sessionSnapshot({ run_event_sequence: 1, work_state: "thinking",
+      work_state_from_record: true }));
+    const workState = (state: "idle" | "tool_call", sequence: number) =>
+      handleRuntimeEvent({
+        event: "session_work_state", identity: runIdentity(sequence), session: "claude",
+        state, detail: null, previous_state: null, timestamp: "2026-10-25T03:00:00Z",
+      }, ctx);
+    workState("idle", 2);
+    expect(ctx.snapshotById.get(SESSION_A)).toMatchObject({ work_state: "thinking", work_state_from_record: true });
+    expect(ctx.applyPaneSnapshot, "no repaint to Ready").not.toHaveBeenCalled();
+    workState("tool_call", 3);
+    expect(ctx.snapshotById.get(SESSION_A)).toMatchObject({ work_state: "tool_call", work_state_from_record: false });
+    handleRuntimeEvent({
+      event: "session_state", identity: runIdentity(4), session: "claude", state: "starting",
+      reason: "test", timestamp: "2026-10-25T03:00:01Z",
+    }, ctx);
+    expect(ctx.snapshotById.get(SESSION_A)?.work_state_from_record).toBe(false);
+  });
+
+  it("a starting, failed or exited run carries no question from the run before", () => {
+    const line = "it is asking whether to trust the folder — answer that question in its terminal, then send again";
+    for (const state of ["starting", "closed", "failed"] as const) {
+      const ctx = makeContext();
+      ctx.snapshotById.set(SESSION_A, sessionSnapshot({ run_event_sequence: 1, blocked_reason: line }));
+      handleRuntimeEvent({
+        event: "session_state", identity: runIdentity(2), session: "claude", state,
+        reason: "test", timestamp: "2026-10-19T14:43:21Z",
+      }, ctx);
+      expect(ctx.snapshotById.get(SESSION_A)?.blocked_reason ?? null).toBeNull();
+    }
+    const kept = makeContext();
+    kept.snapshotById.set(SESSION_A, sessionSnapshot({ run_event_sequence: 1, blocked_reason: line }));
+    handleRuntimeEvent({
+      event: "session_state", identity: runIdentity(2), session: "claude", state: "idle",
+      reason: "quiesce timeout 3s", timestamp: "2026-10-19T14:43:22Z",
+    }, kept);
+    expect(kept.snapshotById.get(SESSION_A)?.blocked_reason).toBe(line);
+
+    const exited = makeContext();
+    exited.snapshotById.set(SESSION_A, sessionSnapshot({ run_event_sequence: 1, blocked_reason: line }));
+    handleRuntimeEvent({
+      event: "session_exit", identity: runIdentity(2), session: "claude", process_id: 42,
+      exit_code: 0, signal: null, success: true, reason: "operator_stop", requested: true,
+      timestamp: "2026-10-19T14:43:23Z",
+    }, exited);
+    expect(exited.snapshotById.get(SESSION_A)?.blocked_reason ?? null).toBeNull();
+  });
+
+  it("re-reads authoritative holds and sleep eligibility after every accepted exit", () => {
+    const exit: Extract<RuntimeEvent, { event: "session_exit" }> = {
+      event: "session_exit", identity: runIdentity(3), session: "codex", process_id: 42,
+      exit_code: 0, signal: null, success: true, reason: "operator_stop", requested: true,
+      timestamp: "2026-08-10T00:00:03Z",
+    };
+    const held = makeContext();
+    held.snapshotById.set(SESSION_A, sessionSnapshot({
+      recovery: { original_id: null, provenance: "codex_launch", reason: "Codex identity is unresolved." },
+    }));
+    handleRuntimeEvent(exit, held);
+    expect(held.refreshSnapshotFromEvent).toHaveBeenCalledOnce();
+    expect(held.refreshSnapshotFromEvent).toHaveBeenCalledWith();
+
+    const free = makeContext();
+    free.snapshotById.set(SESSION_A, sessionSnapshot());
+    handleRuntimeEvent(exit, free);
+    expect(free.refreshSnapshotFromEvent).toHaveBeenCalledOnce();
+    expect(free.snapshotById.get(SESSION_A)?.hibernated).toBeUndefined();
+    const authoritative = { ...free.snapshotById.get(SESSION_A)!, hibernated: true };
+    expect(reconcileSessionSnapshot(authoritative, free.snapshotById, free.runEventGate).accepted).toBe(true);
+    expect(free.snapshotById.get(SESSION_A)?.hibernated).toBe(true);
+    expect(reconcileSessionSnapshot({ ...authoritative, hibernated: false }, free.snapshotById, free.runEventGate).accepted).toBe(true);
+    expect(free.snapshotById.get(SESSION_A)?.hibernated).toBe(false);
+  });
+
+  it("refreshes native sleep metadata on launch/retirement transitions but not working-state traffic", () => {
+    for (const state of ["starting", "restarting", "closed", "failed", "ready", "idle", "busy"] as const) {
+      const ctx = makeContext();
+      ctx.snapshotById.set(SESSION_A, sessionSnapshot());
+      handleRuntimeEvent({ event: "session_state", identity: runIdentity(3), session: "codex",
+        state, reason: "native transition", timestamp: "2026-08-10T00:00:03Z" }, ctx);
+      expect(ctx.refreshSnapshotFromEvent).toHaveBeenCalledTimes(["starting", "restarting", "closed", "failed"].includes(state) ? 1 : 0);
+      expect(ctx.snapshotById.get(SESSION_A)?.hibernated).toBeUndefined();
+    }
   });
 
   it("applies a crash exit followed by its monotonic failed state", () => {

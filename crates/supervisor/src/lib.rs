@@ -5,14 +5,14 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Weak,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, NaiveDate, Utc};
 use control_plane::{DEFAULT_ENDPOINT, MAX_FRAME_BYTES, decode_request, encode_response};
 use parking_lot::{Condvar, Mutex, RwLock};
@@ -28,28 +28,96 @@ use shared_types::{
     AddRoomMemberRequest, AlertSeverity, BriefRoomMemberRequest, ControlKey, ControlPlaneSnapshot,
     ControlPlaneStatus, CreateRoomRequest, DeleteRoomRequest, DeliverRoomMessageRequest,
     DriverKind, EnvVar, HeartbeatSessionSummary, LaunchSpec, LifecycleState, LogLevel,
-    MessageScope, MoveRoomRequest, OperatorRouteMessageRequest, PostRoomMessageRequest,
+    MemberPermissions, MessageScope, MoveRoomRequest, OperatorRouteMessageRequest, PostRoomMessageRequest,
     ROOM_EVENT_SCHEMA_VERSION, ReadRoomFeedRequest, RemoveRoomMemberRequest, RenameRoomRequest,
     RoomDeliveryFailure, RoomDeliveryResult, RoomDeliveryStatus, RoomFeedItem, RoomFeedPage,
     RoomId, RoomMember, RoomMembershipAction, RoomMessageSender, RoomPostResult,
     RoomRecipientSelection, RoomRevision, RoomSnapshot, RouteDeliveryPhase, RunEventIdentity,
     RuntimeEvent, RuntimeSnapshot, SendInputRequest, SessionDefinition, SessionErrorKind,
-    SessionExitReason, SessionGeneration, SessionId, SessionSnapshot, SidebandRequest,
-    SidebandResponse,
+    SessionExitReason, SessionGeneration, SessionId, SessionSnapshot, SessionLaunchChoices,
+    SessionBriefChoice, SetRoomResumeRequest, SessionLaunchInputs, SessionLaunchRecord,
+    SessionLaunchPreview, SessionEffectiveSettings, SessionPaneMcpInputs, StartSessionRequest,
+    SidebandRequest, SidebandResponse,
     SidebandResponsePayload, SupervisorAlertType, WaitQuietRequest, WorkState, now_rfc3339,
 };
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
+mod codex_app_server;
 mod harness_executable;
+mod harness_version;
+mod identity_tracker;
+mod recovery_automation;
+mod room_composer;
+mod room_delivery;
+mod room_directory;
+mod room_fallbacks;
+mod session_ledger;
+pub use session_ledger::{PersonalRepoHealth, PersonalRepoSource, PersonalRepoStatus};
+#[cfg(test)]
+mod session_ledger_tests;
+/// A typed storage uncertainty survives anyhow context and IPC classification.
+/// Ordinary validation/quota refusals do not carry this marker.
+pub fn room_commit_is_uncertain(error: &anyhow::Error) -> bool {
+    error.is::<room_log::UncertainCommit>()
+}
+/// Preserve prior uncertain request keys while distinguishing a new append
+/// failure from recovery refusing before this operation could write.
+pub fn room_request_error_kind(error: &anyhow::Error) -> &'static str {
+    if room_commit_is_uncertain(error) { "commit_uncertain" }
+    else if error.is::<room_log::StructuralHistory>() { "history_unavailable" }
+    else if error.is::<room_log::RecoveryRequired>() || error.is::<room_log::StartupSyncFailed>() { "recovery_required" }
+    else if error.is::<rooms::RequestConflict>() { "request_conflict" }
+    else { "rejected" }
+}
+mod room_log;
+mod diagnostics;
+mod rebuild;
+pub use rebuild::closed_checkpoint::{
+    prepare_closed_checkpoint, ClosedCheckpointRequest, ClosedCheckpointProvenance,
+    ClosedCheckpointManifest, CheckpointEntry, CheckpointRole, CheckpointCompatibility,
+    CheckpointChange,
+};
+mod room_guests;
+mod feed_wait;
+mod pane_ancestry;
+mod member_lifecycle;
+mod room_admin;
+mod operator_entry;
+mod runtime_admin;
+mod room_mobility;
+mod room_package;
+#[cfg(test)]
+mod room_package_tests;
 mod rooms;
+mod session;
+mod submit_confirm;
+pub mod session_inventory;
+pub mod trial;
+pub mod upgrade;
+pub mod upgrade_flow;
+pub use trial::StartupAdmission;
+#[cfg(test)]
+mod maintenance_tests;
+mod telemetry;
+pub mod output_credit;
+pub mod tasks;
+pub mod task_graphql;
+pub mod runtime_snapshot;
+mod task_sideband;
+pub use task_sideband::{TaskFolderHealth, TaskFolderSource, TaskFolderStatus};
+#[cfg(test)]
+mod task_sideband_tests;
 
 use harness_executable::ResolvedLaunchProgram;
 use rooms::{
     PersistedRoomV1, ROOM_CATALOG_FILE_NAME, ROOM_MAX_COUNT, ROOM_MEMBER_MAX_COUNT, RoomCatalogV1,
     RoomRuntime, RoomState, default_room_label, validate_room_label,
 };
+use session::RecoveryReference;
+use room_guests::{GUEST_FROM_PANE_REFUSAL, GuestRegistry, guest_sender_label, guest_typed_content};
+pub use room_guests::{guest_agent_invitation, guest_cli_example, guest_mcp_config_json};
 
 type EventSink = Arc<dyn Fn(RuntimeEvent) + Send + Sync>;
 
@@ -82,8 +150,49 @@ const GROK_MINIMAL_LINE_BREAK: &str = "\x1b\r";
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 const TERMINAL_MODE_CONTROL_MAX_CHARS: u16 = 128;
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 1800;
+/** D9 step 1: exits are noticed when they happen. A watcher per run re-checks
+    every EXIT_WATCH_POLL whether its run is still current; the slow tick
+    catches an agent that exits under a still-running wrapper. */
+const EXIT_WATCH_POLL: Duration = Duration::from_secs(1);
+const LIVENESS_TICK: Duration = Duration::from_secs(2);
+/** D9 step 5: operator input is admitted in O(1) and written in admission
+    order by one worker per run, so the UI thread never waits on a PTY write.
+    A keystroke queued behind a room delivery's input gate froze the window
+    for 10.8 s while send_input ran on it. Bounded by count and bytes; a
+    refusal is visible and nothing is ever truncated. */
+const OPERATOR_INPUT_QUEUE_CAP: usize = 1024;
+const OPERATOR_INPUT_MAX_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+const OPERATOR_INPUT_QUEUE_BYTES: usize = 16 * 1024 * 1024;
+const OPERATOR_INPUT_RUN_CHECK: Duration = Duration::from_secs(5);
+
+struct OperatorInputQueue {
+    run_id: Uuid,
+    sender: mpsc::SyncSender<String>,
+    queued_bytes: Arc<AtomicUsize>,
+}
 const DEFAULT_AUTO_RESTART_STALL_THRESHOLD_SECS: u64 = 600;
+/// A16: a Claude or Codex run with no visible output this long after its
+/// spawn is Stalled (a healthy one draws its first screen within seconds).
+const STARTUP_SILENCE: Duration = Duration::from_secs(90);
 const SESSION_STOP_KILL_TIMEOUT: Duration = Duration::from_secs(5);
+/// F2: how long a run whose agent has exited may keep draining while processes
+/// it started still hold the terminal, before they are ended like a Stop would.
+const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(10);
+
+/// The hosted agent harnesses whose processes PRIM-1 can identify in the Job.
+fn hosted_agent(driver: DriverKind) -> bool {
+    matches!(driver, DriverKind::Claude | DriverKind::Codex | DriverKind::Grok)
+}
+
+/// F2: the spawned program is the agent's own native executable (claude.exe,
+/// codex.exe, grok.exe), not a shell wrapper or a Node launcher, so the PTY
+/// child's exit is the agent's exit even while Node tools it started live on.
+fn native_agent_program(driver: DriverKind, program: &Path) -> bool {
+    let Some(name) = program.file_name().and_then(|name| name.to_str()) else { return false };
+    hosted_agent(driver)
+        && pty_host::expected_agent_image_name(driver, name)
+        && !matches!(pty_host::process_image_file_name(name).as_str(), "node.exe" | "node")
+}
 const AUTO_RESTART_WINDOW: Duration = Duration::from_secs(30 * 60);
 const AUTO_RESTART_MAX_PER_WINDOW: usize = 3;
 const RECENT_ROUTE_OVERLAP_WINDOW: Duration = Duration::from_secs(3);
@@ -106,8 +215,47 @@ const PANE_MCP_ENVIRONMENT_VARIABLES: &[&str] = &[
 const PANE_MCP_CLAUDE_ALLOWED_TOOLS: &[&str] = &[
     "mcp__prim1_pane__ping",
     "mcp__prim1_pane__room_read",
+    "mcp__prim1_pane__room_wait",
     "mcp__prim1_pane__room_post",
+    "mcp__prim1_pane__room_ack",
     "mcp__prim1_pane__room_deliver",
+    "mcp__prim1_pane__room_directory",
+    "mcp__prim1_pane__tasks",
+    // Listed only to members the operator lets roam; the grant is the consent.
+    "mcp__prim1_pane__rooms_list",
+    "mcp__prim1_pane__room_peek",
+    "mcp__prim1_pane__room_join",
+    "mcp__prim1_pane__room_leave",
+    // Listed only to members granted maintain; the grant plus the operator's
+    // cancellable notice is the consent.
+    "mcp__prim1_pane__upgrade_request",
+    // Listed only to members the operator lets manage agents (A110, A111,
+    // A16; member_add also needs roam).
+    "mcp__prim1_pane__member_create",
+    "mcp__prim1_pane__member_start",
+    "mcp__prim1_pane__member_stop",
+    "mcp__prim1_pane__member_restart",
+    "mcp__prim1_pane__member_brief",
+    "mcp__prim1_pane__member_input",
+    "mcp__prim1_pane__member_remove",
+    "mcp__prim1_pane__room_fallbacks",
+    "mcp__prim1_pane__members_list",
+    "mcp__prim1_pane__member_update",
+    "mcp__prim1_pane__member_delete",
+    "mcp__prim1_pane__member_add",
+    "mcp__prim1_pane__room_create",
+    "mcp__prim1_pane__room_settings",
+    "mcp__prim1_pane__room_delete",
+    "mcp__prim1_pane__room_guests",
+    "mcp__prim1_pane__room_start",
+    "mcp__prim1_pane__room_stop",
+    "mcp__prim1_pane__room_retry",
+    "mcp__prim1_pane__local_conversations",
+    "mcp__prim1_pane__room_package",
+    // Listed only to members granted maintain (A16), as upgrade_request.
+    "mcp__prim1_pane__runtime_settings",
+    "mcp__prim1_pane__upgrade_control",
+    "mcp__prim1_pane__telemetry",
 ];
 
 #[cfg(windows)]
@@ -452,6 +600,11 @@ trait PaneProcess: Send + Sync {
     fn pid(&self) -> u32;
     fn is_alive(&self) -> Result<bool>;
     fn belongs_to(&self, pty: &dyn PtySession) -> Result<bool>;
+    /// The process's start (FILETIME), where it was read through its pinned
+    /// handle (A16 parent-chain checks).
+    fn creation_time(&self) -> Option<u64> {
+        None
+    }
 }
 
 #[cfg(windows)]
@@ -480,6 +633,10 @@ impl PaneProcess for WindowsPaneProcess {
 
     fn belongs_to(&self, pty: &dyn PtySession) -> Result<bool> {
         pty.contains_process(&self.process)
+    }
+
+    fn creation_time(&self) -> Option<u64> {
+        Some(self.process.creation_time_filetime())
     }
 }
 
@@ -510,17 +667,78 @@ fn mint_pane_secret() -> String {
 /// One resolved room delivery: the operator's Send and a pane's `room_deliver`
 /// build this, then share every step after it (preflight, receipts, writes).
 struct RoomDeliverySpec {
+    fallback_origin: Option<shared_types::RoomFallbackOrigin>,
     room_id: RoomId,
     recipient_ids: Vec<SessionId>,
     membership_revision: RoomRevision,
-    room_label: String,
     sender: RoomMessageSender,
     /// What the recipient's terminal shows after "message from".
     sender_label: String,
     content: String,
+    request_id: Option<String>,
+    admission: RoomDeliveryAdmission,
+    /// A109: the pane named a room_id, which needs roam even when it names
+    /// the caller's own room. Separate from `admission`, which says whether
+    /// the sender is visiting; rechecked at commit.
+    roam_required: bool,
+    /// v3 W3: an ordinary addressed send asks each recipient for an ACK;
+    /// briefs, reminders and recovery or upgrade continuations do not.
+    ack_requested: bool,
+    /// v3 W5: guests the message is addressed to (resolved once, stored).
+    guest_recipient_ids: Vec<Uuid>,
 }
 
-const ROOM_BRIEF_MAX_ATTEMPTS: u8 = 3;
+/// Why a pane's delivery may write into this room; rechecked at commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RoomDeliveryAdmission {
+    /// The operator, or a pane that is a member of the room.
+    Member,
+    /// A109: a pane the operator lets roam writes into a room it is not a
+    /// member of; its roam grant, not membership, is rechecked at commit.
+    Roaming,
+    /// A109: a pane answers `visitor`, a member of another room that
+    /// delivered to it across rooms recently; the visitor must still roam.
+    Reply { visitor: SessionId },
+    /// A110: a pane the operator lets manage agents briefs a member of its
+    /// room (or, with roam, of another room); its run, grant, room scope and
+    /// the recipient's membership are rechecked at commit.
+    Managing,
+    /// A107: an internal continuation, bound to the resumed run and durable intent.
+    Continuation { session_id: SessionId, generation: SessionGeneration, run_id: Uuid, continuation_id: Uuid },
+}
+
+/// One side of a membership change, checked and written into the catalog
+/// candidate but not yet applied to the runtime room.
+struct StagedMembership {
+    room_id: RoomId,
+    session_id: SessionId,
+    action: RoomMembershipAction,
+    revision: RoomRevision,
+    /// The member's read floor; used only when joining.
+    join_floor: shared_types::RoomSequence,
+    prepared: Result<rooms::PreparedRoomFeedEvent>,
+}
+
+struct AppliedMembership {
+    room_id: RoomId,
+    action: RoomMembershipAction,
+    revision: RoomRevision,
+    snapshot: RoomSnapshot,
+    feed_event: Result<shared_types::RoomFeedEvent>,
+}
+
+/// What a committed membership change did to each room it touched.
+struct RoomMembershipCommit {
+    left: Option<RoomMembershipSide>,
+    joined: Option<RoomMembershipSide>,
+}
+
+struct RoomMembershipSide {
+    room_id: RoomId,
+    revision: RoomRevision,
+    snapshot: RoomSnapshot,
+}
+
 const ROOM_BRIEF_TEMPLATE: &str = include_str!("room_brief.txt");
 
 /// Cap for an operator-edited room brief — well under the smallest delivery
@@ -540,6 +758,9 @@ fn normalize_room_brief_template(template: Option<String>) -> Result<Option<Stri
     let Some(template) = template else {
         return Ok(None);
     };
+    if template.contains('\0') {
+        return Err(anyhow!("the room brief must contain no NUL"));
+    }
     let template = template.replace("\r\n", "\n");
     let trimmed = template.trim();
     if trimmed.is_empty() {
@@ -571,6 +792,7 @@ fn render_room_brief(
     room_label: &str,
     members: &[RoomMember],
     you: &RoomMember,
+    grants: MemberPermissions,
     cli: Option<&Path>,
     template: Option<&str>,
 ) -> String {
@@ -584,25 +806,59 @@ fn render_room_brief(
     } else {
         others.join(", ")
     };
-    let tools = match you.driver {
-        DriverKind::Claude | DriverKind::Codex => {
-            "the prim1_pane MCP server: ping, room_read, room_post, room_deliver.".to_string()
-        }
-        _ => {
-            let cli = cli
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "$env:PRIM1_CLI".to_string());
-            format!(
-                "the PRIM-1 CLI from your shell (it prints JSON): & \"{cli}\" --prim1-room ping | read [--cursor '<json>'] | post <text> | deliver <label|all> <text>. Below, ping / room_read / room_post / room_deliver mean these commands."
-            )
-        }
+    let mcp = matches!(you.driver, DriverKind::Claude | DriverKind::Codex);
+    let mut tools = if mcp {
+        "the prim1_pane MCP server: ping, room_read, room_wait, room_post, room_ack, post_card, room_deliver. A line \"[PRIM-1] N new room message(s) for you\" typed into your terminal is only a pointer: run room_read, then room_ack each message addressed to you with its message_id and your next action (or decline it with a reason).".to_string()
+    } else {
+        let cli = cli
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "$env:PRIM1_CLI".to_string());
+        format!(
+            "the PRIM-1 CLI from your shell (it prints JSON): & \"{cli}\" --prim1-room ping | read [--cursor '<json>'] | wait --cursor '<json>' | post <text> | ack <message id> --next <what you do next> (or --decline <why not>) | card <json> | deliver <label|all> <text>. A line \"[PRIM-1] N new room message(s) for you\" typed into your terminal is only a pointer: read, then ack each message addressed to you. Judge each result by its JSON ok and message, not by the exit code, and in PowerShell call it piped (& \"{cli}\" --prim1-room … | Out-String): a bare call neither waits for it nor gets its exit code. Below, ping / room_read / room_wait / room_post / post_card / room_deliver mean these commands."
+        )
     };
+    // A109: only a member the operator lets roam hears of the roaming tools.
+    let mut roaming = match (grants.roam, mcp) {
+        (false, _) => String::new(),
+        (true, true) => " The operator lets you roam: rooms_list shows every room, room_peek reads a room's feed without joining it, room_join moves you into a room and room_leave back to the lobby (both post a notice), and room_deliver with room_id reaches a member of another room.".to_string(),
+        (true, false) => " The operator lets you roam: --prim1-room rooms | peek <room_id> | join <room_id> | leave, and deliver --room <room_id> <label|all> <text> reaches a member of another room. Join and leave post a notice.".to_string(),
+    };
+    // A110: only a member the operator lets manage agents hears of those tools.
+    let mut managing = match (grants.manage, mcp) {
+        (false, _) => String::new(),
+        (true, true) => " The operator lets you manage agents in your room, with the operator's own actions: members_list shows them; member_create adds a Claude, Codex or Grok member (start and brief only when asked; bypass permissions only with permission_profile \"unsafe\"; grants only for a supervisor); member_start (mode resume, fresh or resume_here), member_stop, member_restart, member_brief, member_input (types text and keys into its terminal, for example to answer a prompt; the room sees its length, and the text only with show_text; never to get around a refusal or to give consent that is Victor's), member_remove, member_update (label, permission profile, grants, working directory, tab position; it may edit you) and member_delete (close the session) act on a member named by label or session id. Each takes a fresh request_id (a UUID; reuse it only to retry) and posts a notice.".to_string(),
+        (true, false) => " The operator lets you manage agents in your room: --prim1-room member create --request-id <uuid> --driver <claude|codex|grok> --label <label> [--unsafe] [--grants <list>] [--start] [--brief] [--brief-text <text>]; members lists them; member start --request-id <uuid> <member> [--fresh | --resume-here]; member stop|restart|remove|delete|brief --request-id <uuid> <member> (brief: optional text); member input --request-id <uuid> <member> [--text <t>] [--key enter|up|down|left|right|tab|esc|ctrl_c]... [--show-text] (never to get around a refusal or to give consent that is Victor's); member update --request-id <uuid> <member> [--label <l>] [--profile normal|unsafe] [--grants <list>] [--working-directory <dir>] [--position <n>] (it may edit you; the usage text names the grants). Use a fresh UUID per action, the same one only to retry; each posts a notice.".to_string(),
+    };
+    if grants.manage {
+        managing.push_str(if mcp {
+            " room_fallbacks reads or saves scheduled reminders: get first, then set complete settings with that revision. room_create, room_settings, room_delete, room_guests, room_start and room_stop are the operator's room actions (a guest token is shown to you once, never posted)."
+        } else {
+            " --prim1-room fallbacks get reads scheduled reminders; fallbacks set <revision> <settings-json> saves the complete settings. --prim1-room room create|get|set|delete|start|stop and guests list|invite|revoke are the operator's room actions (a guest token is shown to you once, never posted)."
+        });
+        if grants.roam { managing.push_str(" Your roam permission also allows fallback settings in another room."); }
+    }
+    if grants.manage && grants.roam {
+        managing.push_str(if mcp {
+            " Because you may roam, member_create's room_id and a session id from rooms_list reach other rooms too."
+        } else {
+            " Because you may roam, member create --room <room_id> and a session id from rooms reach other rooms too."
+        });
+    }
+    let template = template.unwrap_or(ROOM_BRIEF_TEMPLATE);
+    // An operator-edited brief predating a placeholder still says it.
+    if !template.contains("{roaming}") {
+        tools.push_str(&std::mem::take(&mut roaming));
+    }
+    if !template.contains("{managing}") {
+        tools.push_str(&std::mem::take(&mut managing));
+    }
     // The template is LF; a checkout (or a pasted edit) carrying CRLF must
     // not leak a carriage return into Grok's LF-only framing.
     let mut text = template
-        .unwrap_or(ROOM_BRIEF_TEMPLATE)
         .replace("\r\n", "\n")
         .replace("{tools}", &tools)
+        .replace("{roaming}", &roaming)
+        .replace("{managing}", &managing)
         .replace("{members}", &others)
         .replace("{your_label}", &you.label)
         .replace("{room_label}", room_label);
@@ -684,6 +940,8 @@ struct RunWriteTarget {
     generation: SessionGeneration,
     pty: Arc<dyn PtySession>,
     input_gate: Arc<RunInputGate>,
+    /// v3 W4 S2: set for a Codex member on the App Server transport.
+    app_server: Option<codex_app_server::Dispatcher>,
 }
 
 struct PlannedDelivery {
@@ -755,6 +1013,10 @@ trait PtySpawner: Send + Sync {
 #[derive(Debug, Clone)]
 struct PreparedLaunch {
     spec: LaunchSpec,
+    driver: DriverKind,
+    launch_choices: SessionLaunchChoices,
+    launch_inputs: Option<SessionLaunchInputs>,
+    has_initial_prompt: bool,
     wsl_scope: Option<WslRunScope>,
     /// The secret placed in this launch's environment; stored on the run so
     /// the sideband can recognise the pane by it.
@@ -770,12 +1032,84 @@ struct PreparedLaunch {
     /// The pane's last known terminal size — the PTY spawns at it so early
     /// paint (a resumed replay especially) wraps for the real width.
     pty_size: Option<(u16, u16)>,
+    /// v3 W2: the resolved launch program whose `--version` is observed once
+    /// the run is live (Claude and Codex, the drivers with a tested version).
+    version_probe: Option<ResolvedLaunchProgram>,
+    /// v3 W4: an App Server member's private owner, started just before the
+    /// terminal spawns and stopped with its run.
+    codex_owner: Option<codex_app_server::OwnerPlan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WslRunScope {
     distro: String,
     unit: String,
+}
+
+/// Prime/WSL is parked in v2 (Victor, 13 Oct 2026). Its startup cleanup stops
+/// every `prim1-session-*.service` unit in the shared Ubuntu user systemd,
+/// whichever PRIM-1 started it, so it and every other WSL command run only
+/// when `PRIM1_ENABLE_PRIME=1`. Unit tests exercise the Prime paths with a
+/// fake WSL control, so the gate is open under `cfg(test)`.
+fn prime_enabled_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+pub fn prime_enabled() -> bool {
+    cfg!(test) || prime_enabled_from(std::env::var("PRIM1_ENABLE_PRIME").ok().as_deref())
+}
+
+const PRIME_PARKED_REASON: &str =
+    "Prime/WSL is parked in PRIM-1 v2; set PRIM1_ENABLE_PRIME=1 to use it. No WSL command was run.";
+
+/// Startup check of every catalog row's working directory. While Prime is
+/// parked a WSL row stays in the catalog and carries the parked reason; no
+/// WSL command runs. `prime_enabled` is a parameter so tests can run it parked.
+fn revalidate_catalog_working_directories(
+    slots: &mut SessionRegistry,
+    runtime_dir: &Path,
+    wsl_control: &dyn WslControl,
+    prime_enabled: bool,
+) {
+    for slot in slots.by_id.values_mut() {
+        let Some(qualified) = slot.qualified_working_directory.as_ref() else {
+            slot.last_error = Some(
+                "working directory unavailable: qualified working-directory metadata is missing"
+                    .into(),
+            );
+            continue;
+        };
+        let availability = match qualified.namespace {
+            WorkingDirectoryNamespace::Windows => {
+                revalidate_qualified_working_directory(slot.session_id, qualified, runtime_dir)
+                    .map(|_lease| ())
+            }
+            WorkingDirectoryNamespace::WslUbuntu if !prime_enabled => {
+                slot.last_error = Some(PRIME_PARKED_REASON.into());
+                continue;
+            }
+            WorkingDirectoryNamespace::WslUbuntu => {
+                wsl_control.revalidate_working_directory(qualified)
+            }
+        };
+        if let Err(error) = availability {
+            slot.last_error = Some(format!("working directory unavailable: {error:#}"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod prime_gate_tests {
+    use super::prime_enabled_from;
+
+    #[test]
+    fn prime_is_parked_unless_explicitly_enabled() {
+        assert!(!prime_enabled_from(None));
+        assert!(!prime_enabled_from(Some("")));
+        assert!(!prime_enabled_from(Some("0")));
+        assert!(!prime_enabled_from(Some("true")));
+        assert!(prime_enabled_from(Some("1")));
+    }
 }
 
 trait WslControl: Send + Sync {
@@ -913,6 +1247,12 @@ impl PtySession for WslScopedPtySession {
 
     fn live_processes(&self) -> Result<Vec<pty_host::ProcessIdentity>> {
         self.inner.live_processes()
+    }
+
+    /// The Windows side only (wsl.exe and its helpers): the Linux processes run
+    /// inside the WSL virtual machine, outside every Windows Job.
+    fn scope_accounting(&self) -> Result<Option<pty_host::ScopeAccounting>> {
+        self.inner.scope_accounting()
     }
 }
 
@@ -1514,10 +1854,12 @@ pub struct SupervisorConfig {
     pub heartbeat_interval: Option<Duration>,
     pub auto_restart_on_stall_sessions: Option<Vec<SessionId>>,
     pub auto_restart_stall_threshold: Option<Duration>,
-    /// Deliver the room brief into a member's terminal when it joins a room
-    /// and on its run's first idle. Off in unit tests (mock PTYs record every
-    /// byte); on in the desktop.
+    /// Legacy constructor compatibility; automatic PTY briefing is removed.
     pub room_brief_on_join: bool,
+    /// Task folder to open at start. If it cannot be opened, the runtime
+    /// still starts and task requests report why. A held trial ignores it.
+    /// The desktop passes None and calls `open_task_folder_from_setting`.
+    pub task_folder: Option<PathBuf>,
 }
 
 struct AuditInner {
@@ -1624,13 +1966,12 @@ impl AuditLog {
 struct RunningSession {
     pty: Option<Arc<dyn PtySession>>,
     input_gate: Arc<RunInputGate>,
+    output_close_in_flight: Arc<AtomicBool>,
     last_resize: Option<(u16, u16)>,
     /// Per-run identity proof handed to the pane as `PRIM1_PANE_SECRET`.
     pane_secret: Option<String>,
-    /// Room-brief attempts still owed to this run (it started as a member, or
-    /// joined a room while not ready): each idle transition spends one until
-    /// a brief is written. Zero once delivered or exhausted.
-    brief_attempts_left: u8,
+    /// v3 W4 S2: an App Server member's way to its owner's observer.
+    app_server: Option<codex_app_server::Dispatcher>,
 }
 
 impl RunningSession {
@@ -1638,9 +1979,10 @@ impl RunningSession {
         Self {
             pty,
             input_gate: Arc::new(RunInputGate::new()),
+            output_close_in_flight: Arc::new(AtomicBool::new(false)),
             last_resize: None,
             pane_secret: None,
-            brief_attempts_left: 0,
+            app_server: None,
         }
     }
 
@@ -1649,8 +1991,8 @@ impl RunningSession {
         self
     }
 
-    fn with_brief_owed(mut self, owed: bool) -> Self {
-        self.brief_attempts_left = if owed { ROOM_BRIEF_MAX_ATTEMPTS } else { 0 };
+    fn with_app_server(mut self, app_server: Option<codex_app_server::Dispatcher>) -> Self {
+        self.app_server = app_server;
         self
     }
 
@@ -1662,6 +2004,24 @@ impl RunningSession {
 struct RunInputGate {
     state: Mutex<RunInputState>,
     ready: Condvar,
+    // Separate from ticket state: operator/pane raw input announces intent
+    // before waiting behind a wake. Never hold this while waiting for a ticket.
+    room_input_activity: Mutex<room_composer::InputActivity>,
+    // One room wake per current run, independent of feed/dedup retention.
+    // A durable Pending with no recorded outcome keeps this run held.
+    room_wake_pending: AtomicBool,
+    room_wake_claim: Mutex<Option<(shared_types::MessageId, shared_types::RoomFeedCursor)>>,
+    // D9 step 5: operator input admitted but not yet terminated (written or
+    // failed). Lock-free so admission never waits on a wake; a room wake is
+    // held at planning, before its paste and before its Enter while this is
+    // non-zero (Codex review of 34cb00c).
+    operator_inputs_pending: AtomicUsize,
+}
+
+impl RunInputGate {
+    fn queued_operator_input_blocks_wake(&self) -> bool {
+        self.operator_inputs_pending.load(Ordering::SeqCst) > 0
+    }
 }
 
 struct RunInputState {
@@ -1722,6 +2082,10 @@ impl RunInputGate {
                 queue: VecDeque::new(),
             }),
             ready: Condvar::new(),
+            room_input_activity: Mutex::new(room_composer::InputActivity::default()),
+            room_wake_pending: AtomicBool::new(false),
+            operator_inputs_pending: AtomicUsize::new(0),
+            room_wake_claim: Mutex::new(None),
         }
     }
 
@@ -2038,13 +2402,28 @@ enum RunRetirementCause {
         final_state: LifecycleState,
         fallback_reason: SessionExitReason,
         detail: String,
+        /// Set only when the exit is inferred from terminal evidence (an Exited
+        /// work state with no agent process yet observed): the run-event
+        /// sequence that inference saw. The retirement claim requires it to be
+        /// unchanged, so fresh same-run output in between cancels the claim.
+        inferred_at_sequence: Option<u64>,
+    },
+    /// F2: the agent's exit was proven, but processes it started still held
+    /// the terminal after the drain grace, so the run could never reach output
+    /// EOF. `root_status` is a native agent root's status read before the scope
+    /// kill; `None` means the root was a wrapper or shim, still running or
+    /// unreadable, and the agent's own exit status is then unknown, never the
+    /// killed root's.
+    DrainExpired {
+        root_status: Option<PtyExitStatus>,
+        detail: String,
     },
 }
 
 impl RunRetirementCause {
     fn final_state(&self) -> LifecycleState {
         match self {
-            Self::OutputClosed => LifecycleState::Closed,
+            Self::OutputClosed | Self::DrainExpired { .. } => LifecycleState::Closed,
             Self::PtyError(_) => LifecycleState::Failed,
             Self::Liveness { final_state, .. } => *final_state,
         }
@@ -2054,7 +2433,7 @@ impl RunRetirementCause {
         match self {
             Self::OutputClosed => "session output closed",
             Self::PtyError(error) => error,
-            Self::Liveness { detail, .. } => detail,
+            Self::Liveness { detail, .. } | Self::DrainExpired { detail, .. } => detail,
         }
     }
 }
@@ -2062,6 +2441,7 @@ impl RunRetirementCause {
 struct QuiesceTimer {
     generation: SessionGeneration,
     run_id: Uuid,
+    /// Stable identity of this worker, not the latest output/deadline.
     armed_at: Instant,
     handle: tokio::task::JoinHandle<()>,
 }
@@ -2069,18 +2449,65 @@ struct QuiesceTimer {
 struct SessionSlot {
     session_id: Uuid,
     definition: SessionDefinition,
+    launch_choices: SessionLaunchChoices,
+    last_launch: Option<SessionLaunchRecord>,
     qualified_working_directory: Option<QualifiedWorkingDirectory>,
     state: LifecycleState,
     work_state: WorkState,
     work_state_observed: bool,
+    /// The state immediately preceding Exited, captured under slots rather than
+    /// inferred from a potentially delayed persistence callback.
+    work_state_before_exit: Option<WorkState>,
+    /// Display projection only. The catalog token remains launch authority.
+    crash_respawn_waiting: bool,
+    /// v3: the one automatic fresh start after Claude found no conversation to
+    /// resume was already spent in this process; a second refusal stops.
+    claude_auto_fresh_attempted: bool,
+    /// Exact crash start admitted before upgrade closing interrupted it. Used
+    /// only to release its process-free Starting state when admission reopens.
+    crash_start_admission: Option<(Uuid, SessionGeneration)>,
+    /// Run-event sequence of the latest committed work-state transition. Its
+    /// side effects (stall watchdog) apply only while it is still the latest,
+    /// so a delayed older transition cannot undo a newer one, even when the
+    /// states repeat (Idle, Blocked, Idle).
+    last_work_state_sequence: Option<u64>,
     work_detail: Option<String>,
+    /// v3 W2 #4: this run's advisory-notice match count when its notice
+    /// expired, and the wall time it went quiet. It holds until a fresh
+    /// matched notice (the count moves), another state or a new run; other
+    /// output never makes it current again (Reviewer ded940b6).
+    advisory_expired_at: Option<(u64, String)>,
+    /// v3 W2 #4: how many times this run's driver has reported an advisory
+    /// notice. Codex reports one only from fresh output, never from a rescan.
+    advisory_notice_matches: u64,
+    /// v3 W2 #6: since when this run has held wakes (a modal question on its
+    /// screen or a provider error), and whether that hold was already
+    /// surfaced as "blocked but active". Reset when the hold ends.
+    hold_since: Option<Instant>,
+    hold_alerted: bool,
+    /// v3 W2 #6: this member's latest own room post, message or card.
+    last_room_post_at: Option<Instant>,
+    /// v3 J4: this run's latest turn ended with this structured provider error
+    /// (from the member's own rollout, set and cleared by the reconciler).
+    provider_error: Option<String>,
+    /// v3 W2: the member's own rollout shows this run's latest turn still open
+    /// (presentation only: a quiet exec-cell screen is not idle).
+    rollout_turn_open: bool,
     work_error_observations: HashMap<String, Vec<Instant>>,
     running: Option<RunningSession>,
+    output_draining: bool,
+    /// When the exact-Job check first reported this run's agent exited (F2):
+    /// the drain grace counts from that evidence, never from a wrapper's exit.
+    agent_exited_at: Option<Instant>,
     run_id: Option<Uuid>,
     last_run_id: Option<Uuid>,
     bracketed_paste: BracketedPasteRunState,
     codex_work_state: driver_codex::WorkStateTracker,
     grok_startup: driver_grok::StartupTracker,
+    room_composer: room_composer::RoomComposer,
+    /// v3 W2: the harness CLI version this run's launch program reported,
+    /// once observed; None is unknown.
+    harness_version: Option<String>,
     grok_initial_idle_pending: bool,
     run_event_sequence: u64,
     generation: SessionGeneration,
@@ -2099,11 +2526,16 @@ struct SessionSlot {
     stall_state_entered_timestamp: Option<String>,
     stall_detector: Option<StallDetector>,
     /// Harness-side conversation id of the newest run — what Launch resumes.
-    /// Minted for Claude/Grok, captured from the rollout for Codex.
+    /// Minted for Claude/Grok. Codex remains unresolved without launch proof.
     harness_session_id: Option<String>,
-    /// The session had a live run when the app last went down; drives the
-    /// UI's "continue where I left off" relaunch on open.
+    recovery: Option<RecoveryReference>,
+    recovery_history: Vec<RecoveryReference>,
+    /// Persisted restart eligibility: set while a run is active, cleared on
+    /// confirmed same-process retirement, retained when app shutdown interrupts
+    /// it. Room restart selection remains independent configuration.
     running_at_shutdown: bool,
+    /// Exact saved identity eligible for this boot only; manual actions consume it.
+    boot_resume_id: Option<String>,
     /// Last terminal size the UI fitted this pane to; the next run's PTY
     /// spawns at it.
     last_pty_size: Option<(u16, u16)>,
@@ -2120,28 +2552,54 @@ struct SessionSlot {
     /// For a Terminal pane: the harness last found running inside it, so the
     /// system log announces a detection once per run, not once per message.
     terminal_harness_announced: Option<DriverKind>,
+    /// Operator grants beyond the member's own room (A109).
+    permissions: MemberPermissions,
+    /// A110: the managing member's request that created it, if one did.
+    created_by: Option<MemberCreation>,
 }
 
 impl SessionSlot {
     fn snapshot(&self) -> SessionSnapshot {
+        // v3 W2: an open turn in the member's own rollout is busy even while
+        // its screen is quiet (a background exec cell); presentation only.
+        let observed = self.running.is_some() && self.work_state_observed;
+        let from_record = observed && self.rollout_turn_open && self.work_state == WorkState::Idle;
+        // v3 W2 #4 (Reviewer ded940b6): an expired advisory notice is not a
+        // current state: no work state and no blocked reason are exported
+        // for it; the driver's latch and detail stay internal evidence.
+        let observed = observed && expired_advisory_since(self).is_none();
         SessionSnapshot {
             session_id: self.session_id,
             alias: self.definition.alias.clone(),
             label: self.definition.label.clone(),
             driver: self.definition.driver,
             permission_profile: self.definition.permission_profile,
+            codex_transport: self.definition.codex_transport,
+            launch_choices: self.launch_choices.clone(),
+            last_launch: self.last_launch.clone(),
+            recovery: self.recovery.as_ref().map(RecoveryReference::snapshot),
+            recovery_history: self.recovery_history.iter().map(RecoveryReference::snapshot).collect(),
             lifecycle_state: self.state,
             working_dir: self.definition.working_dir.clone(),
             generation: self.generation,
             run_id: self.run_id,
             run_event_sequence: self.run_event_sequence,
+            pty_size: Some(self.last_pty_size.unwrap_or(shared_types::DEFAULT_PTY_SIZE)),
             process_id: self.process_id,
             running: self.running.is_some(),
+            output_draining: self.output_draining && self.running.is_some(),
+            crash_respawn_waiting: self.crash_respawn_waiting,
             last_activity_at: self.last_activity_at.clone(),
             last_error: self.last_error.clone(),
             last_error_kind: executable_not_found_kind(self.last_error.as_deref()),
-            resume_available: self.harness_session_id.is_some(),
+            resume_available: self.harness_session_id.is_some() && self.recovery.is_none(),
             was_running_at_shutdown: self.running_at_shutdown,
+            permissions: self.permissions,
+            blocked_reason: snapshot_blocked_reason(self),
+            work_state: observed.then_some(if from_record { WorkState::Thinking } else { self.work_state }),
+            work_state_from_record: from_record,
+            app_server: self.running.as_ref().and_then(|running| running.app_server.as_ref())
+                .map(codex_app_server::Dispatcher::follow),
         }
     }
 
@@ -2175,14 +2633,53 @@ struct PersistedSessionV1 {
     driver: DriverKind,
     working_directory: QualifiedWorkingDirectory,
     permission_profile: shared_types::PermissionProfile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    launch_choices: Option<SessionLaunchChoices>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_launch: Option<SessionLaunchRecord>,
     #[serde(default)]
     harness_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery: Option<RecoveryReference>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    recovery_history: Vec<RecoveryReference>,
     #[serde(default)]
     running_at_shutdown: bool,
     #[serde(default)]
     last_pty_cols: Option<u16>,
     #[serde(default)]
     last_pty_rows: Option<u16>,
+    /// Omitted while no grant is set, so older catalogs and rows stay as written.
+    #[serde(default, skip_serializing_if = "MemberPermissions::is_default")]
+    permissions: MemberPermissions,
+    /// A110: the managing member and request that created this session; a
+    /// retry of that request finds it here instead of creating another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_by: Option<MemberCreation>,
+    /// v3 W4: omitted while `Pty`. A v2 build refuses a row that has it
+    /// (unknown field), so rollback-runtime.ps1 stops on it first (W7).
+    #[serde(default, skip_serializing_if = "shared_types::CodexTransport::is_pty")]
+    codex_transport: shared_types::CodexTransport,
+}
+
+/// Who created a session through `member_create`, under which request_id,
+/// and the SHA-256 of that create's arguments, which a retry must repeat.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct MemberCreation {
+    session_id: SessionId,
+    request_id: String,
+    /// Empty in a row written before it was recorded; such a row matches no
+    /// retry.
+    #[serde(default)]
+    fingerprint: String,
+}
+
+impl MemberCreation {
+    /// The same caller and request_id, whatever the arguments.
+    fn same_request(&self, other: &Self) -> bool {
+        self.session_id == other.session_id && self.request_id == other.request_id
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2191,6 +2688,12 @@ struct SessionCatalogV1 {
     schema_version: u32,
     workspace_preference: QualifiedWorkingDirectory,
     sessions: Vec<PersistedSessionV1>,
+    /// A108: per personal repository, what this install's register writer
+    /// last wrote (or was about to write) for each member's file.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    register_acks: BTreeMap<String, BTreeMap<SessionId, session_ledger::RegisterAck>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    recovery_automation: BTreeMap<SessionId, recovery_automation::RecoveryAutomation>,
 }
 
 impl SessionCatalogV1 {
@@ -2199,6 +2702,8 @@ impl SessionCatalogV1 {
             schema_version: SESSION_CATALOG_SCHEMA_VERSION,
             workspace_preference,
             sessions: Vec::new(),
+            register_acks: BTreeMap::new(),
+            recovery_automation: BTreeMap::new(),
         }
     }
 }
@@ -2213,6 +2718,17 @@ struct SessionRegistry {
 impl SessionRegistry {
     fn from_catalog(catalog: &SessionCatalogV1) -> Result<Self> {
         let mut registry = Self::default();
+        let mut conversation_owners: HashMap<(DriverKind, String), Vec<SessionId>> = HashMap::new();
+        for persisted in &catalog.sessions {
+            if matches!(persisted.driver, DriverKind::Claude | DriverKind::Codex | DriverKind::Grok)
+                && let Some(id) = persisted.harness_session_id.as_deref()
+            {
+                // Normalize UUID spelling for comparison only. Retain the exact
+                // imported reference; never rewrite it or select the first owner.
+                let key = Uuid::parse_str(id).map(|id| id.to_string()).unwrap_or_else(|_| id.into());
+                conversation_owners.entry((persisted.driver, key)).or_default().push(persisted.session_id);
+            }
+        }
         for persisted in &catalog.sessions {
             if registry.by_id.contains_key(&persisted.session_id) {
                 return Err(anyhow!(
@@ -2233,6 +2749,7 @@ impl SessionRegistry {
                 ));
             }
             validate_driver_working_directory_pair(persisted.driver, &persisted.working_directory)?;
+            validate_codex_transport(persisted.driver, persisted.codex_transport)?;
             let definition = SessionDefinition {
                 session_id: persisted.session_id,
                 alias: session_alias(persisted.session_id),
@@ -2240,11 +2757,43 @@ impl SessionRegistry {
                 driver: persisted.driver,
                 working_dir: persisted.working_directory.canonical_path.clone(),
                 permission_profile: persisted.permission_profile,
+                codex_transport: persisted.codex_transport,
             };
             let mut slot = closed_session_slot(definition);
+            if let Some(choices) = &persisted.launch_choices {
+                session::validate_launch_choices(persisted.driver, choices)?;
+                slot.launch_choices = choices.clone();
+            }
             slot.qualified_working_directory = Some(persisted.working_directory.clone());
+            slot.last_launch = persisted.last_launch.clone();
             slot.harness_session_id = persisted.harness_session_id.clone();
+            slot.recovery_history = persisted.recovery_history.clone();
+            slot.recovery = persisted.recovery.clone().or_else(|| {
+                (persisted.driver == DriverKind::Codex
+                    && (persisted.harness_session_id.is_some() || persisted.running_at_shutdown))
+                    .then(|| {
+                        RecoveryReference::unresolved_codex(
+                            persisted.harness_session_id.clone(),
+                            true,
+                        )
+                    })
+            });
+            if let Some(original_id) = persisted.harness_session_id.as_ref() {
+                let key = Uuid::parse_str(original_id).map(|id| id.to_string()).unwrap_or_else(|_| original_id.clone());
+                if let Some(owners) = conversation_owners.get(&(persisted.driver, key)).filter(|owners| owners.len() > 1) {
+                    let duplicate = RecoveryReference::duplicate_catalog_identity(original_id.clone(), owners);
+                    if let Some(previous) = slot.recovery.take()
+                        && previous != duplicate
+                    {
+                        slot.recovery_history.push(previous);
+                    }
+                    slot.recovery = Some(duplicate);
+                }
+            }
             slot.running_at_shutdown = persisted.running_at_shutdown;
+            slot.boot_resume_id = persisted.running_at_shutdown.then(|| persisted.harness_session_id.clone()).flatten();
+            slot.permissions = persisted.permissions;
+            slot.created_by = persisted.created_by.clone();
             slot.last_pty_size = persisted
                 .last_pty_cols
                 .zip(persisted.last_pty_rows)
@@ -2614,12 +3163,26 @@ fn closed_session_slot(definition: SessionDefinition) -> SessionSlot {
     let session_id = definition.session_id;
     SessionSlot {
         session_id,
+        launch_choices: session::default_launch_choices(definition.driver),
+        last_launch: None,
         definition,
         qualified_working_directory: None,
         state: LifecycleState::Closed,
         work_state: WorkState::Idle,
         work_state_observed: false,
+        work_state_before_exit: None,
+        crash_respawn_waiting: false,
+        claude_auto_fresh_attempted: false,
+        crash_start_admission: None,
+        last_work_state_sequence: None,
         work_detail: None,
+        advisory_expired_at: None,
+        advisory_notice_matches: 0,
+        hold_since: None,
+        hold_alerted: false,
+        last_room_post_at: None,
+        provider_error: None,
+        rollout_turn_open: false,
         work_error_observations: HashMap::new(),
         running: None,
         run_id: None,
@@ -2627,6 +3190,8 @@ fn closed_session_slot(definition: SessionDefinition) -> SessionSlot {
         bracketed_paste: BracketedPasteRunState::default(),
         codex_work_state: driver_codex::WorkStateTracker::default(),
         grok_startup: driver_grok::StartupTracker::default(),
+        room_composer: room_composer::RoomComposer::default(),
+        harness_version: None,
         grok_initial_idle_pending: false,
         run_event_sequence: 0,
         generation: 0,
@@ -2645,13 +3210,20 @@ fn closed_session_slot(definition: SessionDefinition) -> SessionSlot {
         stall_state_entered_timestamp: None,
         stall_detector: None,
         harness_session_id: None,
+        recovery: None,
+        recovery_history: Vec::new(),
         running_at_shutdown: false,
+        boot_resume_id: None,
         last_pty_size: None,
+        output_draining: false,
+        agent_exited_at: None,
         run_output_tail: String::new(),
         run_started_at: None,
         run_resume_id: None,
         run_program: None,
         terminal_harness_announced: None,
+        permissions: MemberPermissions::default(),
+        created_by: None,
     }
 }
 
@@ -2759,6 +3331,42 @@ fn last_output_lines(tail: &str, count: usize, max_len: usize) -> Vec<String> {
 const CODEX_RESUME_FAILURE_SIGNATURES: [&str; 3] =
     ["failed to resume", "thread/resume failed", "cannot resume"];
 
+/// "Codex 0.163.0 (<path>)" when the standalone release folder names the
+/// version, else the program path.
+fn codex_build_label(program: Option<&Path>) -> String {
+    let Some(program) = program else {
+        return "This Codex".into();
+    };
+    program
+        .components()
+        .rev()
+        .find_map(|component| {
+            let version = component.as_os_str().to_str()?.split('-').next()?;
+            let parts: Vec<&str> = version.split('.').collect();
+            (parts.len() == 3
+                && parts
+                    .iter()
+                    .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())))
+            .then(|| format!("Codex {version} ({})", program.display()))
+        })
+        .unwrap_or_else(|| format!("The Codex at {}", program.display()))
+}
+
+/// Claude's own refusal to resume `resume_id`: "No conversation found with
+/// session ID" and that exact id on the same line (with or without a colon).
+fn claude_has_no_conversation(tail: &str, resume_id: &str) -> bool {
+    const REFUSAL: &str = "no conversation found with session id";
+    tail.lines().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.find(REFUSAL).is_some_and(|at| {
+            let rest = line[at + REFUSAL.len()..].trim_start();
+            let rest = rest.strip_prefix(':').unwrap_or(rest).trim_start();
+            rest.strip_prefix(resume_id)
+                .is_some_and(|after| !after.starts_with(|ch: char| ch.is_ascii_alphanumeric() || ch == '-'))
+        })
+    })
+}
+
 fn codex_resume_failure_line(tail: &str) -> Option<String> {
     let lower = tail.to_ascii_lowercase();
     if !CODEX_RESUME_FAILURE_SIGNATURES
@@ -2810,8 +3418,11 @@ fn grok_binary_replaced_since(
 
 struct RunDiagnosis {
     last_error: Option<String>,
-    /// The stored conversation id is provably unresumable; drop it.
-    drop_harness_session_id: bool,
+    /// The stored conversation was refused; retain its ID for explicit recovery.
+    needs_recovery: bool,
+    /// v3 (Claude PRIM-1, f0dfecc walk 3): Claude itself answered that it has
+    /// no conversation with this resumed id.
+    missing_conversation: Option<String>,
 }
 
 /// Turn "process exited with code 1" into the sentence the operator needs:
@@ -2825,19 +3436,60 @@ fn diagnose_terminal_run(
     let Some(classification) = classification else {
         return RunDiagnosis {
             last_error: None,
-            drop_harness_session_id: false,
+            needs_recovery: false, missing_conversation: None,
         };
     };
     let Some(base) = classification.last_error.clone() else {
         return RunDiagnosis {
             last_error: None,
-            drop_harness_session_id: false,
+            needs_recovery: false, missing_conversation: None,
         };
     };
     if classification.requested {
         return RunDiagnosis {
             last_error: Some(base),
-            drop_harness_session_id: false,
+            needs_recovery: false, missing_conversation: None,
+        };
+    }
+
+    // Every launch passes --no-daemon so the pane's own process holds its
+    // thread lock; a build without the flag stops at argument parsing.
+    if slot.definition.driver == DriverKind::Codex
+        && slot.run_output_tail.contains("unexpected argument '--no-daemon'")
+    {
+        return RunDiagnosis {
+            last_error: Some(format!(
+                "{} does not accept --no-daemon, which PRIM-1 needs to follow its conversation. Update Codex (codex update, or npm install -g @openai/codex for the npm copy), then press Launch. [{base}]",
+                codex_build_label(slot.run_program.as_deref())
+            )),
+            needs_recovery: false, missing_conversation: None,
+        };
+    }
+
+    // Launching again only repeats this exit until Claude is updated.
+    if slot.definition.driver == DriverKind::Claude
+        && driver_claude::is_version_required_notice(&slot.run_output_tail)
+    {
+        return RunDiagnosis {
+            last_error: Some(format!(
+                "This Claude Code is older than the minimum version it requires and exited. Run claude update, then press Launch. [{base}]"
+            )),
+            needs_recovery: false, missing_conversation: None,
+        };
+    }
+
+    // v3 (Claude PRIM-1, f0dfecc walk 3): a plain resume Claude refused because
+    // it has no conversation with that id. Its own answer, never a path guess.
+    if slot.definition.driver == DriverKind::Claude
+        && let Some(resume_id) = slot.run_resume_id.as_deref()
+        && claude_has_no_conversation(&slot.run_output_tail, resume_id)
+    {
+        return RunDiagnosis {
+            last_error: Some(format!(
+                "Claude has no conversation {resume_id} to resume (\"No conversation found\"). The ID is retained. After stopping the run, choose Start fresh session to start a new conversation. [{base}]"
+            )),
+            needs_recovery: true,
+            missing_conversation: Some(resume_id.to_owned()),
         };
     }
 
@@ -2847,9 +3499,9 @@ fn diagnose_terminal_run(
     {
         return RunDiagnosis {
             last_error: Some(format!(
-                "Codex could not resume conversation {resume_id}: \"{line}\". PRIM-1 dropped that id (it is not resumable) — press Launch for a fresh conversation, or right-click the tab → Start fresh session. [{base}]"
+                "Codex could not resume conversation {resume_id}: \"{line}\". The original ID is retained. After stopping the run, choose Start fresh session to start a new conversation. [{base}]"
             )),
-            drop_harness_session_id: true,
+            needs_recovery: true, missing_conversation: None,
         };
     }
 
@@ -2864,7 +3516,7 @@ fn diagnose_terminal_run(
             last_error: Some(format!(
                 "Grok updated itself{version} and exited to be restarted — press Launch. [{base}]"
             )),
-            drop_harness_session_id: false,
+            needs_recovery: false, missing_conversation: None,
         };
     }
 
@@ -2872,12 +3524,12 @@ fn diagnose_terminal_run(
     if lines.is_empty() {
         return RunDiagnosis {
             last_error: Some(base),
-            drop_harness_session_id: false,
+            needs_recovery: false, missing_conversation: None,
         };
     }
     RunDiagnosis {
         last_error: Some(format!("{base} — last output: \"{}\"", lines.join(" ⏎ "))),
-        drop_harness_session_id: false,
+        needs_recovery: false, missing_conversation: None,
     }
 }
 
@@ -2901,6 +3553,7 @@ fn run_write_target_from_slot(name: &str, slot: &SessionSlot) -> Result<RunWrite
         generation: slot.generation,
         pty,
         input_gate: running.input_gate.clone(),
+        app_server: running.app_server.clone(),
     })
 }
 
@@ -2919,26 +3572,76 @@ fn session_display_name(definition: &SessionDefinition) -> String {
     format!("{} ({short})", definition.label)
 }
 
+/// v3 W2 (11 Oct items 1 and 7): the code a receipt, a member card and the
+/// audit carry for a work-state detail, never the words the screen showed.
+/// Quoting them put the phrase on every member screen that read the receipt
+/// back, which latched those screens in turn (W1 R8). `None` for details
+/// that are not a reason (a thinking timer, a tool name).
+pub(crate) fn work_state_reason_code(detail: &str) -> Option<String> {
+    let code = match detail {
+        "rate_limit" | "usage_limit" => "usage_cap",
+        "stream_disconnected" => "stream_drop",
+        "auth_refresh" => "auth",
+        "context_length_exceeded" => "context_full",
+        "api_error" => "api_error",
+        detail if is_open_question_detail(detail) => return Some(format!("modal:{detail}")),
+        detail if is_work_state_reason(detail) => return Some(format!("blocked:{detail}")),
+        _ => return None,
+    };
+    Some(code.into())
+}
+
+/// A detail that names why a member is blocked (a code), as opposed to a
+/// thinking timer or other screen words, which never reach a receipt.
+fn is_work_state_reason(detail: &str) -> bool {
+    !detail.is_empty()
+        && detail.len() <= 48
+        && detail.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+}
+
+/// v3 W2 (11 Oct item 1): the notices matched in screen text (usage-cap,
+/// stream-drop, auth classes, a full context, an API error banner). They are
+/// advisory status: shown, never a refusal. Every other blocked detail — a
+/// question with its choices, a launcher still starting, a version stop, a
+/// detail this build does not know — holds routed input (fail closed).
+fn is_advisory_notice_detail(detail: &str) -> bool {
+    matches!(
+        detail,
+        "rate_limit" | "usage_limit" | "stream_disconnected" | "auth_refresh" | "api_error"
+            | "context_length_exceeded"
+    )
+}
+
+/// A blocked state with no detail is held: no driver produces one, so it is
+/// unknown, not a known notice.
+fn work_state_holds_delivery(state: WorkState, detail: Option<&str>) -> bool {
+    match state {
+        WorkState::Exited => true,
+        WorkState::Blocked | WorkState::ErrorLoop => !detail.is_some_and(is_advisory_notice_detail),
+        WorkState::Idle | WorkState::Thinking | WorkState::ToolCall => false,
+    }
+}
+
 /// Plain-language reason + the action that actually clears it, keyed by the
 /// driver's work-state detail. The technical detail is still appended to
 /// every message in a bracketed tail, so nothing is hidden from a reader who
-/// wants the raw state.
-fn describe_work_state_block(
-    state: WorkState,
-    detail: Option<&str>,
-    evidence: Option<&str>,
-) -> (String, &'static str) {
-    let quoted = evidence
-        .map(|phrase| format!(" (it printed \"{phrase}\")"))
-        .unwrap_or_default();
+/// wants the raw state. No text here quotes or names a notice's own words.
+fn describe_work_state_block(state: WorkState, detail: Option<&str>) -> (String, &'static str) {
     match (state, detail) {
+        // Starting it again only repeats the exit until Claude is updated.
+        (WorkState::Exited, Some("version_required")) => (
+            "this Claude Code is older than the minimum version and exited".into(),
+            "run claude update, then start it again from its tab",
+        ),
         (WorkState::Exited, _) => (
             "its process has exited".into(),
             "start it again from its tab",
         ),
-        (WorkState::ErrorLoop, Some("rate_limit")) => (
-            "it keeps hitting a rate limit".into(),
-            "wait for the limit to reset, then send again",
+        // A16 T-34: never the banner's own words, which another member's
+        // screen would read back as a notice.
+        (WorkState::ErrorLoop, Some("rate_limit" | "usage_limit")) => (
+            "its screen keeps showing a usage-cap notice (usage_cap, advisory)".into(),
+            "messages still go through; check its terminal if it stops answering",
         ),
         (WorkState::ErrorLoop, Some("context_length_exceeded")) => (
             "its context window is full".into(),
@@ -2968,21 +3671,60 @@ fn describe_work_state_block(
             "it is asking you to sign in".into(),
             "sign in from its terminal, then send again",
         ),
+        // Startup and model questions. PRIM-1 never answers one: terms,
+        // logins, keys and imports are the operator's decision.
+        (_, Some("update_prompt")) => (
+            "Codex is asking whether to update".into(),
+            "press 2 or Esc in its terminal to skip the update, then send again",
+        ),
+        (_, Some("model_migration_prompt")) => (
+            "Codex is offering to switch to a newer model".into(),
+            "choose a model in its terminal, then send again",
+        ),
+        (_, Some("hooks_review")) => (
+            "Codex is asking whether to trust new hooks".into(),
+            "the operator decides in its terminal (PRIM-1 never answers it), then send again",
+        ),
+        (_, Some("rate_limit_model_prompt")) => (
+            "Codex is near its usage cap and asking whether to switch models".into(),
+            "choose in its terminal (Keep current model changes nothing), then send again",
+        ),
+        (_, Some("consumer_terms_notice")) => (
+            "Claude is showing updated consumer terms".into(),
+            "the operator decides them in its terminal (PRIM-1 never answers terms), then send again",
+        ),
+        (_, Some("version_required")) => (
+            "this Claude Code is older than the minimum version and will not start".into(),
+            "run claude update, then start it again from its tab",
+        ),
+        (_, Some("onboarding")) => (
+            "Claude is on its first-run setup (theme, login or tour)".into(),
+            "finish the setup in its terminal, then send again",
+        ),
+        (_, Some("api_key_prompt")) => (
+            "Claude is asking whether to use an API key from its environment".into(),
+            "the operator decides in its terminal, then send again",
+        ),
+        (_, Some("mcp_server_approval")) => (
+            "Claude is asking whether to use a new MCP server from this project".into(),
+            "the operator decides in its terminal, then send again",
+        ),
+        (_, Some("external_imports_prompt")) => (
+            "Claude is asking whether to allow CLAUDE.md imports from outside its folder".into(),
+            "the operator decides in its terminal, then send again",
+        ),
+        // Notices: advisory status read off the screen (v3 W2), never a hold.
         (_, Some("auth_refresh")) => (
-            format!("its login needs refreshing{quoted}"),
-            "log in again from its terminal, then send again",
+            "its screen showed a sign-in notice (auth, advisory)".into(),
+            "messages still go through; if it stops answering, check its login in its terminal",
         ),
         (_, Some("stream_disconnected")) => (
-            format!("its connection to the model dropped{quoted}"),
-            "wait for it to reconnect and show its prompt, or restart it from its tab",
+            "its screen showed a connection notice (stream_drop, advisory)".into(),
+            "messages still go through; it usually reconnects by itself",
         ),
-        (_, Some("rate_limit")) => (
-            format!("it hit a rate limit{quoted}"),
-            "wait for the limit to reset, then send again",
-        ),
-        (_, Some("usage_limit")) => (
-            format!("it hit its usage limit{quoted}"),
-            "wait for the limit to reset or add credits, then send again",
+        (_, Some("rate_limit" | "usage_limit")) => (
+            "its screen showed a usage-cap notice (usage_cap, advisory)".into(),
+            "messages still go through; check its terminal if it stops answering",
         ),
         (_, Some("launcher_menu")) => (
             "it is still on its launcher menu".into(),
@@ -2993,7 +3735,7 @@ fn describe_work_state_block(
             "wait for its prompt, then send again",
         ),
         (_, Some(detail)) => (
-            format!("it reported '{detail}'{quoted}"),
+            format!("it reported '{detail}'"),
             "look at its terminal, resolve it there, then send again",
         ),
         (_, None) => (
@@ -3003,6 +3745,19 @@ fn describe_work_state_block(
     }
 }
 
+#[derive(Debug)]
+struct RoutedInputRefusal {
+    display: String,
+    room_reason: String,
+}
+
+impl std::fmt::Display for RoutedInputRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.display)
+    }
+}
+impl std::error::Error for RoutedInputRefusal {}
+
 fn routed_input_refusal(
     slot: &SessionSlot,
     target: &RunWriteTarget,
@@ -3010,11 +3765,14 @@ fn routed_input_refusal(
     action: &str,
     technical: &str,
 ) -> anyhow::Error {
-    anyhow!(
+    let room_reason = format!("{} can't take a routed message right now: {reason}",
+        session_display_name(&slot.definition));
+    let display = format!(
         "{} can't take a routed message right now: {reason} — {action}. [{}: {technical}]",
         session_display_name(&slot.definition),
         target.session,
-    )
+    );
+    RoutedInputRefusal { display, room_reason }.into()
 }
 
 fn ensure_run_input_safety_locked(
@@ -3026,18 +3784,19 @@ fn ensure_run_input_safety_locked(
         return Ok(());
     }
 
+    // v3 W2: both gates hold only a verified blocker. A latched notice (the
+    // Codex tracker's or the generic work state's) is advisory and passes.
     if slot.definition.driver == DriverKind::Codex {
-        if slot.codex_work_state.is_blocked() {
+        if slot.codex_work_state.is_blocked()
+            && slot.codex_work_state.blocked_class() != Some(driver_codex::BlockerClass::Notice)
+        {
             let detail = slot.codex_work_state.blocked_detail();
-            let (reason, action) = describe_work_state_block(
-                WorkState::Blocked,
-                detail,
-                slot.codex_work_state.blocked_evidence(),
-            );
+            let (reason, action) = describe_work_state_block(WorkState::Blocked, detail);
             let technical = format!(
                 "work state is blocked{}; routed/delivered framing is blocked",
                 detail
-                    .map(|detail| format!(" ({detail})"))
+                    .and_then(work_state_reason_code)
+                    .map(|code| format!(" ({code})"))
                     .unwrap_or_default()
             );
             return Err(routed_input_refusal(
@@ -3050,24 +3809,30 @@ fn ensure_run_input_safety_locked(
                 target,
                 "PRIM-1 has not seen its prompt yet since it started",
                 "wait for its prompt, or answer any startup question in its terminal, then send again",
-                "work state is unknown; routed/delivered framing is blocked until Codex emits an explicit interactive state",
+                "work state is unknown (not_observed); routed/delivered framing is blocked until Codex emits an explicit interactive state",
             ));
         }
     }
 
+    // v3 J4: a structured provider error ending this run's latest turn holds,
+    // with its reason in plain words (codes only, never the provider's message).
+    if let Some(code) = slot.provider_error.as_deref() {
+        let (reason, action) = describe_provider_error(code);
+        let technical = format!("the latest turn ended with a provider error (provider:{code}); routed/delivered framing is blocked");
+        return Err(routed_input_refusal(slot, target, &reason, action, &technical));
+    }
+
     if slot.work_state_observed
-        && matches!(
-            slot.work_state,
-            WorkState::Blocked | WorkState::ErrorLoop | WorkState::Exited
-        )
+        && work_state_holds_delivery(slot.work_state, slot.work_detail.as_deref())
     {
         let detail = slot.work_detail.as_deref();
-        let (reason, action) = describe_work_state_block(slot.work_state, detail, None);
+        let (reason, action) = describe_work_state_block(slot.work_state, detail);
         let technical = format!(
             "work state is {}{}; routed/delivered framing is blocked",
             work_state_alert_label(Some(slot.work_state)),
             detail
-                .map(|detail| format!(" ({detail})"))
+                .and_then(work_state_reason_code)
+                .map(|code| format!(" ({code})"))
                 .unwrap_or_default()
         );
         return Err(routed_input_refusal(
@@ -3115,18 +3880,44 @@ fn ensure_run_input_safety_locked(
 }
 
 struct SupervisorInner {
+    startup_admission: StartupAdmission,
     runtime_dir: PathBuf,
     pane_mcp_executable: Option<PathBuf>,
-    room_brief_on_join: bool,
     catalog: Mutex<SessionCatalogV1>,
+    // Joint room/session scopes take rooms before slots, releasing slots before
+    // room persistence. Publication may wrap rooms or shutdown (move_room's
+    // snapshot); lifecycle code must never take publication while holding
+    // shutdown. Room callbacks run after dropping rooms.
     rooms: Mutex<RoomState>,
     audit: AuditLog,
     slots: Mutex<SessionRegistry>,
     event_sink: RwLock<Option<EventSink>>,
+    output_credit: Arc<output_credit::OutputCreditLedger>,
     control_plane: RwLock<Option<ControlPlaneStatus>>,
     control_plane_lifecycle: Mutex<()>,
-    shutdown_lifecycle: Mutex<()>,
+    /// Shared by every event/sweep/quiesce/control-plane path; exclusive only
+    /// for shutdown. Per-run order is the run-event publisher's job, so a slow
+    /// retirement in one pane no longer blocks other panes' output handling.
+    shutdown_lifecycle: RwLock<()>,
+    // Liveness callers enter without shared guards. Serialize fresh probes
+    // before taking shutdown/slots; native discovery must hold neither.
+    liveness_sweep: Mutex<()>,
+    maintenance_write: Mutex<()>,
+    /// Held only to read or swap the store handle, never during task I/O.
+    task_folder: RwLock<task_sideband::TaskFolderState>,
+    /// A108 register: a leaf lock and a channel to its own writer thread.
+    session_ledger: session_ledger::SessionLedger,
     shutdown_started: AtomicBool,
+    /// A16: Windows is ending the session (`end_session_now`); from then on
+    /// no run that ends clears its `running_at_shutdown`.
+    session_ending: AtomicBool,
+    /// Run exit watchers and the liveness tick; off in unit tests (mock runs
+    /// carry made-up process ids).
+    exit_watch_enabled: AtomicBool,
+    /// One bounded input queue per session, bound to the run it admits for.
+    operator_input: Mutex<HashMap<SessionId, OperatorInputQueue>>,
+    #[cfg(test)]
+    operator_input_workers_started: AtomicUsize,
     #[cfg(windows)]
     control_plane_listener: Mutex<Option<ControlPlaneListener>>,
     pty_spawner: RwLock<Arc<dyn PtySpawner>>,
@@ -3143,24 +3934,84 @@ struct SupervisorInner {
     started_at: Instant,
     heartbeat_interval: Duration,
     sideband_write_timeout: Mutex<Duration>,
+    /// How long one isolated cancellation of a timed-out write may take (250 ms);
+    /// a test seam so a test holding the cancellation never races the budget.
+    input_cancel_timeout: Mutex<Duration>,
     stop_kill_timeout: Mutex<Duration>,
+    output_drain_grace: Mutex<Duration>,
     auto_restart_on_stall: AutoRestartOnStallConfig,
     auto_restart_history: Mutex<HashMap<SessionId, AutoRestartHistory>>,
+    telemetry: Mutex<telemetry::TelemetrySampler>,
+    /// A108: this desktop's upgrade transaction, when the runtime has one.
+    upgrade: RwLock<Option<Arc<upgrade_flow::UpgradeFlow>>>,
+    /// Set while an admitted upgrade closes: starts, restarts and new
+    /// sessions are refused.
+    upgrade_closing: AtomicBool,
     #[cfg(test)]
     fail_next_catalog_write: AtomicBool,
+    #[cfg(test)]
+    codex_identity_root_for_tests: Mutex<Option<PathBuf>>,
     /// Delivery timing override (settle_quiet, settle_cap, verify_window,
     /// attempts): None = production constants. Test builds default to zeros /
     /// one attempt so mock deliveries keep the historical instant
     /// single-submit shape unless a test opts in.
     delivery_timing_tuning: Mutex<Option<(Duration, Duration, Duration, usize)>>,
+    /// v3 W2: how long a Codex pane's output must have been quiet before a
+    /// room wake is typed. Test builds default to zero (mock panes print once).
+    room_wake_output_settle: Mutex<Duration>,
+    /// v3 W2 #2 (Claude PRIM-1, d9613ce walk): how long a busy Codex title may
+    /// hold a wake; then it is typed (A106) and its receipt says so.
+    room_wake_title_busy_cap: Mutex<Duration>,
+    /// v3 W2: harness versions observed per executable identity.
+    #[cfg_attr(test, allow(dead_code))]
+    harness_versions: harness_version::VersionCache,
+    /// Tests: the version every launch observes (no process is run).
+    #[cfg(test)]
+    harness_version_for_tests: Mutex<Option<String>>,
+    /// v3 W3: how long a written wake's submission is looked for in the
+    /// member's own record; None turns the check off (test builds, unless a
+    /// test sets it).
+    submit_confirm_window: Mutex<Option<Duration>>,
+    /// v3 W3b: wakes the one submission reconciler (capacity one, coalesced).
+    submit_reconcile_signal: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+    /// Room messages waiting until their member can take typed input (A106).
+    room_wake_queue: Mutex<room_delivery::RoomWakeQueue>,
+    /// Outside agents and their hashed tokens. A leaf lock: never take rooms
+    /// or slots while holding it.
+    guests: Mutex<GuestRegistry>,
+    /// Bumped for every room feed, deletion, history and guest change; guest
+    /// and pane long-polls wait on it holding no lock.
+    room_feed_watch: tokio::sync::watch::Sender<u64>,
+    /// Bounds concurrent guest long-polls below the pipe's connection cap.
+    guest_waits: Arc<Semaphore>,
+    /// A16 `room_wait`: one open wait per pane (a leaf lock) and
+    /// `PANE_WAIT_SLOTS` in all.
+    pane_waits_by_session: Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>,
+    pane_waits: Arc<Semaphore>,
+    /// Stops the exact-ID follower thread (A108 W2) on shutdown.
+    identity_tracker: Arc<identity_tracker::TrackerControl>,
+    /// A110 member requests by caller and request_id; a leaf lock.
+    member_receipts: Mutex<member_lifecycle::MemberReceipts>,
+    /// A16 room actions' results for retries.
+    room_receipts: Mutex<member_lifecycle::ActionReceipts<shared_types::RoomActionResult>>,
+    /// A16 runtime actions' results for retries.
+    runtime_receipts: Mutex<runtime_admin::RuntimeReceipts>,
     #[cfg(test)]
     fail_next_room_catalog_write: AtomicBool,
+    #[cfg(test)]
+    room_catalog_before_write: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     pty_event_before_commit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     run_input_before_commit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
+    room_wake_before_write: Mutex<Option<Box<dyn FnMut(&'static str) + Send>>>,
+    #[cfg(test)]
+    recovery_start_boundary: Mutex<Option<Box<dyn FnMut(&'static str) + Send>>>,
+    #[cfg(test)]
     work_state_before_side_effect: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    startup_silence_for_tests: Mutex<Option<Duration>>,
     #[cfg(test)]
     stall_before_reservation: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
@@ -3172,12 +4023,23 @@ struct SupervisorInner {
     #[cfg(test)]
     room_delivery_after_preflight: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
+    member_before_effect: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
     room_event_after_append: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// v3 W3b (Reviewer 68568692): the early confirmation worker after its
+    /// no-match read, before it takes the append lock.
+    #[cfg(test)]
+    submit_waiting_before_append: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// A109: a pane's room_join, room_leave or room_peek after its entry
+    /// checks and room waits, before the locks its effect is committed under.
+    #[cfg(test)]
+    room_mobility_before_commit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 struct RoomDeliveryLease {
     inner: Arc<SupervisorInner>,
     room_id: RoomId,
+    receipt_reservations: usize,
 }
 
 impl Drop for RoomDeliveryLease {
@@ -3192,7 +4054,17 @@ impl Drop for RoomDeliveryLease {
         };
         debug_assert!(room.in_flight_deliveries > 0);
         room.in_flight_deliveries = room.in_flight_deliveries.saturating_sub(1);
+        debug_assert!(room.receipt_reservations >= self.receipt_reservations);
+        room.receipt_reservations = room.receipt_reservations.saturating_sub(self.receipt_reservations);
     }
+}
+
+/// An admitted operator Stop awaiting its termination step. Not Clone: each
+/// admission is finished exactly once.
+#[must_use = "an admitted Stop must be finished"]
+pub struct StopTicket {
+    session_id: SessionId,
+    expected: Option<SessionGeneration>,
 }
 
 #[derive(Clone)]
@@ -3243,12 +4115,13 @@ fn audit_event_projection(event: &RuntimeEvent, _inner: &SupervisorInner) -> Opt
             state,
             previous_state,
             timestamp,
-            ..
+            detail,
         } => RuntimeEvent::SessionWorkState {
             identity: *identity,
             session: session.clone(),
             state: *state,
-            detail: None,
+            // v3 W2 (11 Oct item 7): the reason code survives, never content.
+            detail: detail.as_deref().and_then(work_state_reason_code),
             previous_state: *previous_state,
             timestamp: timestamp.clone(),
         },
@@ -3259,6 +4132,9 @@ fn audit_event_projection(event: &RuntimeEvent, _inner: &SupervisorInner) -> Opt
         } => {
             let mut session = session.clone();
             session.working_dir = "[path omitted]".into();
+            if let SessionBriefChoice::Custom { text } = &mut session.launch_choices.brief {
+                *text = "[content omitted]".into();
+            }
             RuntimeEvent::SessionCreated {
                 schema_version: *schema_version,
                 session,
@@ -3281,6 +4157,10 @@ fn audit_event_projection(event: &RuntimeEvent, _inner: &SupervisorInner) -> Opt
             let mut feed_event = feed_event.clone();
             if let RoomFeedItem::Message { content, .. } = &mut feed_event.item {
                 *content = "[content omitted]".into();
+            }
+            if let RoomFeedItem::Card { card, .. } = &mut feed_event.item {
+                card.key = "[omitted]".into(); card.title = "[content omitted]".into();
+                card.summary.clear(); card.body.clear(); card.data = Default::default();
             }
             RuntimeEvent::RoomFeedEvent { feed_event }
         }
@@ -3648,6 +4528,7 @@ fn read_session_catalog(path: &Path) -> Result<SessionCatalogV1> {
         )?;
         validate_driver_working_directory_pair(session.driver, &session.working_directory)?;
     }
+    recovery_automation::validate_catalog(&catalog)?;
     Ok(catalog)
 }
 
@@ -3714,122 +4595,6 @@ fn persist_session_catalog(runtime_dir: &Path, catalog: &SessionCatalogV1) -> Re
         "session catalog",
         catalog,
     )
-}
-
-/// The newest Codex rollout whose recorded cwd matches `working_dir` and
-/// whose file was written at/after `started` (small clock slack). Scans only
-/// the two lexicographically newest day directories.
-fn newest_codex_rollout_for_cwd(
-    sessions_root: &Path,
-    working_dir: &str,
-    started: std::time::SystemTime,
-) -> Option<String> {
-    fn normalize(path: &str) -> String {
-        path.replace('/', "\\")
-            .trim_end_matches('\\')
-            .to_ascii_lowercase()
-    }
-    fn sorted_dirs_desc(root: &Path) -> Vec<PathBuf> {
-        let Ok(entries) = std::fs::read_dir(root) else {
-            return Vec::new();
-        };
-        let mut dirs: Vec<PathBuf> = entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| path.is_dir())
-            .collect();
-        dirs.sort();
-        dirs.reverse();
-        dirs
-    }
-
-    let wanted = normalize(working_dir);
-    let floor = started
-        .checked_sub(Duration::from_secs(5))
-        .unwrap_or(started);
-    let mut day_dirs = Vec::new();
-    'years: for year in sorted_dirs_desc(sessions_root) {
-        for month in sorted_dirs_desc(&year) {
-            for day in sorted_dirs_desc(&month) {
-                day_dirs.push(day);
-                if day_dirs.len() >= 2 {
-                    break 'years;
-                }
-            }
-        }
-    }
-    let mut best: Option<(std::time::SystemTime, String)> = None;
-    for day in day_dirs {
-        let Ok(entries) = std::fs::read_dir(&day) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
-            if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
-                continue;
-            }
-            let Ok(metadata) = path.metadata() else {
-                continue;
-            };
-            let Ok(modified) = metadata.modified() else {
-                continue;
-            };
-            if modified < floor {
-                continue;
-            }
-            if best.as_ref().is_some_and(|(at, _)| *at >= modified) {
-                continue;
-            }
-            let Ok(file) = fs::File::open(&path) else {
-                continue;
-            };
-            let mut first_line = String::new();
-            use std::io::BufRead as _;
-            if StdBufReader::new(file).read_line(&mut first_line).is_err() {
-                continue;
-            }
-            let Ok(meta) = serde_json::from_str::<serde_json::Value>(&first_line) else {
-                continue;
-            };
-            let payload = &meta["payload"];
-            if !codex_rollout_is_resumable_root(payload) {
-                continue;
-            }
-            let Some(cwd) = payload["cwd"].as_str() else {
-                continue;
-            };
-            if normalize(cwd) != wanted {
-                continue;
-            }
-            let Some(id) = payload["id"]
-                .as_str()
-                .or_else(|| payload["session_id"].as_str())
-            else {
-                continue;
-            };
-            best = Some((modified, id.to_string()));
-        }
-    }
-    best.map(|(_, id)| id)
-}
-
-/// A multi-agent child thread writes its own rollout into the same cwd, and
-/// `codex resume` refuses it ("cannot resume an unloaded multi-agent v2
-/// sub-agent through its parent"). Only a root thread started by a user is a
-/// candidate for the pane's resume id (2026-09-08: a child thread was captured
-/// and the room's Codex pane could not start the next day).
-fn codex_rollout_is_resumable_root(session_meta: &serde_json::Value) -> bool {
-    if session_meta["parent_thread_id"]
-        .as_str()
-        .is_some_and(|parent| !parent.trim().is_empty())
-    {
-        return false;
-    }
-    match session_meta["thread_source"].as_str() {
-        Some(source) => source.eq_ignore_ascii_case("user"),
-        None => true,
-    }
 }
 
 fn persist_room_catalog(runtime_dir: &Path, catalog: &RoomCatalogV1) -> Result<()> {
@@ -4183,7 +4948,12 @@ fn restrict_path_to_current_user(path: &Path, is_directory: bool) -> Result<()> 
 }
 
 impl SupervisorHandle {
-    pub fn new(mut config: SupervisorConfig) -> Result<Self> {
+    pub fn new(config: SupervisorConfig) -> Result<Self> {
+        Self::new_with_startup_admission(config, StartupAdmission::Normal)
+    }
+
+    pub fn new_with_startup_admission(mut config: SupervisorConfig, startup_admission: StartupAdmission) -> Result<Self> {
+        startup_admission.validate_config(&config)?;
         #[cfg(windows)]
         if let Some(executable) = config.pane_mcp_executable.as_deref() {
             validate_pane_mcp_executable(executable)?;
@@ -4203,8 +4973,10 @@ impl SupervisorHandle {
         }
         config.runtime_dir = resolved_runtime;
         restrict_path_to_current_user(&config.runtime_dir, true)?;
-        remove_legacy_disk_mailbox(&config.runtime_dir)?;
-        remove_legacy_control_plane_files(&config.runtime_dir)?;
+        if !startup_admission.is_trial() {
+            remove_legacy_disk_mailbox(&config.runtime_dir)?;
+            remove_legacy_control_plane_files(&config.runtime_dir)?;
+        }
         let audit = AuditLog::new(&config.runtime_dir)?;
         let background_runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -4213,7 +4985,7 @@ impl SupervisorHandle {
             .context("failed to create supervisor background runtime")?;
         let (events_watch, _events_watch_rx) = tokio::sync::watch::channel(0_u64);
         let catalog_path = session_catalog_path(&config.runtime_dir);
-        let catalog = if catalog_path.exists() {
+        let mut catalog = if catalog_path.exists() {
             read_session_catalog(&catalog_path)?
         } else {
             let (workspace_preference, _lease) =
@@ -4227,31 +4999,45 @@ impl SupervisorHandle {
         #[cfg(not(test))]
         let wsl_control: Arc<dyn WslControl> =
             Arc::new(ConcreteWslControl::new(config.runtime_dir.clone()));
-        let wsl_reconciliation_error = wsl_control
-            .reconcile_stale_scopes()
-            .err()
-            .map(|error| format!("{error:#}"));
+        // Parked Prime: no WSL command at startup (see `prime_enabled`).
+        let wsl_reconciliation_error = if prime_enabled() && !startup_admission.is_trial() {
+            wsl_control
+                .reconcile_stale_scopes()
+                .err()
+                .map(|error| format!("{error:#}"))
+        } else {
+            None
+        };
 
         let mut slots = SessionRegistry::from_catalog(&catalog)?;
-        for slot in slots.by_id.values_mut() {
-            let availability = slot
-                .qualified_working_directory
-                .as_ref()
-                .ok_or_else(|| anyhow!("qualified working-directory metadata is missing"))
-                .and_then(|qualified| match qualified.namespace {
-                    WorkingDirectoryNamespace::Windows => revalidate_qualified_working_directory(
-                        slot.session_id,
-                        qualified,
-                        &config.runtime_dir,
-                    )
-                    .map(|_lease| ()),
-                    WorkingDirectoryNamespace::WslUbuntu => {
-                        wsl_control.revalidate_working_directory(qualified)
-                    }
-                });
-            if let Err(error) = availability {
-                slot.last_error = Some(format!("working directory unavailable: {error:#}"));
+        // Retain every derived collision hold in the in-memory catalog baseline.
+        // Bootstrap does not write. The next real catalog mutation persists the
+        // complete group atomically, including untouched owners; otherwise Fresh
+        // or Delete on one owner could silently release another after reboot.
+        for row in &mut catalog.sessions {
+            if let Some(slot) = slots.get_by_id(row.session_id)
+                && slot.recovery.as_ref().is_some_and(|reference| reference.provenance == "duplicate_catalog_identity")
+            {
+                row.recovery = slot.recovery.clone();
+                row.recovery_history = slot.recovery_history.clone();
             }
+        }
+        // A108: the register in the personal repo, read before anything can
+        // launch. A held trial resolves neither the repo nor an install id.
+        let session_ledger = session_ledger::SessionLedger::open(
+            &config.runtime_dir,
+            Path::new(&catalog.workspace_preference.canonical_path),
+            startup_admission.is_trial(),
+        );
+        session_ledger.hold_register_disagreements(&mut slots, &mut catalog);
+        let ledger_rows = session_ledger::ledger_rows(&catalog.sessions);
+        if !startup_admission.is_trial() {
+            revalidate_catalog_working_directories(
+                &mut slots,
+                &config.runtime_dir,
+                wsl_control.as_ref(),
+                prime_enabled(),
+            );
         }
         let run_event_publish = slots
             .ordered_slots()
@@ -4275,7 +5061,13 @@ impl SupervisorHandle {
             catalog
         };
         let known_sessions = slots.by_id.keys().copied().collect::<HashSet<_>>();
-        let rooms = RoomState::from_catalog(room_catalog, &known_sessions)?;
+        let mut rooms = RoomState::from_catalog(room_catalog, &known_sessions)?;
+        rooms.open_logs(&config.runtime_dir, |candidate| {
+            persist_room_catalog(&config.runtime_dir, candidate)
+        });
+        let ledger_rooms = session_ledger::ledger_rooms(&rooms.catalog.rooms);
+        let guests = GuestRegistry::load(&config.runtime_dir, &rooms);
+        let (room_feed_watch, _room_feed_watch_rx) = tokio::sync::watch::channel(0_u64);
         let heartbeat_interval = config
             .heartbeat_interval
             .filter(|duration| !duration.is_zero())
@@ -4293,21 +5085,36 @@ impl SupervisorHandle {
                 .filter(|duration| !duration.is_zero())
                 .unwrap_or_else(auto_restart_stall_threshold_from_env),
         };
+        let task_folder = task_sideband::TaskFolderState::open_at_startup(
+            config.task_folder.as_deref(),
+            startup_admission.is_trial(),
+        );
+        let task_folder_unavailable = task_folder.unavailable().map(str::to_owned);
 
         let handle = Self {
             inner: Arc::new(SupervisorInner {
+                startup_admission,
                 runtime_dir: config.runtime_dir,
                 pane_mcp_executable: config.pane_mcp_executable,
-                room_brief_on_join: config.room_brief_on_join,
                 catalog: Mutex::new(catalog),
                 rooms: Mutex::new(rooms),
                 audit,
                 slots: Mutex::new(slots),
                 event_sink: RwLock::new(None),
+                output_credit: Arc::new(output_credit::OutputCreditLedger::default()),
                 control_plane: RwLock::new(None),
                 control_plane_lifecycle: Mutex::new(()),
-                shutdown_lifecycle: Mutex::new(()),
+                shutdown_lifecycle: RwLock::new(()),
+                liveness_sweep: Mutex::new(()),
+                maintenance_write: Mutex::new(()),
+                task_folder: RwLock::new(task_folder),
+                session_ledger,
                 shutdown_started: AtomicBool::new(false),
+                session_ending: AtomicBool::new(false),
+                exit_watch_enabled: AtomicBool::new(!cfg!(test)),
+                operator_input: Mutex::new(HashMap::new()),
+                #[cfg(test)]
+                operator_input_workers_started: AtomicUsize::new(0),
                 #[cfg(windows)]
                 control_plane_listener: Mutex::new(None),
                 pty_spawner: RwLock::new(Arc::new(ConcretePtySpawner {
@@ -4326,11 +5133,18 @@ impl SupervisorHandle {
                 started_at: Instant::now(),
                 heartbeat_interval,
                 sideband_write_timeout: Mutex::new(SidebandTimeouts::write_budget()),
+                input_cancel_timeout: Mutex::new(Duration::from_millis(250)),
                 stop_kill_timeout: Mutex::new(SESSION_STOP_KILL_TIMEOUT),
+                output_drain_grace: Mutex::new(OUTPUT_DRAIN_GRACE),
                 auto_restart_on_stall,
                 auto_restart_history: Mutex::new(HashMap::new()),
+                telemetry: Mutex::new(telemetry::TelemetrySampler::default()),
+                upgrade: RwLock::new(None),
+                upgrade_closing: AtomicBool::new(false),
                 #[cfg(test)]
                 fail_next_catalog_write: AtomicBool::new(false),
+                #[cfg(test)]
+                codex_identity_root_for_tests: Mutex::new(None),
                 delivery_timing_tuning: Mutex::new({
                     #[cfg(test)]
                     {
@@ -4341,14 +5155,39 @@ impl SupervisorHandle {
                         None
                     }
                 }),
+                room_wake_output_settle: Mutex::new(if cfg!(test) { Duration::ZERO } else { room_delivery::ROOM_WAKE_CODEX_OUTPUT_SETTLE }),
+                room_wake_title_busy_cap: Mutex::new(room_delivery::ROOM_WAKE_TITLE_BUSY_CAP),
+                harness_versions: harness_version::VersionCache::default(),
+                #[cfg(test)]
+                harness_version_for_tests: Mutex::new(None),
+                submit_confirm_window: Mutex::new((!cfg!(test)).then_some(room_delivery::SUBMIT_CONFIRM_WINDOW)),
+                submit_reconcile_signal: Mutex::new(None),
+                room_wake_queue: Mutex::new(room_delivery::RoomWakeQueue::default()),
+                guests: Mutex::new(guests),
+                room_feed_watch,
+                guest_waits: Arc::new(Semaphore::new(room_guests::GUEST_WAIT_SLOTS)),
+                pane_waits_by_session: Mutex::new(HashMap::new()),
+                pane_waits: Arc::new(Semaphore::new(feed_wait::PANE_WAIT_SLOTS)),
+                identity_tracker: Arc::default(),
+                member_receipts: Mutex::new(member_lifecycle::MemberReceipts::default()),
+                room_receipts: Mutex::new(member_lifecycle::ActionReceipts::default()),
+                runtime_receipts: Mutex::new(member_lifecycle::ActionReceipts::default()),
                 #[cfg(test)]
                 fail_next_room_catalog_write: AtomicBool::new(false),
+                #[cfg(test)]
+                room_catalog_before_write: Mutex::new(None),
                 #[cfg(test)]
                 pty_event_before_commit: Mutex::new(None),
                 #[cfg(test)]
                 run_input_before_commit: Mutex::new(None),
                 #[cfg(test)]
+                room_wake_before_write: Mutex::new(None),
+                #[cfg(test)]
+                recovery_start_boundary: Mutex::new(None),
+                #[cfg(test)]
                 work_state_before_side_effect: Mutex::new(None),
+                #[cfg(test)]
+                startup_silence_for_tests: Mutex::new(None),
                 #[cfg(test)]
                 stall_before_reservation: Mutex::new(None),
                 #[cfg(test)]
@@ -4360,10 +5199,41 @@ impl SupervisorHandle {
                 #[cfg(test)]
                 room_delivery_after_preflight: Mutex::new(None),
                 #[cfg(test)]
+                member_before_effect: Mutex::new(None),
+                #[cfg(test)]
                 room_event_after_append: Mutex::new(None),
+                #[cfg(test)]
+                submit_waiting_before_append: Mutex::new(None),
+                #[cfg(test)]
+                room_mobility_before_commit: Mutex::new(None),
             }),
         };
-        handle.start_supervisor_heartbeat_task();
+        // A held trial starts no background work: no heartbeat, no liveness
+        // tick, no register writer.
+        if !handle.inner.startup_admission.is_trial() {
+            handle.clear_crash_backoffs_on_boot();
+            handle.start_supervisor_heartbeat_task();
+            handle.start_liveness_tick_task();
+            handle.start_session_ledger(ledger_rows, ledger_rooms);
+            // Unit-test runs carry made-up process ids; tests start their own.
+            if !cfg!(test) {
+                handle.start_room_fallback_timer();
+                handle.record_restart_unknown_submissions();
+                handle.start_submit_reconciler();
+                handle.start_identity_tracker(identity_tracker::IdentityTracker::native());
+                handle.inner.identity_tracker.set_claude_home(identity_tracker::HarnessHomes::from_env().claude);
+            }
+        }
+        // A held trial says why in its folder status; it logs nothing here.
+        if let Some(message) = task_folder_unavailable
+            && !handle.inner.startup_admission.is_trial()
+        {
+            handle.emit(RuntimeEvent::SystemLog {
+                level: LogLevel::Warn,
+                message,
+                timestamp: now_rfc3339(),
+            });
+        }
         Ok(handle)
     }
 
@@ -4395,6 +5265,243 @@ impl SupervisorHandle {
         });
     }
 
+    /// D9 step 2: the liveness sweep left send_input, resize and snapshot.
+    /// This slow tick keeps it for exits a run's own watcher cannot see (an
+    /// agent leaving a wrapper alive). Off in unit tests, whose mock runs
+    /// carry made-up process ids; a test switches it on explicitly.
+    /// v3 W2 #4: marks each advisory notice that has been quiet for the
+    /// expiry period and tells the desktop to refresh that member; never
+    /// changes work state, detail, admission or the driver's own latch.
+    fn expire_quiet_advisory_notices(&self, now: Instant) {
+        let expired: Vec<_> = {
+            let mut slots = self.inner.slots.lock();
+            slots.by_id.values_mut().filter_map(|slot| {
+                let last = slot.last_real_output_at?;
+                if !advisory_notice_shown(slot) || expired_advisory_since(slot).is_some()
+                    || now.saturating_duration_since(last) < ADVISORY_NOTICE_EXPIRY {
+                    return None;
+                }
+                let quiet_since = (Utc::now() - chrono::Duration::from_std(now.saturating_duration_since(last)).ok()?)
+                    .format("%H:%M:%S").to_string();
+                slot.advisory_expired_at = Some((slot.advisory_notice_matches, quiet_since));
+                Some((slot.definition.session_id, slot.run_id?, slot.definition.alias.clone()))
+            }).collect()
+        };
+        for (session_id, run_id, session) in expired {
+            self.emit(RuntimeEvent::SessionPresentationChanged { session_id, run_id, session, timestamp: now_rfc3339() });
+        }
+    }
+
+    /// v3 W2 #6 (11 Oct item 6): a member that has held wakes for a while
+    /// (a modal question on its screen, or a provider error) while its own
+    /// output or room posts continued is surfaced ONCE per hold as an
+    /// inconsistency: a supervisor alert, an audit line and a PRIM-1 notice in
+    /// its room. Delivery is never changed here; the hold may be stale.
+    fn alert_blocked_but_active(&self, now: Instant) {
+        let alerts: Vec<_> = {
+            let mut slots = self.inner.slots.lock();
+            slots.by_id.values_mut().filter_map(|slot| {
+                // Reviewer dfe575e7: the same positive hold evidence admission
+                // uses (an observed non-advisory Blocked/ErrorLoop included);
+                // advisory notices stay excluded, and admission is unchanged.
+                let held = slot.running.is_some()
+                    && (slot.provider_error.is_some() || slot.room_composer.open_question().is_some()
+                        || (slot.work_state_observed && matches!(slot.work_state, WorkState::Blocked | WorkState::ErrorLoop)
+                            && work_state_holds_delivery(slot.work_state, slot.work_detail.as_deref())));
+                if !held {
+                    slot.hold_since = None;
+                    slot.hold_alerted = false;
+                    return None;
+                }
+                let since = *slot.hold_since.get_or_insert(now);
+                if slot.hold_alerted || now.saturating_duration_since(since) < BLOCKED_ACTIVE_AFTER {
+                    return None;
+                }
+                let after = since + BLOCKED_ACTIVE_GRACE;
+                let output = slot.last_real_output_at.is_some_and(|at| at > after);
+                let posted = slot.last_room_post_at.is_some_and(|at| at > after);
+                if !output && !posted { return None; }
+                slot.hold_alerted = true;
+                let reason = blocked_reason(slot)
+                    .or_else(|| slot.room_composer.open_question().map(str::to_owned))
+                    .unwrap_or_else(|| "held".into());
+                Some((slot.definition.session_id, slot.definition.alias.clone(), slot.definition.label.clone(),
+                    reason, output, posted))
+            }).collect()
+        };
+        for (session_id, alias, label, reason, output, posted) in alerts {
+            let activity = match (output, posted) {
+                (true, true) => "its terminal output and its room posts continued",
+                (true, false) => "its terminal output continued",
+                _ => "its room posts continued",
+            };
+            let message = format!("[PRIM-1] {label} is held ({reason}), but {activity} since the hold began; \
+                the hold may be stale, so check its terminal. Messages to it stay stored meanwhile.");
+            self.emit_supervisor_alert(SupervisorAlertEvent { alert_type: SupervisorAlertType::OperatorAttention,
+                request_id: None, session: Some(alias), action: Some("blocked_but_active".into()),
+                last_work_state: None, last_session_state: None, message: message.clone(), severity: AlertSeverity::Warn });
+            self.emit(RuntimeEvent::SystemLog { level: LogLevel::Warn, message: message.clone(), timestamp: now_rfc3339() });
+            let room_id = self.inner.rooms.lock().room_by_session.get(&session_id).copied();
+            if let Some(room_id) = room_id
+                && let Err(error) = self.post_prim1_notice(room_id, message, None)
+            {
+                self.recovery_warning(session_id, error);
+            }
+        }
+    }
+
+    /// v3 W2 #6: a member's own room post or card counts as activity.
+    fn note_room_post_from(&self, session_id: SessionId) {
+        if let Some(slot) = self.inner.slots.lock().get_by_id_mut(session_id) {
+            slot.last_room_post_at = Some(Instant::now());
+        }
+    }
+
+    /// v3 J4: each running Codex member whose conversation is bound, with the
+    /// start of its current run. Read under the slots lock; no file I/O here.
+    fn provider_scan_targets(&self) -> Vec<(SessionId, Uuid, String, String, chrono::DateTime<Utc>)> {
+        let slots = self.inner.slots.lock();
+        slots.by_id.values().filter_map(|slot| {
+            if slot.definition.driver != DriverKind::Codex || slot.running.is_none() || slot.recovery.is_some() {
+                return None;
+            }
+            let run_id = slot.run_id?;
+            let launch = slot.last_launch.as_ref().filter(|launch| launch.run_id == run_id)?;
+            let since = chrono::DateTime::parse_from_rfc3339(&launch.started_at).ok()?.with_timezone(&Utc);
+            Some((slot.definition.session_id, run_id, slot.harness_session_id.clone()?,
+                slot.definition.working_dir.clone(), since))
+        }).collect()
+    }
+
+    /// v3 J4: records what the member's own rollout says of this run's latest
+    /// turn, only while that run is still the member's; Unknown changes nothing.
+    #[cfg(test)]
+    fn apply_provider_turn(&self, session_id: SessionId, run_id: Uuid, conversation: &str,
+        turn: submit_confirm::ProviderTurn) {
+        self.apply_rollout_scan(session_id, run_id, conversation, turn, None);
+    }
+
+    /// v3 J4 and W2: what the member's own rollout says of this run's latest
+    /// turn (its provider verdict, and whether it is still open). Unknown or
+    /// None changes nothing. Applied only while the scan's run AND the
+    /// conversation it read are still the member's, rechecked under this lock:
+    /// the same-process follower can rebind the conversation during the
+    /// off-lock read without a new run (Reviewer 42c82e54).
+    fn apply_rollout_scan(&self, session_id: SessionId, run_id: Uuid, conversation: &str,
+        turn: submit_confirm::ProviderTurn, open: Option<bool>) {
+        let changed = {
+            let mut slots = self.inner.slots.lock();
+            let Some(slot) = slots.get_by_id_mut(session_id).filter(|slot| slot.run_id == Some(run_id)
+                && slot.recovery.is_none() && slot.harness_session_id.as_deref() == Some(conversation)) else { return };
+            let next = match turn {
+                submit_confirm::ProviderTurn::Error(code) => Some(code),
+                submit_confirm::ProviderTurn::Clear => None,
+                submit_confirm::ProviderTurn::Unknown => slot.provider_error.clone(),
+            };
+            let open = open.unwrap_or(slot.rollout_turn_open);
+            (slot.provider_error != next || slot.rollout_turn_open != open).then(|| {
+                slot.provider_error = next;
+                slot.rollout_turn_open = open;
+                slot.definition.alias.clone()
+            })
+        };
+        if let Some(session) = changed {
+            self.emit(RuntimeEvent::SessionPresentationChanged { session_id, run_id, session, timestamp: now_rfc3339() });
+        }
+    }
+
+    fn start_liveness_tick_task(&self) {
+        let weak = Arc::downgrade(&self.inner);
+        self.inner.background_runtime.spawn(async move {
+            loop {
+                tokio::time::sleep(LIVENESS_TICK).await;
+                let Some(inner) = weak.upgrade() else {
+                    break;
+                };
+                if !inner.exit_watch_enabled.load(Ordering::Acquire)
+                    || inner.shutdown_started.load(Ordering::Acquire)
+                {
+                    continue;
+                }
+                let any_running = inner
+                    .slots
+                    .lock()
+                    .by_id
+                    .values()
+                    .any(|slot| slot.running.is_some());
+                if any_running {
+                    let handle = SupervisorHandle { inner };
+                    let _ = tokio::task::spawn_blocking(move || {
+                        handle.refresh_session_liveness();
+                        handle.expire_quiet_advisory_notices(Instant::now());
+                        handle.alert_blocked_but_active(Instant::now());
+                    }).await;
+                }
+            }
+        });
+    }
+
+    /// D9 step 1: one thread per run waits on its pinned root process and runs
+    /// the liveness sweep once it exits, so an exit no longer waits for the
+    /// next keystroke, resize or snapshot to be found.
+    #[cfg(windows)]
+    fn start_run_exit_watcher(&self, session_id: SessionId, run_id: Uuid, process_id: u32) {
+        if !self.inner.exit_watch_enabled.load(Ordering::Acquire) {
+            return;
+        }
+        let weak = Arc::downgrade(&self.inner);
+        let pinned = pty_host::PinnedProcess::open(process_id);
+        let spawned = thread::Builder::new()
+            .name(format!("prim1-exit-watch-{process_id}"))
+            .spawn(move || {
+                let exited = match pinned {
+                    Ok(process) => loop {
+                        match process.wait_for_exit(EXIT_WATCH_POLL) {
+                            Ok(true) => break true,
+                            Ok(false) => {
+                                let Some(inner) = weak.upgrade() else {
+                                    break false;
+                                };
+                                if inner.shutdown_started.load(Ordering::Acquire) {
+                                    break false;
+                                }
+                                let current = inner
+                                    .slots
+                                    .lock()
+                                    .get_by_id(session_id)
+                                    .is_some_and(|slot| slot.run_id == Some(run_id));
+                                if !current {
+                                    break false;
+                                }
+                            }
+                            // Cannot wait on it: let the sweep judge it now.
+                            Err(_) => break true,
+                        }
+                    },
+                    // Gone between spawn and pin: sweep now.
+                    Err(_) => true,
+                };
+                if exited && let Some(inner) = weak.upgrade() {
+                    SupervisorHandle { inner }.refresh_session_liveness();
+                }
+            });
+        if let Err(error) = spawned {
+            self.emit(RuntimeEvent::SystemLog {
+                level: LogLevel::Warn,
+                message: format!("exit watcher could not start for process {process_id}: {error}"),
+                timestamp: now_rfc3339(),
+            });
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn start_run_exit_watcher(&self, _session_id: SessionId, _run_id: Uuid, _process_id: u32) {}
+
+    #[cfg(test)]
+    fn set_exit_watch_enabled_for_tests(&self, enabled: bool) {
+        self.inner.exit_watch_enabled.store(enabled, Ordering::Release);
+    }
+
     fn heartbeat_session_summaries(&self) -> Vec<HeartbeatSessionSummary> {
         let slots = self.inner.slots.lock();
         slots
@@ -4410,6 +5517,7 @@ impl SupervisorHandle {
     }
 
     fn emit_supervisor_heartbeat(&self) {
+        if self.inner.startup_admission.is_trial() { return; }
         self.refresh_session_liveness();
         self.emit(RuntimeEvent::SupervisorHeartbeat {
             wrapper_pid: std::process::id(),
@@ -4437,6 +5545,9 @@ impl SupervisorHandle {
         if let Some(running) = slot.running.as_ref() {
             running.close_input();
         }
+        self.inner.output_credit.cancel_session(session_id);
+        slot.output_draining = false;
+        slot.agent_exited_at = None;
         slot.run_id = None;
         cancel_quiesce_timer_locked(slot);
         slot.generation = next_generation;
@@ -4449,12 +5560,40 @@ impl SupervisorHandle {
         expected_run: Option<(SessionGeneration, Option<Uuid>)>,
         kind: StopIntentKind,
     ) -> Result<(String, SessionGeneration)> {
+        self.declare_stop_operation_checked(session_id, expected_run, kind, None)
+    }
+
+    /// `check`: a managing pane's stop or restart (A110), rechecked under
+    /// the same locks that declare the operation. Rooms come before slots.
+    fn declare_stop_operation_checked(
+        &self,
+        session_id: SessionId,
+        expected_run: Option<(SessionGeneration, Option<Uuid>)>,
+        kind: StopIntentKind,
+        check: Option<&member_lifecycle::ManageCheck<'_>>,
+    ) -> Result<(String, SessionGeneration)> {
+        let rooms = check.map(|_| self.inner.rooms.lock());
         let mut slots = self.inner.slots.lock();
         self.ensure_active()?;
+        if let (Some(check), Some(rooms)) = (check, rooms.as_deref()) {
+            check.check_target(rooms, &slots, session_id)?;
+        }
         let slot = slots
             .get_by_id_mut(session_id)
             .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
+        if let Some((expected_generation, expected_run_id)) = expected_run
+            && (slot.generation != expected_generation || slot.run_id != expected_run_id)
+        {
+            return Err(anyhow!(
+                "session '{session_id}' run changed before lifecycle declaration"
+            ));
+        }
         if let Some(operation) = slot.lifecycle_operation {
+            // Retirement still owns termination, but an authenticated Stop
+            // must cancel this run's automatic respawn while proof is pending.
+            if kind == StopIntentKind::Operator {
+                self.cancel_retiring_crash_claim(slot);
+            }
             return Err(anyhow!(
                 "session '{session_id}' already has a {:?} lifecycle operation in progress at generation {}",
                 operation.kind,
@@ -4472,13 +5611,6 @@ impl SupervisorHandle {
         {
             return Err(anyhow!(
                 "session '{session_id}' has an unverified prior termination"
-            ));
-        }
-        if let Some((expected_generation, expected_run_id)) = expected_run
-            && (slot.generation != expected_generation || slot.run_id != expected_run_id)
-        {
-            return Err(anyhow!(
-                "session '{session_id}' run changed before lifecycle declaration"
             ));
         }
         let alias = slot.definition.alias.clone();
@@ -4499,8 +5631,15 @@ impl SupervisorHandle {
             .generation
             .checked_add(1)
             .ok_or_else(|| anyhow!("session generation exhausted for '{session_id}'"))?;
+        slot.boot_resume_id = None;
+        let recovery_error = if matches!(kind, StopIntentKind::Operator | StopIntentKind::Restart) {
+            slot.crash_respawn_waiting = false;
+            self.clear_recovery_eligibility(session_id).err()
+        } else { None };
         if let Some(running) = slot.running.as_ref() {
             running.close_input();
+            // A108: the run is withdrawn; the register's holder stops.
+            self.note_run_changed(session_id);
         }
         slot.run_id = None;
         cancel_quiesce_timer_locked(slot);
@@ -4512,15 +5651,38 @@ impl SupervisorHandle {
             generation: next_generation,
             kind,
         });
-        Ok((alias, slot.generation))
+        self.inner.output_credit.cancel_session(session_id);
+        slot.output_draining = false;
+        slot.agent_exited_at = None;
+        let result = (alias, slot.generation);
+        drop(slots);
+        drop(rooms);
+        if let Some(error) = recovery_error { self.recovery_warning(session_id, error); }
+        Ok(result)
     }
 
     fn ensure_active(&self) -> Result<()> {
+        self.ensure_not_shutdown()?;
+        self.ensure_mutations_admitted()
+    }
+
+    fn ensure_not_shutdown(&self) -> Result<()> {
         if self.inner.shutdown_started.load(Ordering::Acquire) {
             Err(anyhow!("supervisor has shut down"))
         } else {
             Ok(())
         }
+    }
+
+    fn ensure_mutations_admitted(&self) -> Result<()> {
+        if self.inner.startup_admission.is_trial() {
+            bail!(trial::TRIAL_ADMISSION_HELD);
+        }
+        Ok(())
+    }
+
+    pub fn trial_admission_held(&self) -> bool {
+        self.inner.startup_admission.is_trial()
     }
 
     #[cfg(test)]
@@ -4537,6 +5699,11 @@ impl SupervisorHandle {
         F: Fn(RuntimeEvent) + Send + Sync + 'static,
     {
         *self.inner.event_sink.write() = Some(Arc::new(sink));
+    }
+
+    /// Desktop display transport only; headless callers retain existing behavior.
+    pub fn output_credit(&self) -> Arc<output_credit::OutputCreditLedger> {
+        self.inner.output_credit.clone()
     }
 
     fn emit_supervisor_alert(&self, alert: SupervisorAlertEvent) {
@@ -4607,7 +5774,6 @@ impl SupervisorHandle {
         from: &str,
         session_id: SessionId,
     ) -> Result<DispatchAttemptDecision> {
-        self.refresh_session_liveness();
         let (alias, decision) = {
             let slots = self.inner.slots.lock();
             let slot = slots
@@ -4672,36 +5838,50 @@ impl SupervisorHandle {
 
     fn arm_quiesce_timer(
         &self,
+        _shutdown_guard: &parking_lot::RwLockReadGuard<'_, ()>,
         session_id: SessionId,
         generation: SessionGeneration,
         run_id: Uuid,
         armed_at: Instant,
         threshold: Duration,
     ) {
+        if self.inner.startup_admission.is_trial() { return; }
+        // The caller holds shutdown_lifecycle from output admission through
+        // installation. Validate before spawning; shutdown cannot overtake us.
+        let mut slots = self.inner.slots.lock();
+        if self.inner.shutdown_started.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(slot) = slots.get_by_id_mut(session_id).filter(|slot| {
+            slot.generation == generation
+                && slot.run_id == Some(run_id)
+                && slot.last_real_output_at == Some(armed_at)
+        }) else {
+            return;
+        };
+        if slot.quiesce_timer.as_ref().is_some_and(|timer| {
+            timer.generation == generation && timer.run_id == run_id
+        }) {
+            return;
+        }
+        cancel_quiesce_timer_locked(slot);
         let handle = self.clone();
         let task = self.inner.background_runtime.spawn(async move {
-            tokio::time::sleep(threshold).await;
-            handle.fire_quiesce_timer(session_id, generation, run_id, armed_at, threshold);
+            let mut deadline = armed_at + threshold;
+            loop {
+                tokio::time::sleep_until(deadline.into()).await;
+                match handle.fire_quiesce_timer(session_id, generation, run_id, armed_at, threshold) {
+                    Some(next_deadline) => deadline = next_deadline,
+                    None => break,
+                }
+            }
         });
-
-        let mut slots = self.inner.slots.lock();
-        if !self.inner.shutdown_started.load(Ordering::Acquire)
-            && let Some(slot) = slots.get_by_id_mut(session_id).filter(|slot| {
-                slot.generation == generation
-                    && slot.run_id == Some(run_id)
-                    && slot.last_real_output_at == Some(armed_at)
-            })
-        {
-            cancel_quiesce_timer_locked(slot);
-            slot.quiesce_timer = Some(QuiesceTimer {
-                generation,
-                run_id,
-                armed_at,
-                handle: task,
-            });
-        } else {
-            task.abort();
-        }
+        slot.quiesce_timer = Some(QuiesceTimer {
+            generation,
+            run_id,
+            armed_at,
+            handle: task,
+        });
     }
 
     fn fire_quiesce_timer(
@@ -4711,15 +5891,38 @@ impl SupervisorHandle {
         armed_run_id: Uuid,
         armed_at: Instant,
         threshold: Duration,
-    ) {
-        let _shutdown = self.inner.shutdown_lifecycle.lock();
+    ) -> Option<Instant> {
+        self.fire_quiesce_timer_at(
+            session_id,
+            armed_generation,
+            armed_run_id,
+            armed_at,
+            threshold,
+            Instant::now(),
+        )
+    }
+
+    /// Returns the current deadline to the same worker. Taking/retiring its
+    /// token and output's deadline update use the same lifecycle/slots locks,
+    /// so a last wake racing fresh output cannot lose scheduling.
+    fn fire_quiesce_timer_at(
+        &self,
+        session_id: SessionId,
+        armed_generation: SessionGeneration,
+        armed_run_id: Uuid,
+        armed_at: Instant,
+        threshold: Duration,
+        observed_at: Instant,
+    ) -> Option<Instant> {
+        if self.inner.startup_admission.is_trial() { return None; }
+        let _shutdown = self.inner.shutdown_lifecycle.read();
         if self.inner.shutdown_started.load(Ordering::Acquire) {
-            return;
+            return None;
         }
         let (events, stale_drop) = {
             let mut slots = self.inner.slots.lock();
             let Some(slot) = slots.get_by_id_mut(session_id) else {
-                return;
+                return None;
             };
             let session_alias = slot.definition.alias.clone();
             let timer = slot.quiesce_timer.take();
@@ -4734,12 +5937,40 @@ impl SupervisorHandle {
                     if slot.generation == armed_generation
                         && slot.run_id == Some(armed_run_id)
                         && ordinary_ready
-                        && slot.last_real_output_at == Some(armed_at)
+                        && let Some(last_output) = slot.last_real_output_at
                     {
-                        let quiesce_updates_work_state =
-                            slot.definition.driver != DriverKind::Codex;
+                        let deadline = last_output + threshold;
+                        if observed_at < deadline {
+                            slot.quiesce_timer = Some(timer);
+                            return Some(deadline);
+                        }
+                        // A106: silence under an open approval or trust modal is
+                        // not completion. Blocked stays latched while the
+                        // screen still shows the question, so no room message
+                        // is typed into it; once it is gone, quiet means idle.
+                        // The menu shape misses dialogs without a key hint, so
+                        // the driver's own classifier re-reads the repainted
+                        // screen too. Codex's tracker owns its work state.
+                        let codex = slot.definition.driver == DriverKind::Codex;
+                        let on_screen = (!codex).then(|| screen_question(slot)).flatten();
+                        let question_on_screen = slot.work_state_observed
+                            && slot.work_state == WorkState::Blocked
+                            && (slot.room_composer.question_may_be_open() || on_screen.is_some());
+                        let quiesce_updates_work_state = !codex && !question_on_screen;
+                        // 19 Oct walk: quiet under a question the output chunks
+                        // never named (split across chunks) is that question,
+                        // not idle: before the member's first state, or under
+                        // a selection menu with its hint, so transcript text
+                        // that quotes a question never makes one.
+                        let named = on_screen.filter(|_| {
+                            !slot.work_state_observed || slot.room_composer.open_question().is_some()
+                        });
+                        let (quiet_state, quiet_detail) = match named {
+                            Some(detail) => (WorkState::Blocked, Some(detail)),
+                            None => (WorkState::Idle, None),
+                        };
                         let work_state_event_needed = quiesce_updates_work_state
-                            && (!slot.work_state_observed || slot.work_state != WorkState::Idle);
+                            && (!slot.work_state_observed || slot.work_state != quiet_state);
                         if ensure_run_event_capacity(slot, 1 + u64::from(work_state_event_needed))
                             .is_err()
                         {
@@ -4753,8 +5984,8 @@ impl SupervisorHandle {
                                     &session_alias,
                                     slot,
                                     armed_run_id,
-                                    WorkState::Idle,
-                                    None,
+                                    quiet_state,
+                                    quiet_detail,
                                 )
                             {
                                 events.push(event);
@@ -4785,13 +6016,13 @@ impl SupervisorHandle {
             self.note_stale_quiesce_drop(session_id, armed_generation);
         }
         for event in events {
-            if matches!(&event, RuntimeEvent::SessionWorkState { .. }) {
+            if matches!(&event, RuntimeEvent::SessionWorkState { .. } | RuntimeEvent::SessionPresentationChanged { .. }) {
                 self.emit_run_work_state(event, armed_generation, armed_run_id);
             } else {
                 self.emit_run_event(event);
             }
         }
-        self.deliver_pending_brief_if_due(session_id, armed_generation, armed_run_id);
+        None
     }
 
     fn note_stale_quiesce_drop(&self, session_id: SessionId, generation: SessionGeneration) {
@@ -4818,6 +6049,7 @@ impl SupervisorHandle {
         session_id: SessionId,
         generation: SessionGeneration,
         run_id: Uuid,
+        sequence: u64,
         state: WorkState,
     ) {
         let is_stall_state = matches!(state, WorkState::Blocked | WorkState::ErrorLoop);
@@ -4828,10 +6060,13 @@ impl SupervisorHandle {
         let weak = Arc::downgrade(&self.inner);
 
         let mut slots = self.inner.slots.lock();
-        let Some(slot) = slots
-            .get_by_id_mut(session_id)
-            .filter(|slot| slot.generation == generation && slot.run_id == Some(run_id))
-        else {
+        let Some(slot) = slots.get_by_id_mut(session_id).filter(|slot| {
+            slot.generation == generation
+                && slot.run_id == Some(run_id)
+                && slot.last_work_state_sequence == Some(sequence)
+        }) else {
+            // A newer transition (or a reset) superseded this one; its own
+            // side effects already apply or will apply after it.
             return;
         };
         cancel_stall_detector_locked(slot);
@@ -4867,6 +6102,54 @@ impl SupervisorHandle {
         });
     }
 
+    /// A16 (PC3, 20 Oct: a Codex whose node never ran read "ready" for five
+    /// minutes): a run still Starting with no visible output this long after
+    /// its spawn becomes Stalled, so the members list and its tab say so and
+    /// no room message is typed into it. Visible output later makes it Ready.
+    fn arm_startup_watchdog(&self, session_id: SessionId, generation: SessionGeneration, run_id: Uuid) {
+        let silence = self.startup_silence();
+        let weak = Arc::downgrade(&self.inner);
+        self.inner.background_runtime.spawn(async move {
+            tokio::time::sleep(silence).await;
+            if let Some(inner) = weak.upgrade() {
+                SupervisorHandle { inner }.fire_startup_watchdog(session_id, generation, run_id, silence);
+            }
+        });
+    }
+
+    fn fire_startup_watchdog(&self, session_id: SessionId, generation: SessionGeneration, run_id: Uuid, silence: Duration) {
+        let (event, label) = {
+            let mut slots = self.inner.slots.lock();
+            let Some(slot) = slots.get_by_id_mut(session_id).filter(|slot| slot.generation == generation
+                && slot.run_id == Some(run_id) && slot.running.is_some() && !slot.output_draining
+                && matches!(slot.definition.driver, DriverKind::Claude | DriverKind::Codex)
+                && slot.state == LifecycleState::Starting && !slot.room_composer.drew_visible_text()) else { return };
+            if ensure_run_event_capacity(slot, 1).is_err() { return; }
+            slot.state = LifecycleState::Stalled;
+            let identity = next_run_event_identity(slot, run_id);
+            (RuntimeEvent::SessionState { identity, session: slot.definition.alias.clone(), state: LifecycleState::Stalled,
+                reason: format!("no visible output {} s after it started", silence.as_secs()), timestamp: now_rfc3339() },
+                slot.definition.label.clone())
+        };
+        self.emit_run_event(event);
+        self.emit(RuntimeEvent::SystemLog { level: LogLevel::Warn,
+            message: format!("{label} has shown no output {} s after it started; stop it and start it again", silence.as_secs()),
+            timestamp: now_rfc3339() });
+    }
+
+    fn startup_silence(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(silence) = *self.inner.startup_silence_for_tests.lock() {
+            return silence;
+        }
+        STARTUP_SILENCE
+    }
+
+    #[cfg(test)]
+    fn set_startup_silence_for_tests(&self, silence: Duration) {
+        *self.inner.startup_silence_for_tests.lock() = Some(silence);
+    }
+
     async fn fire_stall_detector(
         &self,
         session_id: SessionId,
@@ -4893,6 +6176,26 @@ impl SupervisorHandle {
             .map(|slot| slot.definition.alias.clone())
             .unwrap_or_else(|| session_alias(session_id));
 
+        let reservation = match reservation {
+            Ok(reservation) => reservation,
+            Err(reason) => {
+                if !self.is_current_run(session_id, generation, run_id) {
+                    return;
+                }
+                self.emit_supervisor_alert(SupervisorAlertEvent {
+                    alert_type: SupervisorAlertType::OperatorAttention,
+                    request_id: None,
+                    session: Some(session_alias),
+                    action: Some("restart_held".into()),
+                    last_work_state: stall.last_work_state,
+                    last_session_state: stall.last_session_state,
+                    message: format!("Auto-restart skipped for run {run_id}: {reason}"),
+                    severity: AlertSeverity::Warn,
+                });
+                return;
+            }
+        };
+
         #[cfg(test)]
         if let Some(hook) = self.inner.stall_after_reservation.lock().take() {
             hook();
@@ -4907,7 +6210,7 @@ impl SupervisorHandle {
                 let restart_handle = self.clone();
                 let restart_session_id = stall.session_id;
                 let join = tokio::task::spawn_blocking(move || {
-                    restart_handle.restart_session_at(restart_session_id, generation, Some(run_id))
+                    restart_handle.restart_session_at(restart_session_id, generation, Some(run_id), None)
                 })
                 .await;
                 match join {
@@ -4985,7 +6288,8 @@ impl SupervisorHandle {
         run_id: Uuid,
         state: WorkState,
         entered_at: Instant,
-    ) -> Option<(StallAlertSnapshot, AutoRestartReservation)> {
+    ) -> Option<(StallAlertSnapshot, std::result::Result<AutoRestartReservation, String>)> {
+        if self.inner.startup_admission.is_trial() { return None; }
         if !self.inner.auto_restart_on_stall.enabled_for(session_id) {
             return None;
         }
@@ -5020,6 +6324,16 @@ impl SupervisorHandle {
             return None;
         }
 
+        let stall = StallAlertSnapshot {
+            session_id: slot.session_id,
+            last_work_state: slot.work_state_observed.then_some(slot.work_state),
+            last_session_state: Some(slot.state),
+        };
+        if let Some(recovery) = &slot.recovery {
+            let reason = recovery.hold(true).to_string();
+            slot.stall_detector.take();
+            return Some((stall, Err(reason)));
+        }
         let now = Instant::now();
         let reservation = {
             let mut history_by_session = self.inner.auto_restart_history.lock();
@@ -5040,14 +6354,7 @@ impl SupervisorHandle {
             }
         };
         slot.stall_detector.take();
-        Some((
-            StallAlertSnapshot {
-                session_id: slot.session_id,
-                last_work_state: slot.work_state_observed.then_some(slot.work_state),
-                last_session_state: Some(slot.state),
-            },
-            reservation,
-        ))
+        Some((stall, Ok(reservation)))
     }
 
     fn rollback_auto_restart_reservation(
@@ -5126,8 +6433,18 @@ impl SupervisorHandle {
     }
 
     #[cfg(test)]
+    fn set_input_cancel_timeout_for_tests(&self, timeout: Duration) {
+        *self.inner.input_cancel_timeout.lock() = timeout;
+    }
+
+    #[cfg(test)]
     fn set_stop_kill_timeout_for_tests(&self, timeout: Duration) {
         *self.inner.stop_kill_timeout.lock() = timeout;
+    }
+
+    #[cfg(test)]
+    fn set_output_drain_grace_for_tests(&self, grace: Duration) {
+        *self.inner.output_drain_grace.lock() = grace;
     }
 
     #[cfg(test)]
@@ -5168,6 +6485,24 @@ impl SupervisorHandle {
         *self.inner.room_event_after_append.lock() = Some(Box::new(hook));
     }
 
+    /// Runs at a room wake's commit boundary: after slots validation, just
+    /// before the final queued-input check and its PTY write ("paste"; since
+    /// A106 the submit follows inside the same writer ticket).
+    #[cfg(test)]
+    fn set_room_wake_before_write_for_tests<F>(&self, hook: F)
+    where
+        F: FnMut(&'static str) + Send + 'static,
+    {
+        *self.inner.room_wake_before_write.lock() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn run_room_wake_before_write_hook_for_tests(&self, write: &'static str) {
+        if let Some(hook) = self.inner.room_wake_before_write.lock().as_mut() {
+            hook(write);
+        }
+    }
+
     #[cfg(test)]
     fn run_room_event_after_append_hook_for_tests(&self) {
         if let Some(hook) = self.inner.room_event_after_append.lock().take() {
@@ -5175,10 +6510,22 @@ impl SupervisorHandle {
         }
     }
 
+    #[cfg(test)]
+    fn run_room_mobility_before_commit_hook_for_tests(&self) {
+        let hook = self.inner.room_mobility_before_commit.lock().take();
+        if let Some(hook) = hook { hook(); }
+    }
+
+    #[cfg(test)]
+    fn run_sideband_after_initial_authorization_for_tests(&self) {
+        let hook = self.inner.sideband_after_initial_authorization.lock().take();
+        if let Some(hook) = hook { hook(); }
+    }
+
     pub fn snapshot(&self) -> RuntimeSnapshot {
-        self.refresh_session_liveness();
         let sessions = self.inner.slots.lock().ordered_snapshots();
         let rooms = self.inner.rooms.lock().snapshots();
+        let rooms = rooms.into_iter().map(|room| self.fill_room_guests(room)).collect();
         let workspace_preference = self
             .inner
             .catalog
@@ -5204,8 +6551,60 @@ impl SupervisorHandle {
         }
     }
 
+    /// One resource sample (PLAN E7): PRIM-1's own process, its WebView2, its
+    /// other helpers and every live run, each process counted once. Pull-based:
+    /// nothing is measured between calls. Windows-only; elsewhere an error.
+    pub fn telemetry_snapshot(&self) -> Result<shared_types::TelemetrySnapshot> {
+        self.ensure_active()?;
+        // One sample at a time, so each measures from the one before it.
+        let mut sampler = self.inner.telemetry.lock();
+        let started = Instant::now();
+        let runs = {
+            let slots = self.inner.slots.lock();
+            slots
+                .ordered_slots()
+                .filter_map(|slot| {
+                    Some(telemetry::LiveRun {
+                        session_id: slot.session_id,
+                        run_id: slot.run_id?,
+                        label: slot.definition.label.clone(),
+                        driver: slot.definition.driver,
+                        pty: slot.running.as_ref()?.pty.clone()?,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let readings = telemetry::read(&runs)?;
+        let mut snapshot = sampler.advance(readings);
+        snapshot.sampler_cost_ms = started.elapsed().as_secs_f64() * 1000.0;
+        Ok(snapshot)
+    }
+
     pub fn start_session_by_id(&self, session_id: SessionId) -> Result<SessionSnapshot> {
         self.start_session_by_id_with_options(session_id, false, false)
+    }
+
+    /// A read-only comparison. No identity is minted, choices persisted, process
+    /// probed, or lifecycle operation begun. Launch resolves again when requested.
+    pub fn preview_session_launch(&self, request: StartSessionRequest) -> Result<SessionLaunchPreview> {
+        self.ensure_active()?;
+        let (definition, choices, previous) = {
+            let slots = self.inner.slots.lock();
+            let slot = slots.get_by_id(request.session_id)
+                .ok_or_else(|| anyhow!("unknown session id '{}'", request.session_id))?;
+            (slot.definition.clone(), request.launch_choices.unwrap_or_else(|| slot.launch_choices.clone()), slot.last_launch.clone())
+        };
+        if definition.driver == DriverKind::Prime {
+            bail!("launch preview is not available for Prime");
+        }
+        session::validate_launch_choices(definition.driver, &choices)?;
+        let resolved = {
+            let resolver = self.inner.executable_resolver.read();
+            if request.search { resolver.resolve_searching(definition.driver)? }
+            else { resolver.resolve(definition.driver)? }
+        };
+        let proposed = launch_inputs(&definition, &resolved, &choices, self.pane_mcp_launch_inputs(definition.driver)?);
+        Ok(SessionLaunchPreview { previous, proposed })
     }
 
     /// `fresh = true` starts a NEW harness conversation; default Launch
@@ -5224,14 +6623,66 @@ impl SupervisorHandle {
         fresh: bool,
         search: bool,
     ) -> Result<SessionSnapshot> {
+        self.start_session_with_launch_choices(session_id, fresh, search, None)
+    }
+
+    pub fn start_session_with_launch_choices(
+        &self,
+        session_id: SessionId,
+        fresh: bool,
+        search: bool,
+        requested_choices: Option<SessionLaunchChoices>,
+    ) -> Result<SessionSnapshot> {
+        self.start_session_checked(session_id, fresh, search, requested_choices, None)
+    }
+
+    /// `check`: a managing pane's member_start (A110), rechecked under the
+    /// locks that admit the launch.
+    fn start_session_checked(
+        &self,
+        session_id: SessionId,
+        fresh: bool,
+        search: bool,
+        requested_choices: Option<SessionLaunchChoices>,
+        check: Option<&member_lifecycle::ManageCheck<'_>>,
+    ) -> Result<SessionSnapshot> {
+        self.start_session_checked_for_reason(session_id, fresh, search, requested_choices, check,
+            recovery_automation::StartReason::Manual)
+    }
+
+    /// Native boot admission, not a renderer assertion of an ordinary Start.
+    pub fn resume_session_after_restart(&self, session_id: SessionId) -> Result<SessionSnapshot> {
+        match self.upgrade_reserves_boot_resume(session_id) {
+            Ok(true) => bail!("this member's resume belongs to the committed upgrade"),
+            Err(error) => self.recovery_warning(session_id, error),
+            Ok(false) => {}
+        }
+        self.start_session_checked_for_reason(session_id, false, false, None, None,
+            recovery_automation::StartReason::Boot)
+    }
+
+    fn start_session_checked_for_reason(
+        &self, session_id: SessionId, fresh: bool, search: bool,
+        requested_choices: Option<SessionLaunchChoices>, check: Option<&member_lifecycle::ManageCheck<'_>>,
+        reason: recovery_automation::StartReason<'_>,
+    ) -> Result<SessionSnapshot> {
         self.ensure_active()?;
+        self.ensure_not_upgrade_closing()?;
+        self.refuse_busy_target(session_id)?;
         self.refresh_session_liveness();
-        let (initial_generation, definition, qualified_directory) = {
+        if reason == recovery_automation::StartReason::Manual {
+            self.invalidate_manual_recovery_start(session_id, check)?;
+        }
+        let (initial_generation, definition, qualified_directory, saved_choices, choices) = {
+            let crash_rooms = matches!(reason, recovery_automation::StartReason::Crash(_)).then(|| self.inner.rooms.lock());
             let slots = self.inner.slots.lock();
             self.ensure_active()?;
             let slot = slots
                 .get_by_id(session_id)
                 .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
+            if let recovery_automation::StartReason::Crash(attempt) = reason {
+                self.check_crash_start(crash_rooms.as_deref().unwrap(), slot, attempt, None)?;
+            }
             if slot.lifecycle_operation.is_some() {
                 return Err(anyhow!(
                     "session '{session_id}' already has a lifecycle operation in progress"
@@ -5248,8 +6699,13 @@ impl SupervisorHandle {
                 ));
             }
             if slot.running.is_some() {
+                if requested_choices.as_ref().is_some_and(|choices| choices != &slot.launch_choices) {
+                    return Err(anyhow!("launch choices cannot change while the session is running"));
+                }
                 return Ok(slot.snapshot());
             }
+            let choices = requested_choices.unwrap_or_else(|| slot.launch_choices.clone());
+            session::validate_launch_choices(slot.definition.driver, &choices)?;
             let qualified_directory = slot
                 .qualified_working_directory
                 .as_ref()
@@ -5261,6 +6717,8 @@ impl SupervisorHandle {
                 slot.generation,
                 slot.definition.clone(),
                 qualified_directory,
+                slot.launch_choices.clone(),
+                choices,
             )
         };
         let lease = self.revalidate_session_working_directory(
@@ -5273,16 +6731,26 @@ impl SupervisorHandle {
             &qualified_directory,
             fresh,
             search,
+            &choices,
         ) {
             Ok(plan) => plan,
             Err(error) => {
-                self.record_launch_prepare_failure(session_id, &error);
+                self.record_launch_prepare_failure(session_id, &error, reason);
                 return Err(error);
             }
         };
+        let mut recovery_error = None;
         let expected = {
+            let rooms = (check.is_some() || matches!(reason, recovery_automation::StartReason::Boot | recovery_automation::StartReason::Crash(_)))
+                .then(|| self.inner.rooms.lock());
             let mut slots = self.inner.slots.lock();
             self.ensure_active()?;
+            if let (Some(check), Some(rooms)) = (check, rooms.as_deref()) {
+                check.check_target(rooms, &slots, session_id)?;
+            }
+            if reason == recovery_automation::StartReason::Boot {
+                self.check_boot_recovery_start(rooms.as_deref().unwrap(), &slots, session_id, &plan)?;
+            }
             let slot = slots
                 .get_by_id_mut(session_id)
                 .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
@@ -5302,10 +6770,14 @@ impl SupervisorHandle {
                 ));
             }
             if slot.running.is_some() {
+                if slot.launch_choices != choices {
+                    return Err(anyhow!("session started with different launch choices; retry after stopping it"));
+                }
                 return Ok(slot.snapshot());
             }
             if slot.generation != initial_generation
                 || slot.definition != definition
+                || slot.launch_choices != saved_choices
                 || slot.qualified_working_directory.as_ref() != Some(&qualified_directory)
             {
                 return Err(anyhow!(
@@ -5313,23 +6785,97 @@ impl SupervisorHandle {
                 ));
             }
             ensure_run_event_capacity(slot, 1)?;
+            if choices != saved_choices {
+                let mut catalog = self.inner.catalog.lock();
+                let mut candidate = catalog.clone();
+                let persisted = candidate.sessions.iter_mut()
+                    .find(|row| row.session_id == session_id)
+                    .ok_or_else(|| anyhow!("session is missing from the catalog"))?;
+                persisted.launch_choices = Some(choices.clone());
+                self.persist_catalog_candidate(&candidate)?;
+                slot.launch_choices = choices;
+                *catalog = candidate;
+            }
             cancel_quiesce_timer_locked(slot);
-            slot.run_id = None;
-            slot.generation = slot
-                .generation
-                .checked_add(1)
+            let next_generation = slot.generation.checked_add(1)
                 .ok_or_else(|| anyhow!("session generation exhausted for '{session_id}'"))?;
+            if let recovery_automation::StartReason::Crash(attempt) = reason {
+                self.check_crash_start(rooms.as_deref().unwrap(), slot, attempt, Some(&plan))?;
+                drop(rooms); // slots still serialize membership/configuration changes
+                self.reserve_crash_attempt(session_id, Utc::now())?;
+                slot.crash_respawn_waiting = false;
+            }
+            if matches!(reason, recovery_automation::StartReason::Boot | recovery_automation::StartReason::Crash(_)) {
+                self.admit_boot_recovery_start(session_id, next_generation, &plan);
+            }
+            slot.boot_resume_id = None;
+            if reason == recovery_automation::StartReason::Manual {
+                // Metadata failure must not block an authorized launch. The
+                // clear is kept in memory and included by later catalog writes.
+                slot.crash_respawn_waiting = false;
+                if let Err(error) = self.clear_recovery_eligibility(session_id) {
+                    // Warn after dropping admission guards below.
+                    recovery_error = Some(error);
+                }
+            }
+            slot.run_id = None;
+            slot.generation = next_generation;
             slot.state = LifecycleState::Starting;
+            slot.crash_start_admission = match reason {
+                recovery_automation::StartReason::Crash(attempt) => Some((attempt.run_id, next_generation)),
+                _ => None,
+            };
+            slot.output_draining = false;
+            slot.agent_exited_at = None;
             slot.generation
         };
-        self.start_session_at(session_id, expected, lease, plan)
+        if let Some(error) = recovery_error { self.recovery_warning(session_id, error); }
+        #[cfg(test)]
+        if let Some(hook) = self.inner.recovery_start_boundary.lock().as_mut() { hook("admitted"); }
+        let result = self.start_session_at(session_id, expected, lease, plan, reason);
+        if matches!(reason, recovery_automation::StartReason::Crash(_)) {
+            let mut slots = self.inner.slots.lock();
+            if let Some(slot) = slots.get_by_id_mut(session_id).filter(|slot| slot.generation == expected
+                && self.crash_effects_admitted().is_ok()) {
+                slot.crash_start_admission = None;
+                if let Err(error) = &result && slot.state == LifecycleState::Starting && slot.running.is_none()
+                    && slot.spawn_in_flight.is_none() && slot.lifecycle_operation.is_none() {
+                    slot.state = LifecycleState::Failed;
+                    slot.last_error = Some(format!("Automatic crash resume did not start: {error:#}"));
+                }
+            }
+        }
+        if let Err(error) = self.clear_unconsumed_recovery_start(session_id, expected, reason) {
+            self.recovery_warning(session_id, error);
+        }
+        result
     }
 
     pub fn stop_session_by_id(&self, session_id: SessionId) -> Result<SessionSnapshot> {
+        let (ticket, _) = self.begin_stop_session(session_id)?;
+        self.finish_stop_session(ticket)
+    }
+
+    /// Operator Stop, step 1: admission only. It declares the Stop operation
+    /// under the slots lock and returns at once, so a caller on an ordered
+    /// command thread admits in request order: a Start, Restart or Delete
+    /// issued after it sees the declared operation and cannot launch first.
+    /// The returned snapshot is the post-admission state, not the final one.
+    pub fn begin_stop_session(&self, session_id: SessionId) -> Result<(StopTicket, SessionSnapshot)> {
+        self.begin_stop_session_checked(session_id, None)
+    }
+
+    /// `check`: a managing pane's member_stop or member_remove (A110).
+    /// Even a closed member mutates continuation eligibility, so recheck its grant.
+    fn begin_stop_session_checked(
+        &self, session_id: SessionId, check: Option<&member_lifecycle::ManageCheck<'_>>,
+    ) -> Result<(StopTicket, SessionSnapshot)> {
+        self.ensure_mutations_admitted()?;
         {
-            let slots = self.inner.slots.lock();
+            let rooms = check.map(|_| self.inner.rooms.lock());
+            let mut slots = self.inner.slots.lock();
             let slot = slots
-                .get_by_id(session_id)
+                .get_by_id_mut(session_id)
                 .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
             if slot.state == LifecycleState::Closed
                 && slot.running.is_none()
@@ -5339,15 +6885,56 @@ impl SupervisorHandle {
                 && slot.stop_intent.is_none()
                 && !slot.termination_uncertain
             {
-                return Ok(slot.snapshot());
+                if let (Some(check), Some(rooms)) = (check, rooms.as_deref()) {
+                    check.check_target(rooms, &slots, session_id)?;
+                }
+                let slot = slots.get_by_id_mut(session_id).unwrap();
+                slot.boot_resume_id = None;
+                slot.crash_respawn_waiting = false;
+                let recovery_error = self.clear_recovery_eligibility(session_id).err();
+                let snapshot = slot.snapshot();
+                drop(slots);
+                drop(rooms);
+                if let Some(error) = recovery_error { self.recovery_warning(session_id, error); }
+                return Ok((StopTicket { session_id, expected: None }, snapshot));
             }
         }
         let (_, expected) =
-            self.declare_stop_operation(session_id, None, StopIntentKind::Operator)?;
+            self.declare_stop_operation_checked(session_id, None, StopIntentKind::Operator, check)?;
+        let snapshot = self
+            .inner
+            .slots
+            .lock()
+            .get_by_id(session_id)
+            .map(|slot| slot.snapshot())
+            .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
+        Ok((StopTicket { session_id, expected: Some(expected) }, snapshot))
+    }
+
+    /// Operator Stop, step 2: the bounded termination wait (up to the kill
+    /// timeout) and persistence, for exactly the admitted operation.
+    pub fn finish_stop_session(&self, ticket: StopTicket) -> Result<SessionSnapshot> {
+        let StopTicket { session_id, expected } = ticket;
+        let Some(expected) = expected else {
+            return self
+                .inner
+                .slots
+                .lock()
+                .get_by_id(session_id)
+                .map(|slot| slot.snapshot())
+                .ok_or_else(|| anyhow!("unknown session id '{session_id}'"));
+        };
         let snapshot = self.stop_session_at(session_id, expected)?;
         {
+            // A Start admitted after this Stop released the session owns a new
+            // generation; never clear that run's restart preference. A16: nor
+            // a stop that Windows' session end overtook.
             let mut slots = self.inner.slots.lock();
-            if let Some(slot) = slots.get_by_id_mut(session_id) {
+            if let Some(slot) = slots
+                .get_by_id_mut(session_id)
+                .filter(|slot| slot.generation == expected)
+                .filter(|_| !self.inner.session_ending.load(Ordering::Acquire))
+            {
                 slot.running_at_shutdown = false;
             }
         }
@@ -5355,7 +6942,54 @@ impl SupervisorHandle {
         Ok(snapshot)
     }
 
+    /// Step 2 for a caller that has already returned the admitted snapshot:
+    /// the final state arrives as runtime events; a failure is reported as a
+    /// system log event because no command result is left to carry it.
+    pub fn finish_stop_session_detached(&self, ticket: StopTicket) {
+        let session_id = ticket.session_id;
+        if let Err(error) = self.finish_stop_session(ticket) {
+            self.emit(RuntimeEvent::SystemLog {
+                level: LogLevel::Error,
+                message: format!("Stop {session_id} failed after it was admitted: {error}"),
+                timestamp: now_rfc3339(),
+            });
+        }
+    }
+
+    /// A target already inside a lifecycle operation (for example, being
+    /// retired after its process exited) is refused at once, before this
+    /// caller's own sweep: the command thread never waits on that operation.
+    /// Every post-sweep and commit-time recheck still applies.
+    fn refuse_busy_target(&self, session_id: SessionId) -> Result<()> {
+        let slots = self.inner.slots.lock();
+        if let Some(operation) = slots
+            .get_by_id(session_id)
+            .and_then(|slot| slot.lifecycle_operation)
+        {
+            return Err(anyhow!(
+                // Keep the established transient phrase: the desktop's Close
+                // retries deletion on "must be fully closed", so an
+                // asynchronous Stop followed by Delete still completes.
+                "session '{session_id}' must be fully closed before this operation: a {:?} lifecycle operation in progress (generation {}) is still finishing; try again in a moment",
+                operation.kind,
+                operation.generation
+            ));
+        }
+        Ok(())
+    }
+
     pub fn restart_session_by_id(&self, session_id: SessionId) -> Result<SessionSnapshot> {
+        self.restart_session_checked(session_id, None)
+    }
+
+    /// `check`: a managing pane's member_restart (A110), rechecked where the
+    /// restart is declared.
+    fn restart_session_checked(
+        &self, session_id: SessionId, check: Option<&member_lifecycle::ManageCheck<'_>>,
+    ) -> Result<SessionSnapshot> {
+        self.ensure_mutations_admitted()?;
+        self.ensure_not_upgrade_closing()?;
+        self.refuse_busy_target(session_id)?;
         self.refresh_session_liveness();
         let (expected_generation, expected_run_id) = {
             let slots = self.inner.slots.lock();
@@ -5380,11 +7014,77 @@ impl SupervisorHandle {
             ensure_run_event_capacity(slot, 5)?;
             (slot.generation, slot.run_id)
         };
-        self.restart_session_at(session_id, expected_generation, expected_run_id)
+        self.restart_session_at(session_id, expected_generation, expected_run_id, check)
     }
 
     pub fn shutdown(&self) -> Result<()> {
-        let _shutdown = self.inner.shutdown_lifecycle.lock();
+        self.shutdown_with(false)
+    }
+
+    /// A108 close for an upgrade: the same shutdown, except that the final
+    /// session-catalog write is part of success. An ordinary close keeps that
+    /// metadata write warning-only so an already-stopped window still closes.
+    pub fn shutdown_for_upgrade(&self) -> Result<()> {
+        self.shutdown_with(true)
+    }
+
+    /// A16 (Victor 345: after a restart, "start the agents, and continue
+    /// work"): Windows is ending the session and may end this process as soon
+    /// as the desktop returns from WM_ENDSESSION, within seconds. So this
+    /// never waits: it first stops any later run end from clearing
+    /// `running_at_shutdown` and checkpoints the catalog with each member's
+    /// flag and pane size, then tells each agent's process scope to end on a
+    /// thread of its own. The pane Jobs end with this process in any case
+    /// (kill on job close). Startup then finds the members that were running
+    /// as interrupted, for Resume on restart and `room start`.
+    pub fn end_session_now(&self) -> Result<()> {
+        self.inner.session_ending.store(true, Ordering::Release);
+        let checkpoint = self.persist_session_end_checkpoint();
+        let slots = self.inner.slots.lock();
+        for running in slots.by_id.values().filter_map(|slot| slot.running.as_ref()) {
+            running.close_input();
+            if let Some(pty) = running.pty.clone() {
+                thread::spawn(move || { let _ = pty.kill(); });
+            }
+        }
+        checkpoint
+    }
+
+    fn persist_session_end_checkpoint(&self) -> Result<()> {
+        let slots = self.inner.slots.lock();
+        let mut catalog = self.inner.catalog.lock();
+        let mut candidate = catalog.clone();
+        for row in &mut candidate.sessions {
+            if let Some(slot) = slots.get_by_id(row.session_id) {
+                row.running_at_shutdown = slot.running_at_shutdown;
+                row.last_pty_cols = slot.last_pty_size.map(|size| size.0);
+                row.last_pty_rows = slot.last_pty_size.map(|size| size.1);
+            }
+        }
+        if candidate != *catalog {
+            self.persist_catalog_candidate(&candidate)?;
+            *catalog = candidate;
+        }
+        Ok(())
+    }
+
+    fn shutdown_with(&self, strict_catalog: bool) -> Result<()> {
+        self.inner.identity_tracker.stop();
+        // Wake output producers before taking the lifecycle lock. No producer
+        // waiting for renderer capacity can participate in a shutdown cycle.
+        // Held trials never admit PTY events. Their defensive refusal below
+        // must leave credit unchanged if an unexpected active slot is found.
+        if !self.inner.startup_admission.is_trial() {
+            self.inner.output_credit.cancel_all();
+        }
+        let _shutdown = self.inner.shutdown_lifecycle.write();
+        if self.inner.startup_admission.is_trial() {
+            if self.inner.slots.lock().by_id.values().any(rebuild::active_or_uncertain) {
+                bail!("held trial unexpectedly contains active members; shutdown state is uncertain");
+            }
+            self.inner.shutdown_started.store(true, Ordering::Release);
+            return Ok(());
+        }
         if self.inner.shutdown_started.swap(true, Ordering::AcqRel) {
             let slots = self.inner.slots.lock();
             let cleanup_pending = slots.ordered_slots().any(|slot| {
@@ -5399,7 +7099,10 @@ impl SupervisorHandle {
             #[cfg(not(windows))]
             let listener_cleanup_pending = false;
             if !cleanup_pending && !listener_cleanup_pending {
-                return Ok(());
+                // A previous close may have cleaned up processes but failed
+                // its final catalog write. Do not turn that failure into a
+                // successful retry without persisting the pending sizes.
+                return self.checkpoint_pty_sizes_on_shutdown(strict_catalog);
             }
         }
 
@@ -5407,6 +7110,7 @@ impl SupervisorHandle {
         let listener = {
             let _lifecycle = self.inner.control_plane_lifecycle.lock();
             self.inner.control_plane.write().take();
+            self.remove_guest_endpoint();
             self.inner.control_plane_listener.lock().take()
         };
 
@@ -5617,11 +7321,67 @@ impl SupervisorHandle {
             }
         }
 
+        if let Err(error) = self.checkpoint_pty_sizes_on_shutdown(strict_catalog) {
+            errors.push(format!("the final session catalog write failed: {error:#}"));
+        }
+        // A108: the register writer writes what it can, each member's
+        // stopped state included, and stops; no git starts here, and a git
+        // already running, even one the writer was waiting for, gets the rest
+        // of the bounded wait. PRIM-1 never kills it; the desktop's job may
+        // still end a git that outlasts the wait when the app exits.
+        // One log line says what was not written or is owed a commit; the
+        // next start brings the files up to the catalog and commits what is
+        // owed. The register is observational, so its close never fails a
+        // shutdown.
+        let register_on = self.personal_repo_status().status == PersonalRepoHealth::On;
+        let register_close = Duration::from_secs(10);
+        let register = self.close_session_ledger(register_close);
+        if register_on {
+            let (level, message) = session_ledger::close_log(register, register_close);
+            self.emit(RuntimeEvent::SystemLog { level, message, timestamp: now_rfc3339() });
+        }
         if errors.is_empty() {
             Ok(())
         } else {
             Err(anyhow!("shutdown incomplete: {}", errors.join("; ")))
         }
+    }
+
+    /// `strict` (upgrade close): a failed write fails the shutdown.
+    fn checkpoint_pty_sizes_on_shutdown(&self, strict: bool) -> Result<()> {
+        if let Err(error) = self.persist_pty_sizes_on_shutdown() {
+            if strict {
+                return Err(error);
+            }
+            // Dimensions are metadata, not proof of process cleanup. The
+            // desktop caches shutdown errors; failing close here would strand
+            // an already-stopped window. Preserve the old catalog and warn.
+            self.emit(RuntimeEvent::SystemLog {
+                level: LogLevel::Warn,
+                message: format!("Pane sizes could not be saved at shutdown; previous dimensions retained: {error}"),
+                timestamp: now_rfc3339(),
+            });
+        }
+        Ok(())
+    }
+
+    /// One bounded catalog checkpoint on ordinary wrapper close. Resize keeps
+    /// dimensions in memory; this preserves the latest sizes without per-fit I/O.
+    fn persist_pty_sizes_on_shutdown(&self) -> Result<()> {
+        let slots = self.inner.slots.lock();
+        let mut catalog = self.inner.catalog.lock();
+        let mut candidate = catalog.clone();
+        for row in &mut candidate.sessions {
+            if let Some(slot) = slots.get_by_id(row.session_id) {
+                row.last_pty_cols = slot.last_pty_size.map(|size| size.0);
+                row.last_pty_rows = slot.last_pty_size.map(|size| size.1);
+            }
+        }
+        if candidate != *catalog {
+            self.persist_catalog_candidate(&candidate)?;
+            *catalog = candidate;
+        }
+        Ok(())
     }
 
     fn persist_catalog_candidate(&self, candidate: &SessionCatalogV1) -> Result<()> {
@@ -5633,7 +7393,10 @@ impl SupervisorHandle {
         {
             return Err(anyhow!("injected session catalog persistence failure"));
         }
-        persist_session_catalog(&self.inner.runtime_dir, candidate)
+        persist_session_catalog(&self.inner.runtime_dir, candidate)?;
+        // A108: the register follows the written catalog on its own thread.
+        self.inner.session_ledger.feed_catalog(&candidate.sessions);
+        Ok(())
     }
 
     fn persist_room_catalog_candidate(&self, candidate: &RoomCatalogV1) -> Result<()> {
@@ -5645,24 +7408,35 @@ impl SupervisorHandle {
         {
             return Err(anyhow!("injected room catalog persistence failure"));
         }
-        persist_room_catalog(&self.inner.runtime_dir, candidate)
+        #[cfg(test)]
+        {
+            let hook = self.inner.room_catalog_before_write.lock().take();
+            if let Some(hook) = hook { hook(); }
+        }
+        persist_room_catalog(&self.inner.runtime_dir, candidate)?;
+        self.inner.session_ledger.feed_rooms(&candidate.rooms);
+        Ok(())
     }
 
     /// Persist the slot's harness conversation id and running-at-shutdown
     /// flag into the session catalog. A failure downgrades to a warning: the
     /// run itself is unaffected, only workspace restore fidelity suffers.
     fn persist_slot_harness_state(&self, session_id: SessionId) {
-        let state = {
-            let slots = self.inner.slots.lock();
-            slots.get_by_id(session_id).map(|slot| {
-                (
-                    slot.harness_session_id.clone(),
-                    slot.running_at_shutdown,
-                    slot.last_pty_size,
-                )
-            })
-        };
-        let Some((harness_session_id, running_at_shutdown, last_pty_size)) = state else {
+        // Keep the registry read serialized with its catalog write. Releasing
+        // it before acquiring the catalog let an older run snapshot overwrite
+        // a newer identification report committed in between.
+        let slots = self.inner.slots.lock();
+        let state = slots.get_by_id(session_id).map(|slot| {
+            (
+                slot.harness_session_id.clone(),
+                slot.recovery.clone(),
+                slot.recovery_history.clone(),
+                slot.last_launch.clone(),
+                slot.running_at_shutdown,
+                slot.last_pty_size,
+            )
+        });
+        let Some((harness_session_id, recovery, recovery_history, last_launch, running_at_shutdown, last_pty_size)) = state else {
             return;
         };
         let (last_pty_cols, last_pty_rows) =
@@ -5677,6 +7451,9 @@ impl SupervisorHandle {
             return;
         };
         if row.harness_session_id == harness_session_id
+            && row.recovery == recovery
+            && row.recovery_history == recovery_history
+            && row.last_launch == last_launch
             && row.running_at_shutdown == running_at_shutdown
             && row.last_pty_cols == last_pty_cols
             && row.last_pty_rows == last_pty_rows
@@ -5684,10 +7461,15 @@ impl SupervisorHandle {
             return;
         }
         row.harness_session_id = harness_session_id;
+        row.recovery = recovery;
+        row.recovery_history = recovery_history;
+        row.last_launch = last_launch;
         row.running_at_shutdown = running_at_shutdown;
         row.last_pty_cols = last_pty_cols;
         row.last_pty_rows = last_pty_rows;
         if let Err(error) = self.persist_catalog_candidate(&candidate) {
+            drop(catalog);
+            drop(slots);
             self.emit(RuntimeEvent::SystemLog {
                 level: LogLevel::Warn,
                 message: format!("Session resume state could not be persisted: {error}"),
@@ -5698,63 +7480,10 @@ impl SupervisorHandle {
         *catalog = candidate;
     }
 
-    /// Codex offers no launch-time id flag: after spawn, watch its rollout
-    /// directory for the new session file (matched by cwd and start time) and
-    /// persist that id for the next resume.
-    fn spawn_codex_session_capture(&self, session_id: SessionId, working_dir: String) {
-        let handle = self.clone();
-        let started = std::time::SystemTime::now();
-        let spawned = std::thread::Builder::new()
-            .name("prim1-codex-session-capture".into())
-            .spawn(move || {
-                let Some(profile) = std::env::var_os("USERPROFILE") else {
-                    return;
-                };
-                let sessions = PathBuf::from(profile).join(".codex").join("sessions");
-                for _ in 0..24 {
-                    std::thread::sleep(Duration::from_secs(1));
-                    let Some(found) =
-                        newest_codex_rollout_for_cwd(&sessions, &working_dir, started)
-                    else {
-                        continue;
-                    };
-                    let changed = {
-                        let mut slots = handle.inner.slots.lock();
-                        match slots.get_by_id_mut(session_id) {
-                            Some(slot)
-                                if slot.harness_session_id.as_deref()
-                                    != Some(found.as_str()) =>
-                            {
-                                slot.harness_session_id = Some(found.clone());
-                                true
-                            }
-                            Some(_) => false,
-                            None => return,
-                        }
-                    };
-                    if changed {
-                        handle.persist_slot_harness_state(session_id);
-                        handle.emit(RuntimeEvent::SystemLog {
-                            level: LogLevel::Info,
-                            message: format!(
-                                "Captured Codex conversation {found} for resume"
-                            ),
-                            timestamp: now_rfc3339(),
-                        });
-                    }
-                    return;
-                }
-            });
-        if let Err(error) = spawned {
-            self.emit(RuntimeEvent::SystemLog {
-                level: LogLevel::Warn,
-                message: format!("Codex session capture thread could not start: {error}"),
-                timestamp: now_rfc3339(),
-            });
-        }
-    }
-
     fn ensure_wsl_reconciled(&self) -> Result<()> {
+        if !prime_enabled() {
+            return Err(anyhow!(PRIME_PARKED_REASON));
+        }
         if self.inner.wsl_reconciliation_error.lock().is_none() {
             return Ok(());
         }
@@ -5800,8 +7529,20 @@ impl SupervisorHandle {
     }
 
     pub fn set_workspace_preference(&self, path: &Path) -> Result<String> {
+        self.set_workspace_preference_checked(path, None)
+    }
+
+    /// `check`: a member's runtime_settings set (A16), run under the session
+    /// lock, which is held (sessions before catalog) until the choice is saved.
+    pub(crate) fn set_workspace_preference_checked(
+        &self, path: &Path, check: Option<&dyn Fn(&SessionRegistry) -> Result<()>>,
+    ) -> Result<String> {
         self.ensure_active()?;
         let (qualified, _lease) = qualify_working_directory(path, &self.inner.runtime_dir)?;
+        let slots = check.map(|_| self.inner.slots.lock());
+        if let (Some(check), Some(slots)) = (check, slots.as_deref()) {
+            check(slots)?;
+        }
         let mut catalog = self.inner.catalog.lock();
         let mut candidate = catalog.clone();
         candidate.workspace_preference = qualified.clone();
@@ -5824,7 +7565,24 @@ impl SupervisorHandle {
         &self,
         request: shared_types::CreateSessionRequest,
     ) -> Result<SessionSnapshot> {
+        self.create_session_as(request, None)
+    }
+
+    /// The operator's create, or (A110) a managing pane's `member_create`:
+    /// then the pane's full room authority is rechecked where the session
+    /// commits, the request is recorded with it, its room joining is checked
+    /// again, and a refused join removes the new session instead of leaving
+    /// it in the lobby.
+    fn create_session_as(
+        &self,
+        request: shared_types::CreateSessionRequest,
+        by: Option<(&member_lifecycle::ManageCheck<'_>, &MemberCreation)>,
+    ) -> Result<SessionSnapshot> {
         self.ensure_active()?;
+        self.ensure_not_upgrade_closing()?;
+        let launch_choices = request.launch_choices
+            .unwrap_or_else(|| session::default_launch_choices(request.driver));
+        session::validate_launch_choices(request.driver, &launch_choices)?;
         let label = request.label.unwrap_or_else(|| match request.driver {
             DriverKind::Claude => "Claude".into(),
             DriverKind::Codex => "Codex".into(),
@@ -5842,6 +7600,11 @@ impl SupervisorHandle {
                 "{:?} sessions do not support the unsafe permission profile",
                 request.driver
             ));
+        }
+        let permissions = request.permissions.unwrap_or_default();
+        if !permissions.is_default() && !room_mobility::grants_apply_to(request.driver) {
+            bail!("{} panes have no room tools, so \"Can roam\", \"Can upgrade PRIM-1\" and \"Can manage agents\" do nothing for them",
+                driver_display_name(request.driver));
         }
         if let Some(room_id) = request.room_id {
             // Fail before any side effect when the target room cannot take the
@@ -5882,7 +7645,23 @@ impl SupervisorHandle {
             )?;
             workspace_preference.clone()
         };
+        validate_codex_transport(request.driver, request.codex_transport)?;
         let session_id = Uuid::new_v4();
+        // v3 W4 (Claude PRIM-1 60384b19 (b)): the opt-in is refused where its
+        // owner socket could never be created, with the launch check's own
+        // reason (path, its canonical byte length and the limit); the
+        // nonce's length is fixed, so any nonce gives the launch's length.
+        // The refusal is kept in the audit file too (Codex PRIM-1, after
+        // 60384b19), with no runtime event and no member.
+        if request.codex_transport == shared_types::CodexTransport::AppServer
+            && let Err(error) = codex_app_server::OwnerSocket::for_launch(&self.inner.runtime_dir, session_id, Uuid::nil()) {
+            let error = anyhow!("the Codex App Server transport cannot be used in this PRIM-1: {error:#}");
+            if let Err(audit) = self.inner.audit.append(&RuntimeEvent::SystemLog { level: LogLevel::Error,
+                message: format!("member {label:?} not created: {error:#}"), timestamp: now_rfc3339() }) {
+                eprintln!("audit log failure: {audit}");
+            }
+            return Err(error);
+        }
         let definition = SessionDefinition {
             session_id,
             alias: session_alias(session_id),
@@ -5890,12 +7669,21 @@ impl SupervisorHandle {
             driver: request.driver,
             working_dir: qualified_directory.canonical_path.clone(),
             permission_profile: request.permission_profile,
+            codex_transport: request.codex_transport,
         };
         let mut slot = closed_session_slot(definition);
+        slot.launch_choices = launch_choices.clone();
         slot.qualified_working_directory = Some(qualified_directory.clone());
+        slot.created_by = by.map(|(_, creation)| creation.clone());
+        slot.permissions = permissions;
         let snapshot = slot.snapshot();
 
         {
+            // A110: rooms too (rooms before slots), so the caller's run,
+            // generation, manage grant and, for another room, roam are all
+            // checked before the first mutation, and none can change before
+            // the commit: a withdrawn grant leaves nothing to publish.
+            let rooms = by.map(|_| self.inner.rooms.lock());
             let mut slots = self.inner.slots.lock();
             let mut catalog = self.inner.catalog.lock();
             if request.driver != DriverKind::Prime
@@ -5905,6 +7693,14 @@ impl SupervisorHandle {
                     "workspace preference changed while the session was being created; retry"
                 ));
             }
+            if let (Some((check, creation)), Some(rooms)) = (by, rooms.as_deref()) {
+                check.check(rooms, &slots)?;
+                if slots.by_id.values().any(|other| {
+                    other.created_by.as_ref().is_some_and(|earlier| earlier.same_request(creation))
+                }) {
+                    bail!("this request_id already created a member");
+                }
+            }
             slots.validate_insert(&slot)?;
             let mut candidate = catalog.clone();
             candidate.sessions.push(PersistedSessionV1 {
@@ -5913,10 +7709,17 @@ impl SupervisorHandle {
                 driver: request.driver,
                 working_directory: qualified_directory,
                 permission_profile: request.permission_profile,
+                launch_choices: Some(launch_choices),
+                last_launch: None,
                 harness_session_id: None,
+                recovery: None,
+                recovery_history: Vec::new(),
                 running_at_shutdown: false,
                 last_pty_cols: None,
                 last_pty_rows: None,
+                permissions,
+                created_by: by.map(|(_, creation)| creation.clone()),
+                codex_transport: request.codex_transport,
             });
             self.persist_catalog_candidate(&candidate)?;
             slots.insert_prevalidated(slot);
@@ -5932,7 +7735,18 @@ impl SupervisorHandle {
             session: snapshot.clone(),
             timestamp: now_rfc3339(),
         });
-        if let Some(room_id) = request.room_id {
+        if let (Some(room_id), Some((check, _))) = (request.room_id, by) {
+            // A managing pane creates only room members: a refused join
+            // (grant withdrawn, room full or deleted) removes the newborn.
+            let joined = self.add_room_member_checked(
+                AddRoomMemberRequest { room_id, session_id: snapshot.session_id }, Some(check));
+            if let Err(error) = joined {
+                return Err(match self.delete_session(snapshot.session_id) {
+                    Ok(()) => anyhow!("nothing was created: {error}"),
+                    Err(cleanup) => anyhow!("member \"{}\" was created but could not join the room ({error}) and could not be removed again ({cleanup}); it is in the lobby", snapshot.label),
+                });
+            }
+        } else if let Some(room_id) = request.room_id {
             // Pre-validated above; a failure here (the room was deleted or
             // filled meanwhile) leaves an honest lobby session, never a
             // rollback of the created definition.
@@ -5951,11 +7765,30 @@ impl SupervisorHandle {
     }
 
     pub fn rename_session(&self, session_id: SessionId, label: &str) -> Result<SessionSnapshot> {
+        self.rename_session_checked(session_id, label, None)
+    }
+
+    /// `check`: a managing pane's member_update (A16), rechecked where the
+    /// label commits. Labels address members, so a pane's rename keeps them
+    /// unique in the room, as member_create does.
+    pub(crate) fn rename_session_checked(
+        &self, session_id: SessionId, label: &str, check: Option<&member_lifecycle::ManageCheck<'_>>,
+    ) -> Result<SessionSnapshot> {
         self.ensure_active()?;
         validate_session_label(label)?;
         let (snapshot, old_label) = {
+            let rooms = check.map(|_| self.inner.rooms.lock());
             let mut slots = self.inner.slots.lock();
             let mut catalog = self.inner.catalog.lock();
+            if let (Some(check), Some(rooms)) = (check, rooms.as_deref()) {
+                check.check_editable(rooms, &slots, session_id)?;
+                if let Some(room) = rooms.room_by_session.get(&session_id).and_then(|room_id| rooms.get(*room_id))
+                    && room.definition.member_ids.iter().any(|id| *id != session_id && slots.get_by_id(*id)
+                        .is_some_and(|slot| slot.definition.label.trim().eq_ignore_ascii_case(label.trim())))
+                {
+                    bail!("room \"{}\" already has a member labelled '{label}'; choose another label", room.definition.label);
+                }
+            }
             let old_label = slots
                 .get_by_id(session_id)
                 .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?
@@ -5993,11 +7826,23 @@ impl SupervisorHandle {
         session_id: SessionId,
         path: &Path,
     ) -> Result<SessionSnapshot> {
+        self.set_session_working_directory_checked(session_id, path, None)
+    }
+
+    /// `check`: a managing pane's member_update (A16), rechecked where the
+    /// directory commits (rooms before sessions, as everywhere).
+    pub(crate) fn set_session_working_directory_checked(
+        &self, session_id: SessionId, path: &Path, check: Option<&member_lifecycle::ManageCheck<'_>>,
+    ) -> Result<SessionSnapshot> {
         self.ensure_active()?;
         let (qualified, _lease) = qualify_working_directory(path, &self.inner.runtime_dir)?;
         let (snapshot, old_working_dir) = {
+            let rooms = check.map(|_| self.inner.rooms.lock());
             let mut slots = self.inner.slots.lock();
             let mut catalog = self.inner.catalog.lock();
+            if let (Some(check), Some(rooms)) = (check, rooms.as_deref()) {
+                check.check_editable(rooms, &slots, session_id)?;
+            }
             let slot = slots
                 .get_by_id(session_id)
                 .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
@@ -6104,10 +7949,25 @@ impl SupervisorHandle {
         session_id: SessionId,
         permission_profile: shared_types::PermissionProfile,
     ) -> Result<SessionSnapshot> {
+        self.set_permission_profile_checked(session_id, permission_profile, None)
+    }
+
+    /// `check`: a managing pane's member_update (A16), rechecked where the
+    /// profile commits.
+    pub(crate) fn set_permission_profile_checked(
+        &self,
+        session_id: SessionId,
+        permission_profile: shared_types::PermissionProfile,
+        check: Option<&member_lifecycle::ManageCheck<'_>>,
+    ) -> Result<SessionSnapshot> {
         self.ensure_active()?;
         let (snapshot, old_profile) = {
+            let rooms = check.map(|_| self.inner.rooms.lock());
             let mut slots = self.inner.slots.lock();
             let mut catalog = self.inner.catalog.lock();
+            if let (Some(check), Some(rooms)) = (check, rooms.as_deref()) {
+                check.check_editable(rooms, &slots, session_id)?;
+            }
             let slot = slots
                 .get_by_id(session_id)
                 .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
@@ -6150,10 +8010,33 @@ impl SupervisorHandle {
     }
 
     pub fn move_session(&self, session_id: SessionId, new_index: usize) -> Result<RuntimeSnapshot> {
+        self.move_session_checked(session_id, new_index, None)?;
+        Ok(self.snapshot())
+    }
+
+    /// `check`: a managing pane's member_update position (A16). Then
+    /// `position` counts among the sessions the caller may list, its own
+    /// room's members or with roam every session, and the tab takes the
+    /// place of the one listed there; the grant is rechecked where the order
+    /// commits. False when it already stands there.
+    pub(crate) fn move_session_checked(
+        &self, session_id: SessionId, position: usize, check: Option<&member_lifecycle::ManageCheck<'_>>,
+    ) -> Result<bool> {
         self.ensure_active()?;
-        let old_index = {
+        let moved = {
+            let rooms = check.map(|_| self.inner.rooms.lock());
             let mut slots = self.inner.slots.lock();
             let mut catalog = self.inner.catalog.lock();
+            let new_index = match (check, rooms.as_deref()) {
+                (Some(check), Some(rooms)) => {
+                    check.check_editable(rooms, &slots, session_id)?;
+                    let listed = check.listed_order(rooms, &slots);
+                    let at = *listed.get(position).ok_or_else(|| anyhow!(
+                        "position {position} is beyond the {} sessions you may list (0 is first)", listed.len()))?;
+                    slots.order.iter().position(|candidate| *candidate == at).expect("a listed session is in the order")
+                }
+                _ => position,
+            };
             let old_index = slots
                 .order
                 .iter()
@@ -6166,9 +8049,7 @@ impl SupervisorHandle {
                 ));
             }
             if old_index == new_index {
-                drop(catalog);
-                drop(slots);
-                return Ok(self.snapshot());
+                return Ok(false);
             }
             let mut candidate = catalog.clone();
             let persisted = candidate.sessions.remove(old_index);
@@ -6177,8 +8058,9 @@ impl SupervisorHandle {
             let moved = slots.order.remove(old_index);
             slots.order.insert(new_index, moved);
             *catalog = candidate;
-            old_index
+            (old_index, new_index)
         };
+        let (old_index, new_index) = moved;
         self.emit(RuntimeEvent::SessionMoved {
             schema_version: 1,
             session_id,
@@ -6186,14 +8068,41 @@ impl SupervisorHandle {
             new_index,
             timestamp: now_rfc3339(),
         });
-        Ok(self.snapshot())
+        Ok(true)
     }
 
     pub fn delete_session(&self, session_id: SessionId) -> Result<()> {
+        self.delete_session_checked(session_id, None)
+    }
+
+    /// `check`: a managing pane's member_delete (A16), rechecked where the
+    /// session leaves the catalog.
+    pub(crate) fn delete_session_checked(
+        &self, session_id: SessionId, check: Option<&member_lifecycle::DeleteCheck<'_>>,
+    ) -> Result<()> {
         self.ensure_active()?;
+        self.refuse_busy_target(session_id)?;
         self.refresh_session_liveness();
+        // Membership additions use this publication guard too. Keep it from
+        // the membership check through deletion, without holding rooms during
+        // the session catalog write or waiting for rooms while holding slots.
+        let _room_event_publish = self.inner.room_event_publish.lock();
+        {
+            let rooms = self.inner.rooms.lock();
+            if let Some(room_id) = rooms.room_by_session.get(&session_id) {
+                return Err(anyhow!(
+                    "session '{session_id}' belongs to room '{room_id}'; remove it from the room before deletion"
+                ));
+            }
+        }
         let label = {
+            // Rooms before sessions, held only for the A16 recheck.
+            let rooms = check.map(|_| self.inner.rooms.lock());
             let mut slots = self.inner.slots.lock();
+            if let (Some(check), Some(rooms)) = (check, rooms.as_deref()) {
+                check.check(rooms, &slots, session_id)?;
+            }
+            drop(rooms);
             let slot = slots
                 .get_by_id(session_id)
                 .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
@@ -6216,12 +8125,6 @@ impl SupervisorHandle {
                     ));
                 }
             }
-            let rooms = self.inner.rooms.lock();
-            if let Some(room_id) = rooms.room_by_session.get(&session_id) {
-                return Err(anyhow!(
-                    "session '{session_id}' belongs to room '{room_id}'; remove it from the room before deletion"
-                ));
-            }
             let label = slot.definition.label.clone();
             let mut catalog = self.inner.catalog.lock();
             let mut candidate = catalog.clone();
@@ -6231,6 +8134,7 @@ impl SupervisorHandle {
                 .position(|session| session.session_id == session_id)
                 .ok_or_else(|| anyhow!("session '{session_id}' is missing from the catalog"))?;
             candidate.sessions.remove(index);
+            candidate.recovery_automation.remove(&session_id);
             self.persist_catalog_candidate(&candidate)?;
             slots
                 .remove(session_id)
@@ -6239,6 +8143,11 @@ impl SupervisorHandle {
             *catalog = candidate;
             label
         };
+        // D9 step 5: a deleted session keeps no input queue. Dropping its
+        // sender lets the worker drain and exit. Taken with no slots lock
+        // held, so the queue-then-slots lock order holds.
+        self.inner.operator_input.lock().remove(&session_id);
+        self.inner.output_credit.cancel_session(session_id);
         self.emit(RuntimeEvent::SessionDeleted {
             schema_version: 1,
             session_id,
@@ -6248,7 +8157,15 @@ impl SupervisorHandle {
         Ok(())
     }
 
-    pub fn create_room(&self, mut request: CreateRoomRequest) -> Result<RoomSnapshot> {
+    pub fn create_room(&self, request: CreateRoomRequest) -> Result<RoomSnapshot> {
+        self.create_room_checked(request, None, false)
+    }
+
+    /// `caller`: a managing pane's room_create (A16); its run and manage
+    /// grant are rechecked where the room commits. `resume_on_restart` is
+    /// written in that same catalog write.
+    pub(crate) fn create_room_checked(&self, mut request: CreateRoomRequest, caller: Option<member_lifecycle::Actor<'_>>,
+        resume_on_restart: bool) -> Result<RoomSnapshot> {
         self.ensure_active()?;
         let brief_template = normalize_room_brief_template(request.brief_template.take())?;
         // Any member count from zero up is a legal room: an empty room is a
@@ -6269,13 +8186,16 @@ impl SupervisorHandle {
 
         let _room_event_publish = self.inner.room_event_publish.lock();
         let (snapshot, feed_events) = {
+            let mut rooms = self.inner.rooms.lock();
             let slots = self.inner.slots.lock();
+            if let Some(caller) = caller {
+                caller.manage_locked(&slots)?;
+            }
             for session_id in &request.member_ids {
                 if slots.get_by_id(*session_id).is_none() {
                     return Err(anyhow!("unknown session id '{session_id}'"));
                 }
             }
-            let mut rooms = self.inner.rooms.lock();
             if rooms.order.len() >= ROOM_MAX_COUNT {
                 return Err(anyhow!("room limit of {ROOM_MAX_COUNT} has been reached"));
             }
@@ -6295,8 +8215,13 @@ impl SupervisorHandle {
                 room_id = Uuid::new_v4();
             }
             let definition = PersistedRoomV1 {
+                fallbacks: Default::default(),
+                join_floors: Some(request.member_ids.iter().map(|id| (*id, 0)).collect()),
+                join_floor_epoch: None,
+                history_restarted: false,
                 room_id,
                 label,
+                resume_on_restart,
                 member_ids: request.member_ids.clone(),
                 membership_revision: 1,
                 brief_on_join: request.brief_on_join,
@@ -6304,6 +8229,9 @@ impl SupervisorHandle {
                 briefed_member_ids: Some(Vec::new()),
             };
             let mut runtime = RoomRuntime::from_persisted(definition.clone());
+            self.validate_room_brief_rendering(&runtime, &slots)?;
+            drop(slots);
+            runtime.open_log(&self.inner.runtime_dir)?;
             let mut feed_events = Vec::with_capacity(definition.member_ids.len());
             for session_id in &definition.member_ids {
                 feed_events.push(runtime.append(RoomFeedItem::Membership {
@@ -6314,7 +8242,7 @@ impl SupervisorHandle {
             }
             let snapshot = runtime.snapshot();
             let mut candidate = rooms.catalog.clone();
-            candidate.rooms.push(definition);
+            candidate.rooms.push(runtime.definition.clone());
             self.persist_room_catalog_candidate(&candidate)?;
             for session_id in &request.member_ids {
                 rooms.room_by_session.insert(*session_id, room_id);
@@ -6335,16 +8263,26 @@ impl SupervisorHandle {
         for feed_event in feed_events {
             self.emit(RuntimeEvent::RoomFeedEvent { feed_event });
         }
-        self.schedule_room_briefs(snapshot.room_id, &request.member_ids);
         Ok(snapshot)
     }
 
     pub fn rename_room(&self, request: RenameRoomRequest) -> Result<RoomSnapshot> {
+        self.rename_room_checked(request, None)
+    }
+
+    /// `check`: a managing pane's room_update (A16), rechecked where the
+    /// label commits.
+    pub(crate) fn rename_room_checked(
+        &self, request: RenameRoomRequest, check: Option<&member_lifecycle::ManageCheck<'_>>,
+    ) -> Result<RoomSnapshot> {
         self.ensure_active()?;
         validate_room_label(&request.label)?;
         let _room_event_publish = self.inner.room_event_publish.lock();
         let (snapshot, old_label) = {
             let mut rooms = self.inner.rooms.lock();
+            if let Some(check) = check {
+                check.check(&rooms, &self.inner.slots.lock())?;
+            }
             let old_label = rooms
                 .get(request.room_id)
                 .ok_or_else(|| anyhow!("unknown room id '{}'", request.room_id))?
@@ -6374,14 +8312,133 @@ impl SupervisorHandle {
             new_label: request.label,
             timestamp: now_rfc3339(),
         });
-        Ok(snapshot)
+        Ok(self.fill_room_guests(snapshot))
+    }
+
+    /// Change configuration only: never start or stop a member as a side effect.
+    /// Persistence succeeds before the new choice becomes visible in memory.
+    pub fn set_room_resume_on_restart(&self, request: SetRoomResumeRequest) -> Result<RoomSnapshot> {
+        self.set_room_resume_on_restart_checked(request, None)
+    }
+
+    /// `check`: a managing pane's room_update (A16), rechecked where the
+    /// choice commits.
+    pub(crate) fn set_room_resume_on_restart_checked(
+        &self, request: SetRoomResumeRequest, check: Option<&member_lifecycle::ManageCheck<'_>>,
+    ) -> Result<RoomSnapshot> {
+        self.ensure_active()?;
+        let _room_event_publish = self.inner.room_event_publish.lock();
+        let mut rooms = self.inner.rooms.lock();
+        if let Some(check) = check {
+            check.check(&rooms, &self.inner.slots.lock())?;
+        }
+        let room = rooms
+            .get(request.room_id)
+            .ok_or_else(|| anyhow!("unknown room id '{}'", request.room_id))?;
+        if room.definition.resume_on_restart == request.resume_on_restart {
+            return Ok(self.fill_room_guests(room.snapshot()));
+        }
+        let mut candidate = rooms.catalog.clone();
+        candidate
+            .rooms
+            .iter_mut()
+            .find(|room| room.room_id == request.room_id)
+            .expect("validated room missing from persisted catalog")
+            .resume_on_restart = request.resume_on_restart;
+        self.persist_room_catalog_candidate(&candidate)?;
+        let room = rooms
+            .get_mut(request.room_id)
+            .expect("validated room disappeared while updating restart choice");
+        room.definition.resume_on_restart = request.resume_on_restart;
+        let snapshot = room.snapshot();
+        rooms.catalog = candidate;
+        drop(rooms);
+        self.emit(RuntimeEvent::SystemLog {
+            level: LogLevel::Info,
+            message: format!("Room restart selection changed: room_id={} resume_on_restart={}", request.room_id, request.resume_on_restart),
+            timestamp: now_rfc3339(),
+        });
+        Ok(self.fill_room_guests(snapshot))
+    }
+
+    pub fn read_room_brief(&self, request: shared_types::ReadRoomBriefRequest) -> Result<shared_types::RoomBriefSettings> {
+        self.ensure_not_shutdown()?;
+        let rooms = self.inner.rooms.lock();
+        let room = rooms.get(request.room_id)
+            .ok_or_else(|| anyhow!("unknown room id '{}'", request.room_id))?;
+        Ok(shared_types::RoomBriefSettings {
+            room_id: request.room_id,
+            brief_on_join: room.definition.brief_on_join,
+            brief_template: room.definition.brief_template.clone(),
+        })
+    }
+
+    /// Configuration only; active runs receive no terminal input.
+    pub fn update_room_brief(&self, request: shared_types::UpdateRoomBriefRequest) -> Result<shared_types::RoomBriefSettings> {
+        self.update_room_brief_checked(request, None)
+    }
+
+    /// `check`: a managing pane's room_update (A16), rechecked where the
+    /// brief commits.
+    pub(crate) fn update_room_brief_checked(
+        &self, request: shared_types::UpdateRoomBriefRequest, check: Option<&member_lifecycle::ManageCheck<'_>>,
+    ) -> Result<shared_types::RoomBriefSettings> {
+        self.ensure_active()?;
+        let template = normalize_room_brief_template(request.brief_template)?;
+        // Recovery snapshots this definition while replaying outside rooms.
+        // Serialize its final settings commit with candidate publication.
+        let _publish = self.inner.room_event_publish.lock();
+        let mut rooms = self.inner.rooms.lock();
+        let slots = self.inner.slots.lock();
+        if let Some(check) = check {
+            check.check(&rooms, &slots)?;
+        }
+        let room = rooms.get(request.room_id)
+            .ok_or_else(|| anyhow!("unknown room id '{}'", request.room_id))?;
+        let settings = shared_types::RoomBriefSettings {
+            room_id: request.room_id,
+            brief_on_join: request.brief_on_join,
+            brief_template: template.clone(),
+        };
+        if room.definition.brief_on_join == settings.brief_on_join
+            && room.definition.brief_template == template {
+            return Ok(settings);
+        }
+        let mut proposed = room.definition.clone();
+        proposed.brief_on_join = settings.brief_on_join;
+        proposed.brief_template = template.clone();
+        self.validate_room_brief_rendering(&RoomRuntime::from_persisted(proposed), &slots)?;
+        drop(slots);
+        let mut candidate = rooms.catalog.clone();
+        let persisted = candidate.rooms.iter_mut()
+            .find(|room| room.room_id == request.room_id)
+            .expect("validated room is missing from its catalog");
+        persisted.brief_on_join = settings.brief_on_join;
+        persisted.brief_template = template.clone();
+        self.persist_room_catalog_candidate(&candidate)?;
+        let room = rooms.get_mut(request.room_id).expect("validated room disappeared");
+        room.definition.brief_on_join = settings.brief_on_join;
+        room.definition.brief_template = template;
+        rooms.catalog = candidate;
+        Ok(settings)
     }
 
     pub fn move_room(&self, request: MoveRoomRequest) -> Result<RuntimeSnapshot> {
+        self.move_room_checked(request, None)
+    }
+
+    /// `check`: a managing pane's room_update (A16), rechecked where the
+    /// order commits.
+    pub(crate) fn move_room_checked(
+        &self, request: MoveRoomRequest, check: Option<&member_lifecycle::ManageCheck<'_>>,
+    ) -> Result<RuntimeSnapshot> {
         self.ensure_active()?;
         let _room_event_publish = self.inner.room_event_publish.lock();
         let old_index = {
             let mut rooms = self.inner.rooms.lock();
+            if let Some(check) = check {
+                check.check(&rooms, &self.inner.slots.lock())?;
+            }
             let old_index = rooms
                 .order
                 .iter()
@@ -6418,147 +8475,242 @@ impl SupervisorHandle {
     }
 
     pub fn add_room_member(&self, request: AddRoomMemberRequest) -> Result<RoomSnapshot> {
-        self.ensure_active()?;
-        let _room_event_publish = self.inner.room_event_publish.lock();
-        let (snapshot, feed_event, revision) = {
-            let slots = self.inner.slots.lock();
-            if slots.get_by_id(request.session_id).is_none() {
-                return Err(anyhow!("unknown session id '{}'", request.session_id));
-            }
-            let mut rooms = self.inner.rooms.lock();
-            if let Some(room_id) = rooms.room_by_session.get(&request.session_id) {
-                return Err(anyhow!(
-                    "session '{}' already belongs to room '{room_id}'",
-                    request.session_id
-                ));
-            }
-            let room = rooms
-                .get(request.room_id)
-                .ok_or_else(|| anyhow!("unknown room id '{}'", request.room_id))?;
-            if room.definition.member_ids.len() >= ROOM_MEMBER_MAX_COUNT {
-                return Err(anyhow!(
-                    "room '{}' has reached the {ROOM_MEMBER_MAX_COUNT} member limit",
-                    request.room_id
-                ));
-            }
-            let revision = room
-                .definition
-                .membership_revision
-                .checked_add(1)
-                .ok_or_else(|| anyhow!("room membership revision exhausted"))?;
-            let join_floor = room.next_sequence.saturating_sub(1);
-            let prepared = room.prepare_append(RoomFeedItem::Membership {
-                action: RoomMembershipAction::Joined,
-                session_id: request.session_id,
-                membership_revision: revision,
-            })?;
-            let mut candidate = rooms.catalog.clone();
-            let persisted = candidate
-                .rooms
-                .iter_mut()
-                .find(|room| room.room_id == request.room_id)
-                .expect("validated room missing from persisted catalog");
-            persisted.member_ids.push(request.session_id);
-            persisted.membership_revision = revision;
-            self.persist_room_catalog_candidate(&candidate)?;
-            let room = rooms
-                .get_mut(request.room_id)
-                .expect("validated room disappeared during membership update");
-            room.definition.member_ids.push(request.session_id);
-            room.definition.membership_revision = revision;
-            room.join_floor_by_session
-                .insert(request.session_id, join_floor);
-            let feed_event = room.commit_append(prepared);
-            let snapshot = room.snapshot();
-            rooms
-                .room_by_session
-                .insert(request.session_id, request.room_id);
-            rooms.catalog = candidate;
-            (snapshot, feed_event, revision)
-        };
-        #[cfg(test)]
-        self.run_room_event_after_append_hook_for_tests();
-        self.emit(RuntimeEvent::RoomMemberAdded {
-            schema_version: ROOM_EVENT_SCHEMA_VERSION,
-            room_id: request.room_id,
-            session_id: request.session_id,
-            membership_revision: revision,
-            timestamp: now_rfc3339(),
-        });
-        self.emit(RuntimeEvent::RoomFeedEvent { feed_event });
-        self.schedule_room_briefs(request.room_id, std::slice::from_ref(&request.session_id));
-        Ok(snapshot)
+        self.add_room_member_checked(request, None)
+    }
+
+    /// `check`: a managing pane's member_create (A110), rechecked where the
+    /// membership commits.
+    fn add_room_member_checked(
+        &self, request: AddRoomMemberRequest, check: Option<&member_lifecycle::ManageCheck<'_>>,
+    ) -> Result<RoomSnapshot> {
+        let change = self.change_room_membership(request.session_id, None, Some(request.room_id), None, check)?;
+        let joined = change.joined.expect("a join reports the room it joined");
+        Ok(self.fill_room_guests(joined.snapshot))
     }
 
     pub fn remove_room_member(&self, request: RemoveRoomMemberRequest) -> Result<RoomSnapshot> {
+        self.remove_room_member_checked(request, None)
+    }
+
+    /// `check`: a managing pane's member_remove (A110), rechecked where the
+    /// removal commits.
+    fn remove_room_member_checked(
+        &self, request: RemoveRoomMemberRequest, check: Option<&member_lifecycle::ManageCheck<'_>>,
+    ) -> Result<RoomSnapshot> {
+        let change = self.change_room_membership(request.session_id, Some(request.room_id), None, None, check)?;
+        let left = change.left.expect("a removal reports the room it left");
+        let snapshot = self.inner.rooms.lock().get(request.room_id)
+            .map(RoomRuntime::snapshot).unwrap_or(left.snapshot);
+        Ok(self.fill_room_guests(snapshot))
+    }
+
+    /// One session leaves `from`, joins `to`, or both (a move), in a single
+    /// room-catalog write: a refused or failed change changes nothing, so a
+    /// move never strands the member in the lobby. `caller` is a pane moving
+    /// itself (A109); its run and roam grant are rechecked at the commit,
+    /// after every wait, just before the catalog is written. `manage` is a
+    /// managing pane adding or removing another member (A110), rechecked at
+    /// the same point.
+    fn change_room_membership(
+        &self,
+        session_id: SessionId,
+        from: Option<RoomId>,
+        to: Option<RoomId>,
+        caller: Option<&PaneCaller>,
+        manage: Option<&member_lifecycle::ManageCheck<'_>>,
+    ) -> Result<RoomMembershipCommit> {
         self.ensure_active()?;
+        if from.is_none() && to.is_none() {
+            bail!("a membership change needs a room to leave or join");
+        }
+        if let (Some(from), Some(to)) = (from, to) && from == to {
+            bail!("session '{session_id}' is already a member of room '{from}'");
+        }
         let _room_event_publish = self.inner.room_event_publish.lock();
-        let (snapshot, feed_event, revision) = {
+        if let Some(to) = to {
+            self.recover_room_writer(to)?;
+        }
+        #[cfg(test)]
+        if caller.is_some() {
+            self.run_room_mobility_before_commit_hook_for_tests();
+        }
+        let (left, joined, recovery_error) = {
             let mut rooms = self.inner.rooms.lock();
-            let room = rooms
-                .get(request.room_id)
-                .ok_or_else(|| anyhow!("unknown room id '{}'", request.room_id))?;
-            if !room.definition.member_ids.contains(&request.session_id) {
-                return Err(anyhow!(
-                    "session '{}' is not a member of room '{}'",
-                    request.session_id,
-                    request.room_id
-                ));
+            if to.is_some() && self.inner.slots.lock().get_by_id(session_id).is_none() {
+                return Err(anyhow!("unknown session id '{session_id}'"));
             }
-            let revision = room
-                .definition
-                .membership_revision
-                .checked_add(1)
-                .ok_or_else(|| anyhow!("room membership revision exhausted"))?;
-            let prepared = room.prepare_append(RoomFeedItem::Membership {
-                action: RoomMembershipAction::Removed,
-                session_id: request.session_id,
-                membership_revision: revision,
-            })?;
+            if from.is_none() && let Some(room_id) = rooms.room_by_session.get(&session_id) {
+                return Err(anyhow!("session '{session_id}' already belongs to room '{room_id}'"));
+            }
             let mut candidate = rooms.catalog.clone();
-            let persisted = candidate
-                .rooms
-                .iter_mut()
-                .find(|room| room.room_id == request.room_id)
-                .expect("validated room missing from persisted catalog");
-            persisted
-                .member_ids
-                .retain(|session_id| *session_id != request.session_id);
-            persisted.membership_revision = revision;
-            persisted.clear_member_briefed(request.session_id);
+            let removal = from.map(|room_id| Self::stage_member_removal(&rooms, &mut candidate, room_id, session_id))
+                .transpose()?;
+            let addition = to.map(|room_id| Self::stage_member_addition(&rooms, &mut candidate, room_id, session_id))
+                .transpose()?;
+            if let Some(caller) = caller {
+                // A109: authorized before the waits above; the grant or the
+                // run may have changed since.
+                Self::pane_roam_locked(caller, &self.inner.slots.lock())?;
+            }
+            if let Some(check) = manage {
+                // A110: a newborn joining is not yet a member; a removal's
+                // target still is (the staged change is not applied yet).
+                let slots = self.inner.slots.lock();
+                if from.is_some() { check.check_target(&rooms, &slots, session_id)? } else { check.check(&rooms, &slots)? }
+            }
             self.persist_room_catalog_candidate(&candidate)?;
-            let room = rooms
-                .get_mut(request.room_id)
-                .expect("validated room disappeared during membership update");
-            room.definition
-                .member_ids
-                .retain(|session_id| *session_id != request.session_id);
-            room.definition.membership_revision = revision;
-            room.join_floor_by_session.remove(&request.session_id);
-            let feed_event = room.commit_append(prepared);
-            let snapshot = room.snapshot();
-            rooms.room_by_session.remove(&request.session_id);
+            let left = removal.map(|staged| Self::apply_staged_membership(&mut rooms, &candidate, staged));
+            let joined = addition.map(|staged| Self::apply_staged_membership(&mut rooms, &candidate, staged));
             rooms.catalog = candidate;
-            (snapshot, feed_event, revision)
+            let recovery_error = if from.is_some() {
+                let mut slots = self.inner.slots.lock();
+                if let Some(slot) = slots.get_by_id_mut(session_id) { slot.boot_resume_id = None; slot.crash_respawn_waiting = false; }
+                self.clear_recovery_eligibility(session_id).err()
+            } else { None };
+            (left, joined, recovery_error)
         };
+        if let Some(error) = recovery_error { self.recovery_warning(session_id, error); }
         #[cfg(test)]
         self.run_room_event_after_append_hook_for_tests();
-        self.emit(RuntimeEvent::RoomMemberRemoved {
-            schema_version: ROOM_EVENT_SCHEMA_VERSION,
-            room_id: request.room_id,
-            session_id: request.session_id,
+        let mut commit = RoomMembershipCommit { left: None, joined: None };
+        for (applied, slot) in [(left, &mut commit.left), (joined, &mut commit.joined)] {
+            let Some(applied) = applied else { continue };
+            let (room_id, revision, timestamp) = (applied.room_id, applied.revision, now_rfc3339());
+            self.emit(match applied.action {
+                RoomMembershipAction::Removed => RuntimeEvent::RoomMemberRemoved { schema_version: ROOM_EVENT_SCHEMA_VERSION,
+                    room_id, session_id, membership_revision: revision, timestamp },
+                _ => RuntimeEvent::RoomMemberAdded { schema_version: ROOM_EVENT_SCHEMA_VERSION,
+                    room_id, session_id, membership_revision: revision, timestamp },
+            });
+            self.publish_membership_feed(room_id, applied.feed_event);
+            *slot = Some(RoomMembershipSide { room_id, revision, snapshot: applied.snapshot });
+        }
+        // Revocation already persisted; an unavailable journal must not veto
+        // removal. Recover afterward so revoked targets gain no new retry
+        // rights, while durable known outcomes can release their exact run gate.
+        if let Some(from) = from {
+            let _ = self.recover_room_writer(from);
+        }
+        Ok(commit)
+    }
+
+    /// Leaving `room_id`: checked against the room, written into `candidate`.
+    /// Its feed record is optional: an unavailable journal never vetoes removal.
+    fn stage_member_removal(
+        rooms: &RoomState, candidate: &mut RoomCatalogV1, room_id: RoomId, session_id: SessionId,
+    ) -> Result<StagedMembership> {
+        let room = rooms.get(room_id).ok_or_else(|| anyhow!("unknown room id '{room_id}'"))?;
+        if room.in_flight_deliveries != 0 {
+            return Err(anyhow!("room '{room_id}' has a delivery in progress; retry removal after it settles"));
+        }
+        if !room.definition.member_ids.contains(&session_id) {
+            return Err(anyhow!("session '{session_id}' is not a member of room '{room_id}'"));
+        }
+        let revision = room.definition.membership_revision.checked_add(1)
+            .ok_or_else(|| anyhow!("room membership revision exhausted"))?;
+        let prepared = room.prepare_append(RoomFeedItem::Membership {
+            action: RoomMembershipAction::Removed,
+            session_id,
             membership_revision: revision,
-            timestamp: now_rfc3339(),
         });
-        self.emit(RuntimeEvent::RoomFeedEvent { feed_event });
-        Ok(snapshot)
+        let persisted = candidate.rooms.iter_mut().find(|room| room.room_id == room_id)
+            .expect("validated room missing from persisted catalog");
+        persisted.member_ids.retain(|member| *member != session_id);
+        persisted.membership_revision = revision;
+        if let Some(floors) = persisted.join_floors.as_mut() { floors.remove(&session_id); }
+        persisted.clear_member_briefed(session_id);
+        Ok(StagedMembership { room_id, session_id, action: RoomMembershipAction::Removed, revision, join_floor: 0, prepared })
+    }
+
+    /// Joining `room_id`: checked against the room, written into `candidate`.
+    /// The member's join record must be appendable before anything is saved.
+    fn stage_member_addition(
+        rooms: &RoomState, candidate: &mut RoomCatalogV1, room_id: RoomId, session_id: SessionId,
+    ) -> Result<StagedMembership> {
+        let room = rooms.get(room_id).ok_or_else(|| anyhow!("unknown room id '{room_id}'"))?;
+        if room.definition.member_ids.len() >= ROOM_MEMBER_MAX_COUNT {
+            return Err(anyhow!("room '{room_id}' has reached the {ROOM_MEMBER_MAX_COUNT} member limit"));
+        }
+        let revision = room.definition.membership_revision.checked_add(1)
+            .ok_or_else(|| anyhow!("room membership revision exhausted"))?;
+        let join_floor = room.next_sequence.saturating_sub(1);
+        let prepared = room.prepare_append(RoomFeedItem::Membership {
+            action: RoomMembershipAction::Joined,
+            session_id,
+            membership_revision: revision,
+        })?;
+        let persisted = candidate.rooms.iter_mut().find(|room| room.room_id == room_id)
+            .expect("validated room missing from persisted catalog");
+        persisted.join_floors.get_or_insert_with(|| room.join_floor_by_session.clone())
+            .insert(session_id, join_floor);
+        persisted.member_ids.push(session_id);
+        persisted.membership_revision = revision;
+        Ok(StagedMembership { room_id, session_id, action: RoomMembershipAction::Joined, revision, join_floor,
+            prepared: Ok(prepared) })
+    }
+
+    /// After the catalog holding `staged` was written: the runtime room and
+    /// its journal follow it.
+    fn apply_staged_membership(rooms: &mut RoomState, candidate: &RoomCatalogV1, staged: StagedMembership) -> AppliedMembership {
+        let StagedMembership { room_id, session_id, action, revision, join_floor, prepared } = staged;
+        let room = rooms.get_mut(room_id).expect("validated room disappeared during membership update");
+        if action == RoomMembershipAction::Removed {
+            room.definition.member_ids.retain(|member| *member != session_id);
+            room.definition.membership_revision = revision;
+            room.join_floor_by_session.remove(&session_id);
+            room.definition.join_floors = Some(room.join_floor_by_session.clone());
+        } else {
+            room.definition.join_floors = candidate.rooms.iter().find(|r| r.room_id == room_id)
+                .and_then(|r| r.join_floors.clone());
+            room.definition.member_ids.push(session_id);
+            room.definition.membership_revision = revision;
+            room.join_floor_by_session.insert(session_id, join_floor);
+        }
+        let feed_event = prepared.and_then(|prepared| room.commit_append(prepared));
+        let snapshot = room.snapshot();
+        if action == RoomMembershipAction::Removed {
+            rooms.room_by_session.remove(&session_id);
+        } else {
+            rooms.room_by_session.insert(session_id, room_id);
+        }
+        AppliedMembership { room_id, action, revision, snapshot, feed_event }
+    }
+
+    fn publish_membership_feed(&self, room_id: RoomId, outcome: Result<shared_types::RoomFeedEvent>) {
+        self.notify_room_history_transition(room_id);
+        match outcome {
+            Ok(feed_event) => self.emit(RuntimeEvent::RoomFeedEvent { feed_event }),
+            Err(error) => self.emit(RuntimeEvent::SystemLog { level: LogLevel::Error,
+                message: format!("Room '{room_id}' membership saved; feed record was not confirmed: {error}. Membership is already saved. A poisoned writer replays before the next Post, Send, Retry or add; a quota or corrupt-history refusal needs storage repair. Member removal remains available."),
+                timestamp: now_rfc3339() }),
+        }
     }
 
     pub fn delete_room(&self, request: DeleteRoomRequest) -> Result<()> {
+        self.delete_room_checked(request, None)
+    }
+
+    /// `caller`: a managing pane's room_delete (A16); its run, manage grant
+    /// and (for a room not its own) roam are rechecked where the catalog
+    /// commits.
+    pub(crate) fn delete_room_checked(&self, request: DeleteRoomRequest, caller: Option<member_lifecycle::Actor<'_>>) -> Result<()> {
         self.ensure_active()?;
         let _room_event_publish = self.inner.room_event_publish.lock();
-        let label = {
+        let needs_receipt_recovery = self.inner.rooms.lock().get(request.room_id)
+            .is_some_and(RoomRuntime::has_receipt_evidence);
+        if needs_receipt_recovery {
+            self.recover_room_writer(request.room_id).map_err(|error| {
+                let guidance = if error.is::<room_log::StructuralHistory>() {
+                    " Restart PRIM-1 to reopen the history before retrying deletion; this does not repair damaged history."
+                } else { "" };
+                anyhow!("Room not deleted: known wake receipts must be saved before deleting its history: {error:#}.{guidance}")
+            })?;
+        }
+        let (label, recovery_errors) = {
             let mut rooms = self.inner.rooms.lock();
+            if let Some(caller) = caller {
+                member_lifecycle::ManageCheck::of(caller, request.room_id).check(&rooms, &self.inner.slots.lock())?;
+            }
             let room = rooms
                 .get(request.room_id)
                 .ok_or_else(|| anyhow!("unknown room id '{}'", request.room_id))?;
@@ -6577,39 +8729,117 @@ impl SupervisorHandle {
             self.persist_room_catalog_candidate(&candidate)?;
             rooms.by_id.remove(&request.room_id);
             rooms.order.retain(|room_id| *room_id != request.room_id);
+            let mut recovery_errors = Vec::new();
+            let mut slots = self.inner.slots.lock();
             for session_id in members {
                 rooms.room_by_session.remove(&session_id);
+                if let Some(slot) = slots.get_by_id_mut(session_id) { slot.boot_resume_id = None; slot.crash_respawn_waiting = false; }
+                if let Err(error) = self.clear_recovery_eligibility(session_id) { recovery_errors.push((session_id, error)); }
             }
             rooms.catalog = candidate;
-            label
+            (label, recovery_errors)
         };
+        for (session_id, error) in recovery_errors { self.recovery_warning(session_id, error); }
+        self.forget_room_guests(request.room_id);
         self.emit(RuntimeEvent::RoomDeleted {
             schema_version: ROOM_EVENT_SCHEMA_VERSION,
             room_id: request.room_id,
             label,
             timestamp: now_rfc3339(),
         });
+        if let Err(error) = room_log::remove_room_files(self.runtime_dir(), request.room_id) {
+            let message = format!("room deleted; history cleanup incomplete: {error:#}");
+            self.emit(RuntimeEvent::SystemLog { level: LogLevel::Warn,
+                message: message.clone(), timestamp: now_rfc3339() });
+            return Err(anyhow!(message));
+        }
         Ok(())
     }
 
     pub fn read_room_feed(&self, request: ReadRoomFeedRequest) -> Result<RoomFeedPage> {
-        self.ensure_active()?;
-        let slots = self.inner.slots.lock();
+        self.read_room_feed_as(request, None)
+    }
+
+    /// The operator's read of a room feed. `caller` is a roaming pane's peek
+    /// (A109): its run and roam grant are rechecked under the same locks the
+    /// page is read under, after any startup-recovery wait.
+    fn read_room_feed_as(&self, request: ReadRoomFeedRequest, caller: Option<&PaneCaller>) -> Result<RoomFeedPage> {
+        self.ensure_not_shutdown()?;
+        let startup_held = self.inner.rooms.lock().get(request.room_id)
+            .is_some_and(RoomRuntime::startup_sync_pending);
+        if startup_held {
+            let _publish = self.inner.room_event_publish.lock();
+            self.recover_room_startup_fence(request.room_id)?;
+        }
+        #[cfg(test)]
+        if caller.is_some() {
+            self.run_room_mobility_before_commit_hook_for_tests();
+        }
         let rooms = self.inner.rooms.lock();
+        let slots = self.inner.slots.lock();
+        if let Some(caller) = caller {
+            Self::pane_roam_locked(caller, &slots)?;
+        }
         let room = rooms
             .get(request.room_id)
             .ok_or_else(|| anyhow!("unknown room id '{}'", request.room_id))?;
         let mut page = room.read(request.cursor, 0)?;
         page.members = Self::room_members_locked(room, &slots);
+        page.guests = self.room_guests(request.room_id);
         Ok(page)
     }
 
+    /// The operator's Post. A16 (Victor, 20 Oct: "I just post it in the feed
+    /// and you are not seeing it"): members designated Supervisor (all three
+    /// grants) are addressed and woken through the operator's Send path,
+    /// attributed to the operator; a room without one stores the post and
+    /// wakes no one. Fallback reminders keep their own path and marking.
     pub fn post_room_message(&self, request: PostRoomMessageRequest) -> Result<RoomPostResult> {
-        self.post_room_message_as(
-            request.room_id,
-            RoomMessageSender::Operator {},
-            request.content,
-        )
+        self.ensure_active()?;
+        // A retry is the Post it repeats: replay what was stored, never wake
+        // again, whoever is Supervisor now (the Reviewer's T-31 hold).
+        if let Some(request_id) = request.request_id.as_deref() {
+            let _publish = self.inner.room_event_publish.lock();
+            self.recover_room_writer(request.room_id)?;
+            let rooms = self.inner.rooms.lock();
+            let room = rooms.get(request.room_id).ok_or_else(|| anyhow!("unknown room id '{}'", request.room_id))?;
+            if let Some(event) = room.replayed_operator_post(request_id, &request.content)? {
+                let RoomFeedItem::Message { message_id, request_id, .. } = &event.item else { unreachable!() };
+                return Ok(RoomPostResult { room_id: request.room_id, message_id: *message_id, cursor: event.cursor,
+                    request_id: request_id.clone(), replayed: true });
+            }
+        }
+        let supervisors = {
+            let rooms = self.inner.rooms.lock();
+            let slots = self.inner.slots.lock();
+            let room = rooms.get(request.room_id).ok_or_else(|| anyhow!("unknown room id '{}'", request.room_id))?;
+            let ids: Vec<SessionId> = room.definition.member_ids.iter().copied()
+                .filter(|id| slots.get_by_id(*id).is_some_and(|slot|
+                    room_mobility::grants_apply_to(slot.definition.driver) && slot.permissions.is_supervisor()))
+                .collect();
+            (!ids.is_empty()).then_some((room.definition.membership_revision, ids))
+        };
+        let Some((membership_revision, recipient_ids)) = supervisors else {
+            return self.post_room_message_as(request.room_id, RoomMessageSender::Operator {}, request.content,
+                request.request_id);
+        };
+        self.ensure_active()?;
+        validate_message_body(&request.content)?;
+        let delivered = self.deliver_room_message_as(RoomDeliverySpec { guest_recipient_ids: Vec::new(),
+            fallback_origin: None,
+            room_id: request.room_id,
+            recipient_ids,
+            membership_revision,
+            sender: RoomMessageSender::Operator {},
+            sender_label: "operator".into(),
+            content: request.content,
+            request_id: request.request_id,
+            admission: RoomDeliveryAdmission::Member,
+            roam_required: false,
+            ack_requested: true,
+        }, None)?;
+        Ok(RoomPostResult { room_id: delivered.room_id, message_id: delivered.message_id, cursor: delivered.cursor,
+            request_id: delivered.request_id, replayed: delivered.replayed })
     }
 
     pub fn deliver_room_message(
@@ -6618,7 +8848,7 @@ impl SupervisorHandle {
     ) -> Result<RoomDeliveryResult> {
         self.ensure_active()?;
         validate_message_body(&request.content)?;
-        let (membership_revision, room_label, recipient_ids) = {
+        let (membership_revision, recipient_ids) = {
             let rooms = self.inner.rooms.lock();
             let room = rooms
                 .get(request.room_id)
@@ -6643,237 +8873,193 @@ impl SupervisorHandle {
             };
             (
                 room.definition.membership_revision,
-                room.definition.label.clone(),
                 recipient_ids,
             )
         };
 
-        self.deliver_room_message_as(RoomDeliverySpec {
+        self.deliver_room_message_as(RoomDeliverySpec { guest_recipient_ids: Vec::new(),
+            fallback_origin: None,
             room_id: request.room_id,
             recipient_ids,
             membership_revision,
-            room_label,
             sender: RoomMessageSender::Operator {},
             sender_label: "operator".into(),
             content: request.content,
-        })
-    }
-
-    /// Deliver into every terminal in `recipient_ids` as one logical message:
-    /// preflight all, append the message + pending receipts, then write each
-    /// and record its terminal receipt. Identical for the operator and a pane.
-    fn deliver_room_message_as(&self, spec: RoomDeliverySpec) -> Result<RoomDeliveryResult> {
-        let RoomDeliverySpec {
-            room_id,
-            recipient_ids,
-            membership_revision,
-            room_label,
-            sender,
-            sender_label,
-            content,
-        } = spec;
-        self.refresh_session_liveness();
-        let mut delivery_plan = Vec::with_capacity(recipient_ids.len());
-        for recipient_id in &recipient_ids {
-            let (target, behavior, payload) = self
-                .delivery_target_for_session_id(*recipient_id)
-                .and_then(|(target, behavior)| {
-                    if matches!(
-                        self.inner
-                            .slots
-                            .lock()
-                            .get_by_id(*recipient_id)
-                            .map(|slot| slot.definition.driver),
-                        Some(DriverKind::Prime)
-                    ) {
-                        return Err(anyhow!(
-                            "Prime/WSL panes only take typed input — type into its terminal instead. [Prime/WSL room delivery is not admitted; use its visible raw terminal input]"
-                        ));
-                    }
-                    validate_message_framing(&content, behavior)?;
-                    let route = RouteMessageRequest {
-                        from: sender_label.clone(),
-                        to: room_label.clone(),
-                        scope: MessageScope::Room,
-                        content: content.clone(),
-                    };
-                    Ok((target, behavior, routed_message_payload(&route, behavior)))
-                })
-                .map_err(|error| {
-                    let scope = if recipient_ids.len() > 1 {
-                        format!(
-                            "Nothing was delivered to any of the {} recipients (a room send is all-or-nothing).",
-                            recipient_ids.len()
-                        )
-                    } else {
-                        "Nothing was delivered.".to_string()
-                    };
-                    anyhow!(
-                        "{scope} {error} [room delivery preflight failed for recipient '{recipient_id}']"
-                    )
-                })?;
-            delivery_plan.push((
-                *recipient_id,
-                PlannedDelivery {
-                    target,
-                    submit_behavior: behavior,
-                    payload,
-                },
-            ));
-        }
-
-        #[cfg(test)]
-        if let Some(hook) = self.inner.room_delivery_after_preflight.lock().take() {
-            hook();
-        }
-
-        let message_id = Uuid::new_v4();
-        let (message_cursor, _delivery_lease) = {
-            let _room_event_publish = self.inner.room_event_publish.lock();
-            let (message_event, pending_events) = {
-                let mut rooms = self.inner.rooms.lock();
-                let room = rooms
-                    .get_mut(room_id)
-                    .ok_or_else(|| anyhow!("room '{room_id}' was deleted before delivery"))?;
-                if room.definition.membership_revision != membership_revision {
-                    return Err(anyhow!(
-                        "room '{room_id}' membership changed during delivery preflight; retry"
-                    ));
-                }
-                if room.in_flight_deliveries == usize::MAX {
-                    return Err(anyhow!("room delivery counter exhausted"));
-                }
-                room.ensure_sequence_capacity(1 + recipient_ids.len() * 2)?;
-                let message_event = room.append(RoomFeedItem::Message {
-                    message_id,
-                    sender,
-                    content,
-                    recipient_ids: recipient_ids.clone(),
-                    membership_revision,
-                })?;
-                let mut pending_events = Vec::with_capacity(delivery_plan.len());
-                for (recipient_id, delivery) in &delivery_plan {
-                    pending_events.push(room.append(RoomFeedItem::Delivery {
-                        message_id,
-                        recipient_id: *recipient_id,
-                        status: RoomDeliveryStatus::Pending,
-                        bytes_written: 0,
-                        error: None,
-                        run_id: Some(delivery.target.run_id),
-                        generation: Some(delivery.target.generation),
-                    })?);
-                }
-                room.in_flight_deliveries += 1;
-                (message_event, pending_events)
-            };
-            let delivery_lease = RoomDeliveryLease {
-                inner: self.inner.clone(),
-                room_id,
-            };
-            let message_cursor = message_event.cursor;
-            #[cfg(test)]
-            self.run_room_event_after_append_hook_for_tests();
-            self.emit(RuntimeEvent::RoomFeedEvent {
-                feed_event: message_event,
-            });
-            for feed_event in pending_events {
-                self.emit(RuntimeEvent::RoomFeedEvent { feed_event });
-            }
-            (message_cursor, delivery_lease)
-        };
-
-        let mut failures = Vec::new();
-        let mut written_count = 0usize;
-        for (recipient_id, delivery) in delivery_plan {
-            let (status, bytes_written, error) = match self.deliver_prepared_payload(
-                &delivery.target,
-                &delivery.payload,
-                delivery.submit_behavior,
-            ) {
-                Ok(result) => {
-                    written_count += 1;
-                    (RoomDeliveryStatus::Written, result.bytes_written, None)
-                }
-                Err(error) => {
-                    let bytes_written = error
-                        .downcast_ref::<PtyWriteError>()
-                        .map(PtyWriteError::bytes_written)
-                        .unwrap_or(0);
-                    let error = bounded_room_delivery_error(&error.to_string());
-                    failures.push(RoomDeliveryFailure {
-                        recipient_id,
-                        bytes_written,
-                        error: error.clone(),
-                    });
-                    (RoomDeliveryStatus::Failed, bytes_written, Some(error))
-                }
-            };
-            {
-                let _room_event_publish = self.inner.room_event_publish.lock();
-                let feed_event = {
-                    let mut rooms = self.inner.rooms.lock();
-                    let room = rooms
-                        .get_mut(room_id)
-                        .expect("in-flight room cannot be deleted");
-                    room.append(RoomFeedItem::Delivery {
-                        message_id,
-                        recipient_id,
-                        status,
-                        bytes_written,
-                        error,
-                        run_id: Some(delivery.target.run_id),
-                        generation: Some(delivery.target.generation),
-                    })
-                    .expect("room delivery reserved feed sequence capacity")
-                };
-                #[cfg(test)]
-                self.run_room_event_after_append_hook_for_tests();
-                self.emit(RuntimeEvent::RoomFeedEvent { feed_event });
-            }
-        }
-        Ok(RoomDeliveryResult {
-            room_id,
-            message_id,
-            cursor: message_cursor,
-            recipient_count: recipient_ids.len(),
-            written_count,
-            failures,
-        })
+            request_id: request.request_id,
+            admission: RoomDeliveryAdmission::Member,
+            roam_required: false,
+            ack_requested: true,
+        }, None)
     }
 
     fn post_room_message_as(
-        &self,
-        room_id: RoomId,
-        sender: RoomMessageSender,
-        content: String,
+        &self, room_id: RoomId, sender: RoomMessageSender, content: String, request_id: Option<String>,
     ) -> Result<RoomPostResult> {
         self.ensure_active()?;
         validate_message_body(&content)?;
-        let _room_event_publish = self.inner.room_event_publish.lock();
-        let message_id = Uuid::new_v4();
-        let feed_event = {
+        let request_id = rooms::request_id(request_id)?;
+        let _publish = self.inner.room_event_publish.lock();
+        self.recover_room_writer(room_id)?;
+        let (feed_event, replayed) = {
             let mut rooms = self.inner.rooms.lock();
-            let room = rooms
-                .get_mut(room_id)
-                .ok_or_else(|| anyhow!("unknown room id '{room_id}'"))?;
-            let membership_revision = room.definition.membership_revision;
-            room.append(RoomFeedItem::Message {
-                message_id,
-                sender,
-                content,
-                recipient_ids: Vec::new(),
-                membership_revision,
-            })?
-        };
-        let result = RoomPostResult {
-            room_id,
-            message_id,
-            cursor: feed_event.cursor,
-        };
-        #[cfg(test)]
-        self.run_room_event_after_append_hook_for_tests();
-        self.emit(RuntimeEvent::RoomFeedEvent { feed_event });
+            let room = rooms.get_mut(room_id).ok_or_else(|| anyhow!("unknown room id '{room_id}'"))?;
+            room.post(request_id.clone(), sender, content, Vec::new(), room.definition.membership_revision)
+        }.map_err(|error| { self.notify_room_history_transition(room_id); error })?;
+        let RoomFeedItem::Message { message_id, .. } = &feed_event.item else { unreachable!() };
+        let result = RoomPostResult { room_id, message_id: *message_id, cursor: feed_event.cursor,
+            request_id, replayed };
+        if !replayed {
+            #[cfg(test)]
+            self.run_room_event_after_append_hook_for_tests();
+            self.emit(RuntimeEvent::RoomFeedEvent { feed_event });
+        }
         Ok(result)
+    }
+
+    /// v3 (Claude PRIM-1 ef3870d walk #10): a feed-only notice PRIM-1 itself
+    /// writes (automatic recoveries), with sender PRIM-1: members, guests and
+    /// the operator all read it as PRIM-1's, never as anyone's instruction.
+    fn post_prim1_notice(&self, room_id: RoomId, content: String, request_id: Option<String>)
+        -> Result<RoomPostResult> {
+        self.post_room_message_as(room_id, RoomMessageSender::Prim1 {}, content, request_id)
+    }
+
+    /// Caller owns room_event_publish and no session registry/shutdown guard.
+    /// Publish recovered commits even when the following requested write is
+    /// rejected or replays a prior request, so observers agree with room_read.
+    fn recover_room_writer(&self, room_id: RoomId) -> Result<()> {
+        self.recover_room_startup_fence(room_id)?;
+        let preparation = {
+            let mut rooms = self.inner.rooms.lock();
+            let room = rooms.get_mut(room_id).ok_or_else(|| anyhow!("unknown room id '{room_id}'"))?;
+            if !room.writer_needs_replay() { return Ok(()); }
+            let current_runs = {
+                let slots = self.inner.slots.lock();
+                room.definition.member_ids.iter().filter_map(|id| {
+                    let slot = slots.get_by_id(*id)?;
+                    slot.running.as_ref()?;
+                    Some((*id, (slot.run_id?, slot.generation)))
+                }).collect()
+            }; // No session registry guard across replay or receipt sync.
+            room.prepare_recovery(&self.inner.runtime_dir, current_runs)
+        };
+        // Retain publication but release the shared registry during all log
+        // parsing, torn-tail preservation and receipt-repair sync. The original
+        // poisoned writer and acknowledged prefix remain available to readers.
+        let recovered = preparation.and_then(|work| {
+            let Some(work) = work else { return Ok(None); };
+            let candidate = work.run()?;
+            self.inner.rooms.lock().get_mut(room_id)
+                .ok_or_else(|| anyhow!("unknown room id '{room_id}'"))?
+                .finish_recovery(candidate).map(Some)
+        }).map_err(|error: anyhow::Error| {
+            let detail = format!("room {room_id} history {}: {error:#}",
+                self.inner.runtime_dir.join("rooms").join(format!("{room_id}.jsonl")).display());
+            if error.is::<room_log::StructuralHistory>() {
+                room_log::structural_history(detail)
+            } else { room_log::RecoveryRequired(detail).into() }
+        });
+        if let Err(error) = &recovered {
+            if let Some(room) = self.inner.rooms.lock().get_mut(room_id) {
+                room.note_recovery_failure(error);
+            }
+        }
+        self.notify_room_history_transition(room_id);
+        if let Some(events) = recovered? {
+            self.reconcile_recovered_room_wakes(&events);
+            for feed_event in events {
+                self.resolve_upgrade_continuation_receipt(&feed_event);
+                self.emit(RuntimeEvent::RoomFeedEvent { feed_event });
+            }
+            self.emit(RuntimeEvent::SystemLog {
+                level: LogLevel::Info,
+                message: format!("Room {room_id} history replayed after an uncertain write; no wake was repeated"),
+                timestamp: now_rfc3339(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Caller owns publication. Only a typed failed startup fence can enter
+    /// this path; corrupt history is never reopened or reinterpreted as retryable.
+    fn recover_room_startup_fence(&self, room_id: RoomId) -> Result<()> {
+        let preparation = {
+            let mut rooms = self.inner.rooms.lock();
+            let room = rooms.get_mut(room_id).ok_or_else(|| anyhow!("unknown room id '{room_id}'"))?;
+            if !room.startup_sync_pending() { return Ok(()); }
+            self.ensure_active()?; // Held trials may observe the hold, never repair it.
+            room.prepare_startup_sync()
+        };
+        let outcome: Result<()> = preparation.and_then(|work| {
+            let Some(mut work) = work else { return Ok(()); };
+            work.run()?; // Only the cloned owned handle; no shared registry lock.
+            let (candidate, changed) = {
+                let rooms = self.inner.rooms.lock();
+                let room = rooms.get(room_id).ok_or_else(|| anyhow!("startup room disappeared"))?;
+                room.validate_startup_sync(&work)?;
+                let mut candidate = rooms.catalog.clone();
+                let definition = candidate.rooms.iter_mut().find(|room| room.room_id == room_id)
+                    .ok_or_else(|| anyhow!("startup room is absent from its catalog"))?;
+                let changed = *definition != work.definition;
+                *definition = work.definition.clone();
+                (candidate, changed)
+            };
+            // Persist normalized epoch/floors before allowing any history read.
+            // Publication serializes catalog writers; no room/slot lock spans I/O.
+            if changed { self.persist_room_catalog_candidate(&candidate)?; }
+            let mut rooms = self.inner.rooms.lock();
+            let room = rooms.get_mut(room_id).ok_or_else(|| anyhow!("startup room disappeared"))?;
+            room.finish_startup_sync(work)?;
+            room.take_history_transition();
+            if changed { rooms.catalog = candidate; }
+            Ok(())
+        }).map_err(|error: anyhow::Error| room_log::StartupSyncFailed(format!(
+            "Room {room_id} startup history remains held; retry room access: {error:#}")).into());
+        if let Err(error) = &outcome {
+            if let Some(room) = self.inner.rooms.lock().get_mut(room_id) {
+                room.note_startup_sync_failure(error);
+            }
+            self.notify_room_history_transition(room_id);
+        } else {
+            self.emit(RuntimeEvent::RoomHistoryChanged { schema_version: ROOM_EVENT_SCHEMA_VERSION,
+                room_id, timestamp: now_rfc3339() });
+        }
+        outcome
+    }
+
+    /// Caller still owns publication. Recovery admitted no in-flight delivery;
+    /// only a newly durable terminal outcome may release the same run's claim.
+    /// Never infer completion from Fetched, a retained historical receipt, or
+    /// a Pending whose transport outcome remains unknown.
+    fn reconcile_recovered_room_wakes(&self, events: &[shared_types::RoomFeedEvent]) {
+        let slots = self.inner.slots.lock();
+        for event in events {
+            let RoomFeedItem::Delivery { message_id, recipient_id, status, run_id: Some(run_id),
+                generation: Some(generation), .. } = &event.item else { continue; };
+            if !matches!(status, RoomDeliveryStatus::Written | RoomDeliveryStatus::Woken | RoomDeliveryStatus::Failed) {
+                continue;
+            }
+            let Some(slot) = slots.get_by_id(*recipient_id) else { continue; };
+            if slot.run_id == Some(*run_id) && slot.generation == *generation {
+                if let Some(running) = &slot.running {
+                    let mut claim = running.input_gate.room_wake_claim.lock();
+                    if claim.is_some_and(|(id, pending)| id == *message_id
+                        && pending.epoch == event.cursor.epoch && pending.sequence < event.cursor.sequence) {
+                        *claim = None;
+                        running.input_gate.room_wake_pending.store(false, Ordering::SeqCst);
+                    }
+                }
+            }
+        }
+    }
+
+    fn notify_room_history_transition(&self, room_id: RoomId) {
+        let changed = self.inner.rooms.lock().get_mut(room_id)
+            .is_some_and(RoomRuntime::take_history_transition);
+        if changed {
+            self.emit(RuntimeEvent::RoomHistoryChanged { schema_version: ROOM_EVENT_SCHEMA_VERSION,
+                room_id, timestamp: now_rfc3339() });
+        }
     }
 
     fn schedule_late_termination_reproof(
@@ -7156,6 +9342,9 @@ impl SupervisorHandle {
                 slot.running = None;
                 slot.process_id = None;
                 slot.state = LifecycleState::Closed;
+                // A108: release is proved; the register's holder goes from
+                // "stopping" to "stopped" (Codex room 350).
+                self.note_run_changed(session_id);
             } else {
                 slot.state = LifecycleState::Failed;
                 slot.last_error = Some(match exit_poll_error.as_deref() {
@@ -7233,15 +9422,38 @@ impl SupervisorHandle {
         session_id: SessionId,
         expected: SessionGeneration,
         directory_lease: SessionDirectoryLease,
-        plan: PreparedLaunch,
+        mut plan: PreparedLaunch,
+        reason: recovery_automation::StartReason<'_>,
     ) -> Result<SessionSnapshot> {
+        if matches!(reason, recovery_automation::StartReason::Crash(_)) { self.crash_effects_admitted()?; }
         self.refresh_session_liveness();
+        // Restart prepared the executable before stopping the prior run. Resolve
+        // the brief again at launch admission so room edits/moves during that
+        // stop cannot launch the old room's task. No flags are reconstructed.
+        if let Err(error) = self.refresh_prepared_launch_brief(session_id, &mut plan)
+            .and_then(|()| self.settle_claude_new_start(session_id, &plan))
+        {
+            self.record_launch_prepare_failure(session_id, &error, reason);
+            return Err(error);
+        }
+        if let recovery_automation::StartReason::Crash(attempt) = reason {
+            self.check_crash_upgrade_owner(session_id, attempt)?;
+        }
+        let continuation = match self.prepare_recovery_start(session_id, expected, &plan, reason) {
+            Ok(permit) => permit,
+            Err(error) if matches!(reason, recovery_automation::StartReason::Crash(_)) => return Err(error),
+            Err(error) => { self.recovery_warning(session_id, error); None }
+        };
         let (run_id, starting_event) = {
+            let crash_rooms = matches!(reason, recovery_automation::StartReason::Crash(_)).then(|| self.inner.rooms.lock());
             let mut slots = self.inner.slots.lock();
             self.ensure_active()?;
             let slot = slots
                 .get_by_id_mut(session_id)
                 .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
+            if let recovery_automation::StartReason::Crash(attempt) = reason {
+                self.check_crash_binding(crash_rooms.as_deref().unwrap(), slot, attempt)?;
+            }
             if slot.generation != expected {
                 return Err(anyhow!(
                     "start_session_at superseded: expected gen {expected}, current {}",
@@ -7270,6 +9482,8 @@ impl SupervisorHandle {
             slot.last_real_output_at = None;
             reset_work_state_locked(slot);
             let run_id = Uuid::new_v4();
+            slot.output_draining = false;
+            slot.agent_exited_at = None;
             slot.bracketed_paste.begin_run(RunBinding {
                 session_id: slot.session_id,
                 run_id,
@@ -7277,7 +9491,15 @@ impl SupervisorHandle {
             });
             slot.codex_work_state.begin_run();
             slot.grok_startup.begin_run();
+            slot.room_composer.begin_run();
+            slot.harness_version = None;
+            if let Some((cols, rows)) = plan.pty_size {
+                slot.room_composer.resize(cols, rows);
+            }
             slot.run_id = Some(run_id);
+            self.inner.output_credit.open_run(output_credit::OutputRun {
+                session_id, run_id, generation: expected,
+            });
             slot.last_run_id = Some(run_id);
             slot.spawn_in_flight = Some(SpawnReservation {
                 generation: expected,
@@ -7301,24 +9523,28 @@ impl SupervisorHandle {
             handle.handle_pty_event_by_id(session_id, expected, run_id, event);
         });
 
-        let spawn_result = self.inner.pty_spawner.read().clone().spawn(&plan, handler);
+        // v3 W4: an App Server member's owner listens, initialized and empty,
+        // before its terminal starts; a failed launch drops the guard, which
+        // stops the owner.
+        let codex_owner = match plan.codex_owner.clone() {
+            Some(owner) => match codex_app_server::start(self, owner, session_id, expected, run_id) {
+                Ok(guard) => Ok(Some(guard)),
+                Err(error) => Err(error),
+            },
+            None => Ok(None),
+        };
+        let spawn_result = match &codex_owner {
+            Ok(_) => self.inner.pty_spawner.read().clone().spawn(&plan, handler),
+            Err(error) => Err(anyhow!("{error:#}")),
+        };
+        let codex_owner = codex_owner.ok().flatten();
+        let app_server = codex_owner.as_ref().map(codex_app_server::OwnerGuard::dispatcher);
         drop(directory_lease);
         match spawn_result {
             Ok(pty) => {
                 let pty: Arc<dyn PtySession> = Arc::from(pty);
-                let brief_owed = {
-                    let rooms = self.inner.rooms.lock();
-                    rooms
-                        .room_by_session
-                        .get(&session_id)
-                        .and_then(|room_id| rooms.get(*room_id))
-                        .map(|room| {
-                            room.definition.brief_on_join
-                                && !room.definition.member_briefed(session_id)
-                        })
-                        .unwrap_or(false)
-                };
                 let installation = {
+                    let crash_rooms = matches!(reason, recovery_automation::StartReason::Crash(_)).then(|| self.inner.rooms.lock());
                     let mut slots = self.inner.slots.lock();
                     match slots.get_by_id_mut(session_id) {
                         None => Err(anyhow!(
@@ -7343,13 +9569,18 @@ impl SupervisorHandle {
                                 })
                             {
                                 Err(anyhow!("start_session_at lost its spawn reservation"))
+                            } else if let recovery_automation::StartReason::Crash(attempt) = reason
+                                && let Err(error) = self.check_crash_binding(crash_rooms.as_deref().unwrap(), slot, attempt) {
+                                Err(error)
                             } else if let Err(error) = ensure_run_event_capacity(
                                 slot,
                                 1 + u64::from(
                                     (slot.definition.driver == DriverKind::Codex
                                         && slot.codex_work_state.has_pending_classification())
                                         || (slot.definition.driver == DriverKind::Grok
-                                            && slot.grok_startup.is_interactive_ready()),
+                                            && slot.grok_startup.is_interactive_ready())
+                                        || (work_state_follows_screen(slot.definition.driver)
+                                            && screen_question(slot).is_some()),
                                 ),
                             ) {
                                 Err(error)
@@ -7359,12 +9590,49 @@ impl SupervisorHandle {
                                 slot.running = Some(
                                     RunningSession::new(Some(pty.clone()))
                                         .with_pane_secret(plan.pane_secret.clone())
-                                        .with_brief_owed(brief_owed),
+                                        .with_app_server(app_server.clone()),
                                 );
+                                // A108: the register's holder follows every run,
+                                // also a resume that changes no conversation.
+                                self.note_run_changed(session_id);
+                                if !plan.resumes_conversation {
+                                    if let Some(previous) = slot.recovery.clone() {
+                                        slot.recovery_history.push(previous);
+                                    }
+                                }
+                                // A108: a minted id (Claude, Grok) is proven by
+                                // this launch. Never blocks; no I/O here.
+                                if !plan.resumes_conversation
+                                    && let Some(minted) = plan.harness_session_id.clone()
+                                {
+                                    self.note_conversation_change(session_ledger::ConversationChange {
+                                        session_id,
+                                        harness: slot.definition.driver,
+                                        conversation_id: minted,
+                                        reason: if slot.harness_session_id.is_some() { "start_fresh" } else { "launch" },
+                                        via: "minted",
+                                        run_id: Some(run_id),
+                                        pid: slot.process_id,
+                                    });
+                                }
                                 slot.harness_session_id = plan.harness_session_id.clone();
+                                slot.recovery = (slot.definition.driver == DriverKind::Codex)
+                                    .then(|| {
+                                        RecoveryReference::unresolved_codex(
+                                            plan.harness_session_id.clone(),
+                                            false,
+                                        )
+                                    });
                                 slot.running_at_shutdown = true;
                                 slot.run_output_tail.clear();
                                 slot.run_started_at = Some(std::time::SystemTime::now());
+                                slot.last_launch = plan.launch_inputs.clone().map(|inputs| SessionLaunchRecord {
+                                    run_id,
+                                    generation: expected,
+                                    started_at: now_rfc3339(),
+                                    inputs,
+                                    effective: SessionEffectiveSettings::default(),
+                                });
                                 slot.run_resume_id = plan
                                     .resumes_conversation
                                     .then(|| plan.harness_session_id.clone())
@@ -7390,6 +9658,9 @@ impl SupervisorHandle {
                                 {
                                     (DriverKind::Grok, true) => LifecycleState::Idle,
                                     (DriverKind::Grok, false) => LifecycleState::Starting,
+                                    // A16 (PC3, 20 Oct): a harness whose process
+                                    // exists but has drawn nothing is not ready.
+                                    (DriverKind::Claude | DriverKind::Codex, _) if !slot.room_composer.drew_visible_text() => LifecycleState::Starting,
                                     _ => LifecycleState::Ready,
                                 };
                                 slot.last_activity_at = Some(now_rfc3339());
@@ -7403,18 +9674,32 @@ impl SupervisorHandle {
                                         WorkState::Idle,
                                         None,
                                     )
+                                } else if let Some((state, detail)) =
+                                    slot.codex_work_state.take_pending_classification()
+                                {
+                                    transition_work_state_locked(
+                                        &slot.definition.alias.clone(),
+                                        slot,
+                                        run_id,
+                                        state,
+                                        detail,
+                                    )
+                                } else if let Some(detail) = work_state_follows_screen(slot.definition.driver)
+                                    .then(|| screen_question(slot))
+                                    .flatten()
+                                {
+                                    // 19 Oct walk: a startup question painted
+                                    // before the spawn was confirmed was never
+                                    // classified; the screen still shows it.
+                                    transition_work_state_locked(
+                                        &slot.definition.alias.clone(),
+                                        slot,
+                                        run_id,
+                                        WorkState::Blocked,
+                                        Some(detail),
+                                    )
                                 } else {
-                                    slot.codex_work_state
-                                        .take_pending_classification()
-                                        .and_then(|(state, detail)| {
-                                            transition_work_state_locked(
-                                                &slot.definition.alias.clone(),
-                                                slot,
-                                                run_id,
-                                                state,
-                                                detail,
-                                            )
-                                        })
+                                    None
                                 };
                                 let identity = next_run_event_identity(slot, run_id);
                                 Ok((slot.snapshot(), identity, pending_work_state_event))
@@ -7423,8 +9708,15 @@ impl SupervisorHandle {
                     }
                 };
                 let (snapshot, identity, pending_work_state_event) = match installation {
-                    Ok(result) => result,
+                    Ok(result) => {
+                        // v3 W4: installed; the owner now lives with the run.
+                        if let Some(guard) = codex_owner { guard.detach(); }
+                        result
+                    }
                     Err(error) => {
+                        self.inner.output_credit.retire_run(output_credit::OutputRun {
+                            session_id, run_id, generation: expected,
+                        });
                         let process_id = pty.process_id();
                         let reservation = SpawnReservation {
                             generation: expected,
@@ -7568,6 +9860,8 @@ impl SupervisorHandle {
                         };
                     }
                 };
+                #[cfg(test)]
+                if let Some(hook) = self.inner.recovery_start_boundary.lock().as_mut() { hook("installed"); }
                 if let Some(event) = pending_work_state_event {
                     self.emit_run_work_state(event, expected, run_id);
                 }
@@ -7577,11 +9871,25 @@ impl SupervisorHandle {
                     timestamp: now_rfc3339(),
                 });
                 self.persist_slot_harness_state(session_id);
-                if snapshot.driver == DriverKind::Codex && plan.harness_session_id.is_none() {
-                    self.spawn_codex_session_capture(session_id, snapshot.working_dir.clone());
+                self.finish_recovery_start(session_id, expected, run_id, &plan, continuation);
+                if let Some(process_id) = snapshot.process_id {
+                    self.start_run_exit_watcher(session_id, run_id, process_id);
                 }
-                if snapshot.lifecycle_state == LifecycleState::Idle {
-                    self.deliver_pending_brief_if_due(session_id, expected, run_id);
+                if !plan.resumes_conversation {
+                    if let Some(previous) = snapshot.recovery_history.last() {
+                        self.emit(RuntimeEvent::SystemLog {
+                            level: LogLevel::Info,
+                            message: format!("Fresh launch retains historical conversation reference {} ({}).",
+                                previous.original_id.as_deref().unwrap_or("unresolved"), previous.provenance),
+                            timestamp: now_rfc3339(),
+                        });
+                    }
+                }
+                // Grok keeps its measured startup; terminals start Ready.
+                if snapshot.lifecycle_state == LifecycleState::Starting
+                    && matches!(snapshot.driver, DriverKind::Claude | DriverKind::Codex)
+                {
+                    self.arm_startup_watchdog(session_id, expected, run_id);
                 }
                 self.emit_run_event(RuntimeEvent::SessionState {
                     identity,
@@ -7593,14 +9901,22 @@ impl SupervisorHandle {
                         "Grok completed its measured interactive startup repaint".into()
                     } else if snapshot.driver == DriverKind::Grok {
                         "Grok process started; awaiting interactive session readiness".into()
+                    } else if snapshot.lifecycle_state == LifecycleState::Starting {
+                        "process started; awaiting its first visible output".into()
                     } else {
                         "session ready".into()
                     },
                     timestamp: now_rfc3339(),
                 });
+                if let Some(resolved) = plan.version_probe.clone() {
+                    self.observe_harness_version(session_id, run_id, resolved);
+                }
                 Ok(snapshot)
             }
             Err(error) => {
+                self.inner.output_credit.retire_run(output_credit::OutputRun {
+                    session_id, run_id, generation: expected,
+                });
                 let terminal = {
                     let mut slots = self.inner.slots.lock();
                     let Some(slot) = slots.get_by_id_mut(session_id) else {
@@ -7680,8 +9996,9 @@ impl SupervisorHandle {
         session_id: SessionId,
         expected_generation: SessionGeneration,
         expected_run_id: Option<Uuid>,
+        check: Option<&member_lifecycle::ManageCheck<'_>>,
     ) -> Result<SessionSnapshot> {
-        let (definition, qualified_directory) = {
+        let (definition, qualified_directory, choices) = {
             let slots = self.inner.slots.lock();
             self.ensure_active()?;
             let slot = slots
@@ -7714,7 +10031,7 @@ impl SupervisorHandle {
                     anyhow!("session '{session_id}' has no qualified working directory")
                 })?
                 .clone();
-            (slot.definition.clone(), qualified_directory)
+            (slot.definition.clone(), qualified_directory, slot.launch_choices.clone())
         };
         let directory_lease = self.revalidate_session_working_directory(
             session_id,
@@ -7726,17 +10043,19 @@ impl SupervisorHandle {
             &qualified_directory,
             false,
             false,
+            &choices,
         ) {
             Ok(plan) => plan,
             Err(error) => {
-                self.record_launch_prepare_failure(session_id, &error);
+                self.record_launch_prepare_failure(session_id, &error, recovery_automation::StartReason::Manual);
                 return Err(error);
             }
         };
-        let (_, expected_stop) = self.declare_stop_operation(
+        let (_, expected_stop) = self.declare_stop_operation_checked(
             session_id,
             Some((expected_generation, expected_run_id)),
             StopIntentKind::Restart,
+            check,
         )?;
         let restarting_event = {
             let mut slots = self.inner.slots.lock();
@@ -7797,7 +10116,8 @@ impl SupervisorHandle {
                         "restart_session_at lifecycle declaration changed after stop"
                     ));
                 }
-                if slot.definition.driver != definition.driver
+                if slot.launch_choices != choices
+                    || slot.definition.driver != definition.driver
                     || slot.definition.working_dir != definition.working_dir
                     || slot.definition.permission_profile != definition.permission_profile
                     || slot.qualified_working_directory.as_ref() != Some(&qualified_directory)
@@ -7839,7 +10159,8 @@ impl SupervisorHandle {
             admission
         };
         let expected_start = expected_start_result?;
-        let result = self.start_session_at(session_id, expected_start, directory_lease, plan);
+        let result = self.start_session_at(session_id, expected_start, directory_lease, plan,
+            recovery_automation::StartReason::Manual);
         let shutdown_crossed_restart = self.inner.shutdown_started.load(Ordering::Acquire);
         let mut slots = self.inner.slots.lock();
         if let Some(slot) = slots.get_by_id_mut(session_id)
@@ -7926,6 +10247,7 @@ impl SupervisorHandle {
         safety: RunInputSafety,
         control: Option<&'a InputWriteControl>,
     ) -> Result<RunInputPermit<'a>> {
+        self.ensure_mutations_admitted()?;
         #[cfg(test)]
         if let Some(hook) = self.inner.run_input_before_commit.lock().take() {
             hook();
@@ -7938,6 +10260,39 @@ impl SupervisorHandle {
             control.begin_pty_write()?;
         }
         Ok(writer)
+    }
+
+    /// D2: input submitted to a run uses that run's conversation.
+    fn revoke_minted_for_run(&self, target: &RunWriteTarget) {
+        let conversation = self.inner.slots.lock().get_by_id(target.session_id)
+            .filter(|slot| slot.run_id == Some(target.run_id))
+            .map(|slot| slot.harness_session_id.clone());
+        // A run that is no longer current, or an unknown binding, revokes conservatively.
+        self.inner.identity_tracker
+            .revoke_minted_claude_conversation(target.session_id, conversation.flatten().as_deref());
+    }
+
+    /// D2 at the launch boundary, after the old run stopped (no more input can
+    /// reach it): a same-id new start chosen earlier is refused if its
+    /// conversation was used meanwhile, and a launch carrying an initial prompt
+    /// runs its first turn at spawn, so its conversation is used from the start.
+    fn settle_claude_new_start(&self, session_id: SessionId, plan: &PreparedLaunch) -> Result<()> {
+        if plan.driver != DriverKind::Claude {
+            return Ok(());
+        }
+        let control = &self.inner.identity_tracker;
+        if !plan.resumes_conversation
+            && let Some(id) = plan.harness_session_id.as_deref()
+            && control.minted_claude(session_id).as_deref() != Some(id)
+        {
+            return Err(anyhow!(
+                "this member's conversation was used while it was restarting; nothing was started, so start it again"
+            ));
+        }
+        if plan.has_initial_prompt {
+            control.revoke_minted_claude(session_id);
+        }
+        Ok(())
     }
 
     fn write_full_pty_input(pty: &dyn PtySession, input: &str) -> Result<usize> {
@@ -7971,7 +10326,41 @@ impl SupervisorHandle {
         safety: RunInputSafety,
         control: Option<&InputWriteControl>,
     ) -> Result<usize> {
+        self.write_run_input_checked(target, caller, input, safety, control, None)
+    }
+
+    /// `admit` (A16 member_input) runs once the run's writer ticket is held,
+    /// just before the bytes are written, so a grant withdrawn or a target
+    /// moved while this write waited types nothing.
+    fn write_run_input_checked(
+        &self,
+        target: &RunWriteTarget,
+        caller: Option<&PaneCaller>,
+        input: &str,
+        safety: RunInputSafety,
+        control: Option<&InputWriteControl>,
+        admit: Option<&dyn Fn() -> Result<()>>,
+    ) -> Result<usize> {
+        if safety == RunInputSafety::Raw && !input.is_empty() {
+            target.input_gate.room_input_activity.lock().record_input(input);
+            let mut slots = self.inner.slots.lock();
+            if let Some(slot) = slots.get_by_id_mut(target.session_id).filter(|slot|
+                slot.run_id == Some(target.run_id) && slot.generation == target.generation) {
+                // Never treat a pre-keystroke empty screen as current while
+                // waiting for the terminal's echo or a complete repaint.
+                slot.room_composer.invalidate_for_input();
+            }
+        }
         let _writer = self.begin_run_input_write(target, caller, safety, control)?;
+        if let Some(admit) = admit {
+            admit()?;
+        }
+        // D2: a submitted line may create the conversation, so the member is no
+        // longer eligible for a new start. Terminal replies to Claude's startup
+        // queries (device attributes, cursor position) carry no line end.
+        if input.contains(['\r', '\n']) {
+            self.revoke_minted_for_run(target);
+        }
         let write_result = Self::write_full_pty_input(target.pty.as_ref(), input);
         if let Some(control) = control {
             control.finish();
@@ -7985,8 +10374,29 @@ impl SupervisorHandle {
         content: &str,
         submit_behavior: SubmitBehavior,
     ) -> Result<usize> {
+        self.write_bracketed_submission_checked(target, content, submit_behavior, None)
+    }
+
+    /// `room_check` (room messages, A106) runs once the run's writer ticket is
+    /// held, so operator input admitted while this write waited is never
+    /// pasted ahead of the room message or submitted with it. A refusal after
+    /// the paste then reports the room wording, never "send again".
+    fn write_bracketed_submission_checked(
+        &self,
+        target: &RunWriteTarget,
+        content: &str,
+        submit_behavior: SubmitBehavior,
+        room_check: Option<&dyn Fn() -> Result<()>>,
+    ) -> Result<usize> {
         let safety = RunInputSafety::BracketedPasteEnabled;
         let _writer = self.begin_run_input_write(target, None, safety, None)?;
+        if let Some(check) = room_check {
+            check()?;
+        }
+        // D2: a submission about to be written is evidence of use. Only after
+        // the room check: a delivery it refuses writes nothing (Codex review of
+        // 733c558), so it must not cost a never-used member its new start.
+        self.revoke_minted_for_run(target);
         let framed_content = frame_message_payload(content, submit_behavior.framing);
         let content_bytes = Self::write_full_pty_input(target.pty.as_ref(), &framed_content)?;
         thread::sleep(bracketed_paste_submit_delay(
@@ -8041,6 +10451,13 @@ impl SupervisorHandle {
             RunInputSafety::RoutedSubmit,
             &slots,
         ) {
+            if room_check.is_some()
+                && let Some(refusal) = error.downcast_ref::<RoutedInputRefusal>()
+            {
+                return Err(PtyWriteError::new(content_bytes, format!(
+                    "{}. The message was pasted but not submitted; it stays stored in the room. Check the member's input before sending anything else.",
+                    refusal.room_reason)).into());
+            }
             return Err(Self::delivery_error_after_progress(error, content_bytes));
         }
         drop(slots);
@@ -8052,6 +10469,11 @@ impl SupervisorHandle {
         // retried. An extra Enter into an already-submitted, empty composer
         // is a no-op on every measured harness.
         let mut written = content_bytes;
+        // v3 W3: a room wake gets one CR. Output after it is not acceptance,
+        // and another Enter into an unverified composer is not safe; its
+        // submission is confirmed from the member's own record instead
+        // (Supervisor 1086baa2, Reviewer be7a79e7).
+        let attempts = if room_check.is_some() { 1 } else { attempts };
         for attempt in 0..attempts {
             let submitted_at = Instant::now();
             written += Self::write_full_pty_input(target.pty.as_ref(), submit_behavior.sequence)
@@ -8082,7 +10504,6 @@ impl SupervisorHandle {
     }
 
     fn send_input_with_bytes(&self, request: SendInputRequest) -> Result<(SessionSnapshot, usize)> {
-        self.refresh_session_liveness();
         let (snapshot, target) = {
             let slots = self.inner.slots.lock();
             let slot = slots
@@ -8099,15 +10520,319 @@ impl SupervisorHandle {
         Ok((snapshot, bytes_written))
     }
 
+    /// Admits operator input for the session's current run and returns at
+    /// once; that run's worker writes it in admission order. The run is read
+    /// while owning queue publication, so a caller that saw an older run can
+    /// never replace a newer run's queue. Each admitted input raises the run's
+    /// pending-input barrier until the worker has written or failed it, so a
+    /// room wake never gets ahead of typing that is still queued.
+    pub fn enqueue_operator_input(&self, request: SendInputRequest) -> Result<()> {
+        self.ensure_active()?;
+        let bytes = request.input.len();
+        if bytes > OPERATOR_INPUT_MAX_PAYLOAD_BYTES {
+            return Err(anyhow!(
+                "this input is {bytes} bytes; one input may be at most {OPERATOR_INPUT_MAX_PAYLOAD_BYTES} bytes. Nothing was sent."
+            ));
+        }
+        let mut queues = self.inner.operator_input.lock();
+        let (run_id, input_gate) = {
+            let slots = self.inner.slots.lock();
+            let slot = slots
+                .get_by_id(request.session_id)
+                .ok_or_else(|| anyhow!("unknown session id '{}'", request.session_id))?;
+            match (slot.running.as_ref(), slot.run_id) {
+                (Some(running), Some(run_id)) => (run_id, running.input_gate.clone()),
+                _ => {
+                    return Err(anyhow!(
+                        "session '{}' is not running",
+                        slot.definition.alias
+                    ));
+                }
+            }
+        };
+        if !input_gate.is_accepting() {
+            return Err(anyhow!(
+                "this pane's run is closing and accepts no more input. Nothing was sent."
+            ));
+        }
+        let mut input = request.input;
+        for _ in 0..2 {
+            let current = queues
+                .get(&request.session_id)
+                .is_some_and(|queue| queue.run_id == run_id);
+            if !current {
+                let (sender, receiver) = mpsc::sync_channel(OPERATOR_INPUT_QUEUE_CAP);
+                let queued_bytes = Arc::new(AtomicUsize::new(0));
+                self.start_operator_input_worker(
+                    request.session_id,
+                    run_id,
+                    receiver,
+                    Arc::clone(&queued_bytes),
+                    Arc::clone(&input_gate),
+                )?;
+                queues.insert(
+                    request.session_id,
+                    OperatorInputQueue {
+                        run_id,
+                        sender,
+                        queued_bytes,
+                    },
+                );
+            }
+            let queue = queues
+                .get(&request.session_id)
+                .expect("operator input queue was just ensured");
+            let waiting = queue.queued_bytes.load(Ordering::Acquire);
+            if waiting + bytes > OPERATOR_INPUT_QUEUE_BYTES {
+                return Err(anyhow!(
+                    "this pane already has {waiting} bytes of input waiting; at most {OPERATOR_INPUT_QUEUE_BYTES} may wait. Nothing was sent."
+                ));
+            }
+            // The barrier rises before the input is visible to the worker and
+            // falls only when the worker has written or failed it. No mutex:
+            // a wake holds the activity mutex across its PTY write, and the
+            // UI thread must never wait behind that.
+            input_gate.operator_inputs_pending.fetch_add(1, Ordering::SeqCst);
+            queue.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
+            match queue.sender.try_send(input) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::TrySendError::Full(_)) => {
+                    input_gate.operator_inputs_pending.fetch_sub(1, Ordering::SeqCst);
+                    queue.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                    return Err(anyhow!(
+                        "this pane's input queue is full ({OPERATOR_INPUT_QUEUE_CAP} inputs waiting); its terminal is not accepting input. Nothing was sent."
+                    ));
+                }
+                // Its worker ended; replace it once for this same, current run.
+                Err(mpsc::TrySendError::Disconnected(returned)) => {
+                    input_gate.operator_inputs_pending.fetch_sub(1, Ordering::SeqCst);
+                    queue.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                    input = returned;
+                    queues.remove(&request.session_id);
+                }
+            }
+        }
+        Err(anyhow!("the input worker for this pane could not be restarted. Nothing was sent."))
+    }
+
+    /// Writes queued input in order and releases its bytes and its wake
+    /// barrier whether each write succeeds or fails; a failure is reported
+    /// where the operator sees it. Once its run is no longer current or no
+    /// longer accepts input, the worker retires: it removes its own registry
+    /// entry and takes back everything admitted behind it, so neither a
+    /// stopped nor a deleted session keeps a queue.
+    fn start_operator_input_worker(
+        &self,
+        session_id: SessionId,
+        run_id: Uuid,
+        receiver: mpsc::Receiver<String>,
+        queued_bytes: Arc<AtomicUsize>,
+        input_gate: Arc<RunInputGate>,
+    ) -> Result<()> {
+        #[cfg(test)]
+        self.inner
+            .operator_input_workers_started
+            .fetch_add(1, Ordering::SeqCst);
+        let weak = Arc::downgrade(&self.inner);
+        thread::Builder::new()
+            .name(format!("prim1-input-{session_id}"))
+            .spawn(move || {
+                loop {
+                    let input = match receiver.recv_timeout(OPERATOR_INPUT_RUN_CHECK) {
+                        Ok(input) => input,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            let Some(inner) = weak.upgrade() else {
+                                break;
+                            };
+                            let handle = SupervisorHandle { inner };
+                            if handle.operator_input_run_open(session_id, run_id, &input_gate) {
+                                continue;
+                            }
+                            let (items, bytes) = handle.retire_operator_input_queue(
+                                session_id,
+                                &receiver,
+                                &queued_bytes,
+                                &input_gate,
+                            );
+                            if items > 0 {
+                                handle.report_operator_input_failure(
+                                    session_id, run_id, None, items, bytes,
+                                );
+                            }
+                            break;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
+                    let length = input.len();
+                    let Some(inner) = weak.upgrade() else {
+                        break;
+                    };
+                    let handle = SupervisorHandle { inner };
+                    let result = handle.write_queued_operator_input(session_id, run_id, &input);
+                    queued_bytes.fetch_sub(length, Ordering::AcqRel);
+                    input_gate
+                        .operator_inputs_pending
+                        .fetch_sub(1, Ordering::SeqCst);
+                    let Err(error) = result else {
+                        continue;
+                    };
+                    if handle.operator_input_run_open(session_id, run_id, &input_gate) {
+                        handle.report_operator_input_failure(
+                            session_id,
+                            run_id,
+                            Some((length, &error)),
+                            0,
+                            0,
+                        );
+                        continue;
+                    }
+                    let (items, bytes) = handle.retire_operator_input_queue(
+                        session_id,
+                        &receiver,
+                        &queued_bytes,
+                        &input_gate,
+                    );
+                    handle.report_operator_input_failure(
+                        session_id,
+                        run_id,
+                        Some((length, &error)),
+                        items,
+                        bytes,
+                    );
+                    break;
+                }
+            })
+            .map(|_| ())
+            .context("failed to start the operator input worker")
+    }
+
+    fn operator_input_run_open(
+        &self,
+        session_id: SessionId,
+        run_id: Uuid,
+        input_gate: &RunInputGate,
+    ) -> bool {
+        let current = self
+            .inner
+            .slots
+            .lock()
+            .get_by_id(session_id)
+            .is_some_and(|slot| slot.run_id == Some(run_id));
+        current && input_gate.is_accepting()
+    }
+
+    /// Removes this worker's own registry entry, never a newer queue for the
+    /// session (the queue's byte counter is its identity), with no slots lock
+    /// held, so the queue-then-slots lock order holds. Once the entry is gone
+    /// nothing more can be admitted to this channel, so the drain takes back
+    /// every input still in it. Returns how many inputs and bytes it took.
+    fn retire_operator_input_queue(
+        &self,
+        session_id: SessionId,
+        receiver: &mpsc::Receiver<String>,
+        queued_bytes: &Arc<AtomicUsize>,
+        input_gate: &RunInputGate,
+    ) -> (usize, usize) {
+        {
+            let mut queues = self.inner.operator_input.lock();
+            if queues
+                .get(&session_id)
+                .is_some_and(|queue| Arc::ptr_eq(&queue.queued_bytes, queued_bytes))
+            {
+                queues.remove(&session_id);
+            }
+        }
+        let (mut items, mut bytes) = (0, 0);
+        while let Ok(input) = receiver.try_recv() {
+            items += 1;
+            bytes += input.len();
+            queued_bytes.fetch_sub(input.len(), Ordering::AcqRel);
+            input_gate
+                .operator_inputs_pending
+                .fetch_sub(1, Ordering::SeqCst);
+        }
+        (items, bytes)
+    }
+
+    /// Queued input that fails after admission is reported at Error, which
+    /// raises the log alert as the rejected send_input promise did. It names
+    /// the pane, session and run, and says how much reached the terminal.
+    fn report_operator_input_failure(
+        &self,
+        session_id: SessionId,
+        run_id: Uuid,
+        failed: Option<(usize, &anyhow::Error)>,
+        dropped_items: usize,
+        dropped_bytes: usize,
+    ) {
+        let pane = self
+            .inner
+            .slots
+            .lock()
+            .get_by_id(session_id)
+            .map(|slot| slot.definition.label.clone())
+            .unwrap_or_else(|| "A deleted pane".into());
+        let inputs = |count: usize| if count == 1 { "input" } else { "inputs" };
+        let mut message = match failed {
+            Some((length, error)) => {
+                let written = error
+                    .downcast_ref::<PtyWriteError>()
+                    .map(PtyWriteError::bytes_written)
+                    .unwrap_or(0);
+                if written == 0 {
+                    format!("{pane} input failed and none of it reached the terminal: {error:#}")
+                } else {
+                    format!(
+                        "{pane} input failed after {written} of {length} bytes reached the terminal: {error:#}"
+                    )
+                }
+            }
+            None => format!(
+                "{pane}: {dropped_items} queued {} ({dropped_bytes} bytes) never reached the terminal because its run ended",
+                inputs(dropped_items)
+            ),
+        };
+        if failed.is_some() && dropped_items > 0 {
+            message.push_str(&format!(
+                "; {dropped_items} more queued {} ({dropped_bytes} bytes) behind it never reached the terminal",
+                inputs(dropped_items)
+            ));
+        }
+        self.emit(RuntimeEvent::SystemLog {
+            level: LogLevel::Error,
+            message: format!("{message} [session {session_id}, run {run_id}]"),
+            timestamp: now_rfc3339(),
+        });
+    }
+
+    fn write_queued_operator_input(
+        &self,
+        session_id: SessionId,
+        run_id: Uuid,
+        input: &str,
+    ) -> Result<()> {
+        let target = {
+            let slots = self.inner.slots.lock();
+            let slot = slots
+                .get_by_id(session_id)
+                .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
+            if slot.run_id != Some(run_id) {
+                return Err(anyhow!(
+                    "{}'s run ended before this input was written",
+                    slot.definition.alias
+                ));
+            }
+            run_write_target_from_slot(&slot.definition.alias, slot)?
+        };
+        self.write_run_input(&target, None, input, RunInputSafety::Raw, None)?;
+        Ok(())
+    }
+
     pub fn send_input(&self, request: SendInputRequest) -> Result<SessionSnapshot> {
         self.ensure_active()?;
-        let request_id = Uuid::new_v4().to_string();
-        self.emit_dispatch_attempt_for_session_id(
-            &request_id,
-            "send_input",
-            "operator",
-            request.session_id,
-        )?;
+        // D9 step 4: no dispatch-attempt event (audit line) per operator
+        // keystroke. Explicit control keys and agent or room sends still
+        // record one.
         self.send_input_with_bytes(request)
             .map(|(snapshot, _bytes_written)| snapshot)
     }
@@ -8299,13 +11024,48 @@ impl SupervisorHandle {
         Ok(self.snapshot())
     }
 
+    /// Explicit unbound internal resize; desktop layout uses `resize_session_for_run`.
     pub fn resize_session_by_id(&self, session_id: SessionId, cols: u16, rows: u16) -> Result<()> {
+        self.resize_session_inner(session_id, cols, rows, None)
+    }
+
+    /// Desktop requests remain bound to the run that admitted the layout.
+    pub fn resize_session_for_run(
+        &self,
+        session_id: SessionId,
+        expected_run_id: Uuid,
+        expected_generation: SessionGeneration,
+        cols: u16,
+        rows: u16,
+    ) -> Result<()> {
+        self.resize_session_inner(
+            session_id,
+            cols,
+            rows,
+            Some((expected_run_id, expected_generation)),
+        )
+    }
+
+    fn resize_session_inner(
+        &self,
+        session_id: SessionId,
+        cols: u16,
+        rows: u16,
+        expected_run: Option<(Uuid, SessionGeneration)>,
+    ) -> Result<()> {
         self.ensure_active()?;
-        self.refresh_session_liveness();
         let mut slots = self.inner.slots.lock();
         let slot = slots
             .get_by_id_mut(session_id)
             .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
+        // Check before the unchanged-size fast path and every transport,
+        // saved-grid, composer or driver mutation. Start/stop uses this same
+        // slots lock, so a replacement cannot slip between proof and resize.
+        if let Some((expected_run_id, expected_generation)) = expected_run {
+            if slot.run_id != Some(expected_run_id) || slot.generation != expected_generation {
+                bail!("stale terminal resize for session '{session_id}': run identity changed");
+            }
+        }
         let running = slot
             .running
             .as_mut()
@@ -8319,17 +11079,16 @@ impl SupervisorHandle {
             .ok_or_else(|| anyhow!("session '{session_id}' transport is not available"))?
             .resize(cols, rows)?;
         running.last_resize = Some((cols, rows));
-        let size_changed = slot.last_pty_size != Some((cols, rows));
+        // Keep resize off the catalog fsync path. Start/stop/exit checkpoints
+        // persist this size; an abrupt crash may retain the previous size.
         slot.last_pty_size = Some((cols, rows));
+        slot.room_composer.resize(cols, rows);
         match slot.definition.driver {
             DriverKind::Codex => slot.codex_work_state.resize(cols, rows),
             DriverKind::Grok => slot.grok_startup.resize(cols, rows),
             _ => {}
         }
         drop(slots);
-        if size_changed {
-            self.persist_slot_harness_state(session_id);
-        }
         Ok(())
     }
 
@@ -8342,7 +11101,7 @@ impl SupervisorHandle {
         &self,
         endpoint_override: Option<String>,
     ) -> Result<ControlPlaneStatus> {
-        let _shutdown = self.inner.shutdown_lifecycle.lock();
+        let _shutdown = self.inner.shutdown_lifecycle.read();
         let _lifecycle = self.inner.control_plane_lifecycle.lock();
         self.ensure_active()?;
         if let Some(existing) = self.inner.control_plane.read().clone() {
@@ -8374,6 +11133,7 @@ impl SupervisorHandle {
             let listener = prepared.activate()?;
             *self.inner.control_plane_listener.lock() = Some(listener);
             *self.inner.control_plane.write() = Some(status.clone());
+            self.write_guest_endpoint(&status.endpoint);
             self.emit(RuntimeEvent::ControlPlaneReady {
                 endpoint: status.endpoint.clone(),
                 transport: status.transport.clone(),
@@ -8430,14 +11190,22 @@ impl SupervisorHandle {
         event_run_id: Uuid,
         cause: RunRetirementCause,
     ) {
-        let (session_alias, process_id, pty, input_gate, stop_intent) = {
+        let (session_alias, process_id, pty, input_gate, stop_intent, crash_respawn) = {
+            let rooms = self.inner.rooms.lock();
             let mut slots = self.inner.slots.lock();
+            let inference_still_fresh = |slot: &SessionSlot| match &cause {
+                RunRetirementCause::Liveness { inferred_at_sequence: Some(sequence), .. } => {
+                    slot.run_event_sequence == *sequence
+                }
+                _ => true,
+            };
             let Some(slot) = slots.get_by_id_mut(session_id).filter(|slot| {
                 slot.generation == event_generation
                     && slot.run_id == Some(event_run_id)
                     && slot.lifecycle_operation.is_none()
                     && slot.spawn_in_flight.is_none()
                     && !slot.termination_uncertain
+                    && inference_still_fresh(slot)
             }) else {
                 return;
             };
@@ -8450,8 +11218,14 @@ impl SupervisorHandle {
             let Some(pty) = running.pty.as_ref().cloned() else {
                 return;
             };
+            let crash_respawn = self.claim_crash_respawn(&rooms, slot);
             running.close_input();
+            slot.output_draining = false;
+            slot.agent_exited_at = None;
             slot.run_id = None;
+            // A108: the run ended (exit, PTY error, liveness); the register's
+            // holder stops.
+            self.note_run_changed(session_id);
             slot.lifecycle_operation = Some(LifecycleOperation {
                 generation: event_generation,
                 kind: StopIntentKind::Operator,
@@ -8472,8 +11246,19 @@ impl SupervisorHandle {
                 pty,
                 running.input_gate,
                 slot.stop_intent.take(),
+                crash_respawn,
             )
         };
+
+        if matches!(cause, RunRetirementCause::DrainExpired { .. }) {
+            // The kill closes the console before ending the Job, and that close
+            // waits for credited output. A descendant blocked on saturated credit
+            // must be released first: cancel this exact run's credit as Stop does
+            // (admitted charges stay retained; no EOF is synthesized).
+            self.inner.output_credit.retire_run(output_credit::OutputRun {
+                session_id, generation: event_generation, run_id: event_run_id,
+            });
+        }
 
         if let RunRetirementCause::PtyError(error) = &cause {
             self.emit(RuntimeEvent::SystemLog {
@@ -8547,12 +11332,22 @@ impl SupervisorHandle {
                     *fallback_reason,
                     detail,
                 ),
+                // The status read after the scope kill may be a killed wrapper's,
+                // not the agent's; only the pre-kill status speaks for the run.
+                RunRetirementCause::DrainExpired { root_status, detail } => classify_session_exit(
+                    root_status.clone(),
+                    None,
+                    stop_intent,
+                    SessionExitReason::ProcessDisappeared,
+                    detail,
+                ),
             })
         } else {
             None
         };
 
-        let mut dropped_harness_session_id = false;
+        let mut recorded_recovery = false;
+        let mut auto_fresh: Option<(String, String)> = None;
         let terminal_events = {
             let mut slots = self.inner.slots.lock();
             let Some(slot) = slots.get_by_id_mut(session_id).filter(|slot| {
@@ -8581,12 +11376,39 @@ impl SupervisorHandle {
                 slot.running = None;
                 slot.process_id = None;
                 slot.termination_uncertain = false;
+                // A108: release is proved; the register's holder goes from
+                // "stopping" to "stopped" (Codex room 350).
+                self.note_run_changed(session_id);
+                // This run ended in this app process. Persisting true would
+                // advertise it as an interrupted run on the next startup.
+                // Shutdown uses its separate teardown path and keeps the bit;
+                // so does a run that ends once Windows is ending the session
+                // (A16: the OS may end the agent before PRIM-1).
+                if !self.inner.session_ending.load(Ordering::Acquire) {
+                    slot.running_at_shutdown = false;
+                }
                 slot.state = cause.final_state();
                 let diagnosis = diagnose_terminal_run(slot, classification.as_ref());
                 slot.last_error = diagnosis.last_error;
-                if diagnosis.drop_harness_session_id && slot.harness_session_id.is_some() {
-                    slot.harness_session_id = None;
-                    dropped_harness_session_id = true;
+                // v3 (Claude PRIM-1, f0dfecc walk 3): one automatic fresh start,
+                // only when Claude refused the resume itself, PRIM-1 minted that
+                // id and never saw it used in any run, and it was never an
+                // attached or imported conversation. Otherwise Start fresh stays
+                // the operator's choice, with the reason above.
+                if let Some(missing) = diagnosis.missing_conversation.as_deref()
+                    && self.claude_fresh_allowed(slot, missing)
+                {
+                    slot.claude_auto_fresh_attempted = true;
+                    auto_fresh = Some((slot.definition.label.clone(), missing.to_owned()));
+                }
+                if diagnosis.needs_recovery {
+                    slot.recovery = Some(RecoveryReference::resume_refused(
+                        slot.harness_session_id.clone(),
+                        slot.last_error
+                            .clone()
+                            .unwrap_or_else(|| "Conversation needs recovery".into()),
+                    ));
+                    recorded_recovery = true;
                 }
             } else {
                 slot.state = LifecycleState::Failed;
@@ -8639,12 +11461,30 @@ impl SupervisorHandle {
                 timestamp: now_rfc3339(),
             });
         }
-        if dropped_harness_session_id {
+        if termination_proven || recorded_recovery {
             self.persist_slot_harness_state(session_id);
+        }
+        // The automatic fresh start replaces a crash resume of the same id.
+        let crash_respawn = match crash_respawn {
+            Some(attempt) if auto_fresh.is_some() => { self.discard_crash_claim(&attempt); None }
+            other => other,
+        };
+        if termination_proven && let Some(classification) = &classification {
+            match self.recovery_run_retired(session_id, event_generation, event_run_id, classification) {
+                Ok(()) => self.schedule_crash_respawn(crash_respawn, classification),
+                Err(error) => match crash_respawn {
+                    Some(attempt) => self.hold_crash_respawn(attempt, error),
+                    None => self.recovery_warning(session_id, error),
+                },
+            }
+        } else if let Some(attempt) = crash_respawn {
+            self.discard_crash_claim(&attempt);
+        }
+        if recorded_recovery {
             self.emit(RuntimeEvent::SystemLog {
                 level: LogLevel::Warn,
                 message: format!(
-                    "{session_alias}: the stored conversation id could not be resumed and was dropped; the next Launch starts fresh"
+                    "{session_alias}: needs recovery; the original conversation ID is retained and ordinary Launch is held"
                 ),
                 timestamp: now_rfc3339(),
             });
@@ -8653,6 +11493,9 @@ impl SupervisorHandle {
             self.emit_run_event(exit_event);
         }
         self.emit_run_event(terminal_events.1);
+        self.inner.output_credit.retire_run(output_credit::OutputRun {
+            session_id, generation: event_generation, run_id: event_run_id,
+        });
         if let Some(receiver) = late_termination {
             self.schedule_late_termination_reproof(
                 session_id,
@@ -8663,22 +11506,141 @@ impl SupervisorHandle {
                 "terminal retirement",
             );
         }
+        if let Some((label, missing)) = auto_fresh {
+            self.start_claude_fresh_for_missing_conversation(session_id, label, missing);
+        }
+    }
+
+    /// v3 (Claude PRIM-1, f0dfecc walk 3, three tightenings): after Claude
+    /// refused to resume `missing`, a fresh start is automatic only when PRIM-1
+    /// minted that id for this member in this process and never saw it used
+    /// (Claude PRIM-1 72a26ffe: after a restart the refusal is named and
+    /// Start fresh session stays the operator's), it was never an attached or
+    /// imported conversation, and this process has not spent its one attempt.
+    fn claude_fresh_allowed(&self, slot: &SessionSlot, missing: &str) -> bool {
+        !slot.claude_auto_fresh_attempted
+            && self.inner.identity_tracker.never_used_minted(slot.session_id, missing)
+            && !slot.recovery_history.iter().any(|recovery| recovery.provenance.starts_with("room_import"))
+    }
+
+    /// v3 (Claude PRIM-1, f0dfecc walk 3): the one automatic fresh start, on
+    /// its own thread (never inside the retirement), with a visible notice in
+    /// the member's room either way. If it fails, the member stays stopped
+    /// with the error and Start fresh session remains the operator's.
+    fn start_claude_fresh_for_missing_conversation(&self, session_id: SessionId, label: String, missing: String) {
+        let handle = self.clone();
+        let spawned = thread::Builder::new().name("prim1-claude-fresh".into()).spawn(move || {
+            let outcome = handle.start_session_by_id_with_mode(session_id, true);
+            let detail = match &outcome {
+                Ok(_) => "started fresh: its previous run ended before its first prompt, so there was no conversation to resume".to_string(),
+                Err(error) => format!("Claude had no conversation {missing} to resume, and the automatic fresh start did not complete: {error:#}. Use Start fresh session when ready"),
+            };
+            let message = format!("[PRIM-1 recovery] {label}: {detail}.");
+            handle.emit(RuntimeEvent::SystemLog { level: if outcome.is_ok() { LogLevel::Info } else { LogLevel::Warn },
+                message: message.clone(), timestamp: now_rfc3339() });
+            let room_id = handle.inner.rooms.lock().room_by_session.get(&session_id).copied();
+            if let Some(room_id) = room_id
+                && let Err(error) = handle.post_prim1_notice(room_id, message,
+                    Some(format!("claude-fresh-{session_id}-{missing}")))
+            {
+                handle.recovery_warning(session_id, error);
+            }
+        });
+        if let Err(error) = spawned {
+            self.recovery_warning(session_id, anyhow!("the automatic fresh start could not begin: {error}"));
+        }
     }
 
     fn refresh_session_liveness(&self) {
-        let _shutdown = self.inner.shutdown_lifecycle.lock();
+        if self.inner.startup_admission.is_trial() { return; }
+        struct Probe {
+            session_id: SessionId,
+            generation: SessionGeneration,
+            run_id: Uuid,
+            process_id: Option<u32>,
+            driver: DriverKind,
+            pty: Option<Arc<dyn PtySession>>,
+            work_state: Option<WorkState>,
+            sequence: u64,
+            root_gone: bool,
+            agent_liveness: Option<Result<AgentLiveness>>,
+            /// F2: the PTY child's status, read before any kill, and only when
+            /// that child is the agent's own native executable.
+            root_status: Option<PtyExitStatus>,
+            /// F2: the PTY child is the agent's own native executable.
+            native_root: bool,
+        }
+        let _sweep = self.inner.liveness_sweep.lock();
+        let mut probes = {
+            let _shutdown = self.inner.shutdown_lifecycle.read();
+            if self.inner.shutdown_started.load(Ordering::Acquire) { return; }
+            let slots = self.inner.slots.lock();
+            slots.by_id.values().filter_map(|slot| {
+                let run_id = slot.run_id?;
+                let running = slot.running.as_ref()?;
+                if slot.lifecycle_operation.is_some()
+                    || slot.spawn_in_flight.is_some()
+                    || slot.termination_uncertain
+                { return None; }
+                Some(Probe {
+                    session_id: slot.session_id,
+                    generation: slot.generation,
+                    run_id,
+                    process_id: slot.process_id,
+                    driver: slot.definition.driver,
+                    pty: running.pty.clone(),
+                    work_state: slot.work_state_observed.then_some(slot.work_state),
+                    sequence: slot.run_event_sequence,
+                    root_gone: false,
+                    agent_liveness: None,
+                    root_status: None,
+                    native_root: slot.run_program.as_deref()
+                        .is_some_and(|program| native_agent_program(slot.definition.driver, program)),
+                })
+            }).collect::<Vec<_>>()
+        };
+        // These captured transports must also be dropped outside shared locks:
+        // a stale run's last Arc may own blocking native PTY cleanup.
+        for probe in &mut probes {
+            if self.inner.shutdown_started.load(Ordering::Acquire) { return; }
+            probe.root_gone = probe.process_id.is_some_and(|pid| !process_id_is_running(pid));
+            // A hosted agent is asked even after its root PID is gone: the root
+            // may be a wrapper whose agent still lives (F2).
+            if !probe.root_gone || hosted_agent(probe.driver) {
+                probe.agent_liveness = probe.pty.as_ref().map(|pty| pty.agent_alive(probe.driver));
+            }
+            // A child's exit code speaks for the agent only when that child is
+            // the agent's own native executable. A Node or shell shim may sit in
+            // the recorded agent PIDs too, so its code stays unknown.
+            if probe.native_root && probe.root_gone {
+                probe.root_status = probe.pty.as_ref().and_then(|pty| pty.try_wait().ok().flatten());
+            }
+        }
+        let _shutdown = self.inner.shutdown_lifecycle.read();
         if self.inner.shutdown_started.load(Ordering::Acquire) {
             return;
         }
         let mut retirements = Vec::new();
         let mut log_events = Vec::new();
+        let drain_grace = *self.inner.output_drain_grace.lock();
         {
-            let slots = self.inner.slots.lock();
-            for slot in slots.by_id.values() {
-                let Some(run_id) = slot.run_id else {
+            let mut slots = self.inner.slots.lock();
+            for probe in &mut probes {
+                let Some(slot) = slots.get_by_id_mut(probe.session_id) else {
                     continue;
                 };
-                if slot.running.is_none()
+                let same_pty = slot.running.as_ref().is_some_and(|running| {
+                    match (&running.pty, probe.pty.as_ref()) {
+                        (Some(current), Some(probed)) => Arc::ptr_eq(current, probed),
+                        (None, None) => true,
+                        _ => false,
+                    }
+                });
+                if slot.generation != probe.generation
+                    || slot.run_id != Some(probe.run_id)
+                    || slot.process_id != probe.process_id
+                    || slot.definition.driver != probe.driver
+                    || !same_pty
                     || slot.lifecycle_operation.is_some()
                     || slot.spawn_in_flight.is_some()
                     || slot.termination_uncertain
@@ -8687,9 +11649,29 @@ impl SupervisorHandle {
                 }
 
                 let mut prune_reason: Option<(LifecycleState, SessionExitReason, String)> = None;
-                if let Some(process_id) = slot.process_id
-                    && !process_id_is_running(process_id)
+                let mut inferred_at_sequence = None;
+                let run_id = probe.run_id;
+                // F2 exit proof. A native agent root's retained exit status proves
+                // its own death, whatever Node tools it left (every node.exe in
+                // the Job reads as an agent). Otherwise only the exact-Job check
+                // proves it (a vanished root PID may be a wrapper of a live
+                // agent), and only when every live Job process was identified:
+                // an unreadable image or a recorded agent PID still alive leaves
+                // the exit unproven.
+                let agent_exited = if probe.native_root {
+                    probe.root_status.is_some()
+                } else {
+                    matches!(&probe.agent_liveness, Some(Ok(AgentLiveness::Exited { last_agent_pids, live_processes }))
+                        if live_processes.iter().all(|process| process.image_name.is_some()
+                            && !last_agent_pids.contains(&process.process_id)))
+                };
+                if probe.root_gone && hosted_agent(probe.driver) && !probe.native_root
+                    && matches!(probe.agent_liveness, Some(Ok(AgentLiveness::Alive(_))))
                 {
+                    // Only the wrapper exited; the agent still runs and keeps its input.
+                    continue;
+                }
+                if probe.root_gone {
                     prune_reason = Some((
                         LifecycleState::Closed,
                         SessionExitReason::ProcessDisappeared,
@@ -8698,12 +11680,7 @@ impl SupervisorHandle {
                 }
 
                 if prune_reason.is_none() {
-                    let agent_liveness = slot
-                        .running
-                        .as_ref()
-                        .and_then(|running| running.pty.as_ref())
-                        .map(|pty| pty.agent_alive(slot.definition.driver));
-                    match agent_liveness {
+                    match probe.agent_liveness.take() {
                         Some(Ok(AgentLiveness::Exited { .. })) => {
                             prune_reason = Some((
                                 LifecycleState::Closed,
@@ -8712,7 +11689,12 @@ impl SupervisorHandle {
                             ));
                         }
                         Some(Ok(AgentLiveness::NotYetObserved(_)))
-                            if slot.work_state_observed && slot.work_state == WorkState::Exited =>
+                            if probe.work_state == Some(WorkState::Exited)
+                                && slot.work_state_observed
+                                && slot.work_state == WorkState::Exited
+                                // Fresh terminal evidence may have crossed this
+                                // native probe, even if it returned to Exited.
+                                && slot.run_event_sequence == probe.sequence =>
                         {
                             prune_reason = Some((
                                 LifecycleState::Failed,
@@ -8720,6 +11702,7 @@ impl SupervisorHandle {
                                 "agent terminal signature observed before an agent process was found"
                                     .into(),
                             ));
+                            inferred_at_sequence = Some(slot.run_event_sequence);
                         }
                         Some(Err(error)) => {
                             log_events.push(RuntimeEvent::SystemLog {
@@ -8738,6 +11721,88 @@ impl SupervisorHandle {
                 let Some((closed_state, fallback_reason, fallback_error)) = prune_reason else {
                     continue;
                 };
+                if let Some(first) = self.inner.output_credit.mark_process_ended(output_credit::OutputRun {
+                    session_id: slot.session_id, run_id, generation: slot.generation,
+                }) {
+                    // Process exit is not output EOF. The old run remains the
+                    // output authority, but can never receive new input/wakes.
+                    slot.output_draining = true;
+                    // F2: processes the exited agent started (a tool call, a
+                    // server) can hold the terminal indefinitely; nothing reads
+                    // them and the run never retires or recovers. After the grace,
+                    // counted from the agent's own exit, end them through the same
+                    // proof-bearing scope kill as Stop. Hosted agents only: a
+                    // plain terminal's children keep their own lifetime.
+                    let exited_at = (agent_exited && hosted_agent(probe.driver))
+                        .then(|| *slot.agent_exited_at.get_or_insert_with(Instant::now));
+                    let drain_expired = exited_at.is_some_and(|at| at.elapsed() >= drain_grace);
+                    if let Some(running) = &slot.running { running.close_input(); }
+                    cancel_quiesce_timer_locked(slot);
+                    slot.room_composer.invalidate_for_input();
+                    if !drain_expired
+                        && let Some(running) = &slot.running
+                        && let Some(pty) = running.pty.clone()
+                        && !running.output_close_in_flight.swap(true, Ordering::AcqRel)
+                    {
+                        let in_flight = running.output_close_in_flight.clone();
+                        let handle = self.clone();
+                        self.inner.background_runtime.spawn(async move {
+                            // Only exact captured-run objects cross this
+                            // boundary. ClosePseudoConsole can wait for
+                            // credited output, so never close under locks
+                            // or on the PTY reader / event-pump thread.
+                            let result = tokio::task::spawn_blocking(move || {
+                                let input_error = first.then(|| pty.cancel_input_write().err()).flatten();
+                                (input_error, pty.finish_output_if_scope_exited())
+                            }).await;
+                            let finished = matches!(&result, Ok((_, Ok(true))));
+                            if !finished {
+                                // A live descendant defers this operation;
+                                // the existing liveness tick checks again.
+                                in_flight.store(false, Ordering::Release);
+                            }
+                            let error = match result {
+                                Ok((Some(_), _)) => Some(format!("{run_id}: draining run's input write could not be cancelled; Stop remains available")),
+                                Ok((None, Err(error))) => Some(format!("{run_id}: output producer close deferred: {error}; Stop remains available")),
+                                Err(error) => Some(format!("{run_id}: output drain worker failed: {error}; Stop remains available")),
+                                _ => None,
+                            };
+                            if let Some(message) = error {
+                                handle.emit(RuntimeEvent::SystemLog { level: LogLevel::Error, message, timestamp: now_rfc3339() });
+                            }
+                        });
+                    }
+                    if first {
+                        if ensure_run_event_capacity(slot, 1).is_ok() {
+                            log_events.push(RuntimeEvent::SessionOutputDraining {
+                                identity: next_run_event_identity(slot, run_id),
+                                session: slot.definition.alias.clone(),
+                                timestamp: now_rfc3339(),
+                            });
+                        }
+                    }
+                    if !drain_expired {
+                        continue;
+                    }
+                    // Tense-neutral: it is also the run's error text before and
+                    // after the termination proof.
+                    let detail = format!(
+                        "the agent exited {} s earlier but processes it started still held the terminal after the drain grace",
+                        exited_at.map_or(0, |at| at.elapsed().as_secs())
+                    );
+                    log_events.push(RuntimeEvent::SystemLog {
+                        level: LogLevel::Warn,
+                        message: format!("{} {detail}; PRIM-1 is ending them", slot.title()),
+                        timestamp: now_rfc3339(),
+                    });
+                    retirements.push((
+                        slot.session_id,
+                        slot.generation,
+                        run_id,
+                        RunRetirementCause::DrainExpired { root_status: probe.root_status.clone(), detail },
+                    ));
+                    continue;
+                }
                 log_events.push(RuntimeEvent::SystemLog {
                     level: LogLevel::Warn,
                     message: format!(
@@ -8756,17 +11821,27 @@ impl SupervisorHandle {
                         final_state: closed_state,
                         fallback_reason,
                         detail: fallback_error,
+                        inferred_at_sequence,
                     },
                 ));
             }
         }
 
+        // Another caller's sweep (a Start, Restart or Delete on the command
+        // thread) must not wait behind this sweep's retirements, each of which
+        // can take up to the kill timeout. retire_session_run re-claims its
+        // exact generation/run with no operation under slots, so a duplicate
+        // decision by a concurrent sweep returns early.
+        drop(_sweep);
         for event in log_events {
-            self.emit(event);
+            if matches!(event, RuntimeEvent::SessionOutputDraining { .. }) { self.emit_run_event(event); }
+            else { self.emit(event); }
         }
         for (session_id, generation, run_id, cause) in retirements {
             self.retire_session_run(session_id, generation, run_id, cause);
         }
+        drop(_shutdown);
+        drop(probes);
     }
 
     #[cfg(test)]
@@ -8796,7 +11871,36 @@ impl SupervisorHandle {
         event_run_id: Uuid,
         event: PtyEvent,
     ) {
-        let _shutdown = self.inner.shutdown_lifecycle.lock();
+        if self.inner.startup_admission.is_trial() { return; }
+        let output_run = output_credit::OutputRun {
+            session_id, run_id: event_run_id, generation: event_generation,
+        };
+        // The producing PTY reader waits only up to MAX_ADMISSION_WAIT, never under
+        // supervisor/publisher locks or after allocating a run-event sequence.
+        // Observer-only chunks still classify and traverse the ordered native
+        // sanitizer; the desktop omits their payload with an explicit gap.
+        let reservation = if let PtyEvent::Output(chunk) = &event {
+            match self.inner.output_credit.reserve(output_run, chunk.len()) {
+                output_credit::Admission::Disabled | output_credit::Admission::ObserverOnly => None,
+                output_credit::Admission::Reserved(reservation) => Some(reservation),
+                output_credit::Admission::Cancelled => return,
+                output_credit::Admission::Oversized => {
+                    self.inner.output_credit.retire_run(output_run);
+                    self.emit(RuntimeEvent::SystemLog {
+                        level: LogLevel::Error,
+                        message: format!("{session_id}: output ingress exceeded the 16 KiB decoded-read ceiling; display admission held; stop the session"),
+                        timestamp: now_rfc3339(),
+                    });
+                    return;
+                }
+            }
+        } else {
+            // These are the reader's terminal events, emitted only after its
+            // decoder tail callback returned. A process watcher never sets EOF.
+            self.inner.output_credit.reader_closed(output_run);
+            None
+        };
+        let _shutdown = self.inner.shutdown_lifecycle.read();
         if self.inner.shutdown_started.load(Ordering::Acquire) {
             return;
         }
@@ -8851,6 +11955,7 @@ impl SupervisorHandle {
                             generation: event_generation,
                         };
                         slot.bracketed_paste.observe_output(binding, &chunk);
+                        slot.room_composer.observe(&chunk);
                         append_run_output_tail(&mut slot.run_output_tail, &chunk);
                         let codex_classification = (slot.definition.driver == DriverKind::Codex)
                             .then(|| slot.codex_work_state.observe_output(&chunk))
@@ -8885,7 +11990,7 @@ impl SupervisorHandle {
                             == DriverKind::Grok)
                             .then(|| classify_work_state_for_driver(DriverKind::Grok, &chunk))
                             .flatten();
-                        let classification = if spawn_is_unconfirmed {
+                        let classification = if spawn_is_unconfirmed || slot.output_draining {
                             None
                         } else if grok_startup_progress
                             == Some(driver_grok::StartupProgress::InteractiveReady)
@@ -8899,7 +12004,14 @@ impl SupervisorHandle {
                                     .then_some((WorkState::Idle, None))
                             })
                         } else {
-                            classify_work_state_for_driver(slot.definition.driver, &chunk)
+                            classify_work_state_for_driver(slot.definition.driver, &chunk).or_else(|| {
+                                // Until its first state, a startup question
+                                // split across chunks is read off the screen.
+                                (!slot.work_state_observed)
+                                    .then(|| screen_question(slot))
+                                    .flatten()
+                                    .map(|detail| (WorkState::Blocked, Some(detail)))
+                            })
                         };
                         if classification.is_some() {
                             slot.codex_work_state.acknowledge_pending();
@@ -8916,7 +12028,7 @@ impl SupervisorHandle {
                         if !spawn_is_unconfirmed && slot.grok_initial_idle_pending {
                             slot.grok_initial_idle_pending = false;
                         }
-                        let lifecycle_target = if spawn_is_unconfirmed {
+                        let lifecycle_target = if spawn_is_unconfirmed || slot.output_draining {
                             None
                         } else if slot.definition.driver == DriverKind::Grok
                             && slot.state == LifecycleState::Starting
@@ -8925,6 +12037,16 @@ impl SupervisorHandle {
                                 LifecycleState::Idle,
                                 "Grok completed its measured interactive startup repaint",
                             ))
+                        } else if matches!(slot.definition.driver, DriverKind::Claude | DriverKind::Codex)
+                            && matches!(slot.state, LifecycleState::Starting | LifecycleState::Stalled)
+                            && !slot.room_composer.drew_visible_text()
+                        {
+                            // A16: no sign of life until the run's own
+                            // viewport holds a drawn glyph. It parses the
+                            // stream, so read boundaries and the setup a new
+                            // pseudoconsole writes before its program runs
+                            // never count.
+                            None
                         } else if slot.state != LifecycleState::Ready {
                             Some((LifecycleState::Ready, "session emitted output"))
                         } else {
@@ -8935,6 +12057,7 @@ impl SupervisorHandle {
                             slot.last_activity_at = Some(now_rfc3339());
                         }
                         if !spawn_is_unconfirmed
+                            && !slot.output_draining
                             && has_real_content
                             && let Some(pty) = slot
                                 .running
@@ -8945,13 +12068,19 @@ impl SupervisorHandle {
                         }
 
                         let quiesce_arm = real_output_at
-                            .filter(|_| !spawn_is_unconfirmed)
+                            .filter(|_| !spawn_is_unconfirmed && !slot.output_draining)
                             .and_then(|armed_at| {
                                 slot.last_real_output_at = Some(armed_at);
-                                cancel_quiesce_timer_locked(slot);
-                                quiesce_threshold(slot.definition.driver).map(|threshold| {
-                                    (slot.generation, event_run_id, armed_at, threshold)
-                                })
+                                let worker_present =
+                                    slot.quiesce_timer.as_ref().is_some_and(|timer| {
+                                        timer.generation == slot.generation
+                                            && timer.run_id == event_run_id
+                                    });
+                                quiesce_threshold(slot.definition.driver)
+                                    .filter(|_| !worker_present)
+                                    .map(|threshold| {
+                                        (slot.generation, event_run_id, armed_at, threshold)
+                                    })
                             });
                         let lifecycle_transition = lifecycle_target.map(|(state, reason)| {
                             (
@@ -8984,7 +12113,14 @@ impl SupervisorHandle {
                 };
 
                 if let Some((generation, run_id, armed_at, threshold)) = quiesce_arm {
-                    self.arm_quiesce_timer(session_id, generation, run_id, armed_at, threshold);
+                    self.arm_quiesce_timer(
+                        &_shutdown,
+                        session_id,
+                        generation,
+                        run_id,
+                        armed_at,
+                        threshold,
+                    );
                 }
 
                 if let Some(event) = work_state_event {
@@ -8999,15 +12135,9 @@ impl SupervisorHandle {
                         reason,
                         timestamp: now_rfc3339(),
                     });
-                    if state == LifecycleState::Idle {
-                        self.deliver_pending_brief_if_due(
-                            session_id,
-                            event_generation,
-                            event_run_id,
-                        );
-                    }
                 }
 
+                if let Some(reservation) = reservation { reservation.publish(output_identity); }
                 self.emit_run_event(RuntimeEvent::SessionOutput {
                     identity: output_identity,
                     session: session_alias,
@@ -9048,7 +12178,16 @@ impl SupervisorHandle {
 
         let mut matches = Vec::new();
         let mut query_failed = false;
+        // A closing pane grants no authority, but its Job still rules out
+        // "outside every pane" for a descendant that outlives the shell.
+        let mut in_draining_pane = false;
         for (session_id, slot) in &slots.by_id {
+            if slot.output_draining {
+                if let Some(pty) = slot.running.as_ref().and_then(|running| running.pty.as_deref()) {
+                    in_draining_pane |= !matches!(process.belongs_to(pty), Ok(false));
+                }
+                continue;
+            }
             let Some(running) = slot.running.as_ref() else {
                 continue;
             };
@@ -9084,10 +12223,11 @@ impl SupervisorHandle {
             [(session, session_id, generation, run_id)] => {
                 Ok((session.clone(), *session_id, *generation, *run_id))
             }
-            [] => Err(anyhow!(
-                "sideband caller process {} is not owned by a live pane",
+            [] if in_draining_pane => Err(anyhow!(
+                "sideband caller process {} belongs to a pane that is closing",
                 process.pid()
             )),
+            [] => Err(anyhow::Error::new(OutsideEveryPane(process.pid()))),
             _ => Err(anyhow!(
                 "sideband caller process {} belongs to multiple live panes",
                 process.pid()
@@ -9119,6 +12259,7 @@ impl SupervisorHandle {
         let slots = self.inner.slots.lock();
         let mut matches = Vec::new();
         for (session_id, slot) in &slots.by_id {
+            if slot.output_draining { continue; }
             let Some(live) = slot
                 .running
                 .as_ref()
@@ -9159,6 +12300,7 @@ impl SupervisorHandle {
         if bound_slot.definition.alias != caller.session
             || bound_slot.generation != caller.generation
             || bound_slot.run_id != Some(caller.run_id)
+            || bound_slot.output_draining
         {
             return Err(anyhow!("sideband caller run is stale"));
         }
@@ -9225,9 +12367,47 @@ impl SupervisorHandle {
         caller: &PaneCaller,
         request: &SidebandRequest,
     ) -> Result<()> {
+        self.ensure_mutations_admitted()?;
+        if matches!(request, SidebandRequest::RoomRead { .. } | SidebandRequest::RoomDirectory {} | SidebandRequest::RoomWait { .. }
+            | SidebandRequest::RoomPost { .. } | SidebandRequest::RoomPostCard { .. } | SidebandRequest::RoomAck { .. } | SidebandRequest::RoomDeliver { .. }
+            | SidebandRequest::RoomDeliverTo { .. }) {
+            let rooms = self.inner.rooms.lock();
+            let slots = self.inner.slots.lock();
+            if let SidebandRequest::RoomDeliverTo { room_id, .. } = request {
+                Self::pane_delivery_room_locked(caller, &slots, &rooms, *room_id)?;
+            } else {
+                Self::pane_room_binding_locked(caller, &slots, &rooms)?;
+            }
+            return match request {
+                SidebandRequest::RoomPostCard { card, .. } => card.validate().map_err(anyhow::Error::msg),
+                SidebandRequest::RoomAck { next_action, decline, outcome_ref, .. } =>
+                    room_ack_fields(next_action.as_deref(), decline.as_deref(), outcome_ref.as_deref()).map(|_| ()),
+                SidebandRequest::RoomPost { content, .. }
+                | SidebandRequest::RoomDeliver { content, .. }
+                | SidebandRequest::RoomDeliverTo { content, .. } => validate_message_body(content),
+                _ => Ok(()),
+            };
+        }
+        // Size bounds first: measuring variables must not hold the slots lock.
+        if let SidebandRequest::Tasks { query, variables, operation_name } = request {
+            task_graphql::check_request(query, variables.as_ref(), operation_name.as_deref())
+                .map_err(anyhow::Error::msg)?;
+        }
+        // Ping, input and identity requests never wait for the room journal.
         let slots = self.inner.slots.lock();
         match request {
             SidebandRequest::Ping {} => Self::validate_pane_caller_locked(caller, &slots),
+            SidebandRequest::Doctor {} => Self::validate_pane_caller_locked(caller, &slots),
+            // A108: the operator's maintain grant, rechecked again at admission.
+            SidebandRequest::UpgradeRequest { .. } => Self::pane_maintain_locked(caller, &slots),
+            SidebandRequest::ReportIssue { summary } => {
+                Self::validate_pane_caller_locked(caller, &slots)?;
+                diagnostics::validate_summary(summary)
+            }
+            SidebandRequest::IdentifyCodex { thread_id } => {
+                Self::validate_codex_identity_caller_locked(caller, &slots)?;
+                session::canonical_thread_id(thread_id).map(|_| ())
+            }
             SidebandRequest::WaitQuiet {
                 name,
                 quiet_seconds,
@@ -9239,43 +12419,417 @@ impl SupervisorHandle {
             SidebandRequest::SendInput { name, .. } | SidebandRequest::SendKey { name, .. } => {
                 Self::validate_pane_target_locked(caller, name, &slots)
             }
-            SidebandRequest::RoomRead { .. } => {
-                let rooms = self.inner.rooms.lock();
-                Self::pane_room_binding_locked(caller, &slots, &rooms).map(|_| ())
-            }
-            SidebandRequest::RoomPost { content }
-            | SidebandRequest::RoomDeliver { content, .. } => {
-                let rooms = self.inner.rooms.lock();
-                Self::pane_room_binding_locked(caller, &slots, &rooms)?;
-                validate_message_body(content)
-            }
+            // The task folder is runtime-wide: a lobby pane may use it too.
+            SidebandRequest::Tasks { .. } => Self::validate_pane_caller_locked(caller, &slots),
+            // Any pane may learn its own grants; the roaming tools need roam.
+            SidebandRequest::MemberPermissions {} => Self::validate_pane_caller_locked(caller, &slots),
+            SidebandRequest::RoomsList {} | SidebandRequest::RoomPeek { .. }
+            | SidebandRequest::RoomJoin { .. } | SidebandRequest::RoomLeave {} => Self::pane_roam_locked(caller, &slots),
+            // A110: the action's room and target are checked by the action.
+            SidebandRequest::Member { .. } | SidebandRequest::MembersList {} | SidebandRequest::Room { .. }
+            | SidebandRequest::RoomFallbacks { .. } => Self::pane_manage_locked(caller, &slots),
+            // A16: settings need maintain, local conversations manage.
+            SidebandRequest::Runtime { action, .. } if action.needs_maintain() => Self::pane_maintain_locked(caller, &slots),
+            SidebandRequest::Runtime { .. } => Self::pane_manage_locked(caller, &slots),
+            // v3 W3: disposing for another recipient is the operator's alone.
+            SidebandRequest::RoomDispose { .. } => Err(anyhow!(
+                "disposing of a message for another recipient is an operator action; use room_ack for messages addressed to you")),
+            SidebandRequest::RoomCancel { .. } => Err(anyhow!("withdrawing a message is an operator action")),
+            SidebandRequest::RoomRead { .. } | SidebandRequest::RoomDirectory {} | SidebandRequest::RoomWait { .. } | SidebandRequest::RoomPost { .. }
+            | SidebandRequest::RoomPostCard { .. } | SidebandRequest::RoomAck { .. } | SidebandRequest::RoomDeliver { .. } | SidebandRequest::RoomDeliverTo { .. } =>
+                unreachable!("room authorization returned above"),
         }
     }
 
-    fn read_room_feed_from_pane(
+    /// Resolved program and shim prefix from this exact active run. This only
+    /// supplies argv provenance; callers still need current conversation proof
+    /// and their delivery/input guard. It never makes a native wake ready.
+    pub fn current_run_launch_program(
+        &self,
+        session_id: SessionId,
+        run_id: Uuid,
+        generation: SessionGeneration,
+    ) -> Result<(String, Vec<String>)> {
+        self.ensure_active()?;
+        let slots = self.inner.slots.lock();
+        let slot = slots.get_by_id(session_id).ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
+        if slot.running.is_none() || slot.run_id != Some(run_id) || slot.generation != generation {
+            bail!("launch program lookup refers to a stale or stopped run");
+        }
+        let record = slot.last_launch.as_ref().filter(|record| record.run_id == run_id && record.generation == generation)
+            .ok_or_else(|| anyhow!("this run has no recorded launch program"))?;
+        Ok((record.inputs.program.clone(), record.inputs.prefix_args.clone()))
+    }
+
+    /// S2 must obtain native-queue identity through this current-run gate,
+    /// never by reading a persisted resume ID. A shell report establishes
+    /// identity at one instant; freshness across /new is not yet proven.
+    pub fn codex_native_wake_identity(
+        &self,
+        session_id: SessionId,
+        run_id: Uuid,
+        generation: SessionGeneration,
+    ) -> Result<String> {
+        self.ensure_active()?;
+        let slots = self.inner.slots.lock();
+        let slot = slots
+            .get_by_id(session_id)
+            .ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
+        if slot.definition.driver != DriverKind::Codex {
+            return Err(anyhow!(
+                "native Codex wake requires an attached Codex session"
+            ));
+        }
+        if slot.running.is_none() || slot.run_id != Some(run_id) || slot.generation != generation {
+            return Err(anyhow!("native Codex wake run is unavailable or stale"));
+        }
+        let reason = slot.recovery.as_ref().map(|reference| reference.reason.clone())
+            .unwrap_or_else(|| "native Codex wake is held: current conversation freshness is unproven".into());
+        Err(anyhow!(reason))
+    }
+
+    /// Operator "Resume here" on a member copied from the live PRIM-1: the
+    /// operator confirms the live app no longer drives this conversation.
+    /// Only that hold is released; Codex still needs its exact root rollout.
+    pub fn resume_held_conversation(&self, session_id: SessionId) -> Result<SessionSnapshot> {
+        self.resume_held_conversation_checked(session_id, None)
+    }
+
+    /// `check`: a managing pane's member_start in mode resume_here (A16),
+    /// rechecked where the hold is released.
+    pub(crate) fn resume_held_conversation_checked(
+        &self, session_id: SessionId, check: Option<&member_lifecycle::ManageCheck<'_>>,
+    ) -> Result<SessionSnapshot> {
+        self.ensure_active()?;
+        self.ensure_not_upgrade_closing()?;
+        // Resume here is never a silent new start: any attempt revokes a
+        // minted Claude identity, also one refused below. A16: a member's
+        // attempt revokes only while the locks its grant was checked under
+        // are held; the grant is checked again where the hold is released.
+        match check {
+            Some(check) => {
+                let rooms = self.inner.rooms.lock();
+                let slots = self.inner.slots.lock();
+                check.check_target(&rooms, &slots, session_id)?;
+                self.inner.identity_tracker.revoke_minted_claude(session_id);
+            }
+            None => self.inner.identity_tracker.revoke_minted_claude(session_id),
+        }
+        let (driver, working_dir, held) = {
+            let slots = self.inner.slots.lock();
+            let slot = slots.get_by_id(session_id).ok_or_else(|| anyhow!("unknown session id '{session_id}'"))?;
+            if slot.running.is_some() {
+                return Err(anyhow!("stop this session before resuming its copied conversation here"));
+            }
+            let recovery = slot.recovery.as_ref()
+                .filter(|recovery| recovery.provenance == "room_import_in_use")
+                .ok_or_else(|| anyhow!("this session has no copied conversation waiting to resume"))?;
+            let held = recovery.original_id.clone().ok_or_else(|| anyhow!("the copied conversation has no ID to resume"))?;
+            (slot.definition.driver, slot.definition.working_dir.clone(), held)
+        };
+        if driver == DriverKind::Codex {
+            let root = session::codex_sessions_root()?;
+            session::verify_codex_rollout(&root, &held, &working_dir)
+                .context("the copied Codex conversation was not found for this folder")?;
+        }
+        let rooms = check.map(|_| self.inner.rooms.lock());
+        let mut slots = self.inner.slots.lock();
+        let mut catalog = self.inner.catalog.lock();
+        if let (Some(check), Some(rooms)) = (check, rooms.as_deref()) {
+            check.check_target(rooms, &slots, session_id)?;
+        }
+        let slot = slots.get_by_id(session_id).ok_or_else(|| anyhow!("session disappeared"))?;
+        let Some(previous) = slot.recovery.clone().filter(|recovery| recovery.provenance == "room_import_in_use"
+            && recovery.original_id.as_deref() == Some(held.as_str())) else {
+            return Err(anyhow!("the session changed while resuming; try again"));
+        };
+        if slot.running.is_some() { return Err(anyhow!("the session started while resuming; stop it first")); }
+        if slot.definition.driver != driver || slot.definition.working_dir != working_dir {
+            return Err(anyhow!("the session's folder changed while resuming; try again"));
+        }
+        // The same hold also marks a conversation another session in THIS
+        // runtime owns or holds (room_package settle): never release those.
+        let same = |id: &str| Uuid::parse_str(id).map(|id| id.to_string()).unwrap_or_else(|_| id.to_owned())
+            == Uuid::parse_str(&held).map(|id| id.to_string()).unwrap_or_else(|_| held.clone());
+        if let Some(owner) = slots.ordered_slots().into_iter().find(|other| other.session_id != session_id
+            && other.definition.driver == driver
+            && (other.harness_session_id.as_deref().is_some_and(same)
+                || other.recovery.as_ref().and_then(|r| r.original_id.as_deref()).is_some_and(same)
+                || other.recovery.as_ref().and_then(|r| r.reported_codex.as_ref())
+                    .is_some_and(|evidence| same(&evidence.thread_id)))) {
+            return Err(anyhow!("\"{}\" in this PRIM-1 also uses this conversation; choose Start fresh session instead",
+                owner.definition.label));
+        }
+        let mut recovery_history = slot.recovery_history.clone();
+        if !recovery_history.contains(&previous) { recovery_history.push(previous); }
+        let mut candidate = catalog.clone();
+        let row = candidate.sessions.iter_mut().find(|row| row.session_id == session_id)
+            .ok_or_else(|| anyhow!("session is missing from the catalog"))?;
+        row.harness_session_id = Some(held.clone());
+        row.recovery = None;
+        row.recovery_history = recovery_history.clone();
+        self.persist_catalog_candidate(&candidate)?;
+        let slot = slots.get_by_id_mut(session_id).expect("checked above");
+        slot.harness_session_id = Some(held.clone());
+        slot.recovery = None;
+        slot.recovery_history = recovery_history;
+        let snapshot = slot.snapshot();
+        *catalog = candidate;
+        // Sent under the catalog lock: the register sees changes in the
+        // order the catalog was written. A leaf lock and a channel send.
+        self.note_conversation_change(session_ledger::ConversationChange {
+            session_id,
+            harness: driver,
+            conversation_id: held,
+            reason: "resume_here",
+            via: "resume_here",
+            run_id: None,
+            pid: None,
+        });
+        drop(catalog);
+        drop(slots);
+        drop(rooms);
+        self.emit(RuntimeEvent::SystemLog { level: LogLevel::Info,
+            message: format!("{}: copied conversation released for Launch here", snapshot.label),
+            timestamp: now_rfc3339() });
+        Ok(snapshot)
+    }
+
+    /// The caller's current Codex run carries no identity hold and is bound
+    /// to `thread_id` (the follower or an earlier identify proved it).
+    fn codex_identity_already_proved_locked(caller: &PaneCaller, slots: &SessionRegistry, thread_id: &str) -> Option<String> {
+        Self::validate_pane_caller_locked(caller, slots).ok()?;
+        let slot = slots.get_by_id(caller.session_id)?;
+        let key = |id: &str| Uuid::parse_str(id.trim()).map(|id| id.to_string()).unwrap_or_else(|_| id.trim().to_owned());
+        (slot.definition.driver == DriverKind::Codex && slot.recovery.is_none()
+            && slot.harness_session_id.as_deref().is_some_and(|bound| key(bound) == key(thread_id)))
+            .then(|| "PRIM-1 has already proved this run's Codex conversation; nothing to record".into())
+    }
+
+    fn validate_codex_identity_caller_locked(
+        caller: &PaneCaller,
+        slots: &SessionRegistry,
+    ) -> Result<()> {
+        // This protects against accidental cross-run binding, not a malicious
+        // same-user process forging its environment or protocol messages. The
+        // supported helper reads its own ID; MCP exposes no identify(ID) tool.
+        Self::validate_pane_caller_locked(caller, slots)?;
+        if !matches!(&caller.identity, PaneCallerIdentity::Job(_)) {
+            return Err(anyhow!(
+                "Codex identify requires native process attestation; a pane secret alone is insufficient. \
+                 PRIM-1 follows a Codex conversation itself from its writer lock: if it has not proved yours, \
+                 say so in the room instead of retrying"
+            ));
+        }
+        let slot = slots
+            .get_by_id(caller.session_id)
+            .ok_or_else(|| anyhow!("Codex identify caller is unavailable"))?;
+        if slot.definition.driver != DriverKind::Codex {
+            return Err(anyhow!(
+                "Codex identify is only available to an attached Codex run"
+            ));
+        }
+        Ok(())
+    }
+
+    fn identify_codex_from_pane(
         &self,
         caller: &PaneCaller,
-        cursor: Option<shared_types::RoomFeedCursor>,
+        thread_id: &str,
+        sessions_root: &Path,
+    ) -> Result<String> {
+        self.ensure_active()?;
+        // A16 D2 (PC3, 20 Oct): on a PRIM-1 started by its launcher task a
+        // pane shell's processes are in no pane Job (audit 62), so the helper
+        // arrives with the run's pane secret only. When the follower has
+        // already bound this run to exactly the reported conversation there
+        // is nothing to record: answer that instead of refusing, writing and
+        // binding nothing.
+        if let Some(answer) = Self::codex_identity_already_proved_locked(caller, &self.inner.slots.lock(), thread_id) {
+            return Ok(answer);
+        }
+        let working_dir = {
+            let slots = self.inner.slots.lock();
+            Self::validate_codex_identity_caller_locked(caller, &slots)?;
+            slots
+                .get_by_id(caller.session_id)
+                .unwrap()
+                .definition
+                .working_dir
+                .clone()
+        };
+        let rollout_path = session::verify_codex_rollout(sessions_root, thread_id, &working_dir)?;
+        let mut slots = self.inner.slots.lock();
+        // The run may have stopped/restarted while its rollout was read.
+        Self::validate_codex_identity_caller_locked(caller, &slots)?;
+        let mut catalog = self.inner.catalog.lock();
+        if catalog.sessions.iter().any(|row| {
+            row.session_id != caller.session_id
+                && row.driver == DriverKind::Codex
+                && row.harness_session_id.as_deref() == Some(thread_id)
+        }) || slots.by_id.values().any(|slot| {
+            slot.session_id != caller.session_id
+                && slot.definition.driver == DriverKind::Codex
+                && slot.harness_session_id.as_deref() == Some(thread_id)
+        }) {
+            return Err(anyhow!(
+                "reported Codex ID is already bound to another PRIM-1 session"
+            ));
+        }
+        let slot = slots.get_by_id(caller.session_id).unwrap();
+        let recovery = RecoveryReference {
+            original_id: slot.recovery.as_ref().and_then(|reference| reference.original_id.clone())
+                .or_else(|| slot.harness_session_id.clone()),
+            provenance: "job_attested_codex_shell_report".into(),
+            reason: "Codex identity was reported by the current run and its root rollout checked. Conversation freshness after /new is unproven; resume and native wake remain unavailable.".into(),
+            reported_codex: Some(session::CodexIdentityEvidence {
+                thread_id: thread_id.into(),
+                run_id: caller.run_id,
+                generation: caller.generation,
+                rollout_path,
+                reported_at: now_rfc3339(),
+            }),
+        };
+        let mut recovery_history = slot.recovery_history.clone();
+        if let Some(previous) = slot.recovery.as_ref() {
+            let same_binding = previous.reported_codex.as_ref().is_some_and(|evidence|
+                evidence.thread_id == thread_id && evidence.run_id == caller.run_id
+                    && evidence.generation == caller.generation);
+            if !same_binding && !recovery_history.contains(previous) {
+                recovery_history.push(previous.clone());
+            }
+        }
+        let mut candidate = catalog.clone();
+        let row = candidate
+            .sessions
+            .iter_mut()
+            .find(|row| row.session_id == caller.session_id)
+            .ok_or_else(|| anyhow!("Codex identify caller is missing from the catalog"))?;
+        row.harness_session_id = Some(thread_id.into());
+        row.recovery = Some(recovery.clone());
+        row.recovery_history = recovery_history.clone();
+        self.persist_catalog_candidate(&candidate)?;
+        let slot = slots.get_by_id_mut(caller.session_id).unwrap();
+        slot.harness_session_id = Some(thread_id.into());
+        slot.recovery = Some(recovery);
+        slot.recovery_history = recovery_history;
+        let pid = slot.process_id;
+        *catalog = candidate;
+        // The report proves the thread, not why it became current. Sent
+        // under the catalog lock, in catalog write order.
+        self.note_conversation_change(session_ledger::ConversationChange {
+            session_id: caller.session_id,
+            harness: DriverKind::Codex,
+            conversation_id: thread_id.into(),
+            reason: "observed",
+            via: "codex_identify",
+            run_id: Some(caller.run_id),
+            pid,
+        });
+        drop(catalog);
+        drop(slots);
+        self.emit(RuntimeEvent::SystemLog {
+            level: LogLevel::Info,
+            message: format!("Codex identity report stored: session_id={} run_id={} generation={}; freshness remains unverified", caller.session_id, caller.run_id, caller.generation),
+            timestamp: now_rfc3339(),
+        });
+        Ok("Codex root identity report stored for this run. Resume and native wake remain held until conversation freshness is proven.".into())
+    }
+
+    fn codex_identity_sessions_root(&self) -> Result<PathBuf> {
+        #[cfg(test)]
+        if let Some(root) = self.inner.codex_identity_root_for_tests.lock().clone() {
+            return Ok(root);
+        }
+        session::codex_sessions_root()
+    }
+
+    fn read_room_feed_from_pane(
+        &self, caller: &PaneCaller, cursor: Option<shared_types::RoomFeedCursor>,
     ) -> Result<RoomFeedPage> {
-        let slots = self.inner.slots.lock();
-        let rooms = self.inner.rooms.lock();
-        let (room_id, floor) = Self::pane_room_binding_locked(caller, &slots, &rooms)?;
-        let room = rooms
-            .get(room_id)
-            .expect("validated pane room disappeared while room state was locked");
+        self.read_room_feed_from_pane_expecting(caller, cursor, None, None)
+    }
+
+    /// v3 W3: `expect_room` is the room a PRIM-1 pointer named. A pane that
+    /// has left it is refused with the room it is in now, instead of reading
+    /// another room; the message and its obligation stay where they were.
+    fn read_room_feed_from_pane_expecting(
+        &self, caller: &PaneCaller, cursor: Option<shared_types::RoomFeedCursor>, expect_room: Option<RoomId>,
+        owed_after: Option<shared_types::RoomFeedCursor>,
+    ) -> Result<RoomFeedPage> {
+        let _publish = self.inner.room_event_publish.lock();
+        let mut rooms = self.inner.rooms.lock();
+        let mut slots = self.inner.slots.lock();
+        let (mut room_id, mut floor) = Self::pane_room_binding_locked(caller, &slots, &rooms)?;
+        if let Some(expected) = expect_room.filter(|expected| *expected != room_id) {
+            bail!("scope unavailable: the pointer named room {expected}, but you are now in room {room_id}; \
+                its messages stay open there for the operator, and this read was not made");
+        }
+        if rooms.get(room_id).is_some_and(RoomRuntime::startup_sync_pending) {
+            drop(slots);
+            drop(rooms);
+            self.recover_room_startup_fence(room_id)?;
+            // A run can change while syncing, independently of publication.
+            rooms = self.inner.rooms.lock();
+            slots = self.inner.slots.lock();
+            (room_id, floor) = Self::pane_room_binding_locked(caller, &slots, &rooms)?;
+        }
+        let room = rooms.get_mut(room_id).expect("authenticated room is locked");
         let mut page = room.read(cursor, floor)?;
+        rooms::redact_submission_records(&mut page, Some(caller.session_id));
         page.members = Self::room_members_locked(room, &slots);
+        page.guests = self.room_guests(room_id);
+        // v3 W3: a bounded page of what the reader still owes comes back too,
+        // on every own read and with each message's current receipt, so a
+        // pointer leads straight to its messages (Reviewers ff1dd411, d68ddeea).
+        let next;
+        (page.retained, page.retained_receipts, next) = room.retained_for(caller.session_id, owed_after)?;
+        (page.retained_has_more, page.retained_next) = (next.is_some(), next);
+        drop(slots);
+        // Fetched means included in this response, not model acceptance.
+        // The page remains readable even if its single receipt-batch sync fails.
+        // A known poisoned writer cannot add Fetched evidence. Return the
+        // acknowledged page without repeated futile appends/error-log noise.
+        let receipts = if room.writer_needs_replay() { Ok(Vec::new()) } else {
+            room.record_fetched_page(&page, caller.session_id, caller.run_id, caller.generation)
+        };
+        let (events, receipt_failure) = match receipts {
+            Ok(events) => (events, None),
+            Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+        };
+        drop(rooms);
+        for feed_event in events {
+            self.resolve_upgrade_continuation_receipt(&feed_event);
+            self.emit(RuntimeEvent::RoomFeedEvent { feed_event });
+        }
+        if let Some(error) = receipt_failure {
+            self.notify_room_history_transition(room_id);
+            self.emit(RuntimeEvent::SystemLog {
+                level: LogLevel::Error,
+                message: format!("Room {room_id} fetched receipt was not confirmed: {error}; the acknowledged feed was returned; check room history status before another write"),
+                timestamp: now_rfc3339(),
+            });
+        }
         Ok(page)
     }
 
-    /// Deliver the canonical brief into one member's terminal — the operator's
-    /// Send with the brief as content. Runs on join, on the run's first idle,
-    /// and from the UI's "Brief now".
+    /// Explicit operator Brief now; launches and joins never use this PTY input path.
     pub fn brief_room_member(&self, request: BriefRoomMemberRequest) -> Result<RoomDeliveryResult> {
+        self.brief_room_member_as(request, None)
+    }
+
+    /// `by`: a managing pane's member_brief (A110). It is the sender (never
+    /// the operator), its request_id keys the post so a retry is not a second
+    /// brief, `content` replaces the room brief, and the delivery rechecks
+    /// its grant where the message commits.
+    fn brief_room_member_as(
+        &self, request: BriefRoomMemberRequest, by: Option<member_lifecycle::BriefBy<'_>>,
+    ) -> Result<RoomDeliveryResult> {
         self.ensure_active()?;
+        let caller = by.as_ref().and_then(|by| by.caller.pane());
         let spec = {
-            let slots = self.inner.slots.lock();
             let rooms = self.inner.rooms.lock();
+            let slots = self.inner.slots.lock();
             let room = rooms
                 .get(request.room_id)
                 .ok_or_else(|| anyhow!("unknown room id '{}'", request.room_id))?;
@@ -9292,253 +12846,161 @@ impl SupervisorHandle {
                 .find(|member| member.session_id == request.session_id)
                 .cloned()
                 .ok_or_else(|| anyhow!("unknown session id '{}'", request.session_id))?;
-            let content = render_room_brief(
-                &room.definition.label,
-                &members,
-                &you,
-                self.inner.pane_mcp_executable.as_deref(),
-                room.definition.brief_template.as_deref(),
-            );
-            RoomDeliverySpec {
+            if matches!(you.driver, DriverKind::GenericTerminal | DriverKind::Prime) {
+                return Err(anyhow!("Terminal and Prime panes are never briefed"));
+            }
+            let content = match by.as_ref().and_then(|by| by.content.clone()) {
+                Some(content) => content,
+                None => render_room_brief(
+                    &room.definition.label,
+                    &members,
+                    &you,
+                    Self::member_grants_locked(&slots, you.session_id),
+                    self.inner.pane_mcp_executable.as_deref(),
+                    room.definition.brief_template.as_deref(),
+                ),
+            };
+            let (sender, sender_label, request_id) = match (&by, by.as_ref().and_then(|by| by.caller.pane())) {
+                (Some(by), Some(pane)) => (
+                    RoomMessageSender::Session { session_id: pane.session_id },
+                    // A109/A110: a brief from another room says where it comes from.
+                    if rooms.room_by_session.get(&pane.session_id) == Some(&request.room_id) {
+                        Self::member_label_locked(&slots, pane)
+                    } else {
+                        Self::visiting_label_locked(&rooms, &slots, pane.session_id)
+                            .unwrap_or_else(|| pane.session.clone())
+                    },
+                    Some(by.request_id.clone()),
+                ),
+                // A16: the operator entry briefs under its own name.
+                (Some(by), None) => (by.caller.sender(), by.caller.label_locked(&slots), Some(by.request_id.clone())),
+                (None, _) => (RoomMessageSender::Operator {}, "operator".into(), None),
+            };
+            RoomDeliverySpec { guest_recipient_ids: Vec::new(),
+                fallback_origin: None,
                 room_id: request.room_id,
                 recipient_ids: vec![request.session_id],
                 membership_revision: room.definition.membership_revision,
-                room_label: room.definition.label.clone(),
-                sender: RoomMessageSender::Operator {},
-                sender_label: "operator".into(),
+                sender,
+                sender_label,
                 content,
+                request_id,
+                admission: if caller.is_some() { RoomDeliveryAdmission::Managing } else { RoomDeliveryAdmission::Member },
+                roam_required: false,
+                ack_requested: false,
             }
         };
-        let result = self.deliver_room_message_as(spec)?;
-        if result.failures.is_empty() {
-            {
-                let mut slots = self.inner.slots.lock();
-                if let Some(running) = slots
-                    .get_by_id_mut(request.session_id)
-                    .and_then(|slot| slot.running.as_mut())
-                {
-                    running.brief_attempts_left = 0;
-                }
-            }
-            self.mark_room_member_briefed(request.room_id, request.session_id);
-        }
-        Ok(result)
-    }
-
-    /// A delivered brief is recorded per membership: the member is never
-    /// automatically briefed again unless removed and re-added. A persistence
-    /// failure downgrades to a warning — the delivery itself succeeded.
-    fn mark_room_member_briefed(&self, room_id: RoomId, session_id: SessionId) {
-        let mut rooms = self.inner.rooms.lock();
-        let Some(room) = rooms.get(room_id) else {
-            return;
-        };
-        if room.definition.member_briefed(session_id) {
-            return;
-        }
-        let mut candidate = rooms.catalog.clone();
-        if let Some(persisted) = candidate
-            .rooms
-            .iter_mut()
-            .find(|room| room.room_id == room_id)
-        {
-            persisted.mark_member_briefed(session_id);
-        }
-        if let Err(error) = self.persist_room_catalog_candidate(&candidate) {
-            self.emit(RuntimeEvent::SystemLog {
-                level: LogLevel::Warn,
-                message: format!(
-                    "Room brief delivered but the briefed mark could not be persisted: {error}"
-                ),
-                timestamp: now_rfc3339(),
-            });
-            return;
-        }
-        if let Some(room) = rooms.get_mut(room_id) {
-            room.definition.mark_member_briefed(session_id);
-        }
-        rooms.catalog = candidate;
-    }
-
-    /// On join: brief every running member now; a refusal (harness not ready)
-    /// leaves attempts for the idle hook. Members that are not running are
-    /// briefed when their run starts and first idles.
-    fn schedule_room_briefs(&self, room_id: RoomId, member_ids: &[SessionId]) {
-        if !self.inner.room_brief_on_join {
-            return;
-        }
-        let briefed: HashSet<SessionId> = {
-            let rooms = self.inner.rooms.lock();
-            let Some(room) = rooms.get(room_id) else {
-                return;
-            };
-            if !room.definition.brief_on_join {
-                return;
-            }
-            room.definition
-                .briefed_member_ids
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .copied()
-                .collect()
-        };
-        for session_id in member_ids {
-            if briefed.contains(session_id) {
-                continue;
-            }
-            let running = {
-                let mut slots = self.inner.slots.lock();
-                match slots
-                    .get_by_id_mut(*session_id)
-                    .and_then(|slot| slot.running.as_mut())
-                {
-                    Some(running) => {
-                        running.brief_attempts_left = ROOM_BRIEF_MAX_ATTEMPTS;
-                        true
-                    }
-                    None => false,
-                }
-            };
-            if running {
-                self.spawn_room_brief(room_id, *session_id);
-            }
-        }
-    }
-
-    /// A run just went idle: if it still owes a brief, spend one attempt.
-    fn deliver_pending_brief_if_due(
-        &self,
-        session_id: SessionId,
-        generation: SessionGeneration,
-        run_id: Uuid,
-    ) {
-        if !self.inner.room_brief_on_join {
-            return;
-        }
-        let room_id = {
-            let mut slots = self.inner.slots.lock();
-            let Some(slot) = slots.get_by_id_mut(session_id) else {
-                return;
-            };
-            if slot.generation != generation
-                || slot.run_id != Some(run_id)
-                || slot.state != LifecycleState::Idle
-            {
-                return;
-            }
-            // The member's room — only if it briefs automatically and this
-            // member has never received the brief (once per membership).
-            let room_id = {
-                let rooms = self.inner.rooms.lock();
-                rooms
-                    .room_by_session
-                    .get(&session_id)
-                    .copied()
-                    .filter(|room_id| {
-                        rooms
-                            .get(*room_id)
-                            .map(|room| {
-                                room.definition.brief_on_join
-                                    && !room.definition.member_briefed(session_id)
-                            })
-                            .unwrap_or(false)
-                    })
-            };
-            let Some(running) = slot.running.as_mut() else {
-                return;
-            };
-            if running.brief_attempts_left == 0 {
-                return;
-            }
-            let Some(room_id) = room_id else {
-                running.brief_attempts_left = 0;
-                return;
-            };
-            running.brief_attempts_left -= 1;
-            room_id
-        };
-        self.spawn_room_brief(room_id, session_id);
-    }
-
-    fn spawn_room_brief(&self, room_id: RoomId, session_id: SessionId) {
-        let handle = self.clone();
-        let spawned = std::thread::Builder::new()
-            .name("prim1-room-brief".into())
-            .spawn(move || {
-                let label = handle
-                    .inner
-                    .slots
-                    .lock()
-                    .get_by_id(session_id)
-                    .map(|slot| slot.definition.label.clone())
-                    .unwrap_or_else(|| session_id.to_string());
-                let outcome = handle.brief_room_member(BriefRoomMemberRequest {
-                    room_id,
-                    session_id,
-                });
-                let failure = match outcome {
-                    Ok(result) if result.failures.is_empty() => None,
-                    Ok(result) => result.failures.first().map(|failure| failure.error.clone()),
-                    Err(error) => Some(error.to_string()),
-                };
-                if let Some(reason) = failure {
-                    handle.emit(RuntimeEvent::SystemLog {
-                        level: LogLevel::Warn,
-                        message: format!(
-                            "Room brief for {label} not delivered: {reason} — it is retried when the harness idles; or use Brief now"
-                        ),
-                        timestamp: now_rfc3339(),
-                    });
-                }
-            });
-        if let Err(error) = spawned {
-            self.emit(RuntimeEvent::SystemLog {
-                level: LogLevel::Warn,
-                message: format!("Room brief thread could not start: {error}"),
-                timestamp: now_rfc3339(),
-            });
-        }
+        self.deliver_room_message_as(spec, caller)
     }
 
     /// A pane's `room_deliver`: the operator's Send with the calling pane as
     /// sender. Recipient is a member session id, a member label, or `all`
-    /// (every other member); never the caller itself.
+    /// (every other member); never the caller itself. `room_id` (A109) names
+    /// another room for a pane the operator lets roam. Without `room_id`, a
+    /// recipient outside the caller's room is still reached when it is a
+    /// roaming member that delivered to the caller recently (a reply).
     fn deliver_room_message_from_pane(
         &self,
         caller: &PaneCaller,
+        room_id: Option<RoomId>,
         recipient: &str,
         content: String,
+        request_id: Option<String>,
     ) -> Result<RoomDeliveryResult> {
+        self.note_room_post_from(caller.session_id);
         validate_message_body(&content)?;
         let spec = {
-            let slots = self.inner.slots.lock();
             let rooms = self.inner.rooms.lock();
-            let (room_id, _floor) = Self::pane_room_binding_locked(caller, &slots, &rooms)?;
+            let slots = self.inner.slots.lock();
+            // An explicit room_id needs roam, also for the caller's own room;
+            // `roaming` says only whether the sender is visiting that room.
+            let roam_required = room_id.is_some();
+            let (room_id, roaming) = match room_id {
+                Some(target) => (target, Self::pane_delivery_room_locked(caller, &slots, &rooms, target)?),
+                None => (Self::pane_room_binding_locked(caller, &slots, &rooms)?.0, false),
+            };
             let room = rooms
                 .get(room_id)
                 .expect("validated pane room disappeared while room state was locked");
             // No member-count gate here: `resolve_pane_delivery_recipients`
             // names the exact reason when a solo pane has no one to reach.
-            let recipient_ids =
-                Self::resolve_pane_delivery_recipients(room, &slots, caller.session_id, recipient)?;
-            let sender_label = slots
-                .get_by_id(caller.session_id)
-                .map(|slot| slot.definition.label.clone())
-                .unwrap_or_else(|| caller.session.clone());
+            let mut guest_recipient_ids = Vec::new();
+            // v3 W5: a stored post under this request id wins before any label
+            // lookup, so a retry replays its guests even after a rename.
+            let stored_guests = request_id.as_deref().and_then(|id|
+                room.stored_guest_recipients(&RoomMessageSender::Session { session_id: caller.session_id }, id));
+            let (room_id, recipient_ids, admission) =
+                match Self::resolve_pane_delivery_recipients(room, &slots, caller.session_id, recipient) {
+                    Ok(recipient_ids) => (room_id, recipient_ids, if roaming {
+                        RoomDeliveryAdmission::Roaming
+                    } else {
+                        RoomDeliveryAdmission::Member
+                    }),
+                    Err(error) => {
+                        // A109: a name that matches no member of the caller's
+                        // own room may be a visitor it answers. Ambiguous,
+                        // self and other refusals stand; a room_id is never
+                        // an answer.
+                        let no_member = !roam_required && error.is::<room_mobility::NoRoomMemberNamed>();
+                        let reply = if no_member {
+                            Self::reply_visitor_locked(&rooms, &slots, caller.session_id, recipient)?
+                        } else { None };
+                        match reply {
+                            Some((visitor, visitor_room)) =>
+                                (visitor_room, vec![visitor], RoomDeliveryAdmission::Reply { visitor }),
+                            // v3 W5: a guest is addressed by its stored id and reads by
+                            // poll; it is never woken. A retry replays the stored
+                            // guests rather than resolving the label again.
+                            None if stored_guests.as_ref().is_some_and(|guests| !guests.is_empty())
+                                || self.room_has_guest_named(room_id, recipient) => {
+                                guest_recipient_ids = match stored_guests.clone().filter(|guests| !guests.is_empty()) {
+                                    Some(stored) => stored,
+                                    None => {
+                                        let (guest_id, label, addressed) = self.room_guest_named(room_id, recipient)
+                                            .ok_or_else(|| anyhow!("no guest named '{}' in this room", recipient.trim()))?;
+                                        if !addressed {
+                                            bail!("'{label}' is an outside agent (guest) whose client cannot receive addressed messages yet; ask it to update its PRIM-1 guest client, or use room_post");
+                                        }
+                                        vec![guest_id]
+                                    }
+                                };
+                                (room_id, Vec::new(), RoomDeliveryAdmission::Member)
+                            }
+                            None => match no_member.then(||
+                                Self::closed_reply_window_locked(&rooms, &slots, caller.session_id, recipient)).flatten() {
+                                Some(closed) => bail!("{error}; {closed}"),
+                                None => return Err(error),
+                            },
+                        }
+                    }
+                };
+            let sender_label = match admission {
+                // Managing is never resolved here; it is member_brief's own admission.
+                RoomDeliveryAdmission::Member | RoomDeliveryAdmission::Managing | RoomDeliveryAdmission::Continuation { .. } => Self::member_label_locked(&slots, caller),
+                // A109: the recipient sees where a message from outside its room comes from.
+                RoomDeliveryAdmission::Roaming | RoomDeliveryAdmission::Reply { .. } =>
+                    Self::visiting_label_locked(&rooms, &slots, caller.session_id)
+                        .unwrap_or_else(|| caller.session.clone()),
+            };
             RoomDeliverySpec {
+                fallback_origin: None,
                 room_id,
                 recipient_ids,
-                membership_revision: room.definition.membership_revision,
-                room_label: room.definition.label.clone(),
+                membership_revision: rooms.get(room_id)
+                    .expect("resolved delivery room is locked").definition.membership_revision,
                 sender: RoomMessageSender::Session {
                     session_id: caller.session_id,
                 },
                 sender_label,
                 content,
+                request_id,
+                admission,
+                roam_required,
+                ack_requested: true,
+                guest_recipient_ids,
             }
         };
-        self.deliver_room_message_as(spec)
+        self.deliver_room_message_as(spec, Some(caller))
     }
 
     fn resolve_pane_delivery_recipients(
@@ -9573,10 +13035,10 @@ impl SupervisorHandle {
                 ));
             }
             if !room.definition.member_ids.contains(&session_id) {
-                return Err(anyhow!(
+                return Err(room_mobility::NoRoomMemberNamed(format!(
                     "session '{session_id}' is not a member of room '{}'",
                     room.definition.room_id
-                ));
+                )).into());
             }
             return Ok(vec![session_id]);
         }
@@ -9591,12 +13053,19 @@ impl SupervisorHandle {
                 by_label.push(*member);
             }
         }
+        let names_sender = slots.get_by_id(sender_id)
+            .is_some_and(|slot| slot.definition.label.trim().eq_ignore_ascii_case(wanted));
         match by_label.as_slice() {
             [session_id] => Ok(vec![*session_id]),
-            [] => Err(anyhow!(
+            // The caller's own label names the caller, not someone absent.
+            [] if names_sender => Err(anyhow!(
                 "no other room member is labelled '{wanted}'; members: {}",
                 member_labels.join(", ")
             )),
+            [] => Err(room_mobility::NoRoomMemberNamed(format!(
+                "no other room member is labelled '{wanted}'; members: {}",
+                member_labels.join(", ")
+            )).into()),
             _ => Err(anyhow!(
                 "'{wanted}' names more than one room member; use a session id"
             )),
@@ -9618,39 +13087,101 @@ impl SupervisorHandle {
     }
 
     fn post_room_message_from_pane(
-        &self,
-        caller: &PaneCaller,
-        content: String,
+        &self, caller: &PaneCaller, content: String, request_id: Option<String>,
     ) -> Result<RoomPostResult> {
         validate_message_body(&content)?;
-        let _room_event_publish = self.inner.room_event_publish.lock();
-        let message_id = Uuid::new_v4();
-        let feed_event = {
+        self.note_room_post_from(caller.session_id);
+        let request_id = rooms::request_id(request_id)?;
+        let _publish = self.inner.room_event_publish.lock();
+        let room_id = {
+            let rooms = self.inner.rooms.lock();
             let slots = self.inner.slots.lock();
+            Self::pane_room_binding_locked(caller, &slots, &rooms)?.0
+        };
+        self.recover_room_writer(room_id)?;
+        let (feed_event, replayed) = {
             let mut rooms = self.inner.rooms.lock();
-            let (room_id, _floor) = Self::pane_room_binding_locked(caller, &slots, &rooms)?;
-            let room = rooms
-                .get_mut(room_id)
-                .expect("validated pane room disappeared while room state was locked");
-            let membership_revision = room.definition.membership_revision;
-            room.append(RoomFeedItem::Message {
-                message_id,
-                sender: RoomMessageSender::Session {
-                    session_id: caller.session_id,
-                },
-                content,
-                recipient_ids: Vec::new(),
-                membership_revision,
-            })?
+            let slots = self.inner.slots.lock();
+            let (room_id, _) = Self::pane_room_binding_locked(caller, &slots, &rooms)?;
+            drop(slots); // Never hold the session registry across disk sync.
+            let room = rooms.get_mut(room_id).expect("authenticated room is locked");
+            room.post(request_id.clone(), RoomMessageSender::Session { session_id: caller.session_id },
+                content, Vec::new(), room.definition.membership_revision)
+        }.map_err(|error| { self.notify_room_history_transition(room_id); error })?;
+        let RoomFeedItem::Message { message_id, .. } = &feed_event.item else { unreachable!() };
+        let result = RoomPostResult { room_id: feed_event.room_id, message_id: *message_id,
+            cursor: feed_event.cursor, request_id, replayed };
+        if !replayed {
+            #[cfg(test)]
+            self.run_room_event_after_append_hook_for_tests();
+            self.emit(RuntimeEvent::RoomFeedEvent { feed_event });
+        }
+        Ok(result)
+    }
+
+    /// v3 W3: the calling pane disposes of a room message addressed to it.
+    /// Actor and recipient are the authenticated pane; the message must be in
+    /// the pane's current room, addressed to it and inside its membership.
+    fn ack_room_message_from_pane(&self, caller: &PaneCaller, message_id: shared_types::MessageId,
+        next_action: Option<String>, decline: Option<String>, outcome_ref: Option<String>,
+        request_id: Option<String>) -> Result<shared_types::RoomAckResult> {
+        let (disposition, note) = room_ack_fields(next_action.as_deref(), decline.as_deref(), outcome_ref.as_deref())?;
+        let request_id = rooms::request_id(request_id)?;
+        let _publish = self.inner.room_event_publish.lock();
+        let room_id = {
+            let rooms = self.inner.rooms.lock();
+            let slots = self.inner.slots.lock();
+            Self::pane_room_binding_locked(caller, &slots, &rooms)?.0
         };
-        let result = RoomPostResult {
-            room_id: feed_event.room_id,
-            message_id,
-            cursor: feed_event.cursor,
+        self.recover_room_writer(room_id)?;
+        let (cursor, replayed) = {
+            let mut rooms = self.inner.rooms.lock();
+            let slots = self.inner.slots.lock();
+            let (current, _) = Self::pane_room_binding_locked(caller, &slots, &rooms)?;
+            anyhow::ensure!(current == room_id, "sideband caller changed rooms before the ack was stored");
+            drop(slots); // Never hold the session registry across disk sync.
+            // v3 W3: a message in a room this pane has left is never ACKed or
+            // read from here; its obligation stays open where it is.
+            if !rooms.get(room_id).is_some_and(|room| room.contains_message(message_id))
+                && let Some((elsewhere, _)) = rooms.by_id.iter().find(|(_, room)| room.contains_message(message_id)) {
+                bail!("scope unavailable: message {message_id} is in room {elsewhere}, which you are no longer in; \
+                    it stays open there for the operator to dispose of");
+            }
+            rooms.get_mut(room_id).expect("authenticated room is locked").record_ack(request_id.clone(), message_id,
+                caller.session_id, shared_types::RoomAckActor::Session { session_id: caller.session_id },
+                disposition, note, outcome_ref)
+        }.map_err(|error| { self.notify_room_history_transition(room_id); error })?;
+        if !replayed {
+            let feed_event = self.inner.rooms.lock().get(room_id).and_then(|room| room.event_at(cursor));
+            if let Some(feed_event) = feed_event { self.emit(RuntimeEvent::RoomFeedEvent { feed_event }); }
+        }
+        Ok(shared_types::RoomAckResult { request_id, replayed, room_id, message_id, cursor })
+    }
+
+    fn post_room_card_from_pane(&self, caller: &PaneCaller, card: shared_types::RoomCardContent,
+        request_id: Option<String>) -> Result<shared_types::RoomCardResult> {
+        card.validate().map_err(anyhow::Error::msg)?;
+        self.note_room_post_from(caller.session_id);
+        let request_id = rooms::request_id(request_id)?;
+        let _publish = self.inner.room_event_publish.lock();
+        let room_id = {
+            let rooms = self.inner.rooms.lock();
+            let slots = self.inner.slots.lock();
+            Self::pane_room_binding_locked(caller, &slots, &rooms)?.0
         };
-        #[cfg(test)]
-        self.run_room_event_after_append_hook_for_tests();
-        self.emit(RuntimeEvent::RoomFeedEvent { feed_event });
+        self.recover_room_writer(room_id)?;
+        let (feed_event, replayed) = {
+            let mut rooms = self.inner.rooms.lock();
+            let slots = self.inner.slots.lock();
+            let (room_id, _) = Self::pane_room_binding_locked(caller, &slots, &rooms)?;
+            drop(slots);
+            rooms.get_mut(room_id).expect("authenticated room is locked")
+                .post_card(request_id.clone(), caller.session_id, card)
+        }.map_err(|error| { self.notify_room_history_transition(room_id); error })?;
+        let RoomFeedItem::Card { card_id, .. } = &feed_event.item else { unreachable!() };
+        let result = shared_types::RoomCardResult { room_id: feed_event.room_id, card_id: *card_id,
+            cursor: feed_event.cursor, request_id, replayed };
+        if !replayed { self.emit(RuntimeEvent::RoomFeedEvent { feed_event }); }
         Ok(result)
     }
 
@@ -9775,6 +13306,60 @@ impl SupervisorHandle {
         }
     }
 
+    fn apply_room_feed_request(&self, caller: &PaneCaller, request: SidebandRequest) -> SidebandResponse {
+        match request {
+            SidebandRequest::RoomRead { cursor, expect_room, owed_after } => {
+                match self.read_room_feed_from_pane_expecting(caller, cursor, expect_room, owed_after) {
+                    Ok(page) => SidebandResponse {
+                        ok: true,
+                        message: "room feed read".into(),
+                        timed_out: false,
+                        payload: Some(SidebandResponsePayload::RoomFeed { page }),
+                        request_id: None,
+                    },
+                    Err(error) => Self::rejected_sideband_response(error.to_string()),
+                }
+            }
+            SidebandRequest::RoomDirectory {} => match self.room_directory_for_pane(caller) {
+                Ok(directory) => SidebandResponse { ok: true, message: "room directory read".into(), timed_out: false,
+                    payload: Some(SidebandResponsePayload::RoomDirectory { directory }), request_id: None },
+                Err(error) => Self::rejected_sideband_response(error.to_string()),
+            },
+            SidebandRequest::RoomPostCard { card, request_id } => {
+                match self.post_room_card_from_pane(caller, card, request_id) {
+                    Ok(result) => SidebandResponse { ok: true, message: "room card stored".into(),
+                        timed_out: false, payload: Some(SidebandResponsePayload::RoomCard { result }), request_id: None },
+                    Err(error) => Self::rejected_sideband_response(error.to_string()),
+                }
+            }
+            SidebandRequest::RoomAck { request_id, message_id, next_action, decline, outcome_ref } => {
+                match self.ack_room_message_from_pane(caller, message_id, next_action, decline, outcome_ref, request_id) {
+                    Ok(result) => SidebandResponse {
+                        ok: true,
+                        message: if result.replayed { "room ack already stored".into() } else { "room ack stored".into() },
+                        timed_out: false,
+                        payload: Some(SidebandResponsePayload::RoomAck { result }),
+                        request_id: None,
+                    },
+                    Err(error) => Self::rejected_sideband_response(error.to_string()),
+                }
+            }
+            SidebandRequest::RoomPost { content, request_id } => {
+                match self.post_room_message_from_pane(caller, content, request_id) {
+                    Ok(result) => SidebandResponse {
+                        ok: true,
+                        message: "room message stored".into(),
+                        timed_out: false,
+                        payload: Some(SidebandResponsePayload::RoomPost { result }),
+                        request_id: None,
+                    },
+                    Err(error) => Self::rejected_sideband_response(error.to_string()),
+                }
+            }
+            _ => Self::rejected_sideband_response("not a room feed request"),
+        }
+    }
+
     async fn apply_authorized_sideband_request(
         &self,
         caller: &PaneCaller,
@@ -9805,33 +13390,16 @@ impl SupervisorHandle {
                 self.send_pane_input(caller, &name, control_key_sequence(key))
                     .map(|_| format!("key {:?} sent", key)),
             ),
-            SidebandRequest::RoomRead { cursor } => {
-                match self.read_room_feed_from_pane(caller, cursor) {
-                    Ok(page) => SidebandResponse {
-                        ok: true,
-                        message: "room feed read".into(),
-                        timed_out: false,
-                        payload: Some(SidebandResponsePayload::RoomFeed { page }),
-                        request_id: None,
-                    },
-                    Err(error) => Self::rejected_sideband_response(error.to_string()),
-                }
+            SidebandRequest::RoomRead { .. } | SidebandRequest::RoomDirectory {} | SidebandRequest::RoomWait { .. } | SidebandRequest::RoomPost { .. }
+            | SidebandRequest::RoomPostCard { .. } | SidebandRequest::RoomAck { .. } | SidebandRequest::RoomDeliver { .. } | SidebandRequest::RoomDeliverTo { .. }
+            | SidebandRequest::RoomDispose { .. } | SidebandRequest::RoomCancel { .. }
+            | SidebandRequest::MemberPermissions {} | SidebandRequest::RoomsList {}
+            | SidebandRequest::RoomPeek { .. } | SidebandRequest::RoomJoin { .. } | SidebandRequest::RoomLeave {}
+            | SidebandRequest::Member { .. } | SidebandRequest::MembersList {} | SidebandRequest::Room { .. } | SidebandRequest::Runtime { .. } | SidebandRequest::RoomFallbacks { .. } | SidebandRequest::IdentifyCodex { .. }
+            | SidebandRequest::Doctor {} | SidebandRequest::ReportIssue { .. }
+            | SidebandRequest::UpgradeRequest { .. } | SidebandRequest::Tasks { .. } => {
+                Self::rejected_sideband_response("this request is dispatched on the blocking path")
             }
-            SidebandRequest::RoomPost { content } => {
-                match self.post_room_message_from_pane(caller, content) {
-                    Ok(result) => SidebandResponse {
-                        ok: true,
-                        message: "room message posted".into(),
-                        timed_out: false,
-                        payload: Some(SidebandResponsePayload::RoomPost { result }),
-                        request_id: None,
-                    },
-                    Err(error) => Self::rejected_sideband_response(error.to_string()),
-                }
-            }
-            SidebandRequest::RoomDeliver { .. } => Self::rejected_sideband_response(
-                "room_deliver is dispatched on the blocking delivery path",
-            ),
         }
     }
 
@@ -9888,7 +13456,8 @@ impl SupervisorHandle {
                         let cancel_pty = pty.clone();
                         let cancellation =
                             tokio::task::spawn_blocking(move || cancel_pty.cancel_input_write());
-                        match tokio::time::timeout(Duration::from_millis(250), cancellation).await {
+                        let cancel_budget = *self.inner.input_cancel_timeout.lock();
+                        match tokio::time::timeout(cancel_budget, cancellation).await {
                             Ok(Ok(Ok(()))) => {}
                             Ok(Ok(Err(error))) => {
                                 cancellation_failure =
@@ -9902,8 +13471,8 @@ impl SupervisorHandle {
                                 break;
                             }
                             Err(_) => {
-                                cancellation_failure =
-                                    Some("isolated input cancellation exceeded 250ms".into());
+                                cancellation_failure = Some(format!(
+                                    "isolated input cancellation exceeded {}ms", cancel_budget.as_millis()));
                                 break;
                             }
                         }
@@ -10040,64 +13609,142 @@ impl SupervisorHandle {
         caller: &PaneCaller,
         request: SidebandRequest,
     ) -> SidebandResponse {
+        if let SidebandRequest::RoomWait { cursor, timeout_ms } = request {
+            // A16: each read authorizes on a worker; no lock is held while it sleeps.
+            return self.pane_room_wait(caller, cursor, timeout_ms).await;
+        }
+        if matches!(request, SidebandRequest::RoomRead { .. } | SidebandRequest::RoomDirectory {} | SidebandRequest::RoomPost { .. }
+            | SidebandRequest::RoomPostCard { .. } | SidebandRequest::RoomAck { .. } | SidebandRequest::RoomDeliver { .. }
+            | SidebandRequest::RoomDeliverTo { .. }) {
+            // Even initial room authorization can wait behind journal sync.
+            // Authenticate after worker admission; each operation also checks
+            // the same caller's current run and membership before its effect.
+            let handle = self.clone();
+            let caller = caller.clone();
+            return match tokio::task::spawn_blocking(move || {
+                if let Err(error) = handle.authorize_sideband_request(&caller, &request) {
+                    return Self::rejected_sideband_response(error.to_string());
+                }
+                #[cfg(test)]
+                handle.run_sideband_after_initial_authorization_for_tests();
+                match request {
+                    SidebandRequest::RoomDeliver { recipient, content, request_id } => Self::room_delivery_response(
+                        handle.deliver_room_message_from_pane(&caller, None, &recipient, content, request_id)),
+                    SidebandRequest::RoomDeliverTo { room_id, recipient, content, request_id } => Self::room_delivery_response(
+                        handle.deliver_room_message_from_pane(&caller, Some(room_id), &recipient, content, request_id)),
+                    request => handle.apply_room_feed_request(&caller, request),
+                }
+            }).await {
+                Ok(response) => response,
+                Err(error) => Self::rejected_sideband_response(format!("room worker failed: {error}")),
+            };
+        }
+        if room_mobility::is_mobility_request(&request) {
+            // Membership moves write room journals: same worker pattern.
+            let handle = self.clone();
+            let caller = caller.clone();
+            return match tokio::task::spawn_blocking(move || handle.apply_mobility_request(&caller, request)).await {
+                Ok(response) => response,
+                Err(error) => Self::rejected_sideband_response(format!("room mobility worker failed: {error}")),
+            };
+        }
+        if matches!(request, SidebandRequest::UpgradeRequest { .. }) {
+            // Captures the running set and stages files: a blocking worker.
+            let handle = self.clone();
+            let caller = caller.clone();
+            return match tokio::task::spawn_blocking(move || handle.apply_upgrade_request(&caller, request)).await {
+                Ok(response) => response,
+                Err(error) => Self::rejected_sideband_response(format!("upgrade worker failed: {error}")),
+            };
+        }
+        if runtime_admin::is_runtime_request(&request) {
+            // A16: folder I/O, scans and catalog writes.
+            let handle = self.clone();
+            let caller = caller.clone();
+            return match tokio::task::spawn_blocking(move || handle.apply_runtime_request(&caller, request)).await {
+                Ok(response) => response,
+                Err(error) => Self::rejected_sideband_response(format!("runtime worker failed: {error}")),
+            };
+        }
+        if room_admin::is_room_request(&request) {
+            // A16: catalog and journal writes.
+            let handle = self.clone();
+            let caller = caller.clone();
+            return match tokio::task::spawn_blocking(move || handle.apply_room_request(&caller, request)).await {
+                Ok(response) => response,
+                Err(error) => Self::rejected_sideband_response(format!("room worker failed: {error}")),
+            };
+        }
+        if member_lifecycle::is_member_request(&request) {
+            // A110: catalog and journal writes and a bounded stop wait.
+            let handle = self.clone();
+            let caller = caller.clone();
+            return match tokio::task::spawn_blocking(move || handle.apply_member_request(&caller, request)).await {
+                Ok(response) => response,
+                Err(error) => Self::rejected_sideband_response(format!("member worker failed: {error}")),
+            };
+        }
+        if matches!(request, SidebandRequest::Tasks { .. }) {
+            // Same worker pattern as room requests: authorize after admission
+            // to the worker, then parse, read and write task files there.
+            let handle = self.clone();
+            let caller = caller.clone();
+            return match tokio::task::spawn_blocking(move || handle.apply_tasks_request(&caller, request)).await {
+                Ok(response) => response,
+                Err(error) => Self::rejected_sideband_response(format!("task worker failed: {error}")),
+            };
+        }
+        if matches!(request, SidebandRequest::RoomFallbacks { .. }) {
+            let handle = self.clone(); let caller = caller.clone();
+            return match tokio::task::spawn_blocking(move || handle.apply_room_fallback_request(&caller, request)).await {
+                Ok(response) => response,
+                Err(error) => Self::rejected_sideband_response(format!("fallback settings worker failed: {error}")),
+            };
+        }
         if let Err(error) = self.authorize_sideband_request(caller, &request) {
             return Self::rejected_sideband_response(error.to_string());
         }
 
         #[cfg(test)]
-        if let Some(hook) = self
-            .inner
-            .sideband_after_initial_authorization
-            .lock()
-            .take()
-        {
-            hook();
-        }
+        self.run_sideband_after_initial_authorization_for_tests();
 
-        if matches!(
-            request,
-            SidebandRequest::RoomRead { .. } | SidebandRequest::RoomPost { .. }
-        ) {
-            return self
-                .apply_authorized_sideband_request(caller, request)
-                .await;
+        if matches!(request, SidebandRequest::Doctor {} | SidebandRequest::ReportIssue { .. }) {
+            let handle = self.clone();
+            let caller = caller.clone();
+            return match tokio::task::spawn_blocking(move || handle.apply_maintenance_request(&caller, request)).await {
+                Ok(response) => response,
+                Err(error) => Self::rejected_sideband_response(format!("maintenance worker failed: {error}")),
+            };
         }
-        if let SidebandRequest::RoomDeliver { recipient, content } = request {
-            // Delivery writes PTYs with submit delays: keep it off the
-            // sideband's async thread, exactly as the desktop command does.
+        if let SidebandRequest::IdentifyCodex { thread_id } = request {
             let handle = self.clone();
             let caller = caller.clone();
             return match tokio::task::spawn_blocking(move || {
-                handle.deliver_room_message_from_pane(&caller, &recipient, content)
+                let sessions_root = handle.codex_identity_sessions_root()?;
+                handle.identify_codex_from_pane(&caller, &thread_id, &sessions_root)
             })
             .await
             {
-                Ok(Ok(result)) => SidebandResponse {
-                    ok: true,
-                    message: format!(
-                        "room delivery written for {} of {} recipients",
-                        result.written_count, result.recipient_count
-                    ),
-                    timed_out: false,
-                    payload: Some(SidebandResponsePayload::RoomDelivery { result }),
-                    request_id: None,
-                },
-                Ok(Err(error)) => Self::rejected_sideband_response(error.to_string()),
+                Ok(result) => Self::sideband_response(result),
                 Err(error) => Self::rejected_sideband_response(format!(
-                    "room delivery worker failed: {error}"
+                    "Codex identify worker failed: {error}"
                 )),
             };
         }
-
         let request_id = Uuid::new_v4().to_string();
         let action = match &request {
             SidebandRequest::Ping {} => "ping",
             SidebandRequest::WaitQuiet { .. } => "wait_quiet",
             SidebandRequest::SendInput { .. } => "send_input",
             SidebandRequest::SendKey { .. } => "send_key",
-            SidebandRequest::RoomRead { .. }
-            | SidebandRequest::RoomPost { .. }
-            | SidebandRequest::RoomDeliver { .. } => {
+            SidebandRequest::RoomRead { .. } | SidebandRequest::RoomDirectory {} | SidebandRequest::RoomWait { .. }
+            | SidebandRequest::RoomPost { .. } | SidebandRequest::RoomPostCard { .. } | SidebandRequest::RoomAck { .. }
+            | SidebandRequest::RoomDeliver { .. } | SidebandRequest::RoomDeliverTo { .. } | SidebandRequest::RoomDispose { .. } | SidebandRequest::RoomCancel { .. }
+            | SidebandRequest::MemberPermissions {} | SidebandRequest::RoomsList {}
+            | SidebandRequest::RoomPeek { .. } | SidebandRequest::RoomJoin { .. } | SidebandRequest::RoomLeave {}
+            | SidebandRequest::Doctor {} | SidebandRequest::ReportIssue { .. }
+            | SidebandRequest::UpgradeRequest { .. }
+            | SidebandRequest::Member { .. } | SidebandRequest::MembersList {} | SidebandRequest::Room { .. } | SidebandRequest::Runtime { .. } | SidebandRequest::RoomFallbacks { .. } | SidebandRequest::IdentifyCodex { .. } | SidebandRequest::Tasks { .. } => {
                 unreachable!("room sideband requests return before dispatch metadata")
             }
         };
@@ -10130,9 +13777,14 @@ impl SupervisorHandle {
                 self.apply_authorized_sideband_request(caller, request)
                     .await
             }
-            SidebandRequest::RoomRead { .. }
-            | SidebandRequest::RoomPost { .. }
-            | SidebandRequest::RoomDeliver { .. } => {
+            SidebandRequest::RoomRead { .. } | SidebandRequest::RoomDirectory {} | SidebandRequest::RoomWait { .. }
+            | SidebandRequest::RoomPost { .. } | SidebandRequest::RoomPostCard { .. } | SidebandRequest::RoomAck { .. }
+            | SidebandRequest::RoomDeliver { .. } | SidebandRequest::RoomDeliverTo { .. } | SidebandRequest::RoomDispose { .. } | SidebandRequest::RoomCancel { .. }
+            | SidebandRequest::MemberPermissions {} | SidebandRequest::RoomsList {}
+            | SidebandRequest::RoomPeek { .. } | SidebandRequest::RoomJoin { .. } | SidebandRequest::RoomLeave {}
+            | SidebandRequest::Doctor {} | SidebandRequest::ReportIssue { .. }
+            | SidebandRequest::UpgradeRequest { .. }
+            | SidebandRequest::Member { .. } | SidebandRequest::MembersList {} | SidebandRequest::Room { .. } | SidebandRequest::Runtime { .. } | SidebandRequest::RoomFallbacks { .. } | SidebandRequest::IdentifyCodex { .. } | SidebandRequest::Tasks { .. } => {
                 unreachable!("room sideband requests return before PTY dispatch")
             }
         };
@@ -10150,13 +13802,25 @@ impl SupervisorHandle {
             identity, state, ..
         } = &event
         else {
+            // A repeated state that revived an expired notice (Reviewer c428530b).
+            if let RuntimeEvent::SessionPresentationChanged { session_id, .. } = &event {
+                let is_current = self.inner.slots.lock().get_by_id(*session_id)
+                    .map(|slot| (slot.generation, slot.run_id)) == Some((generation, Some(run_id)));
+                if is_current {
+                    self.emit(event);
+                }
+                return;
+            }
             debug_assert!(false, "emit_run_work_state requires SessionWorkState");
             return;
         };
 
         #[cfg(test)]
-        if let Some(hook) = self.inner.work_state_before_side_effect.lock().take() {
-            hook();
+        {
+            let hook = self.inner.work_state_before_side_effect.lock().take();
+            if let Some(hook) = hook {
+                hook();
+            }
         }
 
         let is_current = self
@@ -10167,10 +13831,12 @@ impl SupervisorHandle {
             .map(|slot| (slot.generation, slot.run_id))
             == Some((generation, Some(run_id)));
         if is_current {
+            self.observe_recovery_work_state(identity.session_id, generation, run_id, identity.sequence, *state);
             self.handle_session_work_state_side_effects(
                 identity.session_id,
                 generation,
                 run_id,
+                identity.sequence,
                 *state,
             );
         }
@@ -10194,6 +13860,7 @@ impl SupervisorHandle {
     fn emit_run_event(&self, event: RuntimeEvent) {
         let identity = match &event {
             RuntimeEvent::SessionState { identity, .. }
+            | RuntimeEvent::SessionOutputDraining { identity, .. }
             | RuntimeEvent::SessionOutput { identity, .. }
             | RuntimeEvent::SessionExit { identity, .. }
             | RuntimeEvent::SessionWorkState { identity, .. } => *identity,
@@ -10211,6 +13878,7 @@ impl SupervisorHandle {
                     "run event for unknown or retired session stream {} sequence {} was dropped",
                     identity.session_id, identity.sequence
                 );
+                self.inner.output_credit.discard_published(identity);
                 return;
             };
             let Some(next_sequence) = stream.next_sequence else {
@@ -10218,6 +13886,7 @@ impl SupervisorHandle {
                     "run event stream {} is exhausted; dropping sequence {}",
                     identity.session_id, identity.sequence
                 );
+                self.inner.output_credit.discard_published(identity);
                 return;
             };
             if identity.sequence < next_sequence {
@@ -10225,6 +13894,7 @@ impl SupervisorHandle {
                     "duplicate run event for stream {}: sequence {} < next {}",
                     identity.session_id, identity.sequence, next_sequence
                 );
+                self.inner.output_credit.discard_published(identity);
                 return;
             }
             if stream.pending.insert(identity.sequence, event).is_some() {
@@ -10289,16 +13959,27 @@ impl SupervisorHandle {
             let next = self.inner.events_seq.fetch_add(1, Ordering::SeqCst) + 1;
             self.inner.events_watch.send_replace(next);
         }
+        if matches!(event, RuntimeEvent::RoomFeedEvent { .. } | RuntimeEvent::RoomDeleted { .. }
+            | RuntimeEvent::RoomHistoryChanged { .. } | RuntimeEvent::RoomGuestsChanged { .. }) {
+            self.inner.room_feed_watch.send_modify(|version| *version = version.wrapping_add(1));
+        }
 
         if let Some(sink) = self.inner.event_sink.read().as_ref() {
             sink(event);
+        } else if let RuntimeEvent::SessionOutput { identity, .. } = event {
+            self.inner.output_credit.discard_published(identity);
         }
     }
 }
 
 impl SupervisorHandle {
-    fn record_launch_prepare_failure(&self, session_id: SessionId, error: &anyhow::Error) {
+    fn record_launch_prepare_failure(&self, session_id: SessionId, error: &anyhow::Error,
+        reason: recovery_automation::StartReason<'_>) {
+        if error.downcast_ref::<session::RecoveryHold>().is_some() {
+            return;
+        }
         let mut slots = self.inner.slots.lock();
+        if matches!(reason, recovery_automation::StartReason::Crash(_)) && self.crash_effects_admitted().is_err() { return; }
         let Some(slot) = slots.get_by_id_mut(session_id) else {
             return;
         };
@@ -10307,6 +13988,84 @@ impl SupervisorHandle {
         }
         slot.state = LifecycleState::Failed;
         slot.last_error = Some(format!("{error:#}"));
+        // v3 W4 (Claude PRIM-1 60384b19 (b)): the reason is also kept in the
+        // audit log, so a launch refused before any process (an App Server
+        // socket path over its limit, for one) can be read after the fact.
+        // Written to the audit file only: a prepare failure stays free of
+        // runtime events (unresolved_driver_binary_is_zero_spawn_...).
+        let message = format!("{} did not start: {error:#}", session_alias(session_id));
+        drop(slots);
+        if let Err(error) = self.inner.audit.append(&RuntimeEvent::SystemLog { level: LogLevel::Error, message,
+            timestamp: now_rfc3339() }) {
+            eprintln!("audit log failure: {error}");
+        }
+    }
+
+    fn validate_room_brief_rendering(&self, room: &RoomRuntime, slots: &SessionRegistry) -> Result<()> {
+        if !room.definition.brief_on_join { return Ok(()); }
+        let members = Self::room_members_locked(room, slots);
+        for you in &members {
+            if matches!(you.driver, DriverKind::GenericTerminal | DriverKind::Prime) { continue; }
+            if !slots.get_by_id(you.session_id).is_some_and(|slot|
+                matches!(slot.launch_choices.brief, SessionBriefChoice::RoomDefault {})) { continue; }
+            let prompt = render_room_brief(&room.definition.label, &members, you,
+                Self::member_grants_locked(slots, you.session_id),
+                self.inner.pane_mcp_executable.as_deref(), room.definition.brief_template.as_deref());
+            session::validate_launch_prompt(&prompt)
+                .map_err(|error| anyhow!("room default cannot be used for the current members: {error}"))?;
+        }
+        Ok(())
+    }
+
+    /// Resolve the room default for a new conversation. A missing
+    /// room or disabled default means no prompt, never pending PTY input.
+    fn resolve_launch_brief(
+        &self,
+        session_id: SessionId,
+        choices: &SessionLaunchChoices,
+    ) -> Result<Option<String>> {
+        match &choices.brief {
+            SessionBriefChoice::None {} => Ok(None),
+            SessionBriefChoice::Custom { text } => Ok(Some(text.clone())),
+            SessionBriefChoice::RoomDefault {} => {
+                let rooms = self.inner.rooms.lock();
+                let slots = self.inner.slots.lock();
+                let Some(room) = rooms.room_by_session.get(&session_id)
+                    .and_then(|room_id| rooms.get(*room_id)) else {
+                    return Ok(None);
+                };
+                if !room.definition.brief_on_join {
+                    return Ok(None);
+                }
+                let members = Self::room_members_locked(room, &slots);
+                let you = members.iter().find(|member| member.session_id == session_id)
+                    .ok_or_else(|| anyhow!("launching member is missing from its room"))?;
+                let prompt = render_room_brief(
+                    &room.definition.label, &members, you,
+                    Self::member_grants_locked(&slots, session_id),
+                    self.inner.pane_mcp_executable.as_deref(),
+                    room.definition.brief_template.as_deref(),
+                );
+                session::validate_launch_prompt(&prompt)
+                    .map_err(|error| anyhow!("room default cannot be used for this launch: {error}"))?;
+                Ok(Some(prompt))
+            }
+        }
+    }
+
+    fn refresh_prepared_launch_brief(&self, session_id: SessionId, plan: &mut PreparedLaunch) -> Result<()> {
+        let prompt = if plan.resumes_conversation { None } else {
+            self.resolve_launch_brief(session_id, &plan.launch_choices)?
+                .map(|text| session::initial_prompt_argument(plan.driver, text)).transpose()?
+        };
+        if plan.has_initial_prompt {
+            plan.spec.args.truncate(plan.spec.args.len() - 2);
+        }
+        plan.has_initial_prompt = prompt.is_some();
+        if let Some(text) = prompt {
+            plan.spec.args.extend(["--".into(), text]);
+        }
+        Ok(())
     }
 
     fn prepare_launch_spec_for_spawn(
@@ -10315,16 +14074,18 @@ impl SupervisorHandle {
         qualified_directory: &QualifiedWorkingDirectory,
         fresh: bool,
         search: bool,
+        choices: &SessionLaunchChoices,
     ) -> Result<PreparedLaunch> {
         validate_driver_working_directory_pair(definition.driver, qualified_directory)?;
-        let harness_session = self.resolve_harness_launch_session(definition, fresh);
+        let harness_session = self.resolve_harness_launch_session(definition, fresh)?;
+        let mut codex_owner = None;
         let pty_size = self
             .inner
             .slots
             .lock()
             .get_by_id(definition.session_id)
             .and_then(|slot| slot.last_pty_size);
-        let (mut spec, wsl_scope) = if definition.driver == DriverKind::Prime {
+        let (mut spec, wsl_scope, resolved_program) = if definition.driver == DriverKind::Prime {
             self.ensure_wsl_reconciled()?;
             let (expected_device, expected_inode) =
                 parse_wsl_identity(&qualified_directory.identity)?;
@@ -10347,7 +14108,7 @@ impl SupervisorHandle {
                 expected_device,
                 expected_inode,
             )?;
-            (spec, Some(scope))
+            (spec, Some(scope), None)
         } else {
             let resolver = self.inner.executable_resolver.read();
             let resolved = if search {
@@ -10356,7 +14117,31 @@ impl SupervisorHandle {
                 resolver.resolve(definition.driver)?
             };
             drop(resolver);
-            (build_launch_spec(definition, &resolved, &harness_session)?, None)
+            if definition.driver == DriverKind::Codex
+                && definition.codex_transport == shared_types::CodexTransport::AppServer
+            {
+                // v3 W4: the terminal attaches to the member's own owner.
+                let socket = codex_app_server::OwnerSocket::for_launch(&self.inner.runtime_dir,
+                    definition.session_id, Uuid::new_v4())?;
+                let endpoint = socket.endpoint();
+                let spec = driver_codex::remote_launch_spec(definition, &resolved.program, &resolved.prefix_args,
+                    &harness_session, &endpoint)?;
+                let owner = driver_codex::app_server_owner_spec(definition, &resolved.program,
+                    &resolved.prefix_args, &endpoint)?;
+                codex_owner = Some(codex_app_server::OwnerPlan {
+                    socket,
+                    spec: owner,
+                    working_dir: definition.working_dir.clone(),
+                    expect: match &harness_session {
+                        HarnessLaunchSession::Resume { session_id } => codex_app_server::Expect::Resume(session_id.clone()),
+                        _ => codex_app_server::Expect::Fresh,
+                    },
+                    label: definition.label.clone(),
+                });
+                (spec, None, Some(resolved))
+            } else {
+                (build_launch_spec(definition, &resolved, &harness_session)?, None, Some(resolved))
+            }
         };
 
         // Prime is still excluded from the pane environment: its WSL launch
@@ -10378,6 +14163,7 @@ impl SupervisorHandle {
             });
         }
         let mut pane_secret = None;
+        let mut pane_mcp = None;
         if definition.driver != DriverKind::Prime
             && let Some(status) = self.inner.control_plane.read().clone()
         {
@@ -10425,14 +14211,36 @@ impl SupervisorHandle {
                         value: cli,
                     });
                     if let Some(client) = PaneMcpClient::for_driver(definition.driver) {
-                        augment_launch_spec_with_pane_mcp(&mut spec, client, executable)?;
+                        // v3 W4: an App Server member's tools run in its owner.
+                        let target = match codex_owner.as_mut() {
+                            Some(owner) => &mut owner.spec,
+                            None => &mut spec,
+                        };
+                        pane_mcp = Some(augment_launch_spec_with_pane_mcp(target, client, executable)?);
                     }
                 }
             }
         }
 
+        // v3 W4: the owner runs with the pane's whole environment (its MCP
+        // server presents the run's pane secret).
+        if let Some(owner) = codex_owner.as_mut() {
+            owner.spec.env = spec.env.clone();
+        }
+        let resumes_conversation = matches!(harness_session, HarnessLaunchSession::Resume { .. });
+        let prompt = if resumes_conversation { None } else {
+            self.resolve_launch_brief(definition.session_id, choices)?
+        };
+        let has_initial_prompt = prompt.is_some();
+        session::apply_launch_choices(&mut spec, definition.driver, choices, prompt)?;
+
+        let launch_inputs = resolved_program.as_ref().map(|resolved| launch_inputs(definition, resolved, choices, pane_mcp));
         Ok(PreparedLaunch {
             spec,
+            driver: definition.driver,
+            launch_choices: choices.clone(),
+            launch_inputs,
+            has_initial_prompt,
             wsl_scope,
             pane_secret,
             harness_session_id: match &harness_session {
@@ -10440,31 +14248,143 @@ impl SupervisorHandle {
                 | HarnessLaunchSession::Resume { session_id } => Some(session_id.clone()),
                 HarnessLaunchSession::Fresh => None,
             },
-            resumes_conversation: matches!(harness_session, HarnessLaunchSession::Resume { .. }),
+            resumes_conversation,
             pty_size,
+            version_probe: resolved_program.filter(|_| harness_version::tested_version(definition.driver).is_some()),
+            codex_owner,
         })
+    }
+
+    /// v3 W2: once a run is live, ask its exact launch program for its version
+    /// (off every lock; cached per executable identity), keep it on the run,
+    /// and say once in the member's room when it is not the tested version.
+    fn observe_harness_version(&self, session_id: SessionId, run_id: Uuid, resolved: ResolvedLaunchProgram) {
+        let handle = self.clone();
+        let spawned = std::thread::Builder::new().name("prim1-harness-version".into()).spawn(move || {
+            #[cfg(test)]
+            let observed = handle.inner.harness_version_for_tests.lock().clone();
+            #[cfg(not(test))]
+            let observed = handle.inner.harness_versions.observe(&resolved);
+            #[cfg(test)]
+            let _ = &resolved;
+            let notice = {
+                let mut slots = handle.inner.slots.lock();
+                let Some(slot) = slots.get_by_id_mut(session_id).filter(|slot| slot.run_id == Some(run_id)) else { return };
+                slot.harness_version = observed.clone();
+                // The launch record's effective settings carry only observations; this is one.
+                if let Some(launch) = slot.last_launch.as_mut().filter(|launch| launch.run_id == run_id) {
+                    launch.effective.harness_version = observed.clone();
+                }
+                harness_version::drift_notice(slot.definition.driver, &slot.definition.label, observed.as_deref())
+            };
+            if observed.is_some() { handle.persist_slot_harness_state(session_id); }
+            let Some(notice) = notice else { return };
+            handle.emit(RuntimeEvent::SystemLog { level: LogLevel::Warn, message: notice.clone(), timestamp: now_rfc3339() });
+            let room_id = handle.inner.rooms.lock().room_by_session.get(&session_id).copied();
+            if let Some(room_id) = room_id
+                && let Err(error) = handle.post_prim1_notice(room_id, notice, Some(format!("version-drift-{run_id}"))) {
+                handle.emit(RuntimeEvent::SystemLog { level: LogLevel::Warn,
+                    message: format!("version notice not stored: {error:#}"), timestamp: now_rfc3339() });
+            }
+        });
+        if let Err(error) = spawned {
+            self.emit(RuntimeEvent::SystemLog { level: LogLevel::Warn,
+                message: format!("{session_id}: harness version not observed: {error}"), timestamp: now_rfc3339() });
+        }
+    }
+
+    fn pane_mcp_launch_inputs(&self, driver: DriverKind) -> Result<Option<SessionPaneMcpInputs>> {
+        #[cfg(windows)]
+        if self.inner.control_plane.read().is_some()
+            && let Some(client) = PaneMcpClient::for_driver(driver)
+            && let Some(executable) = self.inner.pane_mcp_executable.as_deref()
+        {
+            let mut spec = LaunchSpec {
+                program: String::new(), args: Vec::new(), working_dir: String::new(),
+                env: Vec::new(), display_name: String::new(),
+            };
+            return augment_launch_spec_with_pane_mcp(&mut spec, client, executable).map(Some);
+        }
+        #[cfg(not(windows))]
+        let _ = driver;
+        Ok(None)
+    }
+
+    /// Only identity holds (never a duplicate, an in-use copy or a harness
+    /// refusal) are lifted, and only for one exact, verified conversation ID.
+    fn verified_codex_resume_id(driver: DriverKind, working_dir: &str, recovery: &RecoveryReference) -> Option<String> {
+        if driver != DriverKind::Codex
+            || !matches!(recovery.provenance.as_str(), "legacy_catalog" | "codex_launch" | "job_attested_codex_shell_report") {
+            return None;
+        }
+        let thread_id = recovery.reported_codex.as_ref().map(|evidence| evidence.thread_id.clone())
+            .or_else(|| recovery.original_id.clone())?;
+        let root = session::codex_sessions_root().ok()?;
+        session::verify_codex_rollout(&root, &thread_id, working_dir).ok()?;
+        Some(thread_id)
     }
 
     /// Launch = resume the stored conversation by default; `fresh` starts a
     /// new one. Claude and Grok pin a minted id when nothing is stored so the
-    /// NEXT launch can resume; Codex's id is captured from its rollout after
-    /// spawn; terminals and Prime have no conversation identity.
+    /// NEXT launch can resume; Codex needs a verified launch binding.
+    /// Terminals and Prime have no conversation identity.
     fn resolve_harness_launch_session(
         &self,
         definition: &SessionDefinition,
         fresh: bool,
-    ) -> HarnessLaunchSession {
+    ) -> Result<HarnessLaunchSession> {
         let stored = if fresh {
             None
         } else {
-            self.inner
-                .slots
-                .lock()
+            let slots = self.inner.slots.lock();
+            let slot = slots
                 .get_by_id(definition.session_id)
-                .and_then(|slot| slot.harness_session_id.clone())
+                .ok_or_else(|| anyhow!("unknown session id '{}'", definition.session_id))?;
+            if let Some(recovery) = slot.recovery.clone() {
+                let running = slot.running.is_some();
+                let working_dir = slot.definition.working_dir.clone();
+                let driver = slot.definition.driver;
+                drop(slots);
+                // A106: a Codex identity hold resumes its exact conversation
+                // once that ID's root CLI rollout is found for this folder.
+                // The rollout search runs outside the registry lock.
+                match Self::verified_codex_resume_id(driver, &working_dir, &recovery) {
+                    Some(thread_id) => Some(thread_id),
+                    None => return Err(recovery.hold(running).into()),
+                }
+            } else {
+                slot.harness_session_id.clone()
+            }
         };
-        match definition.driver {
-            DriverKind::Claude | DriverKind::Grok => match stored {
+        Ok(match definition.driver {
+            DriverKind::Claude => {
+                let stored_was_none = stored.is_none();
+                let control = &self.inner.identity_tracker;
+                let home = control.claude_home();
+                let minted = control.minted_claude(definition.session_id);
+                let mut found = false;
+                let launch = claude_launch_session(stored, minted.as_deref(), |id| {
+                    let lookup = match home.as_deref() {
+                        Some(home) => identity_tracker::claude_transcript_lookup(home, &definition.working_dir, id),
+                        None => identity_tracker::TranscriptLookup::Unknown,
+                    };
+                    found = lookup == identity_tracker::TranscriptLookup::Found;
+                    lookup
+                });
+                if found {
+                    control.revoke_minted_claude(definition.session_id);
+                }
+                // Only a brand-new id is recorded. A same-id new start is never
+                // re-recorded here: a revoke that raced this unlocked check must
+                // stand, and `settle_claude_new_start` re-checks at launch.
+                if let HarnessLaunchSession::New { session_id } = &launch
+                    && stored_was_none
+                {
+                    control.note_minted_claude(definition.session_id, session_id.clone());
+                }
+                launch
+            }
+            DriverKind::Grok => match stored {
                 Some(session_id) => HarnessLaunchSession::Resume { session_id },
                 None => HarnessLaunchSession::New {
                     session_id: Uuid::new_v4().to_string(),
@@ -10475,7 +14395,7 @@ impl SupervisorHandle {
                 None => HarnessLaunchSession::Fresh,
             },
             DriverKind::Prime | DriverKind::GenericTerminal => HarnessLaunchSession::Fresh,
-        }
+        })
     }
 
     fn deliver_prepared_payload(
@@ -10666,6 +14586,14 @@ fn prepare_control_plane_thread(
     })
 }
 
+/// v3 W4: the App Server transport is a Codex member's opt-in only.
+fn validate_codex_transport(driver: DriverKind, transport: shared_types::CodexTransport) -> Result<()> {
+    if transport == shared_types::CodexTransport::AppServer && driver != DriverKind::Codex {
+        bail!("the Codex App Server transport is for Codex members only");
+    }
+    Ok(())
+}
+
 fn build_launch_spec(
     definition: &SessionDefinition,
     resolved: &ResolvedLaunchProgram,
@@ -10703,6 +14631,24 @@ fn build_launch_spec(
     Ok(spec)
 }
 
+fn launch_inputs(
+    definition: &SessionDefinition,
+    resolved: &ResolvedLaunchProgram,
+    choices: &SessionLaunchChoices,
+    pane_mcp: Option<SessionPaneMcpInputs>,
+) -> SessionLaunchInputs {
+    SessionLaunchInputs {
+        driver: definition.driver,
+        program: resolved.program.clone(),
+        prefix_args: resolved.prefix_args.clone(),
+        working_dir: definition.working_dir.clone(),
+        permission_profile: definition.permission_profile,
+        model: choices.model.clone(),
+        effort: choices.effort.clone(),
+        pane_mcp,
+    }
+}
+
 #[cfg(windows)]
 fn validate_pane_mcp_executable(path: &Path) -> Result<()> {
     if !path.is_absolute() {
@@ -10727,7 +14673,7 @@ fn augment_launch_spec_with_pane_mcp(
     spec: &mut LaunchSpec,
     client: PaneMcpClient,
     pane_mcp_executable: &Path,
-) -> Result<()> {
+) -> Result<SessionPaneMcpInputs> {
     validate_pane_mcp_executable(pane_mcp_executable)?;
     let executable = child_process_path(pane_mcp_executable)
         .into_os_string()
@@ -10775,7 +14721,23 @@ fn augment_launch_spec_with_pane_mcp(
             ]);
         }
     }
-    Ok(())
+    Ok(SessionPaneMcpInputs {
+        server_name: PANE_MCP_SERVER_NAME.into(),
+        program: executable,
+        args: vec![PANE_MCP_MODE_ARGUMENT.into()],
+        environment_names: match client {
+            PaneMcpClient::Claude => Vec::new(),
+            PaneMcpClient::Codex => PANE_MCP_ENVIRONMENT_VARIABLES.iter().map(|name| (*name).into()).collect(),
+        },
+        allowed_tools: match client {
+            PaneMcpClient::Claude => PANE_MCP_CLAUDE_ALLOWED_TOOLS.iter().map(|tool| (*tool).into()).collect(),
+            PaneMcpClient::Codex => Vec::new(),
+        },
+        required: match client {
+            PaneMcpClient::Claude => None,
+            PaneMcpClient::Codex => Some(true),
+        },
+    })
 }
 
 #[cfg(test)]
@@ -10822,7 +14784,15 @@ fn reset_work_state_locked(slot: &mut SessionSlot) {
     cancel_stall_detector_locked(slot);
     slot.work_state = WorkState::Idle;
     slot.work_state_observed = false;
+    slot.work_state_before_exit = None;
+    slot.last_work_state_sequence = None;
     slot.work_detail = None;
+    slot.provider_error = None;
+    slot.rollout_turn_open = false;
+    slot.advisory_expired_at = None;
+    slot.hold_since = None;
+    slot.hold_alerted = false;
+    slot.last_room_post_at = None;
     slot.grok_initial_idle_pending = false;
     slot.work_error_observations.clear();
     slot.stall_state_entered_at = None;
@@ -10842,6 +14812,134 @@ fn classify_work_state_for_driver(
     }
 }
 
+/// A question on screen, not an error: repainting it is no error loop, and
+/// escalating would drop its plain message and the quiesce latch that keeps
+/// a typed message from answering it.
+fn is_open_question_detail(detail: &str) -> bool {
+    matches!(
+        detail,
+        "workspace_trust"
+            | "trust_prompt"
+            | "hooks_review"
+            | "bypass_permissions_warning"
+            | "approval_prompt"
+            | "plan_mode_prompt"
+            | "authentication"
+            | "update_prompt"
+            | "model_migration_prompt"
+            | "rate_limit_model_prompt"
+            | "consumer_terms_notice"
+            | "onboarding"
+            | "api_key_prompt"
+            | "mcp_server_approval"
+            | "external_imports_prompt"
+    )
+}
+
+/// The open question the member's screen shows, title and choices, as its
+/// driver's own classifier reads the composed screen
+/// (`RoomComposer::question_text`): a dialog split across output chunks, or
+/// painted before the spawn was confirmed, is one screen there; quiet under
+/// it is not idle. Notices never come from here.
+fn screen_question(slot: &SessionSlot) -> Option<String> {
+    // No classifier reads these screens.
+    if matches!(slot.definition.driver, DriverKind::Prime | DriverKind::GenericTerminal) {
+        return None;
+    }
+    let screen = slot.room_composer.question_text()?;
+    match classify_work_state_for_driver(slot.definition.driver, &screen) {
+        Some((WorkState::Blocked, Some(detail))) if is_open_question_detail(&detail) => Some(detail),
+        _ => None,
+    }
+}
+
+/// Claude and the drivers without a tracker of their own: their work state
+/// follows the output chunks, the quiesce timer and the composed screen.
+/// Codex's work-state tracker and Grok's startup tracker own theirs.
+fn work_state_follows_screen(driver: DriverKind) -> bool {
+    !matches!(driver, DriverKind::Codex | DriverKind::Grok)
+}
+
+/// What the member card and pane header say while a running member waits
+/// on a person: the operator line for a Blocked state or an error loop. The
+/// lifecycle state alone reads Ready or Idle under a question.
+fn blocked_reason(slot: &SessionSlot) -> Option<String> {
+    if slot.running.is_some() && let Some(code) = slot.provider_error.as_deref() {
+        let (reason, action) = describe_provider_error(code);
+        return Some(format!("{reason} (provider:{code}) — {action}"));
+    }
+    if slot.running.is_none()
+        || !slot.work_state_observed
+        || !matches!(slot.work_state, WorkState::Blocked | WorkState::ErrorLoop)
+    {
+        return None;
+    }
+    // v3 W2 #4 (Reviewer ded940b6): an expired advisory notice asserts no
+    // current blocker.
+    if expired_advisory_since(slot).is_some() {
+        return None;
+    }
+    let (reason, action) = describe_work_state_block(slot.work_state, slot.work_detail.as_deref());
+    Some(format!("{reason} — {action}"))
+}
+
+/// v3 W4 S5 (Reviewer 2542ee80): what the member's snapshot says it waits
+/// on. The existing reasons (a provider error, a blocker on its screen) keep
+/// their place; otherwise a person request its App Server was seen to open,
+/// or that is uncertain since a lost connection, is the reason, in the same
+/// words as the room's hold, so the row never reads Ready while delivery
+/// holds for it.
+fn snapshot_blocked_reason(slot: &SessionSlot) -> Option<String> {
+    blocked_reason(slot).or_else(|| {
+        let (request, followed) = slot.running.as_ref()?.app_server.as_ref()?.open_request()?;
+        Some(room_delivery::person_request_wait(&request, followed))
+    })
+}
+
+/// v3 J4: plain words for a structured provider error, by class. Never the
+/// provider's own message or banner words: another member's screen would read
+/// those back as a notice.
+fn describe_provider_error(code: &str) -> (String, &'static str) {
+    match code {
+        "unauthorized" => ("the provider no longer accepts its credentials (auth class)".into(),
+            "sign the harness in again in its terminal, then send again"),
+        "usage_limit_exceeded" => ("its plan's usage cap was reached (usage_cap class)".into(),
+            "wait for the cap to reset or change the account, then send again"),
+        "rate_limit_exceeded" => ("the provider is throttling it".into(), "wait a few minutes, then send again"),
+        "server_overloaded" | "flex_unavailable" => ("the provider is overloaded".into(),
+            "send again later; its terminal shows when a turn succeeds"),
+        "cyber_policy" | "bio_policy" | "misalignment_policy_violation" =>
+            ("the provider refused the last turn on policy grounds".into(),
+                "look at its terminal and rephrase the task there"),
+        "context_window_exceeded" => ("its context window is full".into(), "compact or restart it from its tab"),
+        _ => (format!("its last turn ended with a provider error ({code})"), "look at its terminal, then send again"),
+    }
+}
+
+/// v3 W2 #4: quiet this long after a Codex advisory notice, it is presented as
+/// an earlier notice (a UX bound, not a measured readiness threshold).
+const ADVISORY_NOTICE_EXPIRY: Duration = Duration::from_secs(30);
+/// v3 W2 #6: a hold is surfaced as "blocked but active" only after it has
+/// lasted this long, and only for activity after its first moments (a turn
+/// that was ending when the hold began is not activity).
+const BLOCKED_ACTIVE_AFTER: Duration = Duration::from_secs(60);
+const BLOCKED_ACTIVE_GRACE: Duration = Duration::from_secs(30);
+
+/// The wall time an advisory notice went quiet, while it is still the shown
+/// state and no fresh matched notice arrived since it expired.
+fn expired_advisory_since(slot: &SessionSlot) -> Option<&str> {
+    let (matches, since) = slot.advisory_expired_at.as_ref()?;
+    (slot.advisory_notice_matches == *matches && advisory_notice_shown(slot)).then_some(since.as_str())
+}
+
+/// A running Codex member whose observed state is an advisory notice (never a
+/// modal, an unknown detail or another driver).
+fn advisory_notice_shown(slot: &SessionSlot) -> bool {
+    slot.running.is_some() && slot.definition.driver == DriverKind::Codex && slot.work_state_observed
+        && matches!(slot.work_state, WorkState::Blocked | WorkState::ErrorLoop)
+        && slot.work_detail.as_deref().is_some_and(is_advisory_notice_detail)
+}
+
 fn transition_work_state_locked(
     session_name: &str,
     slot: &mut SessionSlot,
@@ -10855,6 +14953,7 @@ fn transition_work_state_locked(
                 key,
                 driver_grok::LAUNCHER_MENU_DETAIL | driver_grok::SESSION_STARTING_DETAIL
             )
+            && !is_open_question_detail(key)
         {
             let now = Instant::now();
             let observations = slot
@@ -10870,18 +14969,44 @@ fn transition_work_state_locked(
     } else if state != WorkState::ErrorLoop {
         slot.work_error_observations.clear();
     }
+    // v3 W2 #4: a fresh matched notice is a new incident, also when the state
+    // repeats; it makes an expired notice current again.
+    let was_expired = expired_advisory_since(slot).is_some();
+    if matches!(state, WorkState::Blocked | WorkState::ErrorLoop)
+        && detail.as_deref().is_some_and(is_advisory_notice_detail) {
+        slot.advisory_notice_matches = slot.advisory_notice_matches.wrapping_add(1);
+    }
+    // Claude prints the minimum-version notice and exits; the exit keeps it,
+    // since starting again only repeats the exit until Claude is updated.
+    let detail = if state == WorkState::Exited
+        && detail.is_none()
+        && slot.work_detail.as_deref() == Some("version_required")
+    {
+        slot.work_detail.clone()
+    } else {
+        detail
+    };
 
     if slot.work_state_observed && slot.work_state == state {
         slot.work_state_observed = true;
         slot.work_detail = detail;
-        return None;
+        // Reviewer c428530b: the state repeats, so no work-state event; the
+        // desktop still refreshes the card the expiry made an earlier notice.
+        return (was_expired && expired_advisory_since(slot).is_none()).then(|| {
+            RuntimeEvent::SessionPresentationChanged {
+                session_id: slot.definition.session_id, run_id, session: session_name.to_string(),
+                timestamp: now_rfc3339(),
+            }
+        });
     }
 
     let previous_state = slot.work_state_observed.then_some(slot.work_state);
+    slot.work_state_before_exit = (state == WorkState::Exited).then_some(previous_state).flatten();
     slot.work_state = state;
     slot.work_state_observed = true;
     slot.work_detail = detail.clone();
     let identity = next_run_event_identity(slot, run_id);
+    slot.last_work_state_sequence = Some(identity.sequence);
     Some(RuntimeEvent::SessionWorkState {
         identity,
         session: session_name.to_string(),
@@ -11096,6 +15221,26 @@ fn routed_message_header(scope: MessageScope, sender: &str) -> String {
     format!("[{} message from {}]", scope_label(scope), sender)
 }
 
+/// v3 W3: exactly one of `next_action` (received; what happens next) or
+/// `decline` (why not), as 1..=2048 bytes of text without control characters
+/// other than newlines; an outcome reference is one line of at most 256 bytes.
+fn room_ack_fields(next_action: Option<&str>, decline: Option<&str>, outcome_ref: Option<&str>)
+    -> Result<(shared_types::RoomAckDisposition, String)> {
+    let (disposition, note) = match (next_action, decline) {
+        (Some(note), None) => (shared_types::RoomAckDisposition::Acked, note),
+        (None, Some(note)) => (shared_types::RoomAckDisposition::Declined, note),
+        _ => bail!("give exactly one of next_action (you received the message: what you do next) or decline (why not)"),
+    };
+    let note = note.trim();
+    anyhow::ensure!(!note.is_empty() && note.len() <= 2048, "the ack note must be 1 to 2048 bytes");
+    anyhow::ensure!(!note.chars().any(|ch| ch.is_control() && ch != '\n'), "the ack note may not contain control characters");
+    if let Some(outcome) = outcome_ref {
+        anyhow::ensure!(!outcome.trim().is_empty() && outcome.len() <= 256 && !outcome.chars().any(char::is_control),
+            "outcome_ref must be one line of 1 to 256 bytes");
+    }
+    Ok((disposition, note.to_string()))
+}
+
 fn validate_message_body(content: &str) -> Result<()> {
     if content.len() > MESSAGE_BODY_MAX_BYTES {
         return Err(anyhow!(
@@ -11117,7 +15262,7 @@ fn validate_message_body(content: &str) -> Result<()> {
 }
 
 fn bounded_room_delivery_error(error: &str) -> String {
-    const MAX_CHARS: usize = 4096;
+    const MAX_CHARS: usize = room_log::MAX_RECEIPT_ERROR_CHARS - 1;
     let mut chars = error.chars();
     let bounded = chars.by_ref().take(MAX_CHARS).collect::<String>();
     if chars.next().is_some() {
@@ -11450,30 +15595,121 @@ async fn handle_windows_sideband_connection(
 ) -> Result<()> {
     // Kernel identity first. A caller the Job cannot attribute is not refused
     // yet: it may open with the pane secret from its environment.
-    let job_caller = match pane_process_from_windows_pipe(&server)
-        .and_then(|process| handle.resolve_pane_caller(process))
-    {
-        Ok(caller) => Some(caller),
+    let process = pane_process_from_windows_pipe(&server);
+    let client = windows_pipe_client_session(&server);
+    let resolved = match &process {
+        Ok(process) => handle.resolve_pane_caller(process.clone()),
+        Err(error) => Err(anyhow!("{error:#}")),
+    };
+    let attributed = match resolved {
+        Ok(caller) => {
+            // The audit line names the caller as for any other verdict.
+            let pid = process.as_ref().map_or(0, |process| process.pid());
+            let started = process.as_ref().ok().and_then(|process| process.creation_time());
+            let trace = format!("{}: pane '{}' by its Job",
+                pane_ancestry::describe_process(pid, client.map(|(_, session)| session), started), caller.session);
+            pane_ancestry::Attributed { attribution: JobAttribution::Pane(caller), trace }
+        }
         Err(error) => {
             eprintln!(
-                "sideband client is outside every pane job; awaiting a pane secret: {error:#}"
+                "sideband client is in no verified pane job; awaiting a pane secret: {error:#}"
             );
-            None
+            // Only a proven outsider may present a guest token or use the
+            // operator entry; a failed or ambiguous Job query may still be a
+            // pane, unless the client is in another session. A16: one that no
+            // pane's Job claims is walked up its parent chain first.
+            let session = client.map(|(_, session)| session);
+            match (attribution_without_job(&error, client, windows_pipe_server_session(&server)), &process) {
+                (JobAttribution::Outside(_), Ok(process)) if error.is::<OutsideEveryPane>() =>
+                    handle.attribute_unclaimed(process.as_ref(), session, &pane_ancestry::WindowsAncestry),
+                (JobAttribution::Outside(pid), _) => pane_ancestry::Attributed {
+                    attribution: JobAttribution::Outside(pid),
+                    trace: format!("{}: not readable here, and in another session than PRIM-1's",
+                        pane_ancestry::describe_process(pid, session, None)),
+                },
+                (attribution, _) => pane_ancestry::Attributed { attribution,
+                    trace: format!("{}: {error:#}", pane_ancestry::describe_process(
+                        client.map_or(0, |(pid, _)| pid), session, None)) },
+            }
         }
     };
 
-    handle_sideband_stream(handle, job_caller, server).await
+    handle_sideband_stream(handle, attributed, server).await
+}
+
+/// A16 (Runtime Operator, PC3 20 Oct 11:26Z): PRIM-1 runs at medium
+/// integrity and cannot open an elevated client (an SSH session runs
+/// elevated in session 0), so the Job query fails for it. Every pane process
+/// descends from PRIM-1 and stays in PRIM-1's session, so a client in
+/// another session is outside every pane Job all the same. A same-session
+/// client whose Job cannot be read stays unproven.
+fn attribution_without_job(error: &anyhow::Error, client: Option<(u32, u32)>, server_session: Option<u32>) -> JobAttribution {
+    if let Some(OutsideEveryPane(pid)) = error.downcast_ref::<OutsideEveryPane>() {
+        return JobAttribution::Outside(*pid);
+    }
+    match (client, server_session) {
+        (Some((pid, session)), Some(server)) if session != server => JobAttribution::Outside(pid),
+        _ => JobAttribution::Unknown,
+    }
+}
+
+/// The client's process id and session id, read from the pipe without
+/// opening the process.
+#[cfg(windows)]
+fn windows_pipe_client_session(server: &tokio::net::windows::named_pipe::NamedPipeServer) -> Option<(u32, u32)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::{Foundation::HANDLE, System::Pipes::{GetNamedPipeClientProcessId, GetNamedPipeClientSessionId}};
+    let pipe = server.as_raw_handle() as HANDLE;
+    let (mut pid, mut session) = (0_u32, 0_u32);
+    let read = unsafe { GetNamedPipeClientProcessId(pipe, &mut pid) != 0 && GetNamedPipeClientSessionId(pipe, &mut session) != 0 };
+    read.then_some((pid, session))
+}
+
+#[cfg(windows)]
+fn windows_pipe_server_session(server: &tokio::net::windows::named_pipe::NamedPipeServer) -> Option<u32> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::{Foundation::HANDLE, System::Pipes::GetNamedPipeServerSessionId};
+    let mut session = 0_u32;
+    (unsafe { GetNamedPipeServerSessionId(server.as_raw_handle() as HANDLE, &mut session) } != 0).then_some(session)
+}
+
+/// The caller's process is proven to belong to no live pane's Job.
+#[derive(Debug)]
+struct OutsideEveryPane(u32);
+
+impl std::fmt::Display for OutsideEveryPane {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "sideband caller process {} is not owned by a live pane", self.0)
+    }
+}
+
+impl std::error::Error for OutsideEveryPane {}
+
+/// What the kernel says about a pipe client. Only `Outside` may be a guest;
+/// `Unknown` (a failed or ambiguous Job query) may still be a pane.
+enum JobAttribution {
+    Pane(PaneCaller),
+    /// Proven outside every pane Job: the client process id.
+    Outside(u32),
+    Unknown,
 }
 
 async fn handle_sideband_stream<Stream>(
     handle: SupervisorHandle,
-    job_caller: Option<PaneCaller>,
+    attribution: impl Into<pane_ancestry::Attributed>,
     stream: Stream,
 ) -> Result<()>
 where
     Stream: tokio::io::AsyncRead + AsyncWrite + Unpin,
 {
     const ACCESS_DENIED: &str = "sideband access denied";
+    let pane_ancestry::Attributed { attribution, trace } = attribution.into();
+    let (job_caller, outside_pid) = match attribution {
+        JobAttribution::Pane(caller) => (Some(caller), None),
+        JobAttribution::Outside(pid) => (None, Some(pid)),
+        JobAttribution::Unknown => (None, None),
+    };
+    let outside_proven = outside_pid.is_some();
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
     let first = read_sideband_frame(
@@ -11482,6 +15718,79 @@ where
         SIDEBAND_FRAME_READ_TIMEOUT,
     )
     .await?;
+    // A16: the operator entry, for a local process of this Windows user (the
+    // pipe's ACL) proven outside every pane Job. A pane keeps to its grants.
+    if let Some(preamble) = control_plane::decode_operator_preamble(&first) {
+        let frame = read_sideband_frame(
+            &mut reader,
+            SIDEBAND_FRAME_MAX_BYTES,
+            SIDEBAND_FRAME_READ_TIMEOUT,
+        )
+        .await?;
+        handle.audit_admission("operator entry", job_caller.is_none() && outside_pid.is_some(), &trace);
+        let response = match (&job_caller, outside_pid, decode_request(&frame)) {
+            (Some(caller), _, _) => {
+                eprintln!("refused the operator entry from pane '{}'", caller.session);
+                SupervisorHandle::rejected_sideband_response(operator_entry::OPERATOR_FROM_PANE_REFUSAL)
+            }
+            (None, None, _) => SupervisorHandle::rejected_sideband_response(
+                "PRIM-1 could not confirm that this process runs outside its panes, so the operator entry was refused. Try again from a shell that PRIM-1 did not start."),
+            (None, Some(pid), Ok(request)) => {
+                let local = member_lifecycle::LocalOperator::new(preamble.operator.actor.as_deref(), pid);
+                handle.apply_operator_request_async(local, request).await
+            }
+            (None, Some(_), Err(error)) => SupervisorHandle::rejected_sideband_response(
+                format!("invalid operator request: {error:#}")),
+        };
+        let payload = format!("{}\n", encode_response(&response)?);
+        write_sideband_response(
+            &mut write_half,
+            payload.as_bytes(),
+            SIDEBAND_RESPONSE_WRITE_TIMEOUT,
+        )
+        .await?;
+        return Ok(());
+    }
+    // An outside agent sends only guest requests and gets only guest
+    // responses. A pane is never one: a guest token presented from inside a
+    // pane Job (a shared MCP config) would let room A's members reach room B.
+    if let Some(guest) = control_plane::decode_guest_preamble(&first) {
+        let frame = read_sideband_frame(
+            &mut reader,
+            SIDEBAND_FRAME_MAX_BYTES,
+            SIDEBAND_FRAME_READ_TIMEOUT,
+        )
+        .await?;
+        let refusal = |message: String| shared_types::GuestResponse { retry_after_secs: None,
+            ok: false,
+            message,
+            timed_out: false,
+            payload: None,
+        };
+        handle.audit_admission("guest connection", job_caller.is_none() && outside_proven, &trace);
+        let response = match (&job_caller, control_plane::decode_guest_request(&frame)) {
+            (Some(caller), _) => {
+                eprintln!("refused a guest token from pane '{}'", caller.session);
+                refusal(GUEST_FROM_PANE_REFUSAL.into())
+            }
+            (None, _) if !outside_proven => refusal(
+                "PRIM-1 could not confirm that this process runs outside its panes, so the guest token was not accepted. Try again; if it keeps failing, start the outside app outside PRIM-1.".into()),
+            (None, Ok(request)) => {
+                handle
+                    .apply_guest_request_async(&guest.guest_token, &guest.capabilities, request)
+                    .await
+            }
+            (None, Err(error)) => refusal(format!("invalid guest request: {error:#}")),
+        };
+        let payload = format!("{}\n", control_plane::encode_guest_response(&response)?);
+        write_sideband_response(
+            &mut write_half,
+            payload.as_bytes(),
+            SIDEBAND_RESPONSE_WRITE_TIMEOUT,
+        )
+        .await?;
+        return Ok(());
+    }
     // An optional preamble line carries the pane secret; the request follows.
     // Kernel identity always wins over a presented secret.
     let (caller, frame) = match control_plane::decode_preamble(&first) {
@@ -11595,9 +15904,212 @@ where
     .map_err(|_| anyhow!("sideband request timed out before newline"))?
 }
 
+/// D2 (PC3, 19 Oct): a Claude member restarted before it ever received a
+/// message has a minted id but no transcript, and `--resume` of it exits "No
+/// conversation found". Only an id PRIM-1 minted for this member in this run,
+/// with a definitely absent transcript, launches as new with the same id (the
+/// binding stays stable). Any other stored id, a found transcript or an
+/// uncertain lookup resumes, so an attached or historical conversation is never
+/// silently restarted (Codex BF review of c3cc132).
+fn claude_launch_session(
+    stored: Option<String>,
+    minted: Option<&str>,
+    lookup: impl FnOnce(&str) -> identity_tracker::TranscriptLookup,
+) -> HarnessLaunchSession {
+    match stored {
+        Some(session_id)
+            if minted == Some(session_id.as_str())
+                && lookup(&session_id) == identity_tracker::TranscriptLookup::Absent =>
+        {
+            HarnessLaunchSession::New { session_id }
+        }
+        Some(session_id) => HarnessLaunchSession::Resume { session_id },
+        None => HarnessLaunchSession::New { session_id: Uuid::new_v4().to_string() },
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn claude_same_id_new_start_is_refused_when_used_between_selection_and_launch() {
+        use identity_tracker::TranscriptLookup;
+        let supervisor = test_supervisor();
+        let (pty, _, _) =
+            mock_pty_session_with_exit_status(Some(u32::MAX), None, MockKillBehavior::Immediate);
+        install_mock_running_session_with_process_id(&supervisor, "claude", DriverKind::Claude, Some(u32::MAX), pty);
+        let session_id = test_session_id(&supervisor, "claude");
+        let home = tempfile::tempdir().unwrap();
+        let id = "0f1c7f0e-5a52-4b8e-9d3e-2f6a1b9c8d70".to_string();
+        let control = &supervisor.inner.identity_tracker;
+        control.set_claude_home(Some(home.path().to_path_buf()));
+        control.note_minted_claude(session_id, id.clone());
+        supervisor.inner.slots.lock().get_by_id_mut(session_id).unwrap().harness_session_id = Some(id.clone());
+        let (definition, directory) = {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id(session_id).unwrap();
+            (slot.definition.clone(), slot.qualified_working_directory.clone().unwrap())
+        };
+        let choices = SessionLaunchChoices::default();
+        // Selection: minted, never used, transcript definitely absent -> same-id new start.
+        assert_eq!(identity_tracker::claude_transcript_lookup(home.path(), &definition.working_dir, &id), TranscriptLookup::Absent);
+        let plan = supervisor.prepare_launch_spec_for_spawn(&definition, &directory, false, false, &choices).unwrap();
+        assert!(!plan.resumes_conversation && plan.harness_session_id.as_deref() == Some(id.as_str()));
+        assert!(supervisor.settle_claude_new_start(session_id, &plan).is_ok(), "unused: the plan stands");
+        // Barrier: a queued line is submitted to the old run after selection, before stop and spawn.
+        supervisor.send_input(SendInputRequest { session_id, input: "hello\r".into() }).unwrap();
+        let refused = supervisor.settle_claude_new_start(session_id, &plan).unwrap_err();
+        assert!(format!("{refused:#}").contains("used while it was restarting"), "{refused:#}");
+        // A later selection cannot restore it.
+        let again = supervisor.prepare_launch_spec_for_spawn(&definition, &directory, false, false, &choices).unwrap();
+        assert!(again.resumes_conversation, "a used conversation resumes");
+        assert_eq!(control.minted_claude(session_id), None);
+    }
+
+    #[test]
+    fn claude_refused_room_submission_keeps_new_start_eligibility() {
+        let supervisor = test_supervisor();
+        let claude = test_session_id(&supervisor, "claude");
+        let (pty, inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_bracketed_paste_enabled(&supervisor, "claude", DriverKind::Claude, pty);
+        let home = tempfile::tempdir().unwrap();
+        let id = "0f1c7f0e-5a52-4b8e-9d3e-2f6a1b9c8d70".to_string();
+        let control = &supervisor.inner.identity_tracker;
+        control.set_claude_home(Some(home.path().to_path_buf()));
+        control.note_minted_claude(claude, id.clone());
+        supervisor.inner.slots.lock().get_by_id_mut(claude).unwrap().harness_session_id = Some(id.clone());
+        let target = {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id(claude).unwrap();
+            run_write_target_from_slot(&slot.definition.alias, slot).unwrap()
+        };
+        let behavior = routed_message_submit_behavior(DriverKind::Claude);
+        let refuse: &dyn Fn() -> Result<()> = &|| Err(anyhow!("room check refused this delivery"));
+        let refused = supervisor.write_bracketed_submission_checked(&target, "hello", behavior, Some(refuse));
+        assert!(refused.is_err());
+        assert!(inputs.lock().is_empty(), "a refused room delivery writes nothing");
+        assert_eq!(control.minted_claude(claude).as_deref(), Some(id.as_str()), "nothing written, nothing used");
+        let (definition, directory) = {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id(claude).unwrap();
+            (slot.definition.clone(), slot.qualified_working_directory.clone().unwrap())
+        };
+        let plan = supervisor.prepare_launch_spec_for_spawn(&definition, &directory, false, false, &SessionLaunchChoices::default()).unwrap();
+        assert!(!plan.resumes_conversation && plan.harness_session_id.as_deref() == Some(id.as_str()),
+            "the never-used member still starts as new with the same id");
+        // A delivery the check admits is written and does revoke.
+        let admit: &dyn Fn() -> Result<()> = &|| Ok(());
+        supervisor.write_bracketed_submission_checked(&target, "hello", behavior, Some(admit)).unwrap();
+        assert!(!inputs.lock().is_empty());
+        assert_eq!(control.minted_claude(claude), None);
+    }
+
+    #[test]
+    fn claude_launch_with_an_initial_prompt_uses_its_conversation_at_spawn() {
+        use identity_tracker::TranscriptLookup::Absent;
+        let supervisor = test_supervisor();
+        let claude = test_session_id(&supervisor, "claude");
+        let (pty, _) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_bracketed_paste_enabled(&supervisor, "claude", DriverKind::Claude, pty);
+        supervisor.create_room(CreateRoomRequest {
+            label: Some("Brief room".into()), member_ids: vec![claude],
+            brief_on_join: true, brief_template: Some("First for {your_label}".into()),
+        }).unwrap();
+        let (definition, directory) = {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id(claude).unwrap();
+            (slot.definition.clone(), slot.qualified_working_directory.clone().unwrap())
+        };
+        let choices = SessionLaunchChoices::default();
+        // Fresh: a brand-new minted id, launched with the room brief as its first turn.
+        let mut plan = supervisor.prepare_launch_spec_for_spawn(&definition, &directory, true, false, &choices).unwrap();
+        supervisor.refresh_prepared_launch_brief(claude, &mut plan).unwrap();
+        let id = plan.harness_session_id.clone().unwrap();
+        assert!(plan.has_initial_prompt);
+        let control = &supervisor.inner.identity_tracker;
+        assert_eq!(control.minted_claude(claude).as_deref(), Some(id.as_str()));
+        supervisor.settle_claude_new_start(claude, &plan).unwrap();
+        assert_eq!(control.minted_claude(claude), None, "an argv first turn is use");
+        // If that transcript later goes missing, the id resumes and fails visibly.
+        assert!(matches!(claude_launch_session(Some(id.clone()), control.minted_claude(claude).as_deref(), |_| Absent),
+            HarnessLaunchSession::Resume { session_id } if session_id == id));
+    }
+
+    #[test]
+    fn claude_new_start_eligibility_is_revoked_by_input_and_never_restored() {
+        use identity_tracker::TranscriptLookup::Absent;
+        let supervisor = test_supervisor();
+        let (pty, _, _) =
+            mock_pty_session_with_exit_status(Some(u32::MAX), None, MockKillBehavior::Immediate);
+        install_mock_running_session_with_process_id(&supervisor, "claude", DriverKind::Claude, Some(u32::MAX), pty);
+        let session_id = test_session_id(&supervisor, "claude");
+        let id = "0f1c7f0e-5a52-4b8e-9d3e-2f6a1b9c8d70".to_string();
+        let control = &supervisor.inner.identity_tracker;
+        control.note_minted_claude(session_id, id.clone());
+        assert_eq!(control.minted_claude(session_id).as_deref(), Some(id.as_str()));
+        // The terminal's replies to Claude's startup queries are not use.
+        supervisor.send_input(SendInputRequest { session_id, input: "\u{1b}[?1;2c\u{1b}[12;1R".into() }).unwrap();
+        assert_eq!(control.minted_claude(session_id).as_deref(), Some(id.as_str()), "a terminal reply is not use");
+        // Used: a line was submitted to the run.
+        supervisor.send_input(SendInputRequest { session_id, input: "hello\r".into() }).unwrap();
+        assert_eq!(control.minted_claude(session_id), None, "a submitted line is evidence of use");
+        // Its transcript then going missing does not restore eligibility: it resumes and fails visibly.
+        assert!(matches!(claude_launch_session(Some(id.clone()), control.minted_claude(session_id).as_deref(), |_| Absent),
+            HarnessLaunchSession::Resume { session_id } if session_id == id));
+        // Input reaching a different conversation (an old run) does not revoke a fresh minted id.
+        control.note_minted_claude(session_id, id.clone());
+        supervisor.inner.slots.lock().get_by_id_mut(session_id).unwrap().harness_session_id =
+            Some("11111111-2222-4333-8444-555555555555".into());
+        supervisor.send_input(SendInputRequest { session_id, input: "old run line\r".into() }).unwrap();
+        assert_eq!(control.minted_claude(session_id).as_deref(), Some(id.as_str()), "only the minted conversation's use revokes");
+        // Resume here revokes too, even without input.
+        let _ = supervisor.resume_held_conversation(session_id);
+        assert_eq!(control.minted_claude(session_id), None, "Resume here is never a silent new start");
+    }
+
+    #[test]
+    fn claude_launch_session_restarts_only_a_minted_never_written_id_as_new() {
+        use identity_tracker::TranscriptLookup::{Absent, Found, Unknown};
+        let id = "0f1c7f0e-5a52-4b8e-9d3e-2f6a1b9c8d70".to_string();
+        let new_same = |launch: HarnessLaunchSession| matches!(launch, HarnessLaunchSession::New { session_id } if session_id == id);
+        let resume = |launch: HarnessLaunchSession| matches!(launch, HarnessLaunchSession::Resume { session_id } if session_id == id);
+        // Minted this run and definitely never written: start it, same id.
+        assert!(new_same(claude_launch_session(Some(id.clone()), Some(&id), |_| Absent)));
+        // Written, or not provably absent: resume.
+        assert!(resume(claude_launch_session(Some(id.clone()), Some(&id), |_| Found)));
+        assert!(resume(claude_launch_session(Some(id.clone()), Some(&id), |_| Unknown)));
+        // A historical or attached id (not minted this run, or a different minted id) whose
+        // transcript is missing still resumes and fails visibly; it is never silently restarted.
+        assert!(resume(claude_launch_session(Some(id.clone()), None, |_| Absent)));
+        assert!(resume(claude_launch_session(Some(id.clone()), Some("11111111-2222-4333-8444-555555555555"), |_| Absent)));
+        // Nothing stored: a fresh minted id.
+        assert!(matches!(claude_launch_session(None, None, |_| unreachable!()),
+            HarnessLaunchSession::New { session_id } if Uuid::parse_str(&session_id).is_ok()));
+    }
+
     use super::*;
+    include!("liveness_probe_tests.rs");
+    include!("launch_review_tests.rs");
+    include!("room_recovery_tests.rs");
+    include!("room_receipt_evidence_tests.rs");
+    include!("room_review_tests.rs");
+    include!("room_lock_tests.rs");
+    include!("room_card_auth_tests.rs");
+    include!("room_delivery_queue_tests.rs");
+    include!("room_ack_tests.rs");
+    include!("room_submit_tests.rs");
+    include!("room_app_server_tests.rs");
+    include!("room_fallbacks_tests.rs");
+    include!("room_guests_tests.rs");
+    include!("room_mobility_tests.rs");
+    include!("session_ledger_flow_tests.rs");
+    include!("identity_tracker_tests.rs");
+    include!("upgrade_flow_tests.rs");
+    include!("recovery_automation_tests.rs");
+    include!("member_lifecycle_tests.rs");
+    include!("member_parity_tests.rs");
+    include!("operator_entry_tests.rs");
+    include!("feed_wait_tests.rs");
+    include!("pane_ancestry_tests.rs");
     use control_plane::{decode_response, encode_request};
     use parking_lot::Condvar;
     use pty_host::PtySession as PtySessionTrait;
@@ -11747,6 +16259,7 @@ mod tests {
         cancel_count: Arc<AtomicUsize>,
         kill_count: Arc<AtomicUsize>,
         first_write_error_bytes: usize,
+        agent_exited: Option<Arc<AtomicBool>>,
     }
 
     struct DelayedCancelPtySession {
@@ -11815,7 +16328,9 @@ mod tests {
         }
 
         fn agent_alive(&self, _driver: DriverKind) -> Result<AgentLiveness> {
-            Ok(AgentLiveness::Alive(Vec::new()))
+            Ok(if self.agent_exited.as_ref().is_some_and(|ended| ended.load(Ordering::SeqCst)) {
+                AgentLiveness::Exited { last_agent_pids: Vec::new(), live_processes: Vec::new() }
+            } else { AgentLiveness::Alive(Vec::new()) })
         }
     }
 
@@ -12205,6 +16720,99 @@ mod tests {
         error_message: String,
     }
 
+    struct FirstWriteFailsPtySession {
+        first: AtomicBool,
+        inner: Box<dyn PtySessionTrait>,
+    }
+
+    // Room contract tests use a measured Grok layout and an explicit mock
+    // echo. Labels such as "claude" remain identity labels, not driver proof.
+    // This wrapper is not evidence that a real harness accepts the wake.
+    struct RoomWakeEchoPty {
+        inner: Box<dyn PtySessionTrait>,
+        supervisor: Weak<SupervisorInner>,
+        session_id: SessionId,
+        after_paste: Option<String>,
+    }
+
+    fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !condition() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn room_empty_fixture() -> String {
+        serde_json::from_str(include_str!("../../driver-grok/src/fixtures/grok-startup-fullscreen-v105.json")).unwrap()
+    }
+
+    impl PtySessionTrait for RoomWakeEchoPty {
+        fn send_input(&self, input: &str) -> pty_host::PtyWriteResult {
+            let written = self.inner.send_input(input)?;
+            if written == input.len() {
+                if let Some(supervisor) = self.supervisor.upgrade() {
+                    let mut slots = supervisor.slots.lock();
+                    let slot = slots.get_by_id_mut(self.session_id).unwrap();
+                    if let Some(content) = input.strip_prefix(BRACKETED_PASTE_START)
+                        .and_then(|body| body.strip_suffix(BRACKETED_PASTE_END)) {
+                        let normal = format!("\x1b[?2026h\x1b[52;7H{content}\x1b[?2026l");
+                        slot.room_composer.observe(self.after_paste.as_deref().unwrap_or(&normal));
+                    } else if input == "\r" {
+                        slot.room_composer.observe(&room_empty_fixture());
+                    }
+                }
+            }
+            Ok(written)
+        }
+        fn resize(&self, cols: u16, rows: u16) -> Result<()> { self.inner.resize(cols, rows) }
+        fn kill(&self) -> Result<()> { self.inner.kill() }
+        fn try_wait(&self) -> Result<Option<pty_host::PtyExitStatus>> { self.inner.try_wait() }
+        fn process_id(&self) -> Option<u32> { self.inner.process_id() }
+        fn agent_alive(&self, driver: DriverKind) -> Result<AgentLiveness> { self.inner.agent_alive(driver) }
+    }
+
+    fn install_mock_room_wake_recipient(supervisor: &SupervisorHandle, name: &str,
+        pty: Box<dyn PtySessionTrait>) {
+        install_mock_room_wake_recipient_with_echo(supervisor, name, pty, None);
+    }
+
+    fn install_mock_room_wake_recipient_with_echo(supervisor: &SupervisorHandle, name: &str,
+        pty: Box<dyn PtySessionTrait>, after_paste: Option<String>) {
+        let session_id = test_session_id(supervisor, name);
+        install_mock_running_session_with_bracketed_paste_enabled(supervisor, name, DriverKind::Grok,
+            Box::new(RoomWakeEchoPty { inner: pty, supervisor: Arc::downgrade(&supervisor.inner), session_id, after_paste }));
+        let mut slots = supervisor.inner.slots.lock();
+        let slot = slots.get_by_id_mut(session_id).unwrap();
+        slot.room_composer.begin_run();
+        slot.room_composer.resize(197, 56);
+        slot.room_composer.observe(&room_empty_fixture());
+    }
+
+    fn last_stored_room_body(supervisor: &SupervisorHandle, recipient: SessionId) -> String {
+        let rooms = supervisor.inner.rooms.lock();
+        let room_id = rooms.room_by_session[&recipient];
+        let page = rooms.get(room_id).unwrap().read(None, 0).unwrap();
+        page.events.iter().rev().find_map(|event| match &event.item {
+            RoomFeedItem::Message { content, recipient_ids, .. } if recipient_ids.contains(&recipient) => Some(content.clone()),
+            _ => None,
+        }).expect("brief body was stored")
+    }
+
+    impl PtySessionTrait for FirstWriteFailsPtySession {
+        fn send_input(&self, input: &str) -> pty_host::PtyWriteResult {
+            if self.first.swap(false, Ordering::SeqCst) {
+                return Err(PtyWriteError::new(0, "synthetic confirmed zero-write failure"));
+            }
+            self.inner.send_input(input)
+        }
+        fn resize(&self, cols: u16, rows: u16) -> Result<()> { self.inner.resize(cols, rows) }
+        fn kill(&self) -> Result<()> { self.inner.kill() }
+        fn try_wait(&self) -> Result<Option<pty_host::PtyExitStatus>> { self.inner.try_wait() }
+        fn process_id(&self) -> Option<u32> { self.inner.process_id() }
+        fn agent_alive(&self, driver: DriverKind) -> Result<AgentLiveness> { self.inner.agent_alive(driver) }
+    }
+
     struct ShortOkPtySession {
         bytes_written: usize,
     }
@@ -12335,13 +16943,22 @@ mod tests {
 
     struct QueuePtySpawner {
         sessions: Mutex<VecDeque<Box<dyn PtySessionTrait>>>,
+        /// Like a real harness, each run draws a first screen as it spawns
+        /// (A16 D1: a Claude or Codex run is Ready only once it has shown
+        /// visible text); `silent` models one that never draws.
+        draws: bool,
     }
 
     impl QueuePtySpawner {
         fn new(sessions: Vec<Box<dyn PtySessionTrait>>) -> Self {
             Self {
                 sessions: Mutex::new(sessions.into()),
+                draws: true,
             }
+        }
+
+        fn silent(sessions: Vec<Box<dyn PtySessionTrait>>) -> Self {
+            Self { draws: false, ..Self::new(sessions) }
         }
     }
 
@@ -12349,12 +16966,16 @@ mod tests {
         fn spawn(
             &self,
             _plan: &PreparedLaunch,
-            _handler: PtyEventHandler,
+            handler: PtyEventHandler,
         ) -> Result<Box<dyn PtySessionTrait>> {
-            self.sessions
+            let session = self.sessions
                 .lock()
                 .pop_front()
-                .ok_or_else(|| anyhow!("no queued PTY sessions"))
+                .ok_or_else(|| anyhow!("no queued PTY sessions"))?;
+            if self.draws {
+                handler(PtyEvent::Output("mock harness first screen".into()));
+            }
+            Ok(session)
         }
     }
 
@@ -12464,13 +17085,16 @@ mod tests {
         fn spawn(
             &self,
             plan: &PreparedLaunch,
-            _handler: PtyEventHandler,
+            handler: PtyEventHandler,
         ) -> Result<Box<dyn PtySessionTrait>> {
             self.specs.lock().push(plan.spec.clone());
-            self.sessions
+            let session = self.sessions
                 .lock()
                 .pop_front()
-                .ok_or_else(|| anyhow!("no queued PTY sessions"))
+                .ok_or_else(|| anyhow!("no queued PTY sessions"))?;
+            // A real harness draws a first screen as it spawns (A16 D1).
+            handler(PtyEvent::Output("mock harness first screen".into()));
+            Ok(session)
         }
     }
 
@@ -12517,7 +17141,7 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn create_windows_junction(link: &Path, target: &Path) {
+    pub(super) fn create_windows_junction(link: &Path, target: &Path) {
         let output = std::process::Command::new("cmd.exe")
             .args(["/d", "/c", "mklink", "/J"])
             .arg(link)
@@ -12535,7 +17159,7 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn windows_path_sddl(path: &Path) -> String {
+    pub(super) fn windows_path_sddl(path: &Path) -> String {
         let output = std::process::Command::new("powershell.exe")
             .args([
                 "-NoProfile",
@@ -12633,6 +17257,7 @@ mod tests {
             heartbeat_interval: None,
             auto_restart_on_stall_sessions: None,
             auto_restart_stall_threshold: None,
+            task_folder: None,
         }
     }
 
@@ -12642,7 +17267,8 @@ mod tests {
             "the standard test fixture requires a fresh zero-session catalog"
         );
         supervisor
-            .create_session(shared_types::CreateSessionRequest {
+            .create_session(shared_types::CreateSessionRequest { codex_transport: Default::default(), permissions: None,
+                launch_choices: None,
                 room_id: None,
                 label: Some("claude".into()),
                 driver: DriverKind::Claude,
@@ -12651,7 +17277,8 @@ mod tests {
             })
             .expect("create Claude test session");
         supervisor
-            .create_session(shared_types::CreateSessionRequest {
+            .create_session(shared_types::CreateSessionRequest { codex_transport: Default::default(), permissions: None,
+                launch_choices: None,
                 room_id: None,
                 label: Some("codex".into()),
                 driver: DriverKind::Codex,
@@ -12668,7 +17295,8 @@ mod tests {
         permission_profile: shared_types::PermissionProfile,
     ) -> SessionSnapshot {
         supervisor
-            .create_session(shared_types::CreateSessionRequest {
+            .create_session(shared_types::CreateSessionRequest { codex_transport: Default::default(), permissions: None,
+                launch_choices: None,
                 room_id: None,
                 label: Some(label.into()),
                 driver,
@@ -12708,6 +17336,7 @@ mod tests {
             heartbeat_interval,
             auto_restart_on_stall_sessions: None,
             auto_restart_stall_threshold: auto_restart_threshold,
+            task_folder: None,
         })
         .unwrap();
         install_standard_test_sessions(&supervisor);
@@ -12848,7 +17477,9 @@ mod tests {
         slot.process_id = process_id;
         slot.state = LifecycleState::Busy;
         slot.last_real_output_at = None;
-        if driver == DriverKind::Codex {
+        // A mock run has passed its first prompt; Claude room delivery and
+        // Codex routed input both wait for that observation (A106).
+        if matches!(driver, DriverKind::Codex | DriverKind::Claude) {
             slot.work_state = WorkState::Idle;
             slot.work_state_observed = true;
             slot.work_detail = None;
@@ -13352,11 +17983,19 @@ mod tests {
         let (codex_pty, _, codex_kill_count) = mock_pty_session(None, MockKillBehavior::Immediate);
         install_mock_running_session(&supervisor, "claude", DriverKind::Claude, claude_pty);
         install_mock_running_session(&supervisor, "codex", DriverKind::Codex, codex_pty);
+        arm_test_quiesce_timer(&supervisor, "claude");
+        arm_test_quiesce_timer(&supervisor, "codex");
 
         supervisor.shutdown().unwrap();
 
         assert_eq!(claude_kill_count.load(Ordering::SeqCst), 1);
         assert_eq!(codex_kill_count.load(Ordering::SeqCst), 1);
+        assert!(supervisor
+            .inner
+            .slots
+            .lock()
+            .ordered_slots()
+            .all(|slot| slot.quiesce_timer.is_none()));
         let snapshot = supervisor.snapshot();
         for session in snapshot.sessions {
             assert!(
@@ -14865,7 +19504,7 @@ mod tests {
         assert!(
             denied
                 .to_string()
-                .contains("work state is blocked (session_starting)"),
+                .contains("work state is blocked (blocked:session_starting)"),
             "{denied:#}"
         );
         assert_eq!(inputs.lock().as_slice(), &["raw input remains available"]);
@@ -14925,6 +19564,77 @@ mod tests {
                 }
             ]
         ));
+    }
+
+    #[test]
+    fn grok_same_run_new_clears_the_startup_hold_only_after_ready_repaint() {
+        let supervisor = test_supervisor();
+        let (pty, inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor, "codex", DriverKind::Grok, pty,
+        );
+        let session_id = test_session_id(&supervisor, "codex");
+        let (generation, run_id) = {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id_mut(session_id).unwrap();
+            slot.grok_startup.resize(200, 58);
+            (slot.generation, slot.run_id.unwrap())
+        };
+        handle_current_pty_event(&supervisor, "codex", generation,
+            PtyEvent::Output(grok_ready_frame(false)));
+        {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id(session_id).unwrap();
+            assert_eq!(slot.state, LifecycleState::Ready);
+            assert!(slot.grok_startup.is_interactive_ready());
+            assert_eq!(blocked_reason(slot), None);
+        }
+
+        // /new keeps this PTY/run but emits the semantic startup splash again.
+        handle_current_pty_event(&supervisor, "codex", generation,
+            PtyEvent::Output(grok_starting_frame().into()));
+        {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id(session_id).unwrap();
+            assert_eq!(slot.state, LifecycleState::Ready);
+            assert_eq!(slot.work_state, WorkState::Blocked);
+            assert_eq!(slot.work_detail.as_deref(), Some(driver_grok::SESSION_STARTING_DETAIL));
+            assert!(!slot.grok_startup.is_interactive_ready());
+        }
+        let error = supervisor.route_operator_message(OperatorRouteMessageRequest {
+            recipient_id: session_id, content: "must wait for /new".into(),
+        }).unwrap_err();
+        assert!(error.to_string().contains("work state is blocked (blocked:session_starting)"), "{error:#}");
+        assert!(inputs.lock().is_empty());
+
+        // Reconstruct the exact visible DOM rows from Claude's production
+        // 0d1e1c0 walk. The ANSI positioning is synthetic, not captured PTY bytes.
+        let capture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../driver-grok/src/fixtures/grok-after-new-screen-20261019.json"
+        )).unwrap();
+        let mut ready = "\x1b[?25l\x1b[2J".to_string();
+        for (index, row) in capture["rows"].as_array().unwrap().iter().enumerate() {
+            ready.push_str(&format!("\x1b[{};1H{}", index + 1, row.as_str().unwrap()));
+        }
+        ready.push_str("\x1b[?25h");
+        handle_current_pty_event(&supervisor, "codex", generation, PtyEvent::Output(ready));
+        {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id(session_id).unwrap();
+            assert_eq!(slot.state, LifecycleState::Ready);
+            assert_eq!(slot.work_state, WorkState::Idle);
+            assert_eq!(slot.work_detail, None);
+            assert_eq!(blocked_reason(slot), None);
+            assert_eq!(slot.run_id, Some(run_id));
+            assert_eq!(slot.generation, generation);
+        }
+        supervisor.route_operator_message(OperatorRouteMessageRequest {
+            recipient_id: session_id, content: "after /new".into(),
+        }).expect("the new conversation's ready repaint releases routed delivery");
+        assert_eq!(inputs.lock().as_slice(), &[
+            format!("{BRACKETED_PASTE_START}[Direct message from operator]\nafter /new{BRACKETED_PASTE_END}"),
+            "\r".to_string(),
+        ]);
     }
 
     #[test]
@@ -15171,6 +19881,273 @@ mod tests {
     }
 
     #[test]
+    fn quiesce_burst_keeps_one_worker_and_rechecks_the_latest_deadline() {
+        let supervisor = test_supervisor();
+        install_synthetic_running_session(&supervisor, "codex", DriverKind::Codex);
+        let session_id = test_session_id(&supervisor, "codex");
+        let run_id = current_run_id(&supervisor, "codex");
+        let armed_at = Instant::now() - Duration::from_secs(10);
+        let threshold = Duration::from_secs(2);
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_mut("codex").unwrap();
+            slot.state = LifecycleState::Ready;
+            slot.last_real_output_at = Some(armed_at);
+        }
+        // Park the executor with the existing synthetic timer fixture. Drive
+        // the production wake decision explicitly, without wall-clock races.
+        arm_test_quiesce_timer(&supervisor, "codex");
+        let (worker_id, abort) = {
+            let slots = supervisor.inner.slots.lock();
+            let timer = slots.get("codex").unwrap().quiesce_timer.as_ref().unwrap();
+            (timer.handle.id(), timer.handle.abort_handle())
+        };
+        let events = capture_runtime_events(&supervisor);
+        for index in 0..64 {
+            handle_current_pty_event(
+                &supervisor,
+                "codex",
+                0,
+                PtyEvent::Output(format!("burst {index}\r\n")),
+            );
+        }
+        let latest = {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get("codex").unwrap();
+            let timer = slot.quiesce_timer.as_ref().unwrap();
+            assert_eq!(timer.armed_at, armed_at);
+            assert_eq!(timer.handle.id(), worker_id, "output must retain the worker");
+            slot.last_real_output_at.unwrap()
+        };
+        assert!(latest > armed_at);
+        // Output won the lock first: the old deadline must extend, not idle.
+        assert_eq!(
+            supervisor.fire_quiesce_timer_at(
+                session_id,
+                0,
+                run_id,
+                armed_at,
+                threshold,
+                armed_at + threshold,
+            ),
+            Some(latest + threshold)
+        );
+        {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get("codex").unwrap();
+            assert_eq!(slot.state, LifecycleState::Ready);
+            assert_eq!(slot.quiesce_timer.as_ref().unwrap().handle.id(), worker_id);
+        }
+        assert_eq!(
+            supervisor.fire_quiesce_timer_at(
+                session_id,
+                0,
+                run_id,
+                armed_at,
+                threshold,
+                latest + threshold,
+            ),
+            None
+        );
+        abort.abort();
+        // A duplicate callback cannot publish a second Idle or consume a token.
+        let _ = supervisor.fire_quiesce_timer_at(
+            session_id,
+            0,
+            run_id,
+            armed_at,
+            threshold,
+            latest + threshold,
+        );
+        {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get("codex").unwrap();
+            assert_eq!(slot.state, LifecycleState::Idle);
+            assert!(slot.quiesce_timer.is_none());
+        }
+        {
+            let captured = events.lock();
+            assert_eq!(
+                captured.iter().filter(|event| matches!(
+                    event,
+                    RuntimeEvent::SessionState { state: LifecycleState::Idle, .. }
+                )).count(),
+                1
+            );
+            let identities = captured
+                .iter()
+                .filter_map(|event| match event {
+                    RuntimeEvent::SessionState { identity, .. }
+                    | RuntimeEvent::SessionOutput { identity, .. }
+                    | RuntimeEvent::SessionWorkState { identity, .. } => Some(*identity),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert!(identities.iter().all(|identity| {
+                identity.session_id == session_id && identity.run_id == run_id
+            }));
+            assert_eq!(
+                identities
+                    .iter()
+                    .map(|identity| identity.sequence)
+                    .collect::<Vec<_>>(),
+                (1..=identities.len() as u64).collect::<Vec<_>>()
+            );
+        }
+        // Retirement won the lock first: fresh output installs a replacement.
+        handle_current_pty_event(
+            &supervisor,
+            "codex",
+            0,
+            PtyEvent::Output("new burst".into()),
+        );
+        let replacement_token = {
+            let slots = supervisor.inner.slots.lock();
+            let timer = slots.get("codex").unwrap().quiesce_timer.as_ref().unwrap();
+            assert_ne!(timer.handle.id(), worker_id);
+            assert_ne!(timer.armed_at, armed_at);
+            timer.armed_at
+        };
+        let _ = supervisor.fire_quiesce_timer_at(
+            session_id,
+            0,
+            run_id,
+            armed_at,
+            threshold,
+            latest + threshold,
+        );
+        let mut slots = supervisor.inner.slots.lock();
+        let slot = slots.get_mut("codex").unwrap();
+        assert_eq!(slot.state, LifecycleState::Ready);
+        assert_eq!(
+            slot.quiesce_timer.as_ref().unwrap().armed_at,
+            replacement_token
+        );
+        cancel_quiesce_timer_locked(slot);
+    }
+
+    #[test]
+    fn quiesce_does_not_arm_for_semantic_only_drivers_or_unconfirmed_spawn() {
+        for (driver, spawn_unconfirmed) in [
+            (DriverKind::Grok, false),
+            (DriverKind::Prime, false),
+            (DriverKind::Codex, true),
+        ] {
+            let supervisor = test_supervisor();
+            install_synthetic_running_session(&supervisor, "codex", driver);
+            if spawn_unconfirmed {
+                let mut slots = supervisor.inner.slots.lock();
+                let slot = slots.get_mut("codex").unwrap();
+                slot.state = LifecycleState::Starting;
+                slot.spawn_in_flight = Some(SpawnReservation {
+                    generation: slot.generation,
+                    run_id: slot.run_id.unwrap(),
+                });
+            }
+            handle_current_pty_event(
+                &supervisor,
+                "codex",
+                0,
+                PtyEvent::Output("Working".into()),
+            );
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get("codex").unwrap();
+            assert!(slot.quiesce_timer.is_none(), "{driver:?} must not arm a timer");
+            if spawn_unconfirmed {
+                assert_eq!(slot.state, LifecycleState::Starting);
+                assert!(slot.last_real_output_at.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn output_handling_is_not_serialized_behind_another_lifecycle_holder() {
+        // A slow retirement in one pane holds the lifecycle guard (shared) for
+        // up to the kill timeout; another pane's output must still be handled.
+        let supervisor = test_supervisor();
+        install_synthetic_running_session(&supervisor, "codex", DriverKind::Codex);
+        let session_id = test_session_id(&supervisor, "codex");
+        let run_id = current_run_id(&supervisor, "codex");
+        let generation = supervisor.current_generation_for_tests(session_id).expect("generation");
+        let elsewhere = supervisor.inner.shutdown_lifecycle.read();
+        let worker = supervisor.clone();
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let handle = thread::spawn(move || {
+            worker.handle_pty_event_by_id(session_id, generation, run_id, PtyEvent::Output("concurrent".into()));
+            done_tx.send(()).unwrap();
+        });
+        assert!(done_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "output handling waited for an unrelated lifecycle holder");
+        drop(elsewhere);
+        handle.join().unwrap();
+        // Shutdown remains exclusive: it waits for holders and blocks new ones.
+        let reader = supervisor.inner.shutdown_lifecycle.read();
+        assert!(supervisor.inner.shutdown_lifecycle.try_write().is_none());
+        drop(reader);
+        assert!(supervisor.inner.shutdown_lifecycle.try_write().is_some());
+    }
+
+    #[test]
+    fn admitted_stop_supersedes_a_following_start_until_it_finishes() {
+        let supervisor = test_supervisor();
+        let (pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "claude", DriverKind::Claude, pty);
+        let session_id = test_session_id(&supervisor, "claude");
+        let (ticket, admitted) = supervisor.begin_stop_session(session_id).expect("stop admitted");
+        assert!(admitted.running, "admission returns before the termination wait");
+        // Rapid Start right after the Stop click: the declared operation refuses it.
+        assert!(supervisor.start_session_by_id(session_id).is_err(),
+            "a Start issued after an admitted Stop must not launch ahead of it");
+        let second = supervisor.begin_stop_session(session_id).err().expect("second Stop refused");
+        assert!(second.to_string().contains("lifecycle operation in progress"),
+            "the declared Stop is what refuses it: {second}");
+        let stopped = supervisor.finish_stop_session(ticket).expect("admitted stop finishes");
+        assert!(!stopped.running);
+        // An already-closed session admits without an operation and finishes trivially.
+        let (ticket, closed) = supervisor.begin_stop_session(session_id).expect("closed stop");
+        assert!(!closed.running);
+        assert!(!supervisor.finish_stop_session(ticket).expect("closed finish").running);
+    }
+
+    #[test]
+    fn quiesce_arm_refuses_shutdown_before_creating_a_worker() {
+        let supervisor = test_supervisor();
+        install_synthetic_running_session(&supervisor, "codex", DriverKind::Codex);
+        let session_id = test_session_id(&supervisor, "codex");
+        let run_id = current_run_id(&supervisor, "codex");
+        let armed_at = Instant::now();
+        let shutdown = supervisor.inner.shutdown_lifecycle.read();
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_mut("codex").unwrap();
+            slot.state = LifecycleState::Ready;
+            slot.last_real_output_at = Some(armed_at);
+        }
+        // Leave an otherwise matching run in place: refusal must not rely on
+        // shutdown having already cleared its identity or output timestamp.
+        supervisor
+            .inner
+            .shutdown_started
+            .store(true, Ordering::Release);
+        supervisor.arm_quiesce_timer(
+            &shutdown,
+            session_id,
+            0,
+            run_id,
+            armed_at,
+            Duration::from_secs(2),
+        );
+        assert!(supervisor
+            .inner
+            .slots
+            .lock()
+            .get("codex")
+            .unwrap()
+            .quiesce_timer
+            .is_none());
+    }
+
+    #[test]
     fn stale_quiesce_callback_cannot_consume_a_newer_timer_for_the_same_run() {
         let supervisor = test_supervisor();
         install_synthetic_running_session(&supervisor, "codex", DriverKind::Codex);
@@ -15196,7 +20173,17 @@ mod tests {
         }
         let events = capture_runtime_events(&supervisor);
 
-        supervisor.arm_quiesce_timer(session_id, 0, run_id, older, Duration::from_secs(2));
+        {
+            let shutdown = supervisor.inner.shutdown_lifecycle.read();
+            supervisor.arm_quiesce_timer(
+                &shutdown,
+                session_id,
+                0,
+                run_id,
+                older,
+                Duration::from_secs(2),
+            );
+        }
         assert_eq!(
             supervisor
                 .inner
@@ -15208,7 +20195,7 @@ mod tests {
             Some(newer),
             "an older arm must not replace the current observation's timer"
         );
-        supervisor.fire_quiesce_timer(session_id, 0, run_id, older, Duration::from_secs(2));
+        let _ = supervisor.fire_quiesce_timer(session_id, 0, run_id, older, Duration::from_secs(2));
 
         let slots = supervisor.inner.slots.lock();
         let slot = slots.get("codex").unwrap();
@@ -15247,12 +20234,21 @@ mod tests {
         supervisor
             .bump_session_generation_for_tests(test_session_id(&supervisor, "codex"))
             .unwrap();
-        supervisor.fire_quiesce_timer(
+        assert!(supervisor
+            .inner
+            .slots
+            .lock()
+            .get("codex")
+            .unwrap()
+            .quiesce_timer
+            .is_none());
+        let _ = supervisor.fire_quiesce_timer_at(
             test_session_id(&supervisor, "codex"),
             0,
             stale_run_id,
             armed_at,
             Duration::from_secs(2),
+            armed_at + Duration::from_secs(2),
         );
         thread::sleep(Duration::from_millis(50));
 
@@ -15266,6 +20262,119 @@ mod tests {
             RuntimeEvent::SystemLog { message, .. }
                 if message.contains("Dropped stale quiesce timer")
         )));
+    }
+
+    #[test]
+    fn snapshot_reports_saved_pty_grid_or_the_shared_spawn_default() {
+        let supervisor = test_supervisor();
+        let session_id = test_session_id(&supervisor, "codex");
+        let mut slots = supervisor.inner.slots.lock();
+        let slot = slots.get_by_id_mut(session_id).unwrap();
+        assert_eq!(slot.snapshot().pty_size, Some(shared_types::DEFAULT_PTY_SIZE));
+        // This is the same field loaded from the pre-existing catalog on boot.
+        slot.last_pty_size = Some((196, 22));
+        assert_eq!(slot.snapshot().pty_size, Some((196, 22)));
+    }
+
+    #[test]
+    fn bound_resize_accepts_exact_run_and_preserves_unchanged_size_fast_path() {
+        let supervisor = test_supervisor();
+        let (pty, resizes) = recording_resize_pty_session(std::process::id());
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
+        let session_id = test_session_id(&supervisor, "codex");
+        let run_id = current_run_id(&supervisor, "codex");
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            slots.get_by_id_mut(session_id).unwrap().generation = 7;
+        }
+
+        supervisor.resize_session_for_run(session_id, run_id, 7, 196, 22).unwrap();
+        supervisor.resize_session_for_run(session_id, run_id, 7, 196, 22).unwrap();
+
+        assert_eq!(*resizes.lock(), vec![(196, 22)]);
+        let slots = supervisor.inner.slots.lock();
+        let slot = slots.get_by_id(session_id).unwrap();
+        assert_eq!(slot.running.as_ref().unwrap().last_resize, Some((196, 22)));
+        assert_eq!(slot.last_pty_size, Some((196, 22)));
+        assert_eq!(slot.snapshot().pty_size, Some((196, 22)));
+    }
+
+    #[test]
+    fn bound_resize_rejects_wrong_run_or_generation_before_same_size_or_state_changes() {
+        let supervisor = test_supervisor();
+        let (pty, resizes) = recording_resize_pty_session(std::process::id());
+        install_mock_running_session(&supervisor, "codex", DriverKind::Grok, pty);
+        let session_id = test_session_id(&supervisor, "codex");
+        let run_id = current_run_id(&supervisor, "codex");
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            slots.get_by_id_mut(session_id).unwrap().generation = 7;
+        }
+        supervisor.resize_session_for_run(session_id, run_id, 7, 197, 56).unwrap();
+        let (grok_before, codex_before, composer_before) = {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id_mut(session_id).unwrap();
+            slot.room_composer.observe(&room_empty_fixture());
+            (
+                slot.grok_startup.clone(),
+                slot.codex_work_state.clone(),
+                format!("{:?}", slot.room_composer),
+            )
+        };
+        let wrong_run = Uuid::new_v4();
+        for (expected_run, generation, cols, rows) in [
+            (wrong_run, 7, 180, 40),
+            (run_id, 6, 180, 40),
+            (wrong_run, 7, 197, 56),
+            (run_id, 6, 197, 56),
+        ] {
+            let error = supervisor
+                .resize_session_for_run(session_id, expected_run, generation, cols, rows)
+                .unwrap_err();
+            assert!(error.to_string().contains("run identity changed"));
+            assert_eq!(*resizes.lock(), vec![(197, 56)]);
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id(session_id).unwrap();
+            assert_eq!(slot.running.as_ref().unwrap().last_resize, Some((197, 56)));
+            assert_eq!(slot.last_pty_size, Some((197, 56)));
+            assert_eq!(slot.grok_startup, grok_before);
+            assert_eq!(slot.codex_work_state, codex_before);
+            assert_eq!(format!("{:?}", slot.room_composer), composer_before);
+        }
+    }
+
+    #[test]
+    fn bound_resize_from_retired_run_cannot_resize_or_rewrite_successor_grid() {
+        let supervisor = test_supervisor();
+        let (old_pty, old_resizes) = recording_resize_pty_session(std::process::id());
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, old_pty);
+        let session_id = test_session_id(&supervisor, "codex");
+        let old_run = current_run_id(&supervisor, "codex");
+        supervisor.resize_session_for_run(session_id, old_run, 0, 120, 40).unwrap();
+
+        // Replace the transport/identity before the delayed old request
+        // reaches the slots-locked admission check.
+        let (new_pty, new_resizes) = recording_resize_pty_session(std::process::id());
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, new_pty);
+        let new_run = current_run_id(&supervisor, "codex");
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            slots.get_by_id_mut(session_id).unwrap().generation = 1;
+        }
+        supervisor.resize_session_for_run(session_id, new_run, 1, 196, 22).unwrap();
+        for (cols, rows) in [(120, 40), (196, 22)] {
+            assert!(supervisor.resize_session_for_run(session_id, old_run, 0, cols, rows).is_err());
+        }
+
+        assert_eq!(*old_resizes.lock(), vec![(120, 40)]);
+        assert_eq!(*new_resizes.lock(), vec![(196, 22)]);
+        let slots = supervisor.inner.slots.lock();
+        let slot = slots.get_by_id(session_id).unwrap();
+        assert_eq!(slot.run_id, Some(new_run));
+        assert_eq!(slot.generation, 1);
+        assert_eq!(slot.running.as_ref().unwrap().last_resize, Some((196, 22)));
+        assert_eq!(slot.last_pty_size, Some((196, 22)));
+        assert_eq!(slot.snapshot().pty_size, Some((196, 22)));
     }
 
     #[test]
@@ -15365,12 +20474,13 @@ mod tests {
             slots.get("codex").unwrap().last_real_output_at.unwrap()
         };
         let stale_run_id = current_run_id(&supervisor, "codex");
-        supervisor.fire_quiesce_timer(
+        let _ = supervisor.fire_quiesce_timer_at(
             test_session_id(&supervisor, "codex"),
             0,
             stale_run_id,
             armed_at,
             Duration::from_secs(2),
+            armed_at + Duration::from_secs(2),
         );
 
         let work_events = work_state_events(&events);
@@ -15458,6 +20568,377 @@ mod tests {
                 ..
             } if detail == "usage_limit"
         ));
+    }
+
+    #[test]
+    fn a_repainted_startup_question_stays_blocked_and_never_becomes_an_error_loop() {
+        let supervisor = test_supervisor();
+        install_synthetic_running_session(&supervisor, "claude", DriverKind::Claude);
+        let events = capture_runtime_events(&supervisor);
+        let terms = "Updates to Consumer Terms and Policies\r\n\u{276f} 1. Accept terms \u{b7} Help improve our AI models: ON\r\n  2. Not now\r\nEnter to confirm \u{b7} Esc to cancel";
+
+        for _ in 0..4 {
+            handle_current_pty_event(&supervisor, "claude", 0, PtyEvent::Output(terms.into()));
+        }
+
+        let work_events = work_state_events(&events);
+        assert_eq!(work_events.len(), 1, "{work_events:?}");
+        assert!(matches!(
+            &work_events[0],
+            RuntimeEvent::SessionWorkState {
+                state: WorkState::Blocked,
+                detail: Some(detail),
+                ..
+            } if detail == "consumer_terms_notice"
+        ));
+        let slot = supervisor.inner.slots.lock();
+        let slot = slot.get("claude").unwrap();
+        assert_eq!(slot.work_state, WorkState::Blocked);
+        let (reason, action) =
+            describe_work_state_block(slot.work_state, slot.work_detail.as_deref());
+        assert_eq!(reason, "Claude is showing updated consumer terms");
+        assert!(action.contains("PRIM-1 never answers terms"), "{action}");
+    }
+
+    #[test]
+    fn a_repainted_codex_sign_in_screen_stays_a_question_not_an_error_loop() {
+        let supervisor = test_supervisor();
+        install_synthetic_running_session(&supervisor, "codex", DriverKind::Codex);
+        let events = capture_runtime_events(&supervisor);
+        // Codex onboarding animates, so the same screen is painted again and again.
+        let sign_in = "\x1b[?25l\x1b[2J\x1b[H  Sign in with ChatGPT to use Codex as part of your paid plan\r\n\r\n\u{203a} 1. Sign in with ChatGPT\r\n  2. Sign in with Device Code\r\n  3. Provide your own API key\r\n\r\n  Press enter to continue\x1b[?25h";
+
+        for _ in 0..4 {
+            handle_current_pty_event(&supervisor, "codex", 0, PtyEvent::Output(sign_in.into()));
+        }
+
+        let work_events = work_state_events(&events);
+        assert!(!work_events.is_empty());
+        assert!(
+            work_events.iter().all(|event| matches!(
+                event,
+                RuntimeEvent::SessionWorkState { state: WorkState::Blocked, detail: Some(detail), .. }
+                    if detail == "authentication"
+            )),
+            "{work_events:?}"
+        );
+        let slots = supervisor.inner.slots.lock();
+        let slot = slots.get("codex").unwrap();
+        assert_eq!(slot.work_state, WorkState::Blocked);
+        assert_eq!(
+            describe_work_state_block(slot.work_state, slot.work_detail.as_deref()).0,
+            "it is asking you to sign in"
+        );
+    }
+
+    /// Claude's startup dialogs as driver-claude's own fixtures paint them;
+    /// most have no key hint, so the room composer's menu shape misses them.
+    const CLAUDE_QUESTION_SCREENS: [(&str, &str); 8] = [
+        (
+            "Updates to Consumer Terms and Policies\r\nPlease select how you'd like to continue\r\n\u{276f} 1. Accept terms \u{b7} Help improve our AI models: ON\r\n  2. Accept terms \u{b7} Help improve our AI models: OFF\r\n  3. Not now\r\nEnter to confirm \u{b7} Esc to cancel",
+            "consumer_terms_notice",
+        ),
+        (
+            "Let's get started.\r\nChoose the text style that looks best with your terminal\r\n\u{276f} 1. Dark mode \u{2714}\r\n  2. Light mode\r\n  3. Dark mode (colorblind-friendly)",
+            "onboarding",
+        ),
+        (
+            "Select login method:\r\n\u{276f} 1. Claude account with subscription \u{b7} Pro, Max, Team, or Enterprise\r\n  2. Anthropic Console account \u{b7} API usage billing",
+            "onboarding",
+        ),
+        ("Take the tour  Skip for now", "onboarding"),
+        (
+            "Detected a custom API key in your environment\r\nANTHROPIC_API_KEY: sk-ant-...abcd\r\nDo you want to use this API key?\r\n  1. Yes\r\n\u{276f} 2. No (recommended)",
+            "api_key_prompt",
+        ),
+        (
+            "New MCP server found in this project: fixture\r\n\u{276f} 1. Use this MCP server\r\n  2. Use this and all future MCP servers in this project\r\n  3. Continue without using this MCP server",
+            "mcp_server_approval",
+        ),
+        (
+            "2 new MCP servers found in this project\r\nSelect any you wish to enable.\r\n\u{276f} [x] one\r\n  [x] two",
+            "mcp_server_approval",
+        ),
+        (
+            "Allow external CLAUDE.md file imports?\r\nThis project's CLAUDE.md or .claude/rules imports files outside the current working directory.\r\n\u{276f} No, disable external imports\r\n  Yes, allow external imports",
+            "external_imports_prompt",
+        ),
+    ];
+
+    /// Quiet after the screen's last output: what the 3 s quiesce timer does.
+    fn fire_claude_quiesce_after_last_output(supervisor: &SupervisorHandle) {
+        let (session_id, run_id, armed_at, last_output) = {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get("claude").unwrap();
+            (
+                slot.session_id,
+                slot.run_id.unwrap(),
+                slot.quiesce_timer.as_ref().unwrap().armed_at,
+                slot.last_real_output_at.unwrap(),
+            )
+        };
+        let threshold = Duration::from_secs(3);
+        assert_eq!(
+            supervisor.fire_quiesce_timer_at(session_id, 0, run_id, armed_at, threshold, last_output + threshold),
+            None
+        );
+    }
+
+    #[test]
+    fn quiet_under_any_claude_startup_question_keeps_it_blocked_and_room_messages_queued() {
+        for (screen, detail) in CLAUDE_QUESTION_SCREENS {
+            let supervisor = test_supervisor();
+            let (pty, inputs) = recording_pty_session(std::process::id());
+            install_mock_running_session_with_bracketed_paste_enabled(&supervisor, "claude", DriverKind::Claude, pty);
+            let claude = test_session_id(&supervisor, "claude");
+            let room = supervisor.create_room(CreateRoomRequest { label: Some("Startup question".into()),
+                member_ids: vec![claude], brief_on_join: false, brief_template: None }).unwrap();
+
+            handle_current_pty_event(&supervisor, "claude", 0,
+                PtyEvent::Output(format!("\x1b[2J\x1b[H{screen}")));
+            fire_claude_quiesce_after_last_output(&supervisor);
+
+            {
+                let slots = supervisor.inner.slots.lock();
+                let slot = slots.get("claude").unwrap();
+                assert_eq!(slot.state, LifecycleState::Idle, "{detail}");
+                assert_eq!((slot.work_state, slot.work_detail.as_deref()),
+                    (WorkState::Blocked, Some(detail)), "quiet answered nothing: {screen:?}");
+            }
+            let result = supervisor.deliver_room_message(DeliverRoomMessageRequest { request_id: None,
+                room_id: room.room_id, recipients: RoomRecipientSelection::One { session_id: claude },
+                content: "please continue".into() }).unwrap();
+            assert_eq!(result.receipts[0].status, RoomDeliveryStatus::Stored, "{screen:?}");
+            assert_eq!(supervisor.queued_room_wake_count_for_tests(claude), 1, "{screen:?}");
+            assert!(inputs.lock().is_empty(), "nothing typed into {screen:?}");
+
+            // Answered: a full repaint without the question, then quiet, is idle.
+            handle_current_pty_event(&supervisor, "claude", 0,
+                PtyEvent::Output("\x1b[2J\x1b[HWelcome back".into()));
+            fire_claude_quiesce_after_last_output(&supervisor);
+            let slots = supervisor.inner.slots.lock();
+            assert_eq!(slots.get("claude").unwrap().work_state, WorkState::Idle, "{screen:?}");
+        }
+    }
+
+    /// 19 Oct real walk, first start in a new folder: Claude's and Codex
+    /// 0.163's trust questions, as their panes showed them, read "Idle —
+    /// ready for input" on the member card (header IDLE and READY).
+    const CLAUDE_TRUST_SCREEN: &str = concat!(
+        "\x1b[?25l\x1b[2J\x1b[m\x1b[H",
+        " Accessing workspace:\r\n\r\n",
+        " D:\\prim1-qa\\work\\QA Claude\r\n\r\n",
+        " Quick safety check: Is this a project you created or one you trust? (Like your own code, a\r\n",
+        " well-known open source project, or work from your team). If not, take a moment to review\r\n",
+        " what's in this folder first.\r\n\r\n",
+        " Claude Code'll be able to read, edit, and execute files here.\r\n\r\n",
+        " \u{276f} No, exit\r\n",
+        "   Yes, I trust this folder\r\n\r\n",
+        " Enter to confirm \u{b7} Esc to cancel",
+    );
+    const CODEX_TRUST_SCREEN: &str = concat!(
+        "\x1b[?25l\x1b[2J\x1b[m\x1b[H",
+        "  Folder access\r\n\r\n",
+        "  Trust this folder?\r\n",
+        "  D:\\prim1-qa\\work\\QA Codex\r\n\r\n",
+        "  Codex can read and edit files here and run commands in it.\r\n\r\n",
+        "\u{203a} 1. Trust and continue\r\n",
+        "  2. Quit\r\n\r\n",
+        "  enter continue \u{b7} esc quit",
+    );
+    /// The same question with both choices on one row, as the walk noted it.
+    const CODEX_TRUST_SCREEN_ONE_ROW: &str = concat!(
+        "\x1b[?25l\x1b[2J\x1b[m\x1b[H",
+        "  Folder access\r\n\r\n",
+        "  Trust this folder?\r\n\r\n",
+        "\u{203a} 1. Trust and continue  2. Quit\r\n\r\n",
+        "  enter continue \u{b7} esc quit",
+    );
+    const TRUST_LINE: &str =
+        "it is asking whether to trust the folder \u{2014} answer that question in its terminal, then send again";
+
+    /// Emits its chunks through the run's handler before the spawn returns:
+    /// output PRIM-1 receives before it installs the run.
+    struct ScreenFirstPtySpawner {
+        session: Mutex<Option<Box<dyn PtySessionTrait>>>,
+        before: Vec<String>,
+    }
+
+    impl PtySpawner for ScreenFirstPtySpawner {
+        fn spawn(&self, _plan: &PreparedLaunch, handler: PtyEventHandler) -> Result<Box<dyn PtySessionTrait>> {
+            for chunk in &self.before {
+                handler(PtyEvent::Output(chunk.clone()));
+            }
+            self.session.lock().take().ok_or_else(|| anyhow!("no queued PTY session"))
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum FirstOutput {
+        /// Delivered while the spawn is unconfirmed.
+        BeforeInstall,
+        /// One chunk after the run is installed.
+        OneChunk,
+        /// Two chunks after it, split inside this anchor.
+        SplitInside(&'static str),
+    }
+
+    /// Starts `label` through the spawn path; `screen` is its first output.
+    fn start_with_first_screen(supervisor: &SupervisorHandle, label: &str, screen: &str, how: FirstOutput) {
+        let (pty, _) = recording_pty_session(std::process::id());
+        let before = if matches!(how, FirstOutput::BeforeInstall) { vec![screen.to_string()] } else { Vec::new() };
+        supervisor.set_pty_spawner_for_tests(Arc::new(ScreenFirstPtySpawner { session: Mutex::new(Some(pty)), before }));
+        supervisor.start_session_by_id(test_session_id(supervisor, label)).unwrap();
+        let generation = supervisor.inner.slots.lock().get(label).unwrap().generation;
+        match how {
+            FirstOutput::BeforeInstall => {}
+            FirstOutput::OneChunk => handle_current_pty_event(supervisor, label, generation, PtyEvent::Output(screen.into())),
+            FirstOutput::SplitInside(anchor) => {
+                let at = screen.find(anchor).expect("anchor on the screen") + anchor.len() / 2;
+                handle_current_pty_event(supervisor, label, generation, PtyEvent::Output(screen[..at].into()));
+                handle_current_pty_event(supervisor, label, generation, PtyEvent::Output(screen[at..].into()));
+            }
+        }
+    }
+
+    /// The work state, the member card's line and the lifecycle state.
+    fn shown_state(supervisor: &SupervisorHandle, label: &str) -> (Option<WorkState>, Option<String>, Option<String>, LifecycleState) {
+        let slots = supervisor.inner.slots.lock();
+        let slot = slots.get(label).unwrap();
+        let snapshot = slot.snapshot();
+        (slot.work_state_observed.then_some(slot.work_state), slot.work_detail.clone(), snapshot.blocked_reason, snapshot.lifecycle_state)
+    }
+
+    /// The quiesce timer firing after the last real output.
+    fn fire_quiesce_after_last_output(supervisor: &SupervisorHandle, label: &str) {
+        let (session_id, generation, run_id, armed_at, last_output, threshold) = {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get(label).unwrap();
+            (
+                slot.session_id,
+                slot.generation,
+                slot.run_id.unwrap(),
+                slot.quiesce_timer.as_ref().expect("quiesce armed").armed_at,
+                slot.last_real_output_at.unwrap(),
+                quiesce_threshold(slot.definition.driver).unwrap(),
+            )
+        };
+        assert_eq!(
+            supervisor.fire_quiesce_timer_at(session_id, generation, run_id, armed_at, threshold, last_output + threshold),
+            None
+        );
+    }
+
+    #[test]
+    fn a_trust_question_as_the_first_output_after_spawn_is_blocked_not_idle() {
+        let cases: [(&str, DriverKind, &str, FirstOutput); 8] = [
+            ("claude", DriverKind::Claude, CLAUDE_TRUST_SCREEN, FirstOutput::OneChunk),
+            ("claude", DriverKind::Claude, CLAUDE_TRUST_SCREEN, FirstOutput::SplitInside("No, exit")),
+            ("claude", DriverKind::Claude, CLAUDE_TRUST_SCREEN, FirstOutput::SplitInside("Quick safety check")),
+            ("claude", DriverKind::Claude, CLAUDE_TRUST_SCREEN, FirstOutput::BeforeInstall),
+            ("codex", DriverKind::Codex, CODEX_TRUST_SCREEN, FirstOutput::OneChunk),
+            ("codex", DriverKind::Codex, CODEX_TRUST_SCREEN, FirstOutput::SplitInside("Trust this folder?")),
+            ("codex", DriverKind::Codex, CODEX_TRUST_SCREEN, FirstOutput::BeforeInstall),
+            ("codex", DriverKind::Codex, CODEX_TRUST_SCREEN_ONE_ROW, FirstOutput::OneChunk),
+        ];
+        for (label, driver, screen, how) in cases {
+            let case = format!("{driver:?} {how:?}");
+            let supervisor = test_supervisor();
+            start_with_first_screen(&supervisor, label, screen, how);
+            let (work, detail, line, lifecycle) = shown_state(&supervisor, label);
+            assert_eq!((work, detail.as_deref()), (Some(WorkState::Blocked), Some("workspace_trust")), "{case}");
+            assert_eq!(line.as_deref(), Some(TRUST_LINE), "{case}: the member card names the question");
+            assert_eq!(lifecycle, LifecycleState::Ready, "{case}");
+
+            // Quiet under the question keeps it (no quiet is armed for
+            // output that came before the install).
+            if !matches!(how, FirstOutput::BeforeInstall) {
+                fire_quiesce_after_last_output(&supervisor, label);
+                let (work, _, line, lifecycle) = shown_state(&supervisor, label);
+                assert_eq!((work, lifecycle), (Some(WorkState::Blocked), LifecycleState::Idle), "{case}");
+                assert_eq!(line.as_deref(), Some(TRUST_LINE), "{case}: quiet does not make it ready");
+            }
+
+            // Answered: its prompt replaces the question.
+            let generation = supervisor.inner.slots.lock().get(label).unwrap().generation;
+            let prompt = match driver {
+                DriverKind::Codex => codex_clean_prompt_stream(),
+                _ => "\x1b[2J\x1b[H\u{256d}\u{2500}\u{256e}\r\n\u{2502} > \u{2502}\r\n\u{2570}\u{2500}\u{256f}\r\n  ? for shortcuts".into(),
+            };
+            handle_current_pty_event(&supervisor, label, generation, PtyEvent::Output(prompt));
+            let (work, _, line, _) = shown_state(&supervisor, label);
+            assert_eq!((work, line), (Some(WorkState::Idle), None), "{case}: answered is ready");
+        }
+    }
+
+    #[test]
+    fn quiet_reads_a_claude_question_the_output_chunks_never_named() {
+        // A permission question painted in two chunks mid-run: neither chunk
+        // carries both its question and its hint.
+        let supervisor = test_supervisor();
+        start_with_first_screen(&supervisor, "claude", "\x1b[2J\x1b[H\u{2502} > \u{2502}\r\n? for shortcuts", FirstOutput::OneChunk);
+        assert_eq!(shown_state(&supervisor, "claude").0, Some(WorkState::Idle));
+        let generation = supervisor.inner.slots.lock().get("claude").unwrap().generation;
+        for chunk in [
+            "\x1b[2J\x1b[H Bash command\r\n   rm -rf build\r\n Do you want to proceed?\r\n",
+            " \u{276f} 1. Yes\r\n   2. Yes, and don't ask again\r\n   3. No\r\n\r\n Esc to cancel \u{b7} Tab to amend",
+        ] {
+            handle_current_pty_event(&supervisor, "claude", generation, PtyEvent::Output(chunk.into()));
+        }
+        assert_eq!(shown_state(&supervisor, "claude").0, Some(WorkState::Idle), "no chunk names it");
+        fire_quiesce_after_last_output(&supervisor, "claude");
+        let (work, detail, line, _) = shown_state(&supervisor, "claude");
+        assert_eq!((work, detail.as_deref()), (Some(WorkState::Blocked), Some("approval_prompt")));
+        assert_eq!(
+            line.as_deref(),
+            Some("it is asking for approval to run a command \u{2014} answer that question in its terminal, then send again")
+        );
+    }
+
+    #[test]
+    fn quiet_never_reads_quoted_question_text_as_a_question() {
+        // Mid-run transcript that quotes the trust dialog across two chunks:
+        // the screen names both anchors, but no selection menu is open.
+        let supervisor = test_supervisor();
+        start_with_first_screen(&supervisor, "claude", "\x1b[2J\x1b[H\u{2502} > \u{2502}\r\n? for shortcuts", FirstOutput::OneChunk);
+        let generation = supervisor.inner.slots.lock().get("claude").unwrap().generation;
+        for chunk in [
+            "\x1b[2J\x1b[H The new dialog preselects No, exit\r\n",
+            " and its title reads Quick safety check.\r\n",
+        ] {
+            handle_current_pty_event(&supervisor, "claude", generation, PtyEvent::Output(chunk.into()));
+        }
+        fire_quiesce_after_last_output(&supervisor, "claude");
+        let (work, _, line, _) = shown_state(&supervisor, "claude");
+        assert_eq!((work, line), (Some(WorkState::Idle), None));
+    }
+
+    #[test]
+    fn every_startup_question_has_its_own_plain_operator_line() {
+        for (detail, reason, action) in [
+            ("update_prompt", "Codex is asking whether to update", "press 2 or Esc"),
+            ("model_migration_prompt", "newer model", "choose a model"),
+            ("rate_limit_model_prompt", "near its usage cap", "Keep current model"),
+            ("hooks_review", "trust new hooks", "never answers"),
+            ("authentication", "sign in", "sign in from its terminal"),
+            ("workspace_trust", "trust the folder", "answer that question"),
+            ("consumer_terms_notice", "updated consumer terms", "operator decides"),
+            ("version_required", "minimum version", "claude update"),
+            ("onboarding", "first-run setup", "finish the setup"),
+            ("api_key_prompt", "API key", "operator decides"),
+            ("mcp_server_approval", "MCP server", "operator decides"),
+            ("external_imports_prompt", "CLAUDE.md imports", "operator decides"),
+        ] {
+            let (text, hint) = describe_work_state_block(WorkState::Blocked, Some(detail));
+            assert!(text.contains(reason), "{detail}: {text}");
+            assert!(hint.contains(action), "{detail}: {hint}");
+            assert!(!text.contains("it reported"), "{detail} fell through to the generic line");
+        }
+        assert!(
+            describe_work_state_block(WorkState::Blocked, Some("update_prompt"))
+                .1
+                .ends_with("then send again")
+        );
     }
 
     #[test]
@@ -15705,6 +21186,111 @@ mod tests {
             assert_eq!(slots_mutation_probe(&supervisor), replacement_probe);
             assert!(events.lock().is_empty());
         }
+    }
+
+    #[test]
+    fn delayed_older_work_state_cannot_rearm_or_cancel_a_newer_watchdog() {
+        let supervisor = test_supervisor_with_wrapper_defaults(
+            None,
+            Some(vec!["codex".into()]),
+            Some(Duration::from_secs(60)),
+        );
+        let (pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
+        let run_id = current_run_id(&supervisor, "codex");
+        let session_id = test_session_id(&supervisor, "codex");
+        let generation = supervisor.current_generation_for_tests(session_id).expect("generation");
+        let (hook_entered_tx, hook_entered_rx) = mpsc::sync_channel(1);
+        let (hook_release_tx, hook_release_rx) = mpsc::sync_channel(1);
+        supervisor.set_work_state_before_side_effect_for_tests(move || {
+            hook_entered_tx.send(()).unwrap();
+            hook_release_rx.recv().unwrap();
+        });
+        // Older transition: Blocked, held before its side effects.
+        let older = supervisor.clone();
+        let older_thread = thread::spawn(move || {
+            older.handle_pty_event("codex", 0, run_id, PtyEvent::Output("You've hit your usage limit.".into()))
+        });
+        hook_entered_rx.recv_timeout(Duration::from_secs(2)).expect("older side effect barrier");
+        // Newer transition: Idle, committed and applied while the older waits.
+        let newer = {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_mut("codex").unwrap();
+            assert_eq!(slot.work_state, WorkState::Blocked, "older transition committed first");
+            transition_work_state_locked("codex", slot, run_id, WorkState::Idle, None)
+                .expect("newer Idle transition")
+        };
+        supervisor.emit_run_work_state(newer, generation, run_id);
+        hook_release_tx.send(()).unwrap();
+        older_thread.join().unwrap();
+        let slots = supervisor.inner.slots.lock();
+        let slot = slots.get("codex").unwrap();
+        assert_eq!(slot.work_state, WorkState::Idle);
+        assert!(slot.stall_detector.is_none(), "stale Blocked side effect re-armed the stall watchdog");
+        assert!(slot.stall_state_entered_at.is_none(), "stale Blocked side effect marked a stall");
+    }
+
+    #[test]
+    fn delayed_older_idle_preserves_the_newer_blocked_watchdog() {
+        let supervisor = test_supervisor_with_wrapper_defaults(
+            None,
+            Some(vec!["codex".into()]),
+            Some(Duration::from_secs(60)),
+        );
+        let (pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
+        let run_id = current_run_id(&supervisor, "codex");
+        let session_id = test_session_id(&supervisor, "codex");
+        let generation = supervisor.current_generation_for_tests(session_id).expect("generation");
+        // The mock Codex session starts Idle and observed; seed a real prior
+        // Blocked so the older Idle below is a genuine transition. This also
+        // makes the run Blocked -> Idle -> Blocked (repeated-state ABA).
+        let seeded = {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_mut("codex").unwrap();
+            transition_work_state_locked("codex", slot, run_id, WorkState::Blocked, Some("seed".into()))
+                .expect("seeded Blocked transition")
+        };
+        supervisor.emit_run_work_state(seeded, generation, run_id);
+        let (hook_entered_tx, hook_entered_rx) = mpsc::sync_channel(1);
+        let (hook_release_tx, hook_release_rx) = mpsc::sync_channel(1);
+        supervisor.set_work_state_before_side_effect_for_tests(move || {
+            hook_entered_tx.send(()).unwrap();
+            hook_release_rx.recv().unwrap();
+        });
+        // Older transition: Idle, committed, then held before its side effects.
+        let older = supervisor.clone();
+        let older_thread = thread::spawn(move || {
+            let event = {
+                let mut slots = older.inner.slots.lock();
+                let slot = slots.get_mut("codex").unwrap();
+                transition_work_state_locked("codex", slot, run_id, WorkState::Idle, None)
+                    .expect("older Idle transition")
+            };
+            older.emit_run_work_state(event, generation, run_id);
+        });
+        hook_entered_rx.recv_timeout(Duration::from_secs(2)).expect("older side effect barrier");
+        // Newer transition: Blocked, committed and applied: arms the watchdog.
+        let newer = {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_mut("codex").unwrap();
+            transition_work_state_locked("codex", slot, run_id, WorkState::Blocked, Some("newer".into()))
+                .expect("newer Blocked transition")
+        };
+        supervisor.emit_run_work_state(newer, generation, run_id);
+        let armed_at = {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get("codex").unwrap();
+            slot.stall_detector.as_ref().map(|detector| detector.entered_at).expect("newer watchdog armed")
+        };
+        hook_release_tx.send(()).unwrap();
+        older_thread.join().unwrap();
+        let slots = supervisor.inner.slots.lock();
+        let slot = slots.get("codex").unwrap();
+        assert_eq!(slot.work_state, WorkState::Blocked);
+        assert_eq!(slot.stall_detector.as_ref().map(|detector| detector.entered_at), Some(armed_at),
+            "stale Idle side effect cancelled or replaced the newer watchdog");
+        assert_eq!(slot.stall_state_entered_at, Some(armed_at));
     }
 
     #[test]
@@ -15979,6 +21565,95 @@ mod tests {
             .unwrap()
             .snapshot();
         assert_eq!(slot.last_error, Some("process exited with code 1".into()));
+    }
+
+    #[test]
+    fn natural_retirement_clears_restart_eligibility_in_snapshot_and_catalog() {
+        for exit_code in [0, 3] {
+            let supervisor = test_supervisor();
+            let (pty, _, _) = mock_pty_session_with_exit_status(
+                Some(1203),
+                Some(pty_exit_status(exit_code, None, exit_code == 0)),
+                MockKillBehavior::Immediate,
+            );
+            install_mock_running_session_with_process_id(
+                &supervisor, "claude", DriverKind::Claude, Some(1203), pty,
+            );
+            let id = test_session_id(&supervisor, "claude");
+            supervisor.inner.slots.lock().get_by_id_mut(id).unwrap().running_at_shutdown = true;
+            supervisor.persist_slot_harness_state(id);
+            let path = session_catalog_path(supervisor.runtime_dir());
+            let interrupted = read_session_catalog(&path).unwrap();
+            assert!(SessionRegistry::from_catalog(&interrupted).unwrap()
+                .get_by_id(id).unwrap().snapshot().was_running_at_shutdown,
+                "a genuinely interrupted persisted run remains eligible on startup");
+
+            handle_current_pty_event(&supervisor, "claude", 0, PtyEvent::Closed);
+
+            let snapshot = supervisor.inner.slots.lock().get_by_id(id).unwrap().snapshot();
+            assert!(!snapshot.running);
+            assert!(!snapshot.was_running_at_shutdown, "exit {exit_code} is not restart recovery");
+            let retired = read_session_catalog(&path).unwrap();
+            assert!(!SessionRegistry::from_catalog(&retired).unwrap()
+                .get_by_id(id).unwrap().snapshot().was_running_at_shutdown,
+                "a fresh app must not revive a naturally retired run");
+        }
+    }
+
+    #[test]
+    fn a16_session_end_checkpoints_first_never_waits_and_keeps_eligibility_when_the_agent_dies_first() {
+        let supervisor = test_supervisor();
+        let (pty, _, kills) = mock_pty_session_with_exit_status(
+            Some(1206),
+            Some(pty_exit_status(1, None, false)),
+            MockKillBehavior::Sleep(Duration::from_millis(1500)),
+        );
+        install_mock_running_session_with_process_id(
+            &supervisor, "claude", DriverKind::Claude, Some(1206), pty,
+        );
+        let id = test_session_id(&supervisor, "claude");
+        // In memory only: the session-end checkpoint is what writes it.
+        supervisor.inner.slots.lock().get_by_id_mut(id).unwrap().running_at_shutdown = true;
+        supervisor.inner.slots.lock().get_by_id_mut(id).unwrap().last_pty_size = Some((132, 41));
+        let path = session_catalog_path(supervisor.runtime_dir());
+        let persisted = |path: &Path| SessionRegistry::from_catalog(&read_session_catalog(path).unwrap()).unwrap()
+            .get_by_id(id).unwrap().snapshot();
+
+        let started = Instant::now();
+        supervisor.end_session_now().unwrap();
+        assert!(started.elapsed() < Duration::from_millis(500), "the agent's slow kill is never waited for");
+        assert!(persisted(&path).was_running_at_shutdown);
+        let row = read_session_catalog(&path).unwrap().sessions.into_iter().find(|row| row.session_id == id).unwrap();
+        assert_eq!((row.last_pty_cols, row.last_pty_rows), (Some(132), Some(41)));
+
+        // Windows then ends the agent before PRIM-1: the run ends here and keeps the bit.
+        handle_current_pty_event(&supervisor, "claude", 0, PtyEvent::Closed);
+        let snapshot = supervisor.inner.slots.lock().get_by_id(id).unwrap().snapshot();
+        assert!(!snapshot.running);
+        assert!(snapshot.was_running_at_shutdown, "a run the session end overtook stays eligible");
+        assert!(persisted(&path).was_running_at_shutdown, "the next startup resumes it");
+        assert!(kills.load(Ordering::SeqCst) >= 1, "the agent was told to end");
+    }
+
+    #[test]
+    fn shutdown_preserves_restart_eligibility_for_its_active_run() {
+        let supervisor = test_supervisor();
+        let (pty, _, _) = mock_pty_session(Some(1204), MockKillBehavior::Immediate);
+        install_mock_running_session_with_process_id(
+            &supervisor, "claude", DriverKind::Claude, Some(1204), pty,
+        );
+        let id = test_session_id(&supervisor, "claude");
+        supervisor.inner.slots.lock().get_by_id_mut(id).unwrap().running_at_shutdown = true;
+        supervisor.persist_slot_harness_state(id);
+
+        supervisor.shutdown().unwrap();
+
+        let catalog = read_session_catalog(&session_catalog_path(supervisor.runtime_dir())).unwrap();
+        let restored = SessionRegistry::from_catalog(&catalog).unwrap();
+        let snapshot = restored.get_by_id(id).unwrap().snapshot();
+        assert!(!snapshot.running);
+        assert!(snapshot.was_running_at_shutdown,
+            "shutdown interrupted this run, so room restart selection must still see it");
     }
 
     #[test]
@@ -16386,6 +22061,140 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_input_and_resize_never_sweep_liveness() {
+        // D9 step 2: the hot paths no longer probe processes; only the sweep
+        // (driven by the exit watcher and the liveness tick) prunes a run.
+        let supervisor = test_supervisor();
+        let (pty, _, _) =
+            mock_pty_session_with_exit_status(Some(u32::MAX), None, MockKillBehavior::Immediate);
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            Some(u32::MAX),
+            pty,
+        );
+        let session_id = test_session_id(&supervisor, "codex");
+        let codex_running = |snapshot: &RuntimeSnapshot| {
+            snapshot
+                .sessions
+                .iter()
+                .find(|session| session.label == "codex")
+                .expect("codex session")
+                .running
+        };
+        assert!(codex_running(&supervisor.snapshot()));
+        let _ = supervisor.send_input(SendInputRequest {
+            session_id,
+            input: "x".into(),
+        });
+        let _ = supervisor.resize_session_by_id(session_id, 100, 30);
+        assert!(
+            codex_running(&supervisor.snapshot()),
+            "a hot path swept liveness"
+        );
+        supervisor.refresh_session_liveness();
+        assert!(!codex_running(&supervisor.snapshot()));
+    }
+
+    #[test]
+    fn operator_keystrokes_leave_no_audit_line_without_an_overlap() {
+        // D9 step 4: no DispatchAttempt (audit line) per keystroke.
+        let supervisor = test_supervisor();
+        let (pty, _) = recording_pty_session(101);
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            Some(101),
+            pty,
+        );
+        let events = capture_runtime_events(&supervisor);
+        let session_id = test_session_id(&supervisor, "claude");
+        for key in ["a", "b", "c"] {
+            supervisor
+                .send_input(SendInputRequest {
+                    session_id,
+                    input: key.into(),
+                })
+                .expect("operator keystroke");
+        }
+        assert!(
+            !events
+                .lock()
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::DispatchAttempt { .. }))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exits_are_noticed_without_any_operator_sweep() {
+        // D9 step 1: a real process exit is reported by the run's exit watcher
+        // (or the liveness tick) with no snapshot, input or resize afterwards.
+        let root = tempfile::tempdir().expect("create exit watcher test root");
+        let supervisor = test_supervisor_with_root(root.path().to_path_buf());
+        supervisor.set_exit_watch_enabled_for_tests(true);
+        let events = capture_runtime_events(&supervisor);
+        let powershell = find_direct_executable(&["powershell.exe"])
+            .expect("resolve a concrete PowerShell executable");
+        supervisor.set_executable_resolver_for_tests(Arc::new(FixedExecutableResolver(
+            ResolvedLaunchProgram {
+                program: powershell,
+                prefix_args: vec![
+                    "-NoProfile".into(),
+                    "-NonInteractive".into(),
+                    "-Command".into(),
+                    "Start-Sleep -Milliseconds 300; exit 0".into(),
+                ],
+            },
+        )));
+        // A dedicated Terminal session: with S5, the default Claude slot's
+        // launch choices belong to its driver, so it is not repurposed.
+        let terminal = create_test_session(
+            &supervisor,
+            "Exit watcher receipt",
+            DriverKind::GenericTerminal,
+            shared_types::PermissionProfile::Normal,
+        );
+        let (session_id, session_alias) = (terminal.session_id, terminal.alias);
+        supervisor
+            .start_session_by_id(session_id)
+            .expect("spawn PowerShell through the production PTY path");
+        wait_for_event_count(&events, 1, |event| {
+            matches!(
+                event,
+                RuntimeEvent::SessionOutput { session, chunk, .. }
+                    if session == &session_alias && chunk.contains("\u{1b}[6n")
+            )
+        });
+        supervisor
+            .send_input(SendInputRequest {
+                session_id,
+                input: "\u{1b}[1;1R".into(),
+            })
+            .expect("release the real ConPTY cursor handshake");
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let exited = events.lock().iter().any(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::SessionExit { session, .. } if session == &session_alias
+                )
+            });
+            if exited {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the exit was not noticed without an operator-driven sweep"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
     fn liveness_pruning_without_exit_status_emits_process_disappeared() {
         let supervisor = test_supervisor();
         let (pty, _, _) =
@@ -16399,6 +22208,7 @@ mod tests {
         );
         let events = capture_runtime_events(&supervisor);
 
+        supervisor.refresh_session_liveness();
         let snapshot = supervisor.snapshot();
 
         let codex = snapshot
@@ -17222,7 +23032,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("work state is blocked (workspace_trust)"),
+                .contains("work state is blocked (modal:workspace_trust)"),
             "{error:#}"
         );
         assert_eq!(slots_mutation_probe(&supervisor), before);
@@ -17345,7 +23155,7 @@ mod tests {
         assert!(
             blocked
                 .to_string()
-                .contains("work state is blocked (workspace_trust)"),
+                .contains("work state is blocked (modal:workspace_trust)"),
             "{blocked:#}"
         );
         assert_eq!(slots_mutation_probe(&supervisor), before_blocked);
@@ -17503,6 +23313,7 @@ mod tests {
             pty,
         );
 
+        supervisor.refresh_session_liveness();
         let snapshot = supervisor.snapshot();
         let codex = snapshot
             .sessions
@@ -17619,10 +23430,135 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_prunes_exited_running_session() {
+    fn another_sweeps_slow_retirement_neither_blocks_unrelated_work_nor_admits_its_target() {
+        // B's root process is gone (u32::MAX), so a sweep retires it; its scope
+        // kill blocks on a gate the test holds, so nothing depends on timing.
+        struct GatedKillPty {
+            gate: Arc<(Mutex<bool>, Condvar)>,
+            kills: Arc<AtomicUsize>,
+            entered: Mutex<Option<mpsc::SyncSender<()>>>,
+        }
+        impl PtySessionTrait for GatedKillPty {
+            fn send_input(&self, _: &str) -> pty_host::PtyWriteResult { Ok(0) }
+            fn resize(&self, _: u16, _: u16) -> Result<()> { Ok(()) }
+            fn kill(&self) -> Result<()> {
+                self.kills.fetch_add(1, Ordering::SeqCst);
+                if let Some(entered) = self.entered.lock().take() {
+                    let _ = entered.send(());
+                }
+                let mut released = self.gate.0.lock();
+                while !*released { self.gate.1.wait(&mut released); }
+                Ok(())
+            }
+            fn try_wait(&self) -> Result<Option<PtyExitStatus>> {
+                Ok(Some(PtyExitStatus { exit_code: 1, signal: None, success: false }))
+            }
+            fn process_id(&self) -> Option<u32> { Some(u32::MAX) }
+        }
+        struct ReleaseKill(Arc<(Mutex<bool>, Condvar)>);
+        impl Drop for ReleaseKill {
+            fn drop(&mut self) { *self.0.0.lock() = true; self.0.1.notify_all(); }
+        }
+        let supervisor = test_supervisor();
+        supervisor.set_stop_kill_timeout_for_tests(Duration::from_secs(30));
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let kills = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        install_mock_running_session_with_process_id(
+            &supervisor, "codex", DriverKind::Codex, Some(u32::MAX),
+            Box::new(GatedKillPty { gate: gate.clone(), kills: kills.clone(), entered: Mutex::new(Some(entered_tx)) }),
+        );
+        let target = test_session_id(&supervisor, "codex");
+        let run_id = current_run_id(&supervisor, "codex");
+        let events = capture_runtime_events(&supervisor);
+        let release = ReleaseKill(gate);
+
+        let retiring = supervisor.clone();
+        let retirement = thread::spawn(move || retiring.refresh_session_liveness());
+        entered_rx.recv_timeout(Duration::from_secs(5)).expect("B's retirement reached its kill");
+
+        // Unrelated work: a second sweep completes while B's kill is still held.
+        let second = supervisor.clone();
+        let (swept_tx, swept_rx) = mpsc::sync_channel(1);
+        let second_sweep = thread::spawn(move || {
+            second.refresh_session_liveness();
+            swept_tx.send(()).unwrap();
+        });
+        swept_rx.recv_timeout(Duration::from_secs(5))
+            .expect("a second sweep waited behind another sweep's retirement");
+        second_sweep.join().unwrap();
+
+        // The busy target is refused at once by every command, with both the
+        // desktop's transient phrase and the established exclusion wording.
+        for (action, result) in [
+            ("restart", supervisor.restart_session_by_id(target).map(|_| ())),
+            ("start", supervisor.start_session_by_id(target).map(|_| ())),
+            ("delete", supervisor.delete_session(target)),
+        ] {
+            let error = result.err().unwrap_or_else(|| panic!("{action} admitted a retiring session"));
+            let text = error.to_string();
+            assert!(text.contains("must be fully closed"), "{action}: {text}");
+            assert!(text.contains("lifecycle operation in progress"), "{action}: {text}");
+        }
+        assert_eq!(kills.load(Ordering::SeqCst), 1, "no second retirement while the first is held");
+
+        drop(release);
+        retirement.join().unwrap();
+        assert_eq!(kills.load(Ordering::SeqCst), 1, "exactly one retirement ran");
+        let snapshot = supervisor.inner.slots.lock().get_by_id(target).unwrap().snapshot();
+        assert!(!snapshot.running, "B ended");
+
+        let captured = events.lock().clone();
+        let exits = captured.iter().filter(|event| matches!(event,
+            RuntimeEvent::SessionExit { identity, .. } if identity.run_id == run_id)).count();
+        assert_eq!(exits, 1, "exactly one exit for B's run");
+        let sequences = captured.iter().filter_map(|event| match event {
+            RuntimeEvent::SessionState { identity, .. }
+            | RuntimeEvent::SessionExit { identity, .. }
+            | RuntimeEvent::SessionWorkState { identity, .. }
+            | RuntimeEvent::SessionOutputDraining { identity, .. }
+            | RuntimeEvent::SessionOutput { identity, .. } if identity.run_id == run_id => Some(identity.sequence),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]), "B's run events out of order: {sequences:?}");
+    }
+
+    #[test]
+    fn inferred_exit_retirement_is_cancelled_by_fresh_same_run_evidence() {
+        let supervisor = test_supervisor();
+        let (pty, _, kills) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "codex", DriverKind::Codex, pty);
+        let session_id = test_session_id(&supervisor, "codex");
+        let run_id = current_run_id(&supervisor, "codex");
+        let generation = supervisor.current_generation_for_tests(session_id).expect("generation");
+        let inferred = || supervisor.inner.slots.lock().get_by_id(session_id).unwrap().run_event_sequence;
+        let cause = |sequence| RunRetirementCause::Liveness {
+            final_state: LifecycleState::Failed,
+            fallback_reason: SessionExitReason::CrashExit,
+            detail: "agent terminal signature observed before an agent process was found".into(),
+            inferred_at_sequence: Some(sequence),
+        };
+        // The sweep inferred an exit at this sequence; then fresh output for the
+        // same run arrived before the retirement claim.
+        let seen = inferred();
+        supervisor.handle_pty_event_by_id(session_id, generation, run_id, PtyEvent::Output("still here".into()));
+        assert!(inferred() > seen, "fresh output advanced the run's sequence");
+        supervisor.retire_session_run(session_id, generation, run_id, cause(seen));
+        let slot_running = supervisor.inner.slots.lock().get_by_id(session_id).unwrap().running.is_some();
+        assert!(slot_running, "a stale inference must not retire the run");
+        assert_eq!(kills.load(Ordering::SeqCst), 0);
+        // An unchanged sequence still retires, and so does a real process exit.
+        supervisor.retire_session_run(session_id, generation, run_id, cause(inferred()));
+        assert!(supervisor.inner.slots.lock().get_by_id(session_id).unwrap().running.is_none());
+        assert_eq!(kills.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn liveness_sweep_prunes_exited_running_session() {
         let supervisor = test_supervisor();
         install_stale_running_session(&supervisor, "codex");
 
+        supervisor.refresh_session_liveness();
         let snapshot = supervisor.snapshot();
         let codex = snapshot
             .sessions
@@ -17640,6 +23576,7 @@ mod tests {
         let supervisor = test_supervisor();
         install_stale_running_session(&supervisor, "codex");
         let codex_alias = test_session_alias(&supervisor, "codex");
+        supervisor.refresh_session_liveness();
 
         let error = supervisor
             .send_input(SendInputRequest {
@@ -18256,6 +24193,7 @@ mod tests {
                 cancel_count: cancel_count.clone(),
                 kill_count: kill_count.clone(),
                 first_write_error_bytes: 0,
+                agent_exited: None,
             }),
         );
         let (codex_pty, codex_inputs) = recording_pty_session(102);
@@ -18275,13 +24213,38 @@ mod tests {
             .enable_time()
             .build()
             .unwrap();
-        let started_at = Instant::now();
+
+        // The request reads its budget after it spawns the writer. Holding the
+        // budget until the write is blocked in the PTY starts the 50 ms only
+        // then, so the in-flight path is the one exercised. A cancellation
+        // that wins before entry writes nothing: see
+        // queued_sideband_timeout_never_enters_the_pty_or_cancels_the_active_writer.
+        let budget_gate = supervisor.inner.sideband_write_timeout.lock();
+        let request_supervisor = supervisor.clone();
+        let request_caller = caller.clone();
+        let request = runtime.spawn(async move {
+            request_supervisor
+                .apply_sideband_request_async(
+                    &request_caller,
+                    SidebandRequest::SendInput {
+                        name: request_caller.session.clone(),
+                        input: "must time out".into(),
+                    },
+                )
+                .await
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("sideband write never entered the blocking PTY");
+        drop(budget_gate);
+        // Releases the write only if the fallback never did, so a broken
+        // fallback fails below instead of hanging the test.
         let rescue_release = release.clone();
         let rescue_flag = rescue_fired.clone();
         let (disarm_rescue_tx, disarm_rescue_rx) = mpsc::channel();
         let rescue = thread::spawn(move || {
             if disarm_rescue_rx
-                .recv_timeout(Duration::from_secs(3))
+                .recv_timeout(Duration::from_secs(10))
                 .is_ok()
             {
                 return;
@@ -18296,27 +24259,6 @@ mod tests {
         });
 
         let response = runtime.block_on(async {
-            let request_supervisor = supervisor.clone();
-            let request_caller = caller.clone();
-            let request = tokio::spawn(async move {
-                request_supervisor
-                    .apply_sideband_request_async(
-                        &request_caller,
-                        SidebandRequest::SendInput {
-                            name: request_caller.session.clone(),
-                            input: "must time out".into(),
-                        },
-                    )
-                    .await
-            });
-            tokio::task::spawn_blocking(move || {
-                entered_rx
-                    .recv_timeout(Duration::from_secs(2))
-                    .expect("sideband write never entered the blocking PTY")
-            })
-            .await
-            .unwrap();
-
             supervisor
                 .send_input(SendInputRequest {
                     session_id: test_session_id(&supervisor, "codex"),
@@ -18330,24 +24272,30 @@ mod tests {
         assert!(!response.ok);
         assert!(response.timed_out);
         assert!(response.message.contains("timed out after 50ms"));
+        // This PTY cannot cancel in isolation; on a loaded machine its cancel
+        // worker may also miss the 250 ms budget. Either way the exact run is
+        // terminated at once, without waiting out any 5 s window.
+        let cancel_failed = response.message.contains("isolated input cancellation failed");
         assert!(
-            response
-                .message
-                .contains("isolated input cancellation failed"),
+            cancel_failed || response.message.contains("isolated input cancellation exceeded 250ms"),
             "{}",
             response.message
         );
         assert!(
             response
                 .message
-                .contains("exact run terminated as cancellation fallback"),
+                .contains("exact run terminated as cancellation fallback")
+                && !response.message.contains("exceeded 5s")
+                && !response.message.contains("within 5s"),
             "{}",
             response.message
         );
-        assert!(started_at.elapsed() < Duration::from_secs(2));
         assert_eq!(writes_started.load(Ordering::SeqCst), 1);
         assert_eq!(writes_finished.load(Ordering::SeqCst), 1);
-        assert_eq!(cancel_count.load(Ordering::SeqCst), 1);
+        assert!(cancel_count.load(Ordering::SeqCst) <= 1);
+        if cancel_failed {
+            assert_eq!(cancel_count.load(Ordering::SeqCst), 1);
+        }
         assert_eq!(kill_count.load(Ordering::SeqCst), 1);
         rescue.join().unwrap();
         assert!(!rescue_fired.load(Ordering::SeqCst));
@@ -18399,6 +24347,7 @@ mod tests {
                 cancel_count: cancel_count.clone(),
                 kill_count: kill_count.clone(),
                 first_write_error_bytes: 4,
+                agent_exited: None,
             }),
         );
         let caller = supervisor
@@ -18418,29 +24367,26 @@ mod tests {
             .build()
             .unwrap();
 
-        let response = runtime.block_on(async {
-            let request_supervisor = supervisor.clone();
-            let request_caller = caller.clone();
-            let request = tokio::spawn(async move {
-                request_supervisor
-                    .apply_sideband_request_async(
-                        &request_caller,
-                        SidebandRequest::SendInput {
-                            name: request_caller.session.clone(),
-                            input: "partial timed write".into(),
-                        },
-                    )
-                    .await
-            });
-            tokio::task::spawn_blocking(move || {
-                entered_rx
-                    .recv_timeout(Duration::from_secs(2))
-                    .expect("sideband write never entered the blocking PTY")
-            })
-            .await
-            .unwrap();
-            request.await.unwrap()
+        // As in the fallback test: the 50 ms starts once the write is in the PTY.
+        let budget_gate = supervisor.inner.sideband_write_timeout.lock();
+        let request_supervisor = supervisor.clone();
+        let request_caller = caller.clone();
+        let request = runtime.spawn(async move {
+            request_supervisor
+                .apply_sideband_request_async(
+                    &request_caller,
+                    SidebandRequest::SendInput {
+                        name: request_caller.session.clone(),
+                        input: "partial timed write".into(),
+                    },
+                )
+                .await
         });
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("sideband write never entered the blocking PTY");
+        drop(budget_gate);
+        let response = runtime.block_on(request).unwrap();
 
         assert!(!response.ok);
         assert!(response.timed_out);
@@ -18521,7 +24467,16 @@ mod tests {
         let caller = supervisor
             .resolve_pane_caller(TestPaneProcess::new(7014, [101]))
             .unwrap();
-        supervisor.set_sideband_write_timeout_for_tests(Duration::from_millis(50));
+        // The premise is a write already in flight when the budget expires. At
+        // 50 ms a loaded machine could expire it before the write started (a
+        // correct BeforeStart cancel; PC3 under load, 1 in 40), so the budget
+        // is well above write-start latency. Bounded, not deterministic: the
+        // production budget starts with the request, by design.
+        supervisor.set_sideband_write_timeout_for_tests(Duration::from_millis(1000));
+        // The test holds the isolated cancellation for 150 ms on purpose; a
+        // budget it can never outlast keeps that hold from racing the real
+        // 250 ms under load (PC3 full suite, debug and release).
+        supervisor.set_input_cancel_timeout_for_tests(Duration::from_secs(5));
 
         let timed_supervisor = supervisor.clone();
         let timed_caller = caller.clone();
@@ -18567,7 +24522,11 @@ mod tests {
             ready.notify_all();
         }
         let timed_response = timed_request.join().unwrap();
-        successor.join().unwrap().unwrap();
+        // Diagnostics only (Reviewer c5951a10): the timed request's own outcome
+        // is printed before the successor's result can end the test.
+        let successor_result = successor.join().unwrap();
+        assert!(successor_result.is_ok(), "successor {:?}; timed request ok={} timed_out={} message={}",
+            successor_result, timed_response.ok, timed_response.timed_out, timed_response.message);
         second_entered_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("successor did not resume after cancellation barrier cleared");
@@ -18575,7 +24534,7 @@ mod tests {
         assert!(timed_response.ok, "{}", timed_response.message);
         assert!(timed_response.timed_out);
         assert!(
-            timed_response.message.contains("completed after the 50ms"),
+            timed_response.message.contains("completed after the 1000ms"),
             "{}",
             timed_response.message
         );
@@ -18595,7 +24554,10 @@ mod tests {
         let (successor_entered_tx, successor_entered_rx) = mpsc::sync_channel(1);
         let (cancel_entered_tx, cancel_entered_rx) = mpsc::sync_channel(1);
         let first_release = Arc::new((Mutex::new(false), Condvar::new()));
-        let cancel_release = Arc::new((Mutex::new(false), Condvar::new()));
+        // A's isolated cancellation returns at once, so this test never holds
+        // it against the real 250 ms budget. A's write stays blocked until
+        // first_release, and A owns its barrier until it sees that write stop.
+        let cancel_release = Arc::new((Mutex::new(true), Condvar::new()));
         let inputs = Arc::new(Mutex::new(Vec::new()));
         install_mock_running_session_with_process_id(
             &supervisor,
@@ -18610,65 +24572,40 @@ mod tests {
                 first_release: first_release.clone(),
                 second_entered: Mutex::new(Some(successor_entered_tx)),
                 cancel_entered: Mutex::new(Some(cancel_entered_tx)),
-                cancel_release: cancel_release.clone(),
+                cancel_release,
             }),
         );
         let caller = supervisor
             .resolve_pane_caller(TestPaneProcess::new(7016, [101]))
             .unwrap();
+        let gate = supervisor.inner.slots.lock().get("claude").unwrap()
+            .running.as_ref().unwrap().input_gate.clone();
         supervisor.set_sideband_write_timeout_for_tests(Duration::from_millis(25));
-        let input_gate = supervisor
-            .inner
-            .slots
-            .lock()
-            .get("claude")
-            .unwrap()
-            .running
-            .as_ref()
-            .unwrap()
-            .input_gate
-            .clone();
+        let send = |input: &'static str| {
+            let supervisor = supervisor.clone();
+            let caller = caller.clone();
+            thread::spawn(move || supervisor.apply_sideband_request(&caller,
+                SidebandRequest::SendInput { name: caller.session.clone(), input: input.into() }))
+        };
 
-        let first_supervisor = supervisor.clone();
-        let first_caller = caller.clone();
-        let first = thread::spawn(move || {
-            first_supervisor.apply_sideband_request(
-                &first_caller,
-                SidebandRequest::SendInput {
-                    name: first_caller.session.clone(),
-                    input: "inflight A".into(),
-                },
-            )
-        });
+        // Each request reads its budget after it spawns its writer: holding
+        // the budget starts a 25 ms timeout only once its writer is in place.
+        let budget_gate = supervisor.inner.sideband_write_timeout.lock();
+        let first = send("inflight A");
         first_entered_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(10))
             .expect("inflight writer A did not enter");
+        drop(budget_gate);
         cancel_entered_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(10))
             .expect("A cancellation did not enter");
+        assert!(gate.state.lock().cancellation_barrier, "A's timeout owns the barrier");
 
-        let queued_supervisor = supervisor.clone();
-        let queued_caller = caller.clone();
-        let queued = thread::spawn(move || {
-            queued_supervisor.apply_sideband_request(
-                &queued_caller,
-                SidebandRequest::SendInput {
-                    name: queued_caller.session.clone(),
-                    input: "queued timeout B".into(),
-                },
-            )
-        });
-        let queued_deadline = Instant::now() + Duration::from_secs(2);
-        while input_gate.queued_writes() < 1 && Instant::now() < queued_deadline {
-            thread::yield_now();
-        }
-        assert_eq!(input_gate.queued_writes(), 1);
-
-        {
-            let (released, ready) = &*first_release;
-            *released.lock() = true;
-            ready.notify_all();
-        }
+        // B queues behind A's in-flight write; its 25 ms starts only then.
+        let budget_gate = supervisor.inner.sideband_write_timeout.lock();
+        let queued = send("queued timeout B");
+        wait_until("B is queued behind A", || gate.queued_writes() == 1);
+        drop(budget_gate);
         let queued_response = queued.join().unwrap();
         assert!(!queued_response.ok);
         assert!(queued_response.timed_out);
@@ -18679,7 +24616,13 @@ mod tests {
             "{}",
             queued_response.message
         );
+        assert_eq!(gate.queued_writes(), 0);
+        assert!(
+            gate.state.lock().cancellation_barrier,
+            "queued timeout B cleared A's still-owned cancellation barrier"
+        );
 
+        // C waits behind A; it enters only after A has seen its write stop.
         let successor_session_id = test_session_id(&supervisor, "claude");
         let successor_supervisor = supervisor.clone();
         let successor = thread::spawn(move || {
@@ -18688,15 +24631,9 @@ mod tests {
                 input: "successor C".into(),
             })
         });
-        assert!(
-            successor_entered_rx
-                .recv_timeout(Duration::from_millis(50))
-                .is_err(),
-            "queued timeout B cleared A's still-owned cancellation barrier"
-        );
-
+        wait_until("C is queued behind A", || gate.queued_writes() == 1);
         {
-            let (released, ready) = &*cancel_release;
+            let (released, ready) = &*first_release;
             *released.lock() = true;
             ready.notify_all();
         }
@@ -18711,6 +24648,862 @@ mod tests {
             &*inputs.lock(),
             &["inflight A".to_string(), "successor C".to_string()]
         );
+    }
+
+    fn blocked_first_write_session(
+        supervisor: &SupervisorHandle,
+    ) -> (
+        SessionId,
+        Arc<Mutex<Vec<String>>>,
+        mpsc::Receiver<()>,
+        Arc<(Mutex<bool>, Condvar)>,
+    ) {
+        let inputs = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (first_entered_tx, first_entered_rx) = mpsc::sync_channel(1);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        install_mock_running_session_with_process_id(
+            supervisor,
+            "claude",
+            DriverKind::Claude,
+            None,
+            Box::new(FirstWriteBlockingPtySession {
+                process_id: 101,
+                inputs: inputs.clone(),
+                calls,
+                first_entered: first_entered_tx,
+                release: release.clone(),
+            }),
+        );
+        (
+            test_session_id(supervisor, "claude"),
+            inputs,
+            first_entered_rx,
+            release,
+        )
+    }
+
+    fn release_first_write(release: &Arc<(Mutex<bool>, Condvar)>) {
+        let (released, ready) = &**release;
+        *released.lock() = true;
+        ready.notify_all();
+    }
+
+    fn queued_input_bytes(supervisor: &SupervisorHandle, session_id: SessionId) -> usize {
+        supervisor
+            .inner
+            .operator_input
+            .lock()
+            .get(&session_id)
+            .map(|queue| queue.queued_bytes.load(Ordering::Acquire))
+            .unwrap_or(0)
+    }
+
+    fn wait_for_condition(deadline: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let until = Instant::now() + deadline;
+        while Instant::now() < until {
+            if done() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        done()
+    }
+
+    fn enqueue_text(supervisor: &SupervisorHandle, session_id: SessionId, input: impl Into<String>) -> Result<()> {
+        supervisor.enqueue_operator_input(SendInputRequest {
+            session_id,
+            input: input.into(),
+        })
+    }
+
+    #[test]
+    fn operator_input_is_admitted_at_once_and_written_in_order() {
+        let supervisor = test_supervisor();
+        let (session_id, inputs, first_entered, release) = blocked_first_write_session(&supervisor);
+        enqueue_text(&supervisor, session_id, "a").expect("admit a");
+        first_entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the worker began writing a");
+        let started = Instant::now();
+        enqueue_text(&supervisor, session_id, "b").expect("admit b");
+        enqueue_text(&supervisor, session_id, "c").expect("admit c");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "admission waited on the blocked PTY write"
+        );
+        release_first_write(&release);
+        assert!(wait_for_condition(Duration::from_secs(5), || inputs.lock().len() == 3));
+        assert_eq!(
+            &*inputs.lock(),
+            &["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        assert!(wait_for_condition(Duration::from_secs(5), || queued_input_bytes(&supervisor, session_id) == 0));
+    }
+
+    #[test]
+    fn operator_input_refuses_one_oversized_payload_without_sending_any_of_it() {
+        let supervisor = test_supervisor();
+        let (session_id, inputs, _first_entered, _release) = blocked_first_write_session(&supervisor);
+        let error = enqueue_text(
+            &supervisor,
+            session_id,
+            "x".repeat(OPERATOR_INPUT_MAX_PAYLOAD_BYTES + 1),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Nothing was sent"), "{error:#}");
+        assert!(inputs.lock().is_empty());
+        assert_eq!(queued_input_bytes(&supervisor, session_id), 0);
+    }
+
+    #[test]
+    fn operator_input_bytes_are_bounded_and_released_after_writes() {
+        let supervisor = test_supervisor();
+        let (session_id, inputs, first_entered, release) = blocked_first_write_session(&supervisor);
+        enqueue_text(&supervisor, session_id, "first").expect("admit first");
+        first_entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the worker began writing");
+        let chunk = "y".repeat(OPERATOR_INPUT_MAX_PAYLOAD_BYTES);
+        for _ in 0..3 {
+            enqueue_text(&supervisor, session_id, chunk.clone()).expect("within the byte bound");
+        }
+        let error = enqueue_text(&supervisor, session_id, chunk.clone()).unwrap_err();
+        assert!(error.to_string().contains("bytes of input waiting"), "{error:#}");
+        release_first_write(&release);
+        // Diagnostics only (Reviewer e16b82cc): which writes reached the PTY
+        // and what is still queued when the unchanged 10 s bound expires.
+        assert!(wait_for_condition(Duration::from_secs(10), || queued_input_bytes(&supervisor, session_id) == 0),
+            "queued bytes {} after 10 s; PTY writes {:?} (lengths)", queued_input_bytes(&supervisor, session_id),
+            inputs.lock().iter().map(String::len).collect::<Vec<_>>());
+        enqueue_text(&supervisor, session_id, chunk).expect("bytes were released after the writes");
+    }
+
+    #[test]
+    fn operator_input_queue_refuses_beyond_its_count_bound() {
+        let supervisor = test_supervisor();
+        let (session_id, _inputs, first_entered, release) = blocked_first_write_session(&supervisor);
+        enqueue_text(&supervisor, session_id, "first").expect("admit first");
+        first_entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the worker began writing");
+        for index in 0..OPERATOR_INPUT_QUEUE_CAP {
+            enqueue_text(&supervisor, session_id, format!("k{index}")).expect("within the count bound");
+        }
+        let error = enqueue_text(&supervisor, session_id, "overflow").unwrap_err();
+        assert!(error.to_string().contains("input queue is full"), "{error:#}");
+        release_first_write(&release);
+    }
+
+    #[test]
+    fn a_run_change_between_admissions_keeps_one_worker_per_run_and_the_order() {
+        // Codex review: a caller that read an older run must never replace a
+        // newer run's queue. The run is read under queue publication, so the
+        // new run gets exactly one worker and its keys stay in order; the old
+        // run's leftover input is refused, and its bytes are released.
+        let supervisor = test_supervisor();
+        let (session_id, inputs, first_entered, release) = blocked_first_write_session(&supervisor);
+        let events = capture_runtime_events(&supervisor);
+        enqueue_text(&supervisor, session_id, "a").expect("admit a (old run)");
+        first_entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the worker began writing a");
+        enqueue_text(&supervisor, session_id, "b").expect("admit b (old run)");
+        supervisor
+            .inner
+            .slots
+            .lock()
+            .get_by_id_mut(session_id)
+            .expect("claude slot")
+            .run_id = Some(Uuid::new_v4());
+        for key in ["c", "d", "e"] {
+            enqueue_text(&supervisor, session_id, key).expect("admit for the new run");
+        }
+        assert_eq!(
+            supervisor
+                .inner
+                .operator_input_workers_started
+                .load(Ordering::SeqCst),
+            2,
+            "one worker for the old run and exactly one for the new run"
+        );
+        release_first_write(&release);
+        assert!(wait_for_condition(Duration::from_secs(5), || inputs.lock().len() == 4));
+        assert_eq!(
+            &*inputs.lock(),
+            &[
+                "a".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+                "e".to_string()
+            ]
+        );
+        assert!(wait_for_condition(Duration::from_secs(5), || events.lock().iter().any(|event| {
+            matches!(
+                event,
+                RuntimeEvent::SystemLog { message, .. }
+                    if message.contains("run ended before this input was written")
+            )
+        })));
+        enqueue_text(&supervisor, session_id, "f").expect("admit f");
+        assert_eq!(
+            supervisor
+                .inner
+                .operator_input_workers_started
+                .load(Ordering::SeqCst),
+            2,
+            "the new run's queue is reused"
+        );
+        let gate = run_input_gate(&supervisor, session_id);
+        assert!(wait_for_condition(Duration::from_secs(5), || {
+            gate.operator_inputs_pending.load(Ordering::SeqCst) == 0
+        }), "every admitted item, written or refused, lowered the barrier");
+    }
+
+    fn run_input_gate(supervisor: &SupervisorHandle, session_id: SessionId) -> Arc<RunInputGate> {
+        supervisor
+            .inner
+            .slots
+            .lock()
+            .get_by_id(session_id)
+            .expect("session slot")
+            .running
+            .as_ref()
+            .expect("running session")
+            .input_gate
+            .clone()
+    }
+
+    fn enable_output_credit_for_current_run(supervisor: &SupervisorHandle, name: &str) -> output_credit::OutputRun {
+        let ledger = supervisor.output_credit();
+        ledger.enable();
+        let reset = ledger.begin_renderer();
+        ledger.renderer_ready(reset.epoch, Duration::ZERO).unwrap();
+        let slots = supervisor.inner.slots.lock();
+        let slot = slots.get(name).unwrap();
+        let run = output_credit::OutputRun {
+            session_id: slot.session_id, run_id: slot.run_id.unwrap(), generation: slot.generation,
+        };
+        ledger.open_run(run);
+        run
+    }
+
+    #[test]
+    fn output_credit_wait_precedes_global_locks_and_shutdown_cancels_before_lifecycle_lock() {
+        let supervisor = test_supervisor();
+        let (pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "claude", DriverKind::Claude, pty);
+        let run = enable_output_credit_for_current_run(&supervisor, "claude");
+        let ledger = supervisor.output_credit();
+        let leases = (0..4).map(|_| match ledger.reserve(run, output_credit::MAX_CHUNK_BYTES - output_credit::DISPLAY_OVERHEAD) {
+            output_credit::Admission::Reserved(lease) => lease,
+            _ => panic!("available credit"),
+        }).collect::<Vec<_>>();
+        let sequence = supervisor.inner.slots.lock().get("claude").unwrap().run_event_sequence;
+        let producer = supervisor.clone();
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let reader = thread::spawn(move || {
+            producer.handle_pty_event_by_id(run.session_id, run.generation, run.run_id, PtyEvent::Output("waiting".into()));
+            done_tx.send(()).unwrap();
+        });
+        assert!(ledger.wait_for_blocked_producer(Duration::from_secs(5)));
+        assert_eq!(supervisor.inner.slots.try_lock().expect("credit wait holds no slots lock")
+            .get("claude").unwrap().run_event_sequence, sequence, "no sequence allocated before credit");
+        let lifecycle = supervisor.inner.shutdown_lifecycle.try_write().expect("credit wait holds no lifecycle lock");
+        let stopping = supervisor.clone();
+        let shutdown = thread::spawn(move || stopping.shutdown());
+        let result = done_rx.recv_timeout(Duration::from_secs(5));
+        drop(lifecycle); // Release even on failure so the fixture cannot strand shutdown.
+        assert!(result.is_ok(), "shutdown must cancel producer before waiting on lifecycle");
+        reader.join().unwrap();
+        shutdown.join().unwrap().unwrap();
+        drop(leases);
+    }
+
+    #[test]
+    fn output_credit_natural_exit_keeps_tail_identity_and_tickets_until_reader_eof() {
+        let supervisor = test_supervisor();
+        let (pty, writes, kills) = mock_pty_session_full(None, None, MockKillBehavior::Immediate,
+            AgentLiveness::Exited { last_agent_pids: Vec::new(), live_processes: Vec::new() }, None);
+        install_mock_running_session(&supervisor, "claude", DriverKind::Claude, pty);
+        let run = enable_output_credit_for_current_run(&supervisor, "claude");
+        let events = capture_runtime_events(&supervisor);
+        supervisor.refresh_session_liveness();
+        supervisor.refresh_session_liveness();
+        let snapshot = supervisor.inner.slots.lock().get("claude").unwrap().snapshot();
+        assert!(snapshot.running && snapshot.output_draining);
+        assert_eq!(snapshot.run_id, Some(run.run_id));
+        assert!(!run_input_gate(&supervisor, run.session_id).is_accepting());
+        assert!(enqueue_text(&supervisor, run.session_id, "must refuse").is_err());
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        assert_eq!(kills.load(Ordering::SeqCst), 0, "process watcher cannot close the reader scope");
+        assert!(wait_for_condition(Duration::from_secs(5), || events.lock().iter().any(|event| matches!(event,
+            RuntimeEvent::SystemLog { level: LogLevel::Error, message, .. }
+                if message.contains("input write could not be cancelled") && message.contains("Stop remains available")))));
+        supervisor.handle_pty_event_by_id(run.session_id, run.generation, run.run_id, PtyEvent::Output("final tail".into()));
+        let output_identity = events.lock().iter().find_map(|event| match event {
+            RuntimeEvent::SessionOutput { identity, chunk, .. } if chunk == "final tail" => Some(*identity),
+            _ => None,
+        }).expect("tail published with original identity");
+        let ledger = supervisor.output_credit();
+        let tail_credit = ledger.take_published(output_identity).unwrap();
+        supervisor.handle_pty_event_by_id(run.session_id, run.generation, run.run_id, PtyEvent::Closed);
+        let snapshot = supervisor.inner.slots.lock().get("claude").unwrap().snapshot();
+        assert!(!snapshot.running && !snapshot.output_draining);
+        assert!(ledger.dispatch(&tail_credit));
+        assert_eq!(ledger.acknowledge(&tail_credit).unwrap(), 1, "natural retirement does not invalidate parser ownership");
+        let events = events.lock();
+        assert_eq!(events.iter().filter(|event| matches!(event, RuntimeEvent::SessionOutputDraining { .. })).count(), 1);
+        assert!(!events.iter().any(|event| matches!(event, RuntimeEvent::SessionState {
+            state: LifecycleState::Idle | LifecycleState::Ready, ..
+        })), "tail cannot announce the ended agent ready");
+    }
+
+    #[test]
+    fn output_credit_observer_keeps_classification_tail_and_run_sequence_live() {
+        let supervisor = test_supervisor();
+        let (pty, _, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+        install_mock_running_session(&supervisor, "claude", DriverKind::Claude, pty);
+        let run = enable_output_credit_for_current_run(&supervisor, "claude");
+        let ledger = supervisor.output_credit();
+        let leases = (0..4).map(|_| match ledger.reserve(run, output_credit::MAX_CHUNK_BYTES - output_credit::DISPLAY_OVERHEAD) {
+            output_credit::Admission::Reserved(lease) => lease, _ => panic!("available credit"),
+        }).collect::<Vec<_>>();
+        let events = capture_runtime_events(&supervisor);
+        let producer = supervisor.clone();
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let reader = thread::spawn(move || {
+            producer.handle_pty_event_by_id(run.session_id, run.generation, run.run_id,
+                PtyEvent::Output("\x1b[?2004hobserved while display unavailable".into()));
+            done_tx.send(()).unwrap();
+        });
+        assert!(done_rx.recv_timeout(Duration::from_secs(4)).is_ok(), "native classification must survive missing ACK");
+        reader.join().unwrap();
+        {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get("claude").unwrap();
+            assert!(slot.run_output_tail.contains("observed while display unavailable"));
+            assert_eq!(slot.bracketed_paste.mode_for(RunBinding { session_id: run.session_id,
+                run_id: run.run_id, generation: run.generation }), BracketedPasteMode::Enabled);
+        }
+        let output_identity = events.lock().iter().find_map(|event| match event {
+            RuntimeEvent::SessionOutput { identity, .. } => Some(*identity), _ => None,
+        }).expect("observer output still advances ordered native publication");
+        assert!(ledger.take_published(output_identity).is_none(), "observer cannot invent display credit");
+        drop(leases);
+        supervisor.handle_pty_event_by_id(run.session_id, run.generation, run.run_id, PtyEvent::Output("resumed".into()));
+        let resumed = events.lock().iter().find_map(|event| match event {
+            RuntimeEvent::SessionOutput { identity, chunk, .. } if chunk == "resumed" => Some(*identity), _ => None,
+        }).expect("no publisher sequence hole after observer output");
+        assert!(resumed.sequence > output_identity.sequence);
+        ledger.discard(&ledger.take_published(resumed).expect("resumed output owns credit"));
+        supervisor.shutdown().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn real_supervisor_natural_conpty_exit_retains_tail_and_nonzero_classification() {
+        struct FiniteCmdSpawner;
+        impl PtySpawner for FiniteCmdSpawner {
+            fn spawn(&self, plan: &PreparedLaunch, handler: PtyEventHandler) -> Result<Box<dyn PtySessionTrait>> {
+                let mut spec = plan.spec.clone();
+                spec.program = std::env::var_os("SystemRoot").map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+                    .join("System32").join("cmd.exe").to_string_lossy().into_owned();
+                spec.args = vec!["/d".into(), "/q".into(), "/c".into(), "echo NATURAL_SUPERVISOR_TAIL & exit 3".into()];
+                Ok(Box::new(ConcretePtySession::spawn_with_size(&spec, plan.pty_size, handler)?))
+            }
+        }
+        struct ShutdownOnDrop(SupervisorHandle);
+        impl Drop for ShutdownOnDrop { fn drop(&mut self) { let _ = self.0.shutdown(); } }
+        let root = tempfile::tempdir().expect("create real natural exit fixture");
+        let supervisor = empty_test_supervisor_with_root(root.path().to_path_buf());
+        let _cleanup = ShutdownOnDrop(supervisor.clone());
+        supervisor.set_pty_spawner_for_tests(Arc::new(FiniteCmdSpawner));
+        let ledger = supervisor.output_credit();
+        ledger.enable();
+        let epoch = ledger.begin_renderer().epoch;
+        ledger.renderer_ready(epoch, Duration::ZERO).unwrap();
+        let events = capture_runtime_events(&supervisor);
+        let session = create_test_session(&supervisor, "Natural cmd", DriverKind::GenericTerminal,
+            shared_types::PermissionProfile::Normal);
+        let started = supervisor.start_session_by_id(session.session_id).expect("start only finite cmd fixture");
+        supervisor.send_input(SendInputRequest { session_id: session.session_id, input: "\x1b[1;1R".into() })
+            .expect("answer ConPTY startup query");
+        assert!(wait_for_condition(Duration::from_secs(10), || {
+            supervisor.refresh_session_liveness();
+            events.lock().iter().any(|event| matches!(event, RuntimeEvent::SessionExit { identity, .. }
+                if identity.session_id == session.session_id))
+        }), "verified natural scope close must let the real reader reach EOF");
+        let snapshot = supervisor.inner.slots.lock().get_by_id(session.session_id).unwrap().snapshot();
+        assert!(!snapshot.output_draining);
+        let diagnostic = snapshot.last_error.as_deref().expect("nonzero exit retains diagnostic guidance");
+        assert!(diagnostic.starts_with("process exited with code 3"), "{diagnostic}");
+        assert!(diagnostic.contains("NATURAL_SUPERVISOR_TAIL"), "last output remains in the diagnostic: {diagnostic}");
+        let captured = events.lock().clone();
+        let exit_index = captured.iter().position(|event| matches!(event, RuntimeEvent::SessionExit {
+            identity, reason: SessionExitReason::CrashExit, requested: false, success: false, exit_code: Some(3), ..
+        } if identity.session_id == session.session_id && Some(identity.run_id) == started.run_id))
+            .expect("natural producer closure must not manufacture operator Stop intent");
+        let mut text = String::new();
+        let mut tail_credits = Vec::new();
+        for event in &captured[..exit_index] {
+            if let RuntimeEvent::SessionOutput { identity, chunk, .. } = event {
+                assert_eq!(Some(identity.run_id), started.run_id);
+                text.push_str(chunk);
+                if let Some(credit) = ledger.take_published(*identity) { tail_credits.push(credit); }
+            }
+        }
+        assert!(text.contains("NATURAL_SUPERVISOR_TAIL"), "tail must precede actual exit: {text:?}");
+        assert!(!tail_credits.is_empty(), "reader EOF retains outstanding display ownership");
+        for credit in tail_credits {
+            assert!(ledger.dispatch(&credit));
+            assert!(ledger.acknowledge(&credit).unwrap() > 0);
+        }
+    }
+
+    #[test]
+    fn output_credit_conpty_close_is_single_flight_off_locks_and_rechecks_deferred_scope() {
+        struct DrainPty {
+            calls: Arc<AtomicUsize>,
+            gate: Arc<(Mutex<bool>, Condvar)>,
+            entered: Mutex<Option<mpsc::SyncSender<()>>>,
+        }
+        impl PtySessionTrait for DrainPty {
+            fn send_input(&self, _: &str) -> pty_host::PtyWriteResult { Ok(0) }
+            fn cancel_input_write(&self) -> Result<()> { Ok(()) }
+            fn resize(&self, _: u16, _: u16) -> Result<()> { Ok(()) }
+            fn kill(&self) -> Result<()> { Ok(()) }
+            fn try_wait(&self) -> Result<Option<PtyExitStatus>> {
+                Ok(Some(PtyExitStatus { exit_code: 0, signal: None, success: true }))
+            }
+            fn process_id(&self) -> Option<u32> { None }
+            fn agent_alive(&self, _: DriverKind) -> Result<AgentLiveness> {
+                Ok(AgentLiveness::Exited { last_agent_pids: vec![], live_processes: vec![] })
+            }
+            fn finish_output_if_scope_exited(&self) -> Result<bool> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.entered.lock().take().unwrap().send(()).unwrap();
+                    let mut release = self.gate.0.lock();
+                    while !*release { self.gate.1.wait(&mut release); }
+                    return Ok(false); // A still-live descendant defers closure.
+                }
+                Ok(true)
+            }
+        }
+        struct ReleaseDrain(Arc<(Mutex<bool>, Condvar)>);
+        impl Drop for ReleaseDrain {
+            fn drop(&mut self) { *self.0.0.lock() = true; self.0.1.notify_all(); }
+        }
+        let supervisor = test_supervisor();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        install_mock_running_session(&supervisor, "claude", DriverKind::Claude,
+            Box::new(DrainPty { calls: calls.clone(), gate: gate.clone(), entered: Mutex::new(Some(entered_tx)) }));
+        let run = enable_output_credit_for_current_run(&supervisor, "claude");
+        let release = ReleaseDrain(gate);
+        supervisor.refresh_session_liveness();
+        entered_rx.recv_timeout(Duration::from_secs(5)).expect("close check started");
+        let in_flight = supervisor.inner.slots.try_lock().expect("close check holds no slots lock")
+            .get("claude").unwrap().running.as_ref().unwrap().output_close_in_flight.clone();
+        drop(supervisor.inner.shutdown_lifecycle.try_write().expect("close check holds no lifecycle lock"));
+        for _ in 0..3 { supervisor.refresh_session_liveness(); }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one worker while close is blocked");
+        drop(release);
+        assert!(wait_for_condition(Duration::from_secs(5), || !in_flight.load(Ordering::Acquire)));
+        supervisor.refresh_session_liveness();
+        assert!(wait_for_condition(Duration::from_secs(5), || calls.load(Ordering::SeqCst) == 2));
+        for _ in 0..3 { supervisor.refresh_session_liveness(); }
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "successful producer close is not repeated");
+        let snapshot = supervisor.inner.slots.lock().get("claude").unwrap().snapshot();
+        assert!(snapshot.running && snapshot.output_draining);
+        assert_eq!(snapshot.run_id, Some(run.run_id), "producer close must not synthesize EOF");
+        supervisor.handle_pty_event_by_id(run.session_id, run.generation, run.run_id, PtyEvent::Closed);
+        assert!(!supervisor.inner.slots.lock().get("claude").unwrap().snapshot().running);
+    }
+
+    #[test]
+    fn output_credit_draining_cancels_only_retained_writer_and_finishes_queued_input_accounting() {
+        let supervisor = test_supervisor();
+        let events = capture_runtime_events(&supervisor);
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let inputs = Arc::new(Mutex::new(Vec::new()));
+        let cancels = Arc::new(AtomicUsize::new(0));
+        let kills = Arc::new(AtomicUsize::new(0));
+        let ended = Arc::new(AtomicBool::new(false));
+        install_mock_running_session_with_process_id(&supervisor, "claude", DriverKind::Claude, None,
+            Box::new(TimedOutWritePtySession {
+                process_id: 101, entered: Mutex::new(Some(entered_tx)),
+                release: Arc::new((Mutex::new(false), Condvar::new())),
+                writes_started: Arc::new(AtomicUsize::new(0)), writes_finished: Arc::new(AtomicUsize::new(0)),
+                inputs: inputs.clone(), cancel_supported: true, cancel_count: cancels.clone(), kill_count: kills.clone(),
+                first_write_error_bytes: 1, agent_exited: Some(ended.clone()),
+            }));
+        let run = enable_output_credit_for_current_run(&supervisor, "claude");
+        let gate = run_input_gate(&supervisor, run.session_id);
+        let caller = supervisor.resolve_pane_caller(TestPaneProcess::new(7701, [101])).unwrap();
+        enqueue_text(&supervisor, run.session_id, "active").unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        enqueue_text(&supervisor, run.session_id, "queued").unwrap();
+        ended.store(true, Ordering::SeqCst);
+        supervisor.refresh_session_liveness();
+        supervisor.refresh_session_liveness();
+        assert!(wait_for_condition(Duration::from_secs(5), || gate.operator_inputs_pending.load(Ordering::SeqCst) == 0));
+        assert_eq!(queued_input_bytes(&supervisor, run.session_id), 0);
+        assert_eq!(cancels.load(Ordering::SeqCst), 1);
+        assert_eq!(kills.load(Ordering::SeqCst), 0, "input cancellation leaves reader/process scope owned");
+        assert_eq!(&*inputs.lock(), &["active".to_string()]);
+        assert!(supervisor.resolve_pane_caller(TestPaneProcess::new(7702, [101])).is_err());
+        assert!(!supervisor.apply_sideband_request(&caller, SidebandRequest::Ping {}).ok,
+            "retained draining slot cannot authenticate pane traffic");
+        assert!(wait_for_condition(Duration::from_secs(5), || events.lock().iter().any(|event| matches!(event,
+            RuntimeEvent::SystemLog { level: LogLevel::Error, message, .. }
+                if message.contains("1 of 6 bytes") && message.contains("queued") && message.contains("never reached")))));
+        supervisor.handle_pty_event_by_id(run.session_id, run.generation, run.run_id, PtyEvent::Closed);
+    }
+
+    #[test]
+    fn admission_never_waits_on_a_wake_holding_the_activity_mutex() {
+        // Codex review of 34cb00c: a room wake holds room_input_activity across
+        // its PTY write; the UI thread's admission must not wait behind it.
+        let supervisor = test_supervisor();
+        let (pty, _inputs) = recording_pty_session(101);
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "claude",
+            DriverKind::Claude,
+            Some(101),
+            pty,
+        );
+        let session_id = test_session_id(&supervisor, "claude");
+        let gate = run_input_gate(&supervisor, session_id);
+        let (held_tx, held_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel::<()>(1);
+        let holder_gate = Arc::clone(&gate);
+        let holder = thread::spawn(move || {
+            let _wake_writing = holder_gate.room_input_activity.lock();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        });
+        held_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the simulated wake holds the activity mutex");
+        let started = Instant::now();
+        enqueue_text(&supervisor, session_id, "typed while a wake writes").expect("admit");
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "admission waited on the wake's activity mutex"
+        );
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+    }
+
+    #[test]
+    fn queued_operator_input_holds_the_wake_barrier_until_each_item_terminates() {
+        let supervisor = test_supervisor();
+        let (session_id, _inputs, first_entered, release) = blocked_first_write_session(&supervisor);
+        let gate = run_input_gate(&supervisor, session_id);
+        enqueue_text(&supervisor, session_id, "a").expect("admit a");
+        first_entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the worker began writing a");
+        enqueue_text(&supervisor, session_id, "b").expect("admit b");
+        assert_eq!(gate.operator_inputs_pending.load(Ordering::SeqCst), 2);
+        assert!(gate.queued_operator_input_blocks_wake());
+        release_first_write(&release);
+        assert!(wait_for_condition(Duration::from_secs(5), || {
+            gate.operator_inputs_pending.load(Ordering::SeqCst) == 0
+        }));
+        assert!(!gate.queued_operator_input_blocks_wake());
+    }
+
+    #[test]
+    fn a_room_message_waits_while_queued_operator_input_waits_then_is_typed() {
+        let supervisor = test_supervisor();
+        let (pty, inputs) = recording_pty_session(std::process::id());
+        install_mock_room_wake_recipient(&supervisor, "claude", pty);
+        let recipient = test_session_id(&supervisor, "claude");
+        let room = supervisor
+            .create_room(CreateRoomRequest {
+                brief_on_join: false,
+                brief_template: None,
+                label: Some("Queued input barrier".into()),
+                member_ids: vec![recipient],
+            })
+            .unwrap();
+        let gate = run_input_gate(&supervisor, recipient);
+        // Stands for an admitted keystroke the worker has not reached yet.
+        gate.operator_inputs_pending.fetch_add(1, Ordering::SeqCst);
+        let waiting = supervisor
+            .deliver_room_message(DeliverRoomMessageRequest {
+                request_id: None,
+                room_id: room.room_id,
+                recipients: RoomRecipientSelection::All {},
+                content: "must wait for the operator".into(),
+            })
+            .unwrap();
+        // A106: the message stays Stored and queued; no Held receipt.
+        assert_eq!(waiting.receipts[0].status, RoomDeliveryStatus::Stored);
+        assert_eq!(waiting.receipts[0].bytes_written, 0);
+        assert!(waiting.failures.is_empty());
+        assert_eq!(supervisor.queued_room_wake_count_for_tests(recipient), 1);
+        // Several dispatcher polls pass; the barrier still holds the message.
+        thread::sleep(Duration::from_millis(700));
+        assert!(inputs.lock().is_empty(), "nothing reached the terminal while input waited");
+        assert!(room_receipt_statuses(&supervisor, room.room_id, recipient).is_empty());
+
+        gate.operator_inputs_pending.fetch_sub(1, Ordering::SeqCst);
+        wait_for_room_receipt(&supervisor, room.room_id, waiting.message_id, recipient,
+            RoomDeliveryStatus::Written);
+        // v3 W3: an ordinary send wakes with its pointer, after the barrier.
+        assert_eq!(
+            *inputs.lock(),
+            vec![typed_pointer(&supervisor, 1, waiting.message_id), "\r".to_string()]
+        );
+    }
+
+    fn operator_input_errors(events: &Arc<Mutex<Vec<RuntimeEvent>>>) -> Vec<String> {
+        events
+            .lock()
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::SystemLog {
+                    level: LogLevel::Error,
+                    message,
+                    ..
+                } => Some(message.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn test_label(supervisor: &SupervisorHandle, session_id: SessionId) -> String {
+        supervisor
+            .inner
+            .slots
+            .lock()
+            .get_by_id(session_id)
+            .expect("session slot")
+            .definition
+            .label
+            .clone()
+    }
+
+    #[test]
+    fn failed_and_short_queued_writes_are_errors_naming_the_pane_run_and_progress() {
+        // Codex review of 34cb00c: after admission a failed write was only a
+        // Warn in the closed log, with no pane named.
+        let supervisor = test_supervisor();
+        let (failing, _) = write_failing_pty_session(3, "synthetic transport failure");
+        install_mock_running_session(&supervisor, "claude", DriverKind::Claude, failing);
+        install_mock_running_session(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            Box::new(ShortOkPtySession { bytes_written: 2 }),
+        );
+        let claude = test_session_id(&supervisor, "claude");
+        let codex = test_session_id(&supervisor, "codex");
+        let claude_run = current_run_id(&supervisor, "claude");
+        let codex_run = current_run_id(&supervisor, "codex");
+        let events = capture_runtime_events(&supervisor);
+        enqueue_text(&supervisor, claude, "hello world").expect("admit to claude");
+        enqueue_text(&supervisor, codex, "abcdef").expect("admit to codex");
+        wait_until("both failure reports", || operator_input_errors(&events).len() == 2);
+        let errors = operator_input_errors(&events);
+        let claude_report = errors
+            .iter()
+            .find(|message| message.contains(&claude.to_string()))
+            .expect("claude's report");
+        assert!(claude_report.starts_with(&test_label(&supervisor, claude)));
+        assert!(claude_report.contains("after 3 of 11 bytes reached the terminal"));
+        assert!(claude_report.contains("synthetic transport failure"));
+        assert!(claude_report.contains(&claude_run.to_string()));
+        let codex_report = errors
+            .iter()
+            .find(|message| message.contains(&codex.to_string()))
+            .expect("codex's report");
+        assert!(codex_report.starts_with(&test_label(&supervisor, codex)));
+        assert!(codex_report.contains("after 2 of 6 bytes reached the terminal"));
+        assert!(codex_report.contains(&codex_run.to_string()));
+        for message in &errors {
+            assert!(!message.contains("Nothing was sent"), "{message}");
+        }
+        for session_id in [claude, codex] {
+            let gate = run_input_gate(&supervisor, session_id);
+            wait_until("the barrier falls", || {
+                gate.operator_inputs_pending.load(Ordering::SeqCst) == 0
+            });
+            assert_eq!(queued_input_bytes(&supervisor, session_id), 0);
+        }
+    }
+
+    #[test]
+    fn stopping_a_run_with_queued_input_reports_it_once_and_retires_the_queue() {
+        let supervisor = test_supervisor();
+        let (session_id, inputs, first_entered, _release) = blocked_first_write_session(&supervisor);
+        let gate = run_input_gate(&supervisor, session_id);
+        let events = capture_runtime_events(&supervisor);
+        enqueue_text(&supervisor, session_id, "a").expect("admit a");
+        first_entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the worker began writing a");
+        enqueue_text(&supervisor, session_id, "b").expect("admit b");
+        enqueue_text(&supervisor, session_id, "c").expect("admit c");
+        // The stop's kill releases the blocked write of a.
+        supervisor.stop_session_by_id(session_id).expect("stop");
+        // The worker reports after it has removed its entry and drained.
+        wait_until("the retirement report", || !operator_input_errors(&events).is_empty());
+        assert!(supervisor.inner.operator_input.lock().is_empty(), "the queue retired");
+        assert_eq!(gate.operator_inputs_pending.load(Ordering::SeqCst), 0);
+        assert_eq!(&*inputs.lock(), &["a".to_string()]);
+        let errors = operator_input_errors(&events);
+        assert_eq!(errors.len(), 1, "one report for the stopped queue: {errors:?}");
+        assert!(errors[0].contains("none of it reached the terminal"), "{}", errors[0]);
+        assert!(errors[0].contains("1 more queued input (1 bytes)"), "{}", errors[0]);
+        let refused = enqueue_text(&supervisor, session_id, "d").unwrap_err();
+        assert!(refused.to_string().contains("not running"), "{refused:#}");
+    }
+
+    #[test]
+    fn shutdown_with_queued_input_writes_nothing_more_and_retires_the_queue() {
+        let supervisor = test_supervisor();
+        let (session_id, inputs, first_entered, _release) = blocked_first_write_session(&supervisor);
+        let gate = run_input_gate(&supervisor, session_id);
+        let events = capture_runtime_events(&supervisor);
+        enqueue_text(&supervisor, session_id, "a").expect("admit a");
+        first_entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the worker began writing a");
+        enqueue_text(&supervisor, session_id, "b").expect("admit b");
+        enqueue_text(&supervisor, session_id, "c").expect("admit c");
+        supervisor.shutdown().expect("shutdown proves termination");
+        // The worker reports after it has removed its entry and drained.
+        wait_until("the retirement report", || !operator_input_errors(&events).is_empty());
+        assert!(supervisor.inner.operator_input.lock().is_empty(), "the queue retired");
+        assert_eq!(gate.operator_inputs_pending.load(Ordering::SeqCst), 0);
+        assert_eq!(&*inputs.lock(), &["a".to_string()]);
+        let errors = operator_input_errors(&events);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("1 more queued input (1 bytes)"), "{}", errors[0]);
+        assert!(enqueue_text(&supervisor, session_id, "d").is_err());
+    }
+
+    #[test]
+    fn create_input_stop_delete_churn_leaves_no_input_queue_behind() {
+        // Codex review of 34cb00c: a deleted session kept its queue entry
+        // until the supervisor shut down.
+        let supervisor = empty_test_supervisor();
+        for cycle in 0..3 {
+            let session = create_test_session(
+                &supervisor,
+                &format!("Churn {cycle}"),
+                DriverKind::Claude,
+                shared_types::PermissionProfile::Normal,
+            );
+            let (pty, writes, _) = mock_pty_session(None, MockKillBehavior::Immediate);
+            install_mock_running_session_by_id_with_mode(
+                &supervisor,
+                session.session_id,
+                DriverKind::Claude,
+                None,
+                pty,
+                BracketedPasteMode::Unknown,
+            );
+            enqueue_text(&supervisor, session.session_id, "typed").expect("admit");
+            wait_until("the input is written", || writes.load(Ordering::SeqCst) == 1);
+            supervisor.stop_session_by_id(session.session_id).expect("stop");
+            supervisor.delete_session(session.session_id).expect("delete");
+            assert!(
+                supervisor.inner.operator_input.lock().is_empty(),
+                "cycle {cycle} left an input queue behind"
+            );
+        }
+        assert_eq!(
+            supervisor
+                .inner
+                .operator_input_workers_started
+                .load(Ordering::SeqCst),
+            3
+        );
+    }
+
+    #[test]
+    fn a_wake_rechecks_queued_input_at_its_paste_and_input_queued_after_the_paste_follows_the_submit() {
+        // Codex review of 65b0a2e: admission takes no lock, so input can be
+        // admitted while a wake waits for slots after any earlier check. The
+        // hook runs after slots validation and before the final check.
+        let supervisor = test_supervisor();
+        let (pty, inputs) = recording_pty_session(std::process::id());
+        install_mock_room_wake_recipient(&supervisor, "claude", pty);
+        let recipient = test_session_id(&supervisor, "claude");
+        let room = supervisor
+            .create_room(CreateRoomRequest {
+                brief_on_join: false,
+                brief_template: None,
+                label: Some("Admitted before paste".into()),
+                member_ids: vec![recipient],
+            })
+            .unwrap();
+        let gate = run_input_gate(&supervisor, recipient);
+        let hook_gate = Arc::clone(&gate);
+        supervisor.set_room_wake_before_write_for_tests(move |write| {
+            if write == "paste" {
+                // Stands for typing admitted while the wake waited.
+                hook_gate.operator_inputs_pending.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let result = supervisor
+            .deliver_room_message(DeliverRoomMessageRequest {
+                request_id: None,
+                room_id: room.room_id,
+                recipients: RoomRecipientSelection::All {},
+                content: "must yield to the operator".into(),
+            })
+            .unwrap();
+        let receipt = &result.receipts[0];
+        assert_ne!(receipt.status, RoomDeliveryStatus::Written);
+        assert!(
+            receipt
+                .error
+                .as_ref()
+                .is_some_and(|error| error.contains("queued operator input")),
+            "{:?}",
+            receipt.error
+        );
+        assert!(inputs.lock().is_empty(), "nothing pasted");
+        assert_eq!(receipt.bytes_written, 0);
+
+        // A106: the whole message and its submit are one write under the
+        // run's writer ticket, so there is no separate Enter boundary any
+        // more. Input queued after the paste waits behind the submit.
+        let supervisor = test_supervisor();
+        let (pty, inputs) = recording_pty_session(std::process::id());
+        install_mock_room_wake_recipient(&supervisor, "claude", pty);
+        let recipient = test_session_id(&supervisor, "claude");
+        let room = supervisor
+            .create_room(CreateRoomRequest {
+                brief_on_join: false,
+                brief_template: None,
+                label: Some("Queued after paste".into()),
+                member_ids: vec![recipient],
+            })
+            .unwrap();
+        let wake_handle = supervisor.clone();
+        let wake = thread::spawn(move || wake_handle.deliver_room_message(DeliverRoomMessageRequest {
+            request_id: None, room_id: room.room_id, recipients: RoomRecipientSelection::All {},
+            content: "whole before the draft".into(),
+        }));
+        wait_until("the room paste, before its submit", || !inputs.lock().is_empty());
+        assert_eq!(inputs.lock().len(), 1);
+        enqueue_text(&supervisor, recipient, "queued draft").unwrap();
+        let delivered = wake.join().unwrap().unwrap();
+        assert_eq!(delivered.receipts[0].status, RoomDeliveryStatus::Written);
+        wait_until("the queued draft is written", || inputs.lock().len() == 3);
+        // v3 W3: the paste is the pointer; the draft still follows its submit.
+        assert_eq!(*inputs.lock(), vec![typed_pointer(&supervisor, 1, delivered.message_id),
+            "\r".to_string(), "queued draft".to_string()]);
     }
 
     #[test]
@@ -18776,6 +25569,10 @@ mod tests {
         }
         active_write.join().unwrap().unwrap();
 
+        // The 50 ms budget is the property under test above. The follow-up
+        // only proves the conversation is still writable, so it runs under the
+        // production budget and cannot time out on a loaded machine.
+        supervisor.set_sideband_write_timeout_for_tests(SidebandTimeouts::write_budget());
         let continued = supervisor.apply_sideband_request(
             &caller,
             SidebandRequest::SendInput {
@@ -18821,7 +25618,7 @@ mod tests {
             let handle = supervisor.clone();
             let server_task =
                 tokio::spawn(
-                    async move { handle_sideband_stream(handle, Some(caller), server).await },
+                    async move { handle_sideband_stream(handle, JobAttribution::Pane(caller), server).await },
                 );
             client.write_all(b"{not json}\n").await.unwrap();
             client.flush().await.unwrap();
@@ -18954,7 +25751,7 @@ mod tests {
                 let handle = supervisor.clone();
                 let request_caller = caller.clone();
                 let server_task = tokio::spawn(async move {
-                    handle_sideband_stream(handle, Some(request_caller), server).await
+                    handle_sideband_stream(handle, JobAttribution::Pane(request_caller), server).await
                 });
                 let (read_half, mut write_half) = tokio::io::split(client);
                 let writer = tokio::spawn(async move {
@@ -19064,6 +25861,7 @@ mod tests {
             heartbeat_interval: None,
             auto_restart_on_stall_sessions: None,
             auto_restart_stall_threshold: None,
+            task_folder: None,
         });
         let error = match result {
             Ok(_) => panic!("startup must reject a legacy-named directory"),
@@ -19107,6 +25905,7 @@ mod tests {
             heartbeat_interval: None,
             auto_restart_on_stall_sessions: None,
             auto_restart_stall_threshold: None,
+            task_folder: None,
         })
         .expect("startup should remove the symlink itself");
 
@@ -19140,6 +25939,7 @@ mod tests {
             heartbeat_interval: None,
             auto_restart_on_stall_sessions: None,
             auto_restart_stall_threshold: None,
+            task_folder: None,
         });
         let error = match result {
             Ok(_) => panic!("startup must reject a runtime-directory junction"),
@@ -19184,6 +25984,7 @@ mod tests {
             heartbeat_interval: None,
             auto_restart_on_stall_sessions: None,
             auto_restart_stall_threshold: None,
+            task_folder: None,
         })
         .expect("startup should unlink the legacy sideband junction itself");
 
@@ -19448,9 +26249,22 @@ mod tests {
         let exchange = |lines: Vec<String>| {
             let endpoint = status.endpoint.clone();
             runtime.block_on(async move {
-                let mut client = tokio::net::windows::named_pipe::ClientOptions::new()
-                    .open(&endpoint)
-                    .expect("connect unaffiliated client");
+                // The server re-creates its pipe instance after each client;
+                // under a loaded parallel suite the next connect can arrive
+                // first (ERROR_PIPE_BUSY 231 or ERROR_FILE_NOT_FOUND 2).
+                let connect_deadline = Instant::now() + Duration::from_secs(5);
+                let mut client = loop {
+                    match tokio::net::windows::named_pipe::ClientOptions::new().open(&endpoint) {
+                        Ok(client) => break client,
+                        Err(error)
+                            if matches!(error.raw_os_error(), Some(231) | Some(2))
+                                && Instant::now() < connect_deadline =>
+                        {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        Err(error) => panic!("connect unaffiliated client: {error}"),
+                    }
+                };
                 for line in lines {
                     client
                         .write_all(format!("{line}\n").as_bytes())
@@ -19516,14 +26330,6 @@ mod tests {
             .pane_secret = Some(secret.to_string());
     }
 
-    fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !condition() {
-            assert!(Instant::now() < deadline, "timed out waiting for {what}");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-
     #[test]
     fn secret_identity_binds_to_one_live_run_and_expires_with_it() {
         let supervisor = test_supervisor();
@@ -19581,12 +26387,13 @@ mod tests {
         let posted = supervisor.apply_sideband_request(
             &caller,
             SidebandRequest::RoomPost {
+                request_id: None,
                 content: "posted via the pane secret".into(),
             },
         );
         assert!(posted.ok, "{}", posted.message);
         let read =
-            supervisor.apply_sideband_request(&caller, SidebandRequest::RoomRead { cursor: None });
+            supervisor.apply_sideband_request(&caller, SidebandRequest::RoomRead { owed_after: None, cursor: None, expect_room: None });
         let Some(SidebandResponsePayload::RoomFeed { page }) = read.payload else {
             panic!("missing feed page")
         };
@@ -19640,7 +26447,7 @@ mod tests {
             runtime.block_on(async move {
                 let (mut client, server) = tokio::io::duplex(16 * 1024);
                 let server_task =
-                    tokio::spawn(async move { handle_sideband_stream(handle, None, server).await });
+                    tokio::spawn(async move { handle_sideband_stream(handle, JobAttribution::Outside(0), server).await });
                 for line in lines {
                     client
                         .write_all(format!("{line}\n").as_bytes())
@@ -19691,11 +26498,7 @@ mod tests {
             Some(live_pid),
             claude_pty,
         );
-        install_mock_running_session_with_bracketed_paste_enabled(
-            &supervisor,
-            "codex",
-            DriverKind::Codex,
-            codex_pty,
+        install_mock_room_wake_recipient(&supervisor, "codex", codex_pty,
         );
         let claude = test_session_id(&supervisor, "claude");
         let codex = test_session_id(&supervisor, "codex");
@@ -19714,6 +26517,7 @@ mod tests {
         let delivered = supervisor.apply_sideband_request(
             &caller,
             SidebandRequest::RoomDeliver {
+                request_id: None,
                 recipient: "codex".into(),
                 content: "wake up, I need your output".into(),
             },
@@ -19725,11 +26529,13 @@ mod tests {
         assert_eq!(result.recipient_count, 1);
         assert_eq!(result.written_count, 1);
         assert!(result.failures.is_empty());
-        let framed = frame_message_payload(
-            "[Room message from claude]\nwake up, I need your output",
-            MessageFraming::BracketedPaste,
+        // v3 W3: the wake is a content-neutral pointer; the calling pane's
+        // label reaches the recipient through the stored sender (checked in
+        // the feed below), never through PRIM-1's paste.
+        assert_eq!(
+            *codex_inputs.lock(),
+            vec![typed_pointer(&supervisor, 1, result.message_id), "\r".to_string()]
         );
-        assert_eq!(codex_inputs.lock().as_slice(), &[framed, "\x1b[C\r".into()]);
         assert!(
             claude_inputs.lock().is_empty(),
             "the sender's own terminal stays untouched"
@@ -19738,14 +26544,19 @@ mod tests {
         let by_id = supervisor.apply_sideband_request(
             &caller,
             SidebandRequest::RoomDeliver {
+                request_id: None,
                 recipient: codex.to_string(),
                 content: "by id".into(),
             },
         );
         assert!(by_id.ok, "{}", by_id.message);
+        let Some(SidebandResponsePayload::RoomDelivery { result: by_id_result }) = by_id.payload else {
+            panic!("missing by-id delivery payload")
+        };
         let to_self = supervisor.apply_sideband_request(
             &caller,
             SidebandRequest::RoomDeliver {
+                request_id: None,
                 recipient: claude.to_string(),
                 content: "hello me".into(),
             },
@@ -19759,6 +26570,7 @@ mod tests {
         let nobody = supervisor.apply_sideband_request(
             &caller,
             SidebandRequest::RoomDeliver {
+                request_id: None,
                 recipient: "hermes".into(),
                 content: "anyone?".into(),
             },
@@ -19772,6 +26584,7 @@ mod tests {
         let all = supervisor.apply_sideband_request(
             &caller,
             SidebandRequest::RoomDeliver {
+                request_id: None,
                 recipient: "ALL".into(),
                 content: "everyone but me".into(),
             },
@@ -19783,6 +26596,10 @@ mod tests {
         assert_eq!(all_result.recipient_count, 1, "all excludes the caller");
         assert!(claude_inputs.lock().is_empty());
         assert_eq!(codex_inputs.lock().len(), 6);
+        // Each pointer counts every message codex has neither read nor ACKed.
+        assert_eq!(codex_inputs.lock()[2], typed_pointer(&supervisor, 2, by_id_result.message_id));
+        assert_eq!(codex_inputs.lock()[4], typed_pointer(&supervisor, 3, all_result.message_id));
+        assert!(codex_inputs.lock().iter().all(|input| !input.contains("claude") && !input.contains("everyone")));
 
         let page = supervisor
             .read_room_feed(ReadRoomFeedRequest {
@@ -19807,184 +26624,6 @@ mod tests {
             3
         );
         assert_eq!(page.members.len(), 2);
-    }
-
-    #[test]
-    fn room_brief_is_delivered_on_join_and_retried_on_the_first_idle() {
-        let root = std::env::temp_dir().join(format!("prim1-brief-{}", Uuid::new_v4()));
-        fs::create_dir_all(root.join("work")).unwrap();
-        let mut config = test_supervisor_config(&root);
-        config.room_brief_on_join = true;
-        let supervisor = SupervisorHandle::new(config).unwrap();
-        supervisor.set_executable_resolver_for_tests(Arc::new(TestExecutableResolver));
-        install_standard_test_sessions(&supervisor);
-        let (claude_pty, claude_inputs) = recording_pty_session(std::process::id());
-        let (codex_pty, codex_inputs) = recording_pty_session(std::process::id());
-        install_mock_running_session_with_bracketed_paste_enabled(
-            &supervisor,
-            "claude",
-            DriverKind::Claude,
-            claude_pty,
-        );
-        // Codex is not deliverable yet: its bracketed-paste mode is unknown.
-        install_mock_running_session_with_process_id_and_mode(
-            &supervisor,
-            "codex",
-            DriverKind::Codex,
-            None,
-            codex_pty,
-            BracketedPasteMode::Unknown,
-        );
-        let claude = test_session_id(&supervisor, "claude");
-        let codex = test_session_id(&supervisor, "codex");
-
-        supervisor
-            .create_room(CreateRoomRequest {
-                brief_on_join: true,
-                brief_template: None,
-                label: Some("Brief room".into()),
-                member_ids: vec![claude, codex],
-            })
-            .unwrap();
-
-        wait_until("the join brief to reach claude", || {
-            !claude_inputs.lock().is_empty()
-        });
-        let brief = claude_inputs.lock()[0].clone();
-        assert!(brief.contains("[Room message from operator]"), "{brief}");
-        assert!(brief.contains("PRIM-1 room \"Brief room\""), "{brief}");
-        assert!(brief.contains("Your label is \"claude\""), "{brief}");
-        assert!(brief.contains("codex (Codex)"), "{brief}");
-        assert!(brief.contains("prim1_pane MCP server"), "{brief}");
-        wait_until("claude's brief to be marked delivered", || {
-            let slots = supervisor.inner.slots.lock();
-            slots
-                .get_by_id(claude)
-                .and_then(|slot| slot.running.as_ref())
-                .map(|running| running.brief_attempts_left == 0)
-                .unwrap_or(false)
-        });
-        // Codex refused the immediate brief: nothing written, attempts kept.
-        std::thread::sleep(Duration::from_millis(300));
-        assert!(codex_inputs.lock().is_empty());
-        let (generation, run_id) = {
-            let slots = supervisor.inner.slots.lock();
-            let slot = slots.get_by_id(codex).unwrap();
-            assert_eq!(
-                slot.running.as_ref().unwrap().brief_attempts_left,
-                ROOM_BRIEF_MAX_ATTEMPTS
-            );
-            (slot.generation, slot.run_id.unwrap())
-        };
-
-        // Codex becomes ready and idles: the owed brief is delivered.
-        {
-            let mut slots = supervisor.inner.slots.lock();
-            let slot = slots.get_by_id_mut(codex).unwrap();
-            set_test_bracketed_paste_mode(slot, run_id, BracketedPasteMode::Enabled);
-            slot.state = LifecycleState::Idle;
-        }
-        supervisor.deliver_pending_brief_if_due(codex, generation, run_id);
-        wait_until("the idle brief to reach codex", || {
-            !codex_inputs.lock().is_empty()
-        });
-        let codex_brief = codex_inputs.lock()[0].clone();
-        assert!(
-            codex_brief.contains("Your label is \"codex\""),
-            "{codex_brief}"
-        );
-        assert!(
-            codex_brief.contains("claude (Claude Code)"),
-            "{codex_brief}"
-        );
-        wait_until("codex's brief to be marked delivered", || {
-            let slots = supervisor.inner.slots.lock();
-            slots
-                .get_by_id(codex)
-                .and_then(|slot| slot.running.as_ref())
-                .map(|running| running.brief_attempts_left == 0)
-                .unwrap_or(false)
-        });
-        // Nothing left owed: another idle delivers nothing more.
-        supervisor.deliver_pending_brief_if_due(codex, generation, run_id);
-        std::thread::sleep(Duration::from_millis(200));
-        assert_eq!(codex_inputs.lock().len(), 2);
-    }
-
-    #[test]
-    fn a_room_created_with_auto_brief_off_briefs_nobody_but_brief_now_still_works() {
-        let root = std::env::temp_dir().join(format!("prim1-brief-off-{}", Uuid::new_v4()));
-        fs::create_dir_all(root.join("work")).unwrap();
-        let mut config = test_supervisor_config(&root);
-        config.room_brief_on_join = true;
-        let supervisor = SupervisorHandle::new(config).unwrap();
-        supervisor.set_executable_resolver_for_tests(Arc::new(TestExecutableResolver));
-        install_standard_test_sessions(&supervisor);
-        let (claude_pty, claude_inputs) = recording_pty_session(std::process::id());
-        install_mock_running_session_with_bracketed_paste_enabled(
-            &supervisor,
-            "claude",
-            DriverKind::Claude,
-            claude_pty,
-        );
-        let claude = test_session_id(&supervisor, "claude");
-        let codex = test_session_id(&supervisor, "codex");
-
-        let room = supervisor
-            .create_room(CreateRoomRequest {
-                label: Some("Quiet room".into()),
-                member_ids: vec![claude, codex],
-                brief_on_join: false,
-                brief_template: None,
-            })
-            .unwrap();
-
-        // Nothing is typed on join, and nothing is owed for later.
-        std::thread::sleep(Duration::from_millis(300));
-        assert!(claude_inputs.lock().is_empty());
-        {
-            let slots = supervisor.inner.slots.lock();
-            let running = slots.get_by_id(claude).unwrap().running.as_ref().unwrap();
-            assert_eq!(running.brief_attempts_left, 0);
-        }
-
-        // Even a hand-set owed brief dies at the room's toggle on idle.
-        let (generation, run_id) = {
-            let mut slots = supervisor.inner.slots.lock();
-            let slot = slots.get_by_id_mut(claude).unwrap();
-            slot.state = LifecycleState::Idle;
-            slot.running.as_mut().unwrap().brief_attempts_left = ROOM_BRIEF_MAX_ATTEMPTS;
-            (slot.generation, slot.run_id.unwrap())
-        };
-        supervisor.deliver_pending_brief_if_due(claude, generation, run_id);
-        std::thread::sleep(Duration::from_millis(200));
-        assert!(claude_inputs.lock().is_empty());
-        assert_eq!(
-            supervisor
-                .inner
-                .slots
-                .lock()
-                .get_by_id(claude)
-                .unwrap()
-                .running
-                .as_ref()
-                .unwrap()
-                .brief_attempts_left,
-            0
-        );
-
-        // The operator's "Brief now" ignores the toggle.
-        let result = supervisor
-            .brief_room_member(BriefRoomMemberRequest {
-                room_id: room.room_id,
-                session_id: claude,
-            })
-            .unwrap();
-        assert!(result.failures.is_empty());
-        wait_until("the manual brief to reach claude", || {
-            !claude_inputs.lock().is_empty()
-        });
-        assert!(claude_inputs.lock()[0].contains("PRIM-1 room \"Quiet room\""));
     }
 
     fn set_submit_verify_tuning(supervisor: &SupervisorHandle, window: Duration, attempts: usize) {
@@ -20137,205 +26776,6 @@ mod tests {
     }
 
     #[test]
-    fn the_brief_is_owed_once_per_membership_across_restarts() {
-        let root = std::env::temp_dir().join(format!("prim1-brief-restart-{}", Uuid::new_v4()));
-        fs::create_dir_all(root.join("work")).unwrap();
-
-        // Life 1: claude is running and receives the brief at room creation;
-        // codex is not running and is never briefed.
-        {
-            let mut config = test_supervisor_config(&root);
-            config.room_brief_on_join = true;
-            let supervisor = SupervisorHandle::new(config).unwrap();
-            supervisor.set_executable_resolver_for_tests(Arc::new(TestExecutableResolver));
-            install_standard_test_sessions(&supervisor);
-            let (claude_pty, claude_inputs) = recording_pty_session(std::process::id());
-            install_mock_running_session_with_bracketed_paste_enabled(
-                &supervisor,
-                "claude",
-                DriverKind::Claude,
-                claude_pty,
-            );
-            let claude = test_session_id(&supervisor, "claude");
-            let scout = create_test_session(
-                &supervisor,
-                "scout",
-                DriverKind::Claude,
-                shared_types::PermissionProfile::Normal,
-            )
-            .session_id;
-            let room = supervisor
-                .create_room(CreateRoomRequest {
-                    label: Some("Persisted room".into()),
-                    member_ids: vec![claude, scout],
-                    brief_on_join: true,
-                    brief_template: Some("Persisted mission for {your_label}.".into()),
-                })
-                .unwrap();
-            wait_until("the join brief to reach claude", || {
-                !claude_inputs.lock().is_empty()
-            });
-            wait_until("claude's briefed mark to persist", || {
-                supervisor
-                    .inner
-                    .rooms
-                    .lock()
-                    .get(room.room_id)
-                    .map(|r| r.definition.member_briefed(claude))
-                    .unwrap_or(false)
-            });
-            supervisor.shutdown().unwrap();
-        }
-
-        // Life 2: the app restart. The briefed member relaunches QUIET; the
-        // never-briefed member owes the brief and receives it on first idle.
-        let mut config = test_supervisor_config(&root);
-        config.room_brief_on_join = true;
-        let supervisor = SupervisorHandle::new(config).unwrap();
-        supervisor.set_executable_resolver_for_tests(Arc::new(TestExecutableResolver));
-        let claude = test_session_id(&supervisor, "claude");
-        let scout = test_session_id(&supervisor, "scout");
-
-        let (claude_pty, claude_inputs) = recording_pty_session(std::process::id());
-        supervisor.set_pty_spawner_for_tests(Arc::new(OutputThenReturnPtySpawner {
-            outputs: Vec::new(),
-            session: Mutex::new(Some(claude_pty)),
-        }));
-        start_test_session(&supervisor, "claude").unwrap();
-        {
-            let slots = supervisor.inner.slots.lock();
-            let slot = slots.get_by_id(claude).unwrap();
-            assert_eq!(
-                slot.running.as_ref().unwrap().brief_attempts_left,
-                0,
-                "a briefed member owes nothing at relaunch"
-            );
-        }
-        let (claude_generation, claude_run) = {
-            let mut slots = supervisor.inner.slots.lock();
-            let slot = slots.get_by_id_mut(claude).unwrap();
-            let run_id = slot.run_id.unwrap();
-            set_test_bracketed_paste_mode(slot, run_id, BracketedPasteMode::Enabled);
-            slot.state = LifecycleState::Idle;
-            (slot.generation, run_id)
-        };
-        supervisor.deliver_pending_brief_if_due(claude, claude_generation, claude_run);
-        std::thread::sleep(Duration::from_millis(300));
-        assert!(
-            claude_inputs.lock().is_empty(),
-            "no re-brief for an already-briefed member"
-        );
-
-        let (scout_pty, scout_inputs) = recording_pty_session(std::process::id());
-        supervisor.set_pty_spawner_for_tests(Arc::new(OutputThenReturnPtySpawner {
-            outputs: Vec::new(),
-            session: Mutex::new(Some(scout_pty)),
-        }));
-        start_test_session(&supervisor, "scout").unwrap();
-        let (scout_generation, scout_run) = {
-            let slots = supervisor.inner.slots.lock();
-            let slot = slots.get_by_id(scout).unwrap();
-            assert_eq!(
-                slot.running.as_ref().unwrap().brief_attempts_left,
-                ROOM_BRIEF_MAX_ATTEMPTS,
-                "a never-briefed member owes the brief at launch"
-            );
-            (slot.generation, slot.run_id.unwrap())
-        };
-        {
-            let mut slots = supervisor.inner.slots.lock();
-            let slot = slots.get_by_id_mut(scout).unwrap();
-            set_test_bracketed_paste_mode(slot, scout_run, BracketedPasteMode::Enabled);
-            slot.state = LifecycleState::Idle;
-        }
-        supervisor.deliver_pending_brief_if_due(scout, scout_generation, scout_run);
-        wait_until("the owed brief to reach scout", || {
-            !scout_inputs.lock().is_empty()
-        });
-        assert!(
-            scout_inputs.lock()[0].contains("Persisted mission for scout."),
-            "{}",
-            scout_inputs.lock()[0]
-        );
-    }
-
-    #[test]
-    fn a_rooms_edited_brief_replaces_the_canonical_text_for_join_and_idle_briefs() {
-        let root = std::env::temp_dir().join(format!("prim1-brief-custom-{}", Uuid::new_v4()));
-        fs::create_dir_all(root.join("work")).unwrap();
-        let mut config = test_supervisor_config(&root);
-        config.room_brief_on_join = true;
-        let supervisor = SupervisorHandle::new(config).unwrap();
-        supervisor.set_executable_resolver_for_tests(Arc::new(TestExecutableResolver));
-        install_standard_test_sessions(&supervisor);
-        let (claude_pty, claude_inputs) = recording_pty_session(std::process::id());
-        let (codex_pty, codex_inputs) = recording_pty_session(std::process::id());
-        install_mock_running_session_with_bracketed_paste_enabled(
-            &supervisor,
-            "claude",
-            DriverKind::Claude,
-            claude_pty,
-        );
-        install_mock_running_session_with_process_id_and_mode(
-            &supervisor,
-            "codex",
-            DriverKind::Codex,
-            None,
-            codex_pty,
-            BracketedPasteMode::Unknown,
-        );
-        let claude = test_session_id(&supervisor, "claude");
-        let codex = test_session_id(&supervisor, "codex");
-
-        supervisor
-            .create_room(CreateRoomRequest {
-                label: Some("Custom room".into()),
-                member_ids: vec![claude, codex],
-                brief_on_join: true,
-                brief_template: Some(
-                    "Mission for {your_label} in {room_label}: talk to {members} via {tools}\r\nSecond line."
-                        .into(),
-                ),
-            })
-            .unwrap();
-
-        wait_until("the custom join brief to reach claude", || {
-            !claude_inputs.lock().is_empty()
-        });
-        let brief = claude_inputs.lock()[0].clone();
-        assert!(brief.contains("Mission for claude in Custom room"), "{brief}");
-        assert!(brief.contains("codex (Codex)"), "{brief}");
-        assert!(brief.contains("prim1_pane MCP server"), "{brief}");
-        assert!(brief.contains("Second line."), "{brief}");
-        assert!(
-            !brief.contains("Do not reach the pipe by any other means"),
-            "{brief}"
-        );
-
-        // The owed idle brief uses the same edited text.
-        let (generation, run_id) = {
-            let slots = supervisor.inner.slots.lock();
-            let slot = slots.get_by_id(codex).unwrap();
-            (slot.generation, slot.run_id.unwrap())
-        };
-        {
-            let mut slots = supervisor.inner.slots.lock();
-            let slot = slots.get_by_id_mut(codex).unwrap();
-            set_test_bracketed_paste_mode(slot, run_id, BracketedPasteMode::Enabled);
-            slot.state = LifecycleState::Idle;
-        }
-        supervisor.deliver_pending_brief_if_due(codex, generation, run_id);
-        wait_until("the custom idle brief to reach codex", || {
-            !codex_inputs.lock().is_empty()
-        });
-        let codex_brief = codex_inputs.lock()[0].clone();
-        assert!(
-            codex_brief.contains("Mission for codex in Custom room"),
-            "{codex_brief}"
-        );
-    }
-
-    #[test]
     fn render_room_brief_substitutes_an_edited_template_and_one_lines_it_for_terminals() {
         let claude = RoomMember {
             session_id: Uuid::new_v4(),
@@ -20351,7 +26791,7 @@ mod tests {
         let template =
             "Hello {your_label} of {room_label}.\r\nOthers: {members}.\r\nTools: {tools}";
 
-        let for_claude = render_room_brief("Edited", &members, &claude, None, Some(template));
+        let for_claude = render_room_brief("Edited", &members, &claude, MemberPermissions::default(), None, Some(template));
         assert!(for_claude.contains("Hello CC of Edited."), "{for_claude}");
         assert!(
             for_claude.contains("Others: Shell (Terminal)."),
@@ -20361,7 +26801,7 @@ mod tests {
         assert!(!for_claude.contains('\r'), "{for_claude}");
         assert!(!for_claude.contains("Do not reach the pipe"), "{for_claude}");
 
-        let for_terminal = render_room_brief("Edited", &members, &terminal, None, Some(template));
+        let for_terminal = render_room_brief("Edited", &members, &terminal, MemberPermissions::default(), None, Some(template));
         assert!(!for_terminal.contains('\n'), "{for_terminal}");
         assert!(
             for_terminal.contains("Hello Shell of Edited. · Others: CC (Claude Code)."),
@@ -20409,7 +26849,7 @@ mod tests {
         let members = vec![claude.clone(), grok.clone(), terminal.clone()];
         let cli = Path::new(r"C:\PRIM-1\prim1.exe");
 
-        let for_claude = render_room_brief("Team A", &members, &claude, Some(cli), None);
+        let for_claude = render_room_brief("Team A", &members, &claude, MemberPermissions::default(), Some(cli), None);
         assert!(for_claude.contains("prim1_pane MCP server"));
         assert!(for_claude.contains("Grok (Grok Build), Shell (Terminal)"));
         assert!(
@@ -20418,11 +26858,11 @@ mod tests {
         );
         assert!(for_claude.contains('\n'));
 
-        let for_grok = render_room_brief("Team A", &members, &grok, Some(cli), None);
+        let for_grok = render_room_brief("Team A", &members, &grok, MemberPermissions::default(), Some(cli), None);
         assert!(for_grok.contains(r"C:\PRIM-1\prim1.exe"));
         assert!(for_grok.contains("--prim1-room ping"));
 
-        let for_terminal = render_room_brief("Team A", &members, &terminal, None, None);
+        let for_terminal = render_room_brief("Team A", &members, &terminal, MemberPermissions::default(), None, None);
         assert!(
             !for_terminal.contains('\n'),
             "terminal framing admits a single line"
@@ -20823,7 +27263,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("control-plane start did not reach the prepared barrier");
         assert!(
-            supervisor.inner.shutdown_lifecycle.try_lock().is_none(),
+            supervisor.inner.shutdown_lifecycle.try_write().is_none(),
             "start must hold the terminal lifecycle lock through listener preparation"
         );
 
@@ -21034,20 +27474,13 @@ mod tests {
                 ],
             },
         )));
-        let (session_id, session_alias) = {
-            let slots = supervisor.inner.slots.lock();
-            let slot = slots.get("claude").expect("test Claude slot");
-            (slot.session_id, slot.definition.alias.clone())
-        };
-        {
-            let mut slots = supervisor.inner.slots.lock();
-            let definition = &mut slots
-                .get_mut("claude")
-                .expect("default claude slot")
-                .definition;
-            definition.label = "Rust-to-PowerShell identity receipt".into();
-            definition.driver = DriverKind::GenericTerminal;
-        }
+        let terminal = create_test_session(
+            &supervisor,
+            "Rust-to-PowerShell identity receipt",
+            DriverKind::GenericTerminal,
+            shared_types::PermissionProfile::Normal,
+        );
+        let (session_id, session_alias) = (terminal.session_id, terminal.alias);
 
         let started = supervisor
             .start_session_by_id(session_id)
@@ -21949,7 +28382,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("work state is blocked (workspace_trust)"),
+                .contains("work state is blocked (modal:workspace_trust)"),
             "{error:#}"
         );
         assert!(inputs.lock().is_empty());
@@ -22040,6 +28473,10 @@ mod tests {
             stale_pty,
             BracketedPasteMode::Unknown,
         );
+        // The stale run's vanished root is the agent itself (native claude.exe).
+        // A vanished wrapper whose agent is still alive is kept instead (F2).
+        supervisor.inner.slots.lock().get_mut("claude").unwrap().run_program =
+            Some(PathBuf::from(r"C:\Users\me\.local\bin\claude.exe"));
         let (target_pty, target_inputs) = recording_pty_session(std::process::id());
         install_mock_running_session_with_process_id_and_mode(
             &supervisor,
@@ -22109,6 +28546,10 @@ mod tests {
             stale_pty,
             BracketedPasteMode::Unknown,
         );
+        // The stale run's vanished root is the agent itself (native codex.exe).
+        // A vanished wrapper whose agent is still alive is kept instead (F2).
+        supervisor.inner.slots.lock().get_mut("codex").unwrap().run_program =
+            Some(PathBuf::from(r"C:\Program Files\Codex\codex.exe"));
         let bracketed_before = supervisor
             .inner
             .slots
@@ -22254,80 +28695,88 @@ mod tests {
         assert_eq!(inputs.lock().as_slice(), &["raw sideband typing"]);
     }
 
+    /// v3 W2 (11 Oct item 1; the inherited test31 red): a question on screen
+    /// still refuses routed input before any side effect, while an escalated
+    /// notice is advisory and the message is typed.
     #[test]
     fn observed_unsafe_work_state_rejects_synthetic_delivery_before_message_side_effects() {
-        for (work_state, detail) in [
-            (WorkState::Blocked, "workspace_trust"),
-            (WorkState::ErrorLoop, "rate_limit"),
-        ] {
-            let supervisor = test_supervisor();
-            let (pty, inputs) = recording_pty_session(std::process::id());
-            install_mock_running_session_with_bracketed_paste_enabled(
-                &supervisor,
-                "codex",
-                DriverKind::Codex,
-                pty,
-            );
-            set_session_dispatch_state(
-                &supervisor,
-                "codex",
-                LifecycleState::Ready,
-                Some(work_state),
-            );
-            supervisor
-                .inner
-                .slots
-                .lock()
-                .get_mut("codex")
-                .unwrap()
-                .work_detail = Some(detail.into());
-            let before = slots_mutation_probe(&supervisor);
-            let audit_before = fs::read(supervisor.audit_log_path()).unwrap_or_default();
-            let events = capture_runtime_events(&supervisor);
-            let session_id = test_session_id(&supervisor, "codex");
+        let supervisor = test_supervisor();
+        let (pty, inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            pty,
+        );
+        set_session_dispatch_state(
+            &supervisor,
+            "codex",
+            LifecycleState::Ready,
+            Some(WorkState::Blocked),
+        );
+        supervisor
+            .inner
+            .slots
+            .lock()
+            .get_mut("codex")
+            .unwrap()
+            .work_detail = Some("workspace_trust".into());
+        let before = slots_mutation_probe(&supervisor);
+        let audit_before = fs::read(supervisor.audit_log_path()).unwrap_or_default();
+        let events = capture_runtime_events(&supervisor);
+        let session_id = test_session_id(&supervisor, "codex");
 
-            let error = supervisor
-                .route_operator_message(OperatorRouteMessageRequest {
-                    recipient_id: session_id,
-                    content: "must not enter a modal prompt".into(),
-                })
-                .unwrap_err();
+        let error = supervisor
+            .route_operator_message(OperatorRouteMessageRequest {
+                recipient_id: session_id,
+                content: "must not enter a modal prompt".into(),
+            })
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("work state is blocked (modal:workspace_trust)"), "{error:#}");
+        assert!(
+            text.starts_with("Nothing was delivered. codex (")
+                && text.contains(") can't take a routed message right now: "),
+            "operator-legible lead: {error:#}"
+        );
+        assert!(
+            text.contains("it is asking whether to trust the folder — answer that question in its terminal, then send again."),
+            "{error:#}"
+        );
+        assert!(
+            !text.contains("use raw terminal input to resolve the prompt"),
+            "the old instruction did not clear notices and is gone: {error:#}"
+        );
+        assert_eq!(slots_mutation_probe(&supervisor), before);
+        assert!(inputs.lock().is_empty());
+        assert!(events.lock().is_empty());
+        assert_eq!(
+            fs::read(supervisor.audit_log_path()).unwrap_or_default(),
+            audit_before
+        );
 
-            assert!(
-                error.to_string().contains(&format!(
-                    "work state is {} ({detail})",
-                    work_state_alert_label(Some(work_state))
-                )),
-                "{error:#}"
-            );
-            let text = error.to_string();
-            assert!(
-                text.starts_with("Nothing was delivered. codex (")
-                    && text.contains(") can't take a routed message right now: "),
-                "operator-legible lead: {error:#}"
-            );
-            let expected_reason = match detail {
-                "workspace_trust" => {
-                    "it is asking whether to trust the folder — answer that question in its terminal, then send again."
-                }
-                "rate_limit" => {
-                    "it keeps hitting a rate limit — wait for the limit to reset, then send again."
-                }
-                _ => unreachable!(),
-            };
-            assert!(text.contains(expected_reason), "{error:#}");
-            assert!(
-                !text.contains("use raw terminal input to resolve the prompt"),
-                "the old instruction did not clear notices and is gone: {error:#}"
-            );
-            assert_eq!(slots_mutation_probe(&supervisor), before);
-            assert!(inputs.lock().is_empty());
-            assert!(events.lock().is_empty());
-            assert_eq!(
-                fs::read(supervisor.audit_log_path()).unwrap_or_default(),
-                audit_before
-            );
-        }
+        // The same pane with an escalated usage-cap notice instead: advisory,
+        // so the routed message is typed.
+        set_session_dispatch_state(
+            &supervisor,
+            "codex",
+            LifecycleState::Ready,
+            Some(WorkState::ErrorLoop),
+        );
+        supervisor
+            .inner
+            .slots
+            .lock()
+            .get_mut("codex")
+            .unwrap()
+            .work_detail = Some("rate_limit".into());
+        supervisor
+            .route_operator_message(OperatorRouteMessageRequest {
+                recipient_id: session_id,
+                content: "an advisory notice never refuses".into(),
+            })
+            .expect("a notice is advisory status, not a refusal");
+        assert!(!inputs.lock().is_empty(), "the message was typed");
     }
 
     #[test]
@@ -22377,7 +28826,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("work state is blocked (workspace_trust)"),
+                .contains("work state is blocked (modal:workspace_trust)"),
             "{error:#}"
         );
         assert_eq!(slots_mutation_probe(&supervisor), before);
@@ -22542,11 +28991,13 @@ mod tests {
                 "last_pty_cols".to_string(),
                 "last_pty_rows".to_string(),
                 "label".to_string(),
+                "launch_choices".to_string(),
                 "permission_profile".to_string(),
                 "session_id".to_string(),
                 "working_directory".to_string(),
             ])
         );
+        assert!(persisted.get("last_launch").is_none(), "catalog CRUD did not launch a process");
         assert!(!catalog_value.to_string().contains("run_id"));
         assert!(!catalog_value.to_string().contains("process_id"));
         assert!(!catalog_value.to_string().contains("argv"));
@@ -22581,7 +29032,8 @@ mod tests {
         supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
 
         let session = supervisor
-            .create_session(shared_types::CreateSessionRequest {
+            .create_session(shared_types::CreateSessionRequest { codex_transport: Default::default(), permissions: None,
+                launch_choices: None,
                 room_id: None,
                 label: None,
                 driver: DriverKind::Grok,
@@ -22841,7 +29293,8 @@ mod tests {
         let events = capture_runtime_events(&supervisor);
 
         let error = supervisor
-            .create_session(shared_types::CreateSessionRequest {
+            .create_session(shared_types::CreateSessionRequest { codex_transport: Default::default(), permissions: None,
+                launch_choices: None,
                 room_id: None,
                 label: Some("Must reselect".into()),
                 driver: DriverKind::Claude,
@@ -22891,7 +29344,7 @@ mod tests {
     }
 
     #[test]
-    fn room_catalog_crud_reopens_exact_ids_order_membership_without_feed_content_or_spawn() {
+    fn room_catalog_crud_replays_feed_with_exact_ids_order_membership_without_spawn() {
         let root = tempfile::tempdir().expect("create room catalog root");
         let supervisor = test_supervisor_with_root(root.path().to_path_buf());
         let grok = create_test_session(
@@ -22943,6 +29396,7 @@ mod tests {
         let sentinel = "ROOM-CONTENT-MUST-NOT-PERSIST-λ";
         supervisor
             .post_room_message(PostRoomMessageRequest {
+                request_id: None,
                 room_id: first.room_id,
                 content: sentinel.into(),
             })
@@ -22980,10 +29434,62 @@ mod tests {
         assert_eq!(after.rooms[0].label, "Renamed");
         for room in &after.rooms {
             assert_eq!(room.feed_oldest_sequence, 1);
-            assert_eq!(room.feed_next_sequence, 1);
-            assert_ne!(room.feed_epoch, old_epochs[&room.room_id]);
+            let previous = before.rooms.iter().find(|r| r.room_id == room.room_id).unwrap();
+            assert_eq!(room.feed_next_sequence, previous.feed_next_sequence);
+            assert_eq!(room.feed_epoch, old_epochs[&room.room_id]);
         }
         assert_eq!(fs::read(&catalog_path).unwrap(), catalog_bytes);
+        let replay = reopened.read_room_feed(ReadRoomFeedRequest { room_id: first.room_id, cursor: None }).unwrap();
+        assert!(replay.events.iter().any(|e| matches!(&e.item, RoomFeedItem::Message { content, .. } if content == sentinel)));
+    }
+
+    #[test]
+    fn corrupt_room_log_isolated_while_healthy_room_replays_and_accepts_posts() {
+        let root = tempfile::tempdir().unwrap();
+        let supervisor = test_supervisor_with_root(root.path().to_path_buf());
+        let claude = test_session_id(&supervisor, "claude");
+        let codex = test_session_id(&supervisor, "codex");
+        let broken = supervisor.create_room(CreateRoomRequest {
+            brief_on_join: false, brief_template: None, label: Some("Broken".into()),
+            member_ids: vec![claude],
+        }).unwrap();
+        let healthy = supervisor.create_room(CreateRoomRequest {
+            brief_on_join: false, brief_template: None, label: Some("Healthy".into()),
+            member_ids: vec![codex],
+        }).unwrap();
+        for room_id in [broken.room_id, healthy.room_id] {
+            supervisor.post_room_message(PostRoomMessageRequest {
+                request_id: Some("before-restart".into()), room_id, content: "retained".into(),
+            }).unwrap();
+        }
+        let path = supervisor.runtime_dir().join("rooms").join(format!("{}.jsonl", broken.room_id));
+        drop(supervisor);
+        OpenOptions::new().append(true).open(&path).unwrap().write_all(b"broken complete record\n").unwrap();
+        let damaged = fs::read(&path).unwrap();
+        let reopened = SupervisorHandle::new(test_supervisor_config(root.path())).unwrap();
+        let (spawner, specs) = CapturingPtySpawner::new(Vec::new());
+        reopened.set_pty_spawner_for_tests(Arc::new(spawner));
+        let snapshot = reopened.snapshot();
+        let affected = snapshot.rooms.iter().find(|r| r.room_id == broken.room_id).unwrap();
+        assert!(affected.recovery_error.as_deref().unwrap().contains("invalid complete"));
+        assert_eq!(affected.feed_epoch, broken.feed_epoch);
+        assert!(snapshot.rooms.iter().find(|r| r.room_id == healthy.room_id).unwrap().recovery_error.is_none());
+        assert!(reopened.read_room_feed(ReadRoomFeedRequest { room_id: broken.room_id, cursor: None }).is_err());
+        assert!(reopened.post_room_message(PostRoomMessageRequest {
+            request_id: Some("new-post".into()), room_id: broken.room_id, content: "refuse".into(),
+        }).is_err());
+        assert!(reopened.deliver_room_message(DeliverRoomMessageRequest {
+            request_id: Some("new-wake".into()), room_id: broken.room_id,
+            recipients: RoomRecipientSelection::All {}, content: "refuse wake".into(),
+        }).is_err());
+        assert!(reopened.brief_room_member(BriefRoomMemberRequest { room_id: broken.room_id, session_id: claude }).is_err());
+        let page = reopened.read_room_feed(ReadRoomFeedRequest { room_id: healthy.room_id, cursor: None }).unwrap();
+        assert!(page.events.iter().any(|e| matches!(&e.item, RoomFeedItem::Message { content, .. } if content == "retained")));
+        reopened.post_room_message(PostRoomMessageRequest {
+            request_id: Some("after-restart".into()), room_id: healthy.room_id, content: "still writable".into(),
+        }).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), damaged);
+        assert!(specs.lock().is_empty(), "no room recovery launches a harness");
     }
 
     #[test]
@@ -23014,6 +29520,54 @@ mod tests {
         assert_eq!(fs::read(path).unwrap(), bytes_before);
         assert!(events.lock().is_empty());
         assert!(specs.lock().is_empty());
+    }
+
+    #[test]
+    fn room_membership_reports_committed_change_when_its_feed_record_fails() {
+        for removing in [false, true] {
+            for after_write in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let supervisor = test_supervisor_with_root(root.path().to_path_buf());
+                let recipient = test_session_id(&supervisor, "claude");
+                let other = test_session_id(&supervisor, "codex");
+                let room = supervisor.create_room(CreateRoomRequest { brief_on_join: false, brief_template: None,
+                    label: Some("Membership commit".into()), member_ids: if removing { vec![recipient] } else { vec![] } }).unwrap();
+                let events = capture_runtime_events(&supervisor);
+                supervisor.inner.rooms.lock().get_mut(room.room_id).unwrap().fail_next_commit_for_tests(after_write);
+                if removing {
+                    // Removal now attempts recovery after durable revocation.
+                    // Keep that attempt held so the next mutation still tests
+                    // refusal before its catalog commit when recovery fails.
+                    supervisor.inner.rooms.lock().get_mut(room.room_id).unwrap().fail_next_replay_sync_for_tests();
+                }
+                let snapshot = if removing {
+                    supervisor.remove_room_member(RemoveRoomMemberRequest { room_id: room.room_id, session_id: recipient })
+                } else {
+                    supervisor.add_room_member(AddRoomMemberRequest { room_id: room.room_id, session_id: recipient })
+                }.expect("catalog commit must be reported as success even if its feed receipt fails");
+                assert_eq!(snapshot.member_ids.contains(&recipient), !removing);
+                assert!(events.lock().iter().any(|event| match event {
+                    RuntimeEvent::RoomMemberAdded { session_id, .. } => !removing && *session_id == recipient,
+                    RuntimeEvent::RoomMemberRemoved { session_id, .. } => removing && *session_id == recipient,
+                    _ => false,
+                }));
+                assert!(events.lock().iter().any(|event| matches!(event, RuntimeEvent::SystemLog { message, .. }
+                    if message.contains("membership saved; feed record was not confirmed"))));
+                let before = fs::read(room_catalog_path(supervisor.runtime_dir())).unwrap();
+                supervisor.inner.rooms.lock().get_mut(room.room_id).unwrap().fail_next_replay_sync_for_tests();
+                let refused = supervisor.add_room_member(AddRoomMemberRequest { room_id: room.room_id, session_id: other }).unwrap_err();
+                assert_eq!(room_request_error_kind(&refused), "recovery_required");
+                assert_eq!(fs::read(room_catalog_path(supervisor.runtime_dir())).unwrap(), before,
+                    "failed writer recovery must refuse before another catalog mutation");
+                let recovered = supervisor.add_room_member(AddRoomMemberRequest { room_id: room.room_id, session_id: other }).unwrap();
+                assert!(recovered.member_ids.contains(&other));
+                drop(supervisor);
+                let reopened = SupervisorHandle::new(test_supervisor_config(root.path())).unwrap();
+                let replayed = reopened.snapshot().rooms.into_iter().find(|r| r.room_id == room.room_id).unwrap();
+                assert_eq!(replayed.member_ids.contains(&recipient), !removing);
+                assert!(replayed.recovery_error.is_none());
+            }
+        }
     }
 
     #[test]
@@ -23077,6 +29631,7 @@ mod tests {
         let first = thread::spawn(move || {
             first_supervisor
                 .post_room_message(PostRoomMessageRequest {
+                    request_id: None,
                     room_id: room.room_id,
                     content: "first".into(),
                 })
@@ -23092,6 +29647,7 @@ mod tests {
         let second = thread::spawn(move || {
             second_started_tx.send(()).unwrap();
             let result = second_supervisor.post_room_message(PostRoomMessageRequest {
+                request_id: None,
                 room_id: room.room_id,
                 content: "second".into(),
             });
@@ -23198,6 +29754,7 @@ mod tests {
 
         let result = supervisor
             .post_room_message(PostRoomMessageRequest {
+                request_id: None,
                 room_id: room.room_id,
                 content: sentinel.into(),
             })
@@ -23247,6 +29804,7 @@ mod tests {
         assert!(empty.member_ids.is_empty());
         let refusal = supervisor
             .deliver_room_message(DeliverRoomMessageRequest {
+                request_id: None,
                 room_id: empty.room_id,
                 recipients: RoomRecipientSelection::All {},
                 content: "anyone home?".into(),
@@ -23260,11 +29818,7 @@ mod tests {
 
         // A single-member room is a team of one: operator Send reaches it.
         let (claude_pty, claude_inputs) = recording_pty_session(std::process::id());
-        install_mock_running_session_with_bracketed_paste_enabled(
-            &supervisor,
-            "claude",
-            DriverKind::Claude,
-            claude_pty,
+        install_mock_room_wake_recipient(&supervisor, "claude", claude_pty,
         );
         let solo = supervisor
             .create_room(CreateRoomRequest {
@@ -23276,6 +29830,7 @@ mod tests {
             .unwrap();
         let result = supervisor
             .deliver_room_message(DeliverRoomMessageRequest {
+                request_id: None,
                 room_id: solo.room_id,
                 recipients: RoomRecipientSelection::All {},
                 content: "solo delivery".into(),
@@ -23314,6 +29869,7 @@ mod tests {
         let refused = supervisor.apply_sideband_request(
             &caller,
             SidebandRequest::RoomDeliver {
+                request_id: None,
                 recipient: "all".into(),
                 content: "echo?".into(),
             },
@@ -23340,7 +29896,8 @@ mod tests {
             .unwrap();
 
         let created = supervisor
-            .create_session(shared_types::CreateSessionRequest {
+            .create_session(shared_types::CreateSessionRequest { codex_transport: Default::default(), permissions: None,
+                launch_choices: None,
                 room_id: Some(room.room_id),
                 label: Some("hatchling".into()),
                 driver: DriverKind::Claude,
@@ -23371,7 +29928,8 @@ mod tests {
 
         let sessions_before = supervisor.snapshot().sessions.len();
         let error = supervisor
-            .create_session(shared_types::CreateSessionRequest {
+            .create_session(shared_types::CreateSessionRequest { codex_transport: Default::default(), permissions: None,
+                launch_choices: None,
                 room_id: Some(Uuid::new_v4()),
                 label: Some("orphan".into()),
                 driver: DriverKind::Claude,
@@ -23407,17 +29965,9 @@ mod tests {
         let (first_codex_pty, first_codex_inputs) = recording_pty_session(102);
         let (second_claude_pty, second_claude_inputs) = recording_pty_session(103);
         let (second_codex_pty, second_codex_inputs) = recording_pty_session(104);
-        install_mock_running_session_with_bracketed_paste_enabled(
-            &supervisor,
-            "claude",
-            DriverKind::Claude,
-            first_claude_pty,
+        install_mock_room_wake_recipient(&supervisor, "claude", first_claude_pty,
         );
-        install_mock_running_session_with_bracketed_paste_enabled(
-            &supervisor,
-            "codex",
-            DriverKind::Codex,
-            first_codex_pty,
+        install_mock_room_wake_recipient(&supervisor, "codex", first_codex_pty,
         );
         install_mock_running_session_by_id_with_mode(
             &supervisor,
@@ -23464,6 +30014,7 @@ mod tests {
 
         let result = supervisor
             .deliver_room_message(DeliverRoomMessageRequest {
+                request_id: None,
                 room_id: first.room_id,
                 recipients: RoomRecipientSelection::All {},
                 content: sentinel.into(),
@@ -23525,6 +30076,7 @@ mod tests {
 
         let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = supervisor.deliver_room_message(DeliverRoomMessageRequest {
+                request_id: None,
                 room_id: room.room_id,
                 recipients: RoomRecipientSelection::One {
                     session_id: test_session_id(&supervisor, "claude"),
@@ -23544,21 +30096,16 @@ mod tests {
     }
 
     #[test]
-    fn room_send_all_preflights_every_run_then_records_exact_per_recipient_receipts() {
+    fn room_send_all_stores_then_records_exact_per_recipient_receipts() {
         let supervisor = test_supervisor();
         let (claude_pty, claude_inputs) = recording_pty_session(std::process::id());
         let (codex_pty, codex_inputs) = recording_pty_session(std::process::id());
+        // A106: the real drivers, each with its own measured submit sequence.
         install_mock_running_session_with_bracketed_paste_enabled(
-            &supervisor,
-            "claude",
-            DriverKind::Claude,
-            claude_pty,
+            &supervisor, "claude", DriverKind::Claude, claude_pty,
         );
         install_mock_running_session_with_bracketed_paste_enabled(
-            &supervisor,
-            "codex",
-            DriverKind::Codex,
-            codex_pty,
+            &supervisor, "codex", DriverKind::Codex, codex_pty,
         );
         let room = supervisor
             .create_room(CreateRoomRequest {
@@ -23575,6 +30122,7 @@ mod tests {
 
         let result = supervisor
             .deliver_room_message(DeliverRoomMessageRequest {
+                request_id: None,
                 room_id: room.room_id,
                 recipients: RoomRecipientSelection::All {},
                 content: content.into(),
@@ -23584,10 +30132,15 @@ mod tests {
         assert_eq!(result.recipient_count, 2);
         assert_eq!(result.written_count, 2);
         assert!(result.failures.is_empty());
-        let payload = format!("[Room message from operator]\n{content}");
-        let framed = frame_message_payload(&payload, MessageFraming::BracketedPaste);
-        for (inputs, submit) in [(claude_inputs, "\r"), (codex_inputs, "\x1b[C\r")] {
-            assert_eq!(inputs.lock().as_slice(), &[framed.clone(), submit.into()]);
+        // v3 W3: each recipient gets the same pointer with its own submit;
+        // the exact body stays in the feed (checked below).
+        let typed = typed_pointer(&supervisor, 1, result.message_id);
+        assert_eq!(*claude_inputs.lock(), vec![typed.clone(), "\r".to_string()]);
+        assert_eq!(*codex_inputs.lock(), vec![typed.clone(), "\x1b[C\r".to_string()]);
+        for receipt in &result.receipts {
+            let submit = if receipt.recipient_id == test_session_id(&supervisor, "codex") { "\x1b[C\r" } else { "\r" };
+            assert_eq!(receipt.status, RoomDeliveryStatus::Written);
+            assert_eq!(receipt.bytes_written, typed.len() + submit.len());
         }
         let page = supervisor
             .read_room_feed(ReadRoomFeedRequest {
@@ -23616,7 +30169,7 @@ mod tests {
     }
 
     #[test]
-    fn grok_room_delivery_uses_one_fused_buffer_and_preserves_lf_content() {
+    fn grok_room_delivery_types_the_whole_message_and_preserves_the_exact_feed_body() {
         let supervisor = test_supervisor();
         let grok = create_test_session(
             &supervisor,
@@ -23625,14 +30178,7 @@ mod tests {
             shared_types::PermissionProfile::Normal,
         );
         let (grok_pty, grok_inputs) = recording_pty_session(std::process::id());
-        install_mock_running_session_by_id_with_mode(
-            &supervisor,
-            grok.session_id,
-            DriverKind::Grok,
-            None,
-            grok_pty,
-            BracketedPasteMode::Enabled,
-        );
+        install_mock_room_wake_recipient(&supervisor, "grok", grok_pty);
         let room = supervisor
             .create_room(CreateRoomRequest {
                 brief_on_join: true,
@@ -23645,6 +30191,7 @@ mod tests {
 
         let result = supervisor
             .deliver_room_message(DeliverRoomMessageRequest {
+                request_id: None,
                 room_id: room.room_id,
                 recipients: RoomRecipientSelection::One {
                     session_id: grok.session_id,
@@ -23655,14 +30202,10 @@ mod tests {
 
         assert_eq!(result.written_count, 1);
         assert!(result.failures.is_empty());
-        let payload = format!("[Room message from operator]\n{content}");
-        assert_eq!(
-            grok_inputs.lock().as_slice(),
-            &[
-                frame_message_payload(&payload, MessageFraming::BracketedPaste),
-                "\r".into(),
-            ]
-        );
+        // v3 W3: Grok gets the pointer inside one paste, then CR; the exact
+        // body (whitespace, blank line, non-ASCII) is preserved in the feed.
+        assert_eq!(*grok_inputs.lock(), vec![typed_pointer(&supervisor, 1, result.message_id), "\r".to_string()]);
+        assert_eq!(result.receipts[0].bytes_written, typed_pointer(&supervisor, 1, result.message_id).len() + "\r".len());
         let page = supervisor
             .read_room_feed(ReadRoomFeedRequest {
                 room_id: room.room_id,
@@ -23676,9 +30219,9 @@ mod tests {
     }
 
     #[test]
-    fn mixed_room_framing_rejection_is_atomic_when_a_terminal_is_a_recipient() {
+    fn mixed_room_framing_holds_only_the_incompatible_recipient() {
         // Fullscreen Grok admits CR like the other paste drivers; the strict
-        // recipient proving delivery atomicity is now a generic terminal,
+        // recipient held independently is a generic terminal,
         // whose raw single-line framing rejects control characters.
         let supervisor = test_supervisor();
         let shell = create_test_session(
@@ -23689,11 +30232,7 @@ mod tests {
         );
         let (claude_pty, claude_inputs) = recording_pty_session(std::process::id());
         let (shell_pty, grok_inputs) = recording_pty_session(std::process::id());
-        install_mock_running_session_with_bracketed_paste_enabled(
-            &supervisor,
-            "claude",
-            DriverKind::Claude,
-            claude_pty,
+        install_mock_room_wake_recipient(&supervisor, "claude", claude_pty,
         );
         install_mock_running_session_by_id_with_mode(
             &supervisor,
@@ -23720,33 +30259,36 @@ mod tests {
         let audit_before = fs::read(supervisor.audit_log_path()).unwrap();
         let events = capture_runtime_events(&supervisor);
 
-        let error = supervisor
+        let result = supervisor
             .deliver_room_message(DeliverRoomMessageRequest {
+                request_id: Some("partial-intent".into()),
                 room_id: room.room_id,
                 recipients: RoomRecipientSelection::All {},
                 content: "first\r\nsecond".into(),
             })
-            .unwrap_err();
+            .unwrap();
 
-        assert!(
-            error
-                .to_string()
-                .contains("printable single-line message bodies"),
-            "{error:#}"
-        );
-        assert!(claude_inputs.lock().is_empty());
+        assert_eq!(result.written_count, 1);
+        assert_eq!(result.receipts[0].status, RoomDeliveryStatus::Written);
+        assert_eq!(result.receipts[1].status, RoomDeliveryStatus::Held);
+        assert!(result.failures[0].error.contains("no verified room-wake adapter"));
+        assert!(!claude_inputs.lock().is_empty());
         assert!(grok_inputs.lock().is_empty());
-        assert!(events.lock().is_empty());
-        assert_eq!(
-            supervisor
-                .read_room_feed(ReadRoomFeedRequest {
-                    room_id: room.room_id,
-                    cursor: None,
-                })
-                .unwrap(),
-            before
-        );
-        assert_eq!(fs::read(supervisor.audit_log_path()).unwrap(), audit_before);
+        assert!(!events.lock().is_empty());
+        let page = supervisor.read_room_feed(ReadRoomFeedRequest { room_id: room.room_id, cursor: None }).unwrap();
+        assert!(page.events.len() > before.events.len());
+        assert_ne!(fs::read(supervisor.audit_log_path()).unwrap(), audit_before);
+        let writes = claude_inputs.lock().clone();
+        let retried = supervisor.deliver_room_message(DeliverRoomMessageRequest {
+            request_id: Some("partial-intent".into()), room_id: room.room_id,
+            recipients: RoomRecipientSelection::All {}, content: "first\r\nsecond".into(),
+        }).unwrap();
+        assert!(retried.replayed);
+        assert_eq!(retried.message_id, result.message_id);
+        assert_eq!(retried.receipts, result.receipts);
+        assert_eq!(*claude_inputs.lock(), writes);
+        assert!(grok_inputs.lock().is_empty());
+        assert_eq!(supervisor.read_room_feed(ReadRoomFeedRequest { room_id: room.room_id, cursor: None }).unwrap(), page);
     }
 
     #[test]
@@ -23787,6 +30329,7 @@ mod tests {
 
         let error = supervisor
             .deliver_room_message(DeliverRoomMessageRequest {
+                request_id: None,
                 room_id: room.room_id,
                 recipients: RoomRecipientSelection::All {},
                 content: "must not write".into(),
@@ -23809,20 +30352,16 @@ mod tests {
     }
 
     #[test]
-    fn room_send_all_rejects_one_unknown_mode_before_every_message_side_effect() {
+    fn room_send_all_stores_then_queues_only_the_unknown_mode_recipient() {
         let supervisor = test_supervisor();
         let (claude_pty, claude_inputs) = recording_pty_session(std::process::id());
         let (codex_pty, codex_inputs) = recording_pty_session(std::process::id());
-        install_mock_running_session_with_bracketed_paste_enabled(
-            &supervisor,
-            "claude",
-            DriverKind::Claude,
-            claude_pty,
+        install_mock_room_wake_recipient(&supervisor, "claude", claude_pty,
         );
         install_mock_running_session_with_process_id_and_mode(
             &supervisor,
             "codex",
-            DriverKind::Codex,
+            DriverKind::Grok,
             None,
             codex_pty,
             BracketedPasteMode::Unknown,
@@ -23847,32 +30386,524 @@ mod tests {
         let audit_before = fs::read(supervisor.audit_log_path()).unwrap();
         let events = capture_runtime_events(&supervisor);
 
-        let error = supervisor
+        let result = supervisor
             .deliver_room_message(DeliverRoomMessageRequest {
+                request_id: Some("partial-intent".into()),
                 room_id: room.room_id,
                 recipients: RoomRecipientSelection::All {},
                 content: "atomically rejected".into(),
             })
-            .unwrap_err();
+            .unwrap();
 
-        assert!(
-            error
-                .to_string()
-                .contains("bracketed-paste mode is unknown")
-        );
-        assert!(claude_inputs.lock().is_empty());
+        // A106: the unknown-mode recipient keeps the message Stored and queued.
+        let codex = test_session_id(&supervisor, "codex");
+        assert_eq!(result.written_count, 1);
+        assert_eq!(result.receipts[0].status, RoomDeliveryStatus::Written);
+        assert_eq!(result.receipts[1].status, RoomDeliveryStatus::Stored);
+        assert!(result.failures.is_empty());
+        assert_eq!(supervisor.queued_room_wake_count_for_tests(codex), 1);
+        assert!(!claude_inputs.lock().is_empty());
         assert!(codex_inputs.lock().is_empty());
-        assert!(events.lock().is_empty());
-        assert_eq!(
-            supervisor
-                .read_room_feed(ReadRoomFeedRequest {
-                    room_id: room.room_id,
-                    cursor: None,
-                })
-                .unwrap(),
-            before
-        );
-        assert_eq!(fs::read(supervisor.audit_log_path()).unwrap(), audit_before);
+        assert!(!events.lock().is_empty());
+        let page = supervisor.read_room_feed(ReadRoomFeedRequest { room_id: room.room_id, cursor: None }).unwrap();
+        assert!(page.events.len() > before.events.len());
+        assert!(room_receipt_statuses(&supervisor, room.room_id, codex).is_empty(), "no Held receipt");
+        assert_ne!(fs::read(supervisor.audit_log_path()).unwrap(), audit_before);
+        let writes = claude_inputs.lock().clone();
+        let retried = supervisor.deliver_room_message(DeliverRoomMessageRequest {
+            request_id: Some("partial-intent".into()), room_id: room.room_id,
+            recipients: RoomRecipientSelection::All {}, content: "atomically rejected".into(),
+        }).unwrap();
+        assert!(retried.replayed);
+        assert_eq!(retried.message_id, result.message_id);
+        // A16 (T-30): the reason is in the delivery's own result (and the
+        // audit log); a replay reports the receipts as the feed holds them.
+        assert!(result.receipts.iter().any(|receipt| receipt.queued_because.is_some()));
+        assert!(retried.receipts.iter().all(|receipt| receipt.queued_because.is_none()));
+        let without_reason = |receipts: &[shared_types::RoomDeliveryReceipt]| receipts.iter()
+            .map(|receipt| shared_types::RoomDeliveryReceipt { queued_because: None, ..receipt.clone() }).collect::<Vec<_>>();
+        assert_eq!(without_reason(&retried.receipts), without_reason(&result.receipts));
+        assert_eq!(*claude_inputs.lock(), writes);
+        assert!(codex_inputs.lock().is_empty());
+        assert_eq!(supervisor.queued_room_wake_count_for_tests(codex), 1, "a replay never queues twice");
+        assert_eq!(supervisor.read_room_feed(ReadRoomFeedRequest { room_id: room.room_id, cursor: None }).unwrap(), page);
+        // Once its terminal confirms paste mode, the stored message is typed once.
+        observe_current_run_paste_mode(&supervisor, codex, "\x1b[?2004h");
+        wait_for_room_receipt(&supervisor, room.room_id, result.message_id, codex, RoomDeliveryStatus::Written);
+        assert_eq!(*codex_inputs.lock(), vec![typed_pointer(&supervisor, 1, result.message_id), "\r".to_string()]);
+        assert_eq!(*claude_inputs.lock(), writes);
+    }
+
+    #[test]
+    fn room_wakes_coalesce_during_transport_even_after_fetch_and_other_recipients_proceed() {
+        let supervisor = test_supervisor();
+        let inputs = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        install_mock_room_wake_recipient(&supervisor, "claude", Box::new(FirstWriteBlockingPtySession {
+            process_id: std::process::id(), inputs: inputs.clone(), calls: calls.clone(),
+            first_entered: entered_tx, release: release.clone(),
+        }));
+        let (other_pty, other_inputs) = recording_pty_session(std::process::id());
+        install_mock_room_wake_recipient(&supervisor, "codex", other_pty);
+        let recipient = test_session_id(&supervisor, "claude");
+        let other_recipient = test_session_id(&supervisor, "codex");
+        let room = supervisor.create_room(CreateRoomRequest { brief_on_join: false, brief_template: None,
+            label: Some("Coalesced".into()), member_ids: vec![recipient, other_recipient] }).unwrap();
+        let first_handle = supervisor.clone();
+        let first = thread::spawn(move || first_handle.deliver_room_message(DeliverRoomMessageRequest {
+            request_id: Some("first-wake".into()), room_id: room.room_id,
+            recipients: RoomRecipientSelection::One { session_id: recipient }, content: "first original body".into(),
+        }));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let first_page = supervisor.read_room_feed(ReadRoomFeedRequest { room_id: room.room_id, cursor: None }).unwrap();
+        let first_id = first_page.events.iter().find_map(|event| match event.item {
+            RoomFeedItem::Message { message_id, .. } => Some(message_id), _ => None,
+        }).unwrap();
+        // Fetch is real read evidence, not proof that this concurrent transport
+        // attempt completed. Its sticky receipt must not admit a second wake.
+        supervisor.inner.rooms.lock().get_mut(room.room_id).unwrap().append(RoomFeedItem::Delivery { app_server_turn: None, title_busy: None, already_read: false, readmit: false, pointer: None,
+            message_id: first_id, recipient_id: recipient, status: RoomDeliveryStatus::Fetched,
+            bytes_written: 0, zero_write_confirmed: false, error: None, run_id: None, generation: None,
+        }).unwrap();
+        let next_handle = supervisor.clone();
+        let (next_tx, next_rx) = mpsc::sync_channel(1);
+        let next = thread::spawn(move || { let _ = next_tx.send(next_handle.deliver_room_message(DeliverRoomMessageRequest {
+            request_id: Some("second-wake".into()), room_id: room.room_id,
+            recipients: RoomRecipientSelection::All {}, content: "second original body".into(),
+        })); });
+        let concurrent = next_rx.recv_timeout(Duration::from_secs(5));
+        let calls_while_first_in_transport = calls.load(Ordering::SeqCst);
+        { let (released, ready) = &*release; *released.lock() = true; ready.notify_all(); }
+        first.join().unwrap().unwrap();
+        next.join().unwrap();
+        let concurrent = concurrent.expect("a pending recipient must not block other recipients").unwrap();
+        // A106: the busy recipient keeps the second message Stored and queued
+        // (no Held receipt); the other recipient proceeds at once.
+        let waiting = concurrent.receipts.iter().find(|r| r.recipient_id == recipient).unwrap();
+        assert_eq!(waiting.status, RoomDeliveryStatus::Stored);
+        assert_eq!(waiting.bytes_written, 0);
+        assert_eq!(waiting.error, None);
+        assert_eq!(concurrent.written_count, 1);
+        assert_eq!(calls_while_first_in_transport, 1, "only the first paste reached this PTY during its transport");
+        assert_eq!(other_inputs.lock().len(), 2);
+        // Once the first transport completes, the dispatcher types the second
+        // message exactly once, after the first; the peer is never retyped.
+        wait_for_room_receipt(&supervisor, room.room_id, concurrent.message_id, recipient, RoomDeliveryStatus::Written);
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        // v3 W3: two pointers, in order. The first message was Fetched, so the
+        // second pointer counts only the second message.
+        assert_eq!(*inputs.lock(), vec![
+            typed_pointer(&supervisor, 1, first_id), "\r".to_string(),
+            typed_pointer(&supervisor, 1, concurrent.message_id), "\r".to_string(),
+        ]);
+        assert_eq!(other_inputs.lock()[0], typed_pointer(&supervisor, 1, concurrent.message_id));
+        assert_eq!(other_inputs.lock().len(), 2);
+        let page = supervisor.read_room_feed(ReadRoomFeedRequest { room_id: room.room_id, cursor: None }).unwrap();
+        let bodies: Vec<_> = page.events.iter().filter_map(|event| match &event.item {
+            RoomFeedItem::Message { content, .. } => Some(content.as_str()), _ => None,
+        }).collect();
+        assert_eq!(bodies, vec!["first original body", "second original body"]);
+        assert!(!page.events.iter().any(|event| matches!(event.item, RoomFeedItem::Delivery {
+            status: RoomDeliveryStatus::Held, .. })), "a coalesced message is queued, never held");
+    }
+
+    #[test]
+    fn room_pending_without_an_outcome_holds_the_run_until_replacement() {
+        let supervisor = test_supervisor();
+        let (pty, inputs) = recording_pty_session(std::process::id());
+        install_mock_room_wake_recipient(&supervisor, "claude", pty);
+        let recipient = test_session_id(&supervisor, "claude");
+        let room = supervisor.create_room(CreateRoomRequest { brief_on_join: false, brief_template: None,
+            label: Some("Unknown attempt".into()), member_ids: vec![recipient] }).unwrap();
+        supervisor.set_event_sink(|event| {
+            if matches!(event, RuntimeEvent::RoomFeedEvent { feed_event: shared_types::RoomFeedEvent {
+                item: RoomFeedItem::Delivery { status: RoomDeliveryStatus::Pending, .. }, .. } }) {
+                panic!("synthetic loss of control after durable Pending");
+            }
+        });
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            supervisor.deliver_room_message(DeliverRoomMessageRequest { request_id: Some("unknown-pending".into()),
+                room_id: room.room_id, recipients: RoomRecipientSelection::All {}, content: "original unknown".into() })
+        }));
+        assert!(unwind.is_err());
+        supervisor.set_event_sink(|_| {});
+        let page = supervisor.read_room_feed(ReadRoomFeedRequest { room_id: room.room_id, cursor: None }).unwrap();
+        let (message_id, cursor) = page.events.iter().find_map(|event| match event.item {
+            RoomFeedItem::Delivery { message_id, status: RoomDeliveryStatus::Pending, .. } => Some((message_id, event.cursor)),
+            _ => None,
+        }).unwrap();
+        let next = supervisor.deliver_room_message(DeliverRoomMessageRequest { request_id: Some("later-body".into()),
+            room_id: room.room_id, recipients: RoomRecipientSelection::All {}, content: "later message".into() }).unwrap();
+        // A106: the held run takes nothing more; the later message waits queued.
+        assert_eq!(next.receipts[0].status, RoomDeliveryStatus::Stored);
+        assert_eq!(supervisor.queued_room_wake_count_for_tests(recipient), 1);
+        thread::sleep(Duration::from_millis(700));
+        assert!(inputs.lock().is_empty(), "a run with an unknown wake outcome is never typed into again");
+        let (replacement, replacement_inputs) = recording_pty_session(std::process::id());
+        install_mock_room_wake_recipient(&supervisor, "claude", replacement);
+        assert!(supervisor.retry_room_delivery(shared_types::RetryRoomDeliveryRequest {
+            room_id: room.room_id, message_id, recipient_id: recipient, expected_receipt: cursor,
+        }).unwrap_err().to_string().contains("cannot be safely retried"));
+        // The replacement receives the never-attempted waiting message, never
+        // the one whose outcome is unknown.
+        wait_for_room_receipt(&supervisor, room.room_id, next.message_id, recipient, RoomDeliveryStatus::Written);
+        wait_for_no_queued_room_wake(&supervisor, recipient);
+        // v3 W3: one pointer typed for the waiting message. It counts the
+        // unknown-outcome message too (still unread, so room_read shows it),
+        // but that message's own wake is never typed again.
+        assert_eq!(*replacement_inputs.lock(), vec![typed_pointer(&supervisor, 2, next.message_id), "\r".to_string()]);
+        let fresh = supervisor.deliver_room_message(DeliverRoomMessageRequest { request_id: None,
+            room_id: room.room_id, recipients: RoomRecipientSelection::All {}, content: "new run message".into() }).unwrap();
+        assert_eq!(fresh.written_count, 1);
+        assert_eq!(replacement_inputs.lock().len(), 4);
+        assert_eq!(replacement_inputs.lock()[2], typed_pointer(&supervisor, 3, fresh.message_id));
+        assert!(!replacement_inputs.lock().iter().any(|input| input.contains("original unknown")));
+        let receipts_for_unknown = supervisor.read_room_feed(ReadRoomFeedRequest { room_id: room.room_id, cursor: None })
+            .unwrap().events.iter().filter(|event| matches!(event.item, RoomFeedItem::Delivery { message_id: id, .. }
+                if id == message_id)).count();
+        assert_eq!(receipts_for_unknown, 1, "the unknown-outcome message keeps only its durable Pending");
+        assert!(inputs.lock().is_empty());
+    }
+
+    #[test]
+    fn room_retry_claims_once_keeps_successful_recipient_untouched_and_survives_lost_reply() {
+        let supervisor = test_supervisor();
+        let (claude_pty, claude_inputs) = recording_pty_session(std::process::id());
+        let codex_inputs = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        install_mock_room_wake_recipient(&supervisor, "claude", claude_pty);
+        install_mock_room_wake_recipient(&supervisor, "codex", Box::new(FirstWriteFailsPtySession { first: AtomicBool::new(true), inner: Box::new(FirstWriteBlockingPtySession {
+                process_id: std::process::id(), inputs: codex_inputs.clone(), calls: calls.clone(),
+                first_entered: entered_tx, release: release.clone(),
+            }) }));
+        let recipient = test_session_id(&supervisor, "codex");
+        let room = supervisor.create_room(CreateRoomRequest { brief_on_join: false, brief_template: None,
+            label: Some("Retry".into()), member_ids: vec![test_session_id(&supervisor, "claude"), recipient] }).unwrap();
+        let original = supervisor.deliver_room_message(DeliverRoomMessageRequest { request_id: Some("original".into()),
+            room_id: room.room_id, recipients: RoomRecipientSelection::All {}, content: "one stored message".into() }).unwrap();
+        assert_eq!(original.written_count, 1);
+        let claude_before = claude_inputs.lock().clone();
+        let page = supervisor.read_room_feed(ReadRoomFeedRequest { room_id: room.room_id, cursor: None }).unwrap();
+        let expected_receipt = page.events.iter().find(|e| matches!(e.item,
+            RoomFeedItem::Delivery { recipient_id, status: RoomDeliveryStatus::Failed, zero_write_confirmed: true, .. }
+                if recipient_id == recipient)).unwrap().cursor;
+        let retry_request = shared_types::RetryRoomDeliveryRequest { room_id: room.room_id,
+            message_id: original.message_id, recipient_id: recipient, expected_receipt };
+        let first_handle = supervisor.clone();
+        let first_request = retry_request.clone();
+        let first = thread::spawn(move || first_handle.retry_room_delivery(first_request));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let during = supervisor.read_room_feed(ReadRoomFeedRequest { room_id: room.room_id, cursor: None }).unwrap();
+        let removal = supervisor.remove_room_member(RemoveRoomMemberRequest { room_id: room.room_id, session_id: recipient });
+        let (replay_tx, replay_rx) = mpsc::sync_channel(1);
+        let replay_handle = supervisor.clone();
+        let repeated_request = retry_request.clone();
+        let repeated = thread::spawn(move || { let _ = replay_tx.send(replay_handle.retry_room_delivery(repeated_request)); });
+        let concurrent = replay_rx.recv_timeout(Duration::from_secs(5));
+        { let (released, ready) = &*release; *released.lock() = true; ready.notify_all(); }
+        let completed = first.join().unwrap().unwrap();
+        repeated.join().unwrap();
+        let concurrent = concurrent.expect("stale cursor must not wait for or repeat the active PTY write").unwrap();
+        assert!(concurrent.replayed);
+        assert_eq!(concurrent.receipts.iter().find(|r| r.recipient_id == recipient).unwrap().status, RoomDeliveryStatus::Pending);
+        assert!(during.events.iter().any(|e| matches!(e.item, RoomFeedItem::Delivery {
+            recipient_id, status: RoomDeliveryStatus::Pending, .. } if recipient_id == recipient)));
+        assert!(removal.unwrap_err().to_string().contains("delivery in progress"));
+        assert_eq!(completed.message_id, original.message_id);
+        assert_eq!(completed.written_count, 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(*claude_inputs.lock(), claude_before);
+        let codex_before = codex_inputs.lock().clone();
+        let lost_reply_retry = supervisor.retry_room_delivery(retry_request).unwrap();
+        assert!(lost_reply_retry.replayed);
+        assert_eq!(lost_reply_retry.written_count, 2);
+        assert_eq!(*codex_inputs.lock(), codex_before);
+        let page = supervisor.read_room_feed(ReadRoomFeedRequest { room_id: room.room_id, cursor: None }).unwrap();
+        assert_eq!(page.events.iter().filter(|e| matches!(e.item, RoomFeedItem::Message { .. })).count(), 1);
+    }
+
+    #[test]
+    fn room_wake_operator_input_during_the_room_message_lands_after_its_submit_and_defers_the_next() {
+        // A106 (live PRIM-1 parity): the whole message and its submit are one
+        // write; operator typing waits behind it, never splits it, and keeps
+        // the next room message queued for the typing grace.
+        let supervisor = test_supervisor();
+        let (pty, inputs) = recording_pty_session(std::process::id());
+        install_mock_room_wake_recipient(&supervisor, "claude", pty);
+        let recipient = test_session_id(&supervisor, "claude");
+        let room = supervisor.create_room(CreateRoomRequest { brief_on_join: false, brief_template: None,
+            label: Some("Input race".into()), member_ids: vec![recipient] }).unwrap();
+        let wake_handle = supervisor.clone();
+        let wake = thread::spawn(move || wake_handle.deliver_room_message(DeliverRoomMessageRequest {
+            request_id: None, room_id: room.room_id, recipients: RoomRecipientSelection::All {},
+            content: "model work must stay whole".into(),
+        }));
+        wait_until("the room paste, before its submit", || !inputs.lock().is_empty());
+        assert_eq!(inputs.lock().len(), 1, "the operator types while the submit is still pending");
+        let input_handle = supervisor.clone();
+        let input = thread::spawn(move || input_handle.send_input(SendInputRequest {
+            session_id: recipient, input: "operator draft".into(),
+        }));
+        let result = wake.join().unwrap().unwrap();
+        input.join().unwrap().unwrap();
+        assert_eq!(result.receipts[0].status, RoomDeliveryStatus::Written);
+        assert_eq!(*inputs.lock(), vec![typed_pointer(&supervisor, 1, result.message_id),
+            "\r".to_string(), "operator draft".to_string()]);
+        let next = supervisor.deliver_room_message(DeliverRoomMessageRequest { request_id: None,
+            room_id: room.room_id, recipients: RoomRecipientSelection::All {}, content: "not over the draft".into() }).unwrap();
+        assert_eq!(next.receipts[0].status, RoomDeliveryStatus::Stored, "the operator typed a moment ago");
+        assert_eq!(supervisor.queued_room_wake_count_for_tests(recipient), 1);
+        assert_eq!(inputs.lock().len(), 3);
+    }
+
+    /// A pane whose terminal shows a prompt as soon as the paste lands, as the
+    /// driver's output classification would record it.
+    struct PromptAfterPastePty {
+        inner: Box<dyn PtySessionTrait>,
+        supervisor: Weak<SupervisorInner>,
+        session_id: SessionId,
+    }
+
+    impl PtySessionTrait for PromptAfterPastePty {
+        fn send_input(&self, input: &str) -> pty_host::PtyWriteResult {
+            let written = self.inner.send_input(input)?;
+            if input.starts_with(BRACKETED_PASTE_START) {
+                if let Some(supervisor) = self.supervisor.upgrade() {
+                    let mut slots = supervisor.slots.lock();
+                    let slot = slots.get_by_id_mut(self.session_id).unwrap();
+                    slot.work_state = WorkState::Blocked;
+                    slot.work_state_observed = true;
+                    slot.work_detail = Some("approval_prompt".into());
+                }
+            }
+            Ok(written)
+        }
+        fn resize(&self, cols: u16, rows: u16) -> Result<()> { self.inner.resize(cols, rows) }
+        fn kill(&self) -> Result<()> { self.inner.kill() }
+        fn try_wait(&self) -> Result<Option<pty_host::PtyExitStatus>> { self.inner.try_wait() }
+        fn process_id(&self) -> Option<u32> { self.inner.process_id() }
+        fn agent_alive(&self, driver: DriverKind) -> Result<AgentLiveness> { self.inner.agent_alive(driver) }
+    }
+
+    fn install_prompt_after_paste_recipient(supervisor: &SupervisorHandle, name: &str)
+        -> Arc<Mutex<Vec<String>>> {
+        let (pty, inputs) = recording_pty_session(std::process::id());
+        let session_id = test_session_id(supervisor, name);
+        install_mock_room_wake_recipient(supervisor, name, Box::new(PromptAfterPastePty {
+            inner: pty, supervisor: Arc::downgrade(&supervisor.inner), session_id }));
+        inputs
+    }
+
+    #[test]
+    fn room_wake_modal_after_paste_never_gets_enter_and_is_not_retryable() {
+        // A106: no composer echo any more; the submit-time recheck of the
+        // member's work state is what keeps Enter out of a prompt.
+        let supervisor = test_supervisor();
+        let inputs = install_prompt_after_paste_recipient(&supervisor, "claude");
+        let recipient = test_session_id(&supervisor, "claude");
+        let room = supervisor.create_room(CreateRoomRequest { brief_on_join: false, brief_template: None,
+            label: Some("Modal race".into()), member_ids: vec![recipient] }).unwrap();
+        let result = supervisor.deliver_room_message(DeliverRoomMessageRequest { request_id: None,
+            room_id: room.room_id, recipients: RoomRecipientSelection::All {}, content: "read this later".into() }).unwrap();
+        assert_eq!(result.receipts[0].status, RoomDeliveryStatus::Failed);
+        let typed = typed_pointer(&supervisor, 1, result.message_id);
+        assert_eq!(result.receipts[0].bytes_written, typed.len());
+        assert!(result.receipts[0].error.as_ref().unwrap().contains("asking for approval"));
+        assert_eq!(*inputs.lock(), vec![typed], "no submit into the prompt");
+        let page = supervisor.read_room_feed(ReadRoomFeedRequest { room_id: room.room_id, cursor: None }).unwrap();
+        assert!(supervisor.retry_room_delivery(shared_types::RetryRoomDeliveryRequest {
+            room_id: room.room_id, message_id: result.message_id, recipient_id: recipient,
+            expected_receipt: page.events.last().unwrap().cursor,
+        }).unwrap_err().to_string().contains("cannot be safely retried"));
+        assert_eq!(inputs.lock().len(), 1);
+    }
+
+    // A106 removed the redraw half of this test with the composer evidence: a
+    // member that redraws or works is typed into, as in the live PRIM-1
+    // (a_thinking_claude_member_is_typed_into_at_once_like_the_live_prim1).
+    #[test]
+    fn room_wake_rechecks_operator_input_after_durable_pending_before_paste() {
+        let supervisor = test_supervisor();
+        let (pty, inputs) = recording_pty_session(std::process::id());
+        install_mock_room_wake_recipient(&supervisor, "claude", pty);
+        let recipient = test_session_id(&supervisor, "claude");
+        let room = supervisor.create_room(CreateRoomRequest { brief_on_join: false, brief_template: None,
+            label: Some("Admission race".into()), member_ids: vec![recipient] }).unwrap();
+        let hook_handle = supervisor.clone();
+        // Operator input admitted at the writer boundary, after the wake's plan.
+        supervisor.set_run_input_before_commit_for_tests(move || {
+            let gate = hook_handle.inner.slots.lock().get_by_id(recipient).unwrap()
+                .running.as_ref().unwrap().input_gate.clone();
+            gate.room_input_activity.lock().record();
+        });
+        let result = supervisor.deliver_room_message(DeliverRoomMessageRequest { request_id: None,
+            room_id: room.room_id, recipients: RoomRecipientSelection::All {}, content: "admit only if still safe".into() }).unwrap();
+        assert_eq!(result.receipts[0].status, RoomDeliveryStatus::Failed);
+        assert_eq!(result.receipts[0].bytes_written, 0);
+        assert!(inputs.lock().is_empty());
+        let page = supervisor.read_room_feed(ReadRoomFeedRequest { room_id: room.room_id, cursor: None }).unwrap();
+        assert!(matches!(page.events.last().unwrap().item, RoomFeedItem::Delivery {
+            status: RoomDeliveryStatus::Failed, zero_write_confirmed: true, ..
+        }));
+    }
+
+    #[test]
+    fn room_wake_codex_waits_for_its_observed_prompt_while_idle_claude_is_typed_at_once() {
+        // A106: Claude and Codex have the live PRIM-1 adapter. A Codex whose
+        // prompt PRIM-1 has not seen yet is still not typed into; its message
+        // waits queued until the prompt is observed.
+        let supervisor = test_supervisor();
+        let mut all_inputs = Vec::new();
+        for (name, driver) in [("claude", DriverKind::Claude), ("codex", DriverKind::Codex)] {
+            let (pty, inputs) = recording_pty_session(std::process::id());
+            install_mock_running_session_with_bracketed_paste_enabled(&supervisor, name, driver, pty);
+            all_inputs.push(inputs);
+            let recipient = test_session_id(&supervisor, name);
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id_mut(recipient).unwrap();
+            slot.work_state = WorkState::Idle;
+            slot.work_state_observed = driver == DriverKind::Claude;
+            slot.state = LifecycleState::Idle;
+        }
+        let codex = test_session_id(&supervisor, "codex");
+        let room = supervisor.create_room(CreateRoomRequest { brief_on_join: false, brief_template: None,
+            label: Some("Unproven".into()), member_ids: vec![test_session_id(&supervisor, "claude"), codex] }).unwrap();
+        let result = supervisor.deliver_room_message(DeliverRoomMessageRequest { request_id: None,
+            room_id: room.room_id, recipients: RoomRecipientSelection::All {}, content: "both get the whole message".into() }).unwrap();
+        // v3 W3: both get the same pointer; the body stays in the feed.
+        let typed = typed_pointer(&supervisor, 1, result.message_id);
+        assert_eq!(result.receipts[0].status, RoomDeliveryStatus::Written);
+        assert_eq!(*all_inputs[0].lock(), vec![typed.clone(), "\r".to_string()]);
+        assert_eq!(result.receipts[1].status, RoomDeliveryStatus::Stored);
+        assert!(all_inputs[1].lock().is_empty(), "an unobserved Codex prompt is never typed into");
+        assert_eq!(supervisor.queued_room_wake_count_for_tests(codex), 1);
+
+        supervisor.inner.slots.lock().get_by_id_mut(codex).unwrap().work_state_observed = true;
+        wait_for_room_receipt(&supervisor, room.room_id, result.message_id, codex, RoomDeliveryStatus::Written);
+        assert_eq!(*all_inputs[1].lock(), vec![typed, "\x1b[C\r".to_string()]);
+    }
+
+    #[test]
+    fn room_retry_never_retargets_a_replacement_run() {
+        let supervisor = test_supervisor();
+        let (pty, attempts) = write_failing_pty_session(0, "zero write");
+        install_mock_room_wake_recipient(&supervisor, "claude", pty);
+        let recipient = test_session_id(&supervisor, "claude");
+        let room = supervisor.create_room(CreateRoomRequest { brief_on_join: false, brief_template: None,
+            label: Some("Replacement".into()), member_ids: vec![recipient] }).unwrap();
+        let original = supervisor.deliver_room_message(DeliverRoomMessageRequest { request_id: None,
+            room_id: room.room_id, recipients: RoomRecipientSelection::All {}, content: "bound to the original run".into() }).unwrap();
+        let page = supervisor.read_room_feed(ReadRoomFeedRequest { room_id: room.room_id, cursor: None }).unwrap();
+        let expected_receipt = page.events.last().unwrap().cursor;
+        let (replacement, inputs) = recording_pty_session(std::process::id());
+        install_mock_room_wake_recipient(&supervisor, "claude", replacement);
+        assert!(supervisor.retry_room_delivery(shared_types::RetryRoomDeliveryRequest {
+            room_id: room.room_id, message_id: original.message_id, recipient_id: recipient, expected_receipt,
+        }).unwrap_err().to_string().contains("restarted since this wake"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(inputs.lock().is_empty());
+    }
+
+    #[test]
+    fn room_held_retry_binds_an_existing_run_and_never_retargets_its_replacement() {
+        let supervisor = test_supervisor();
+        let (pty, inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_process_id_and_mode(&supervisor, "claude", DriverKind::Claude,
+            Some(std::process::id()), pty, BracketedPasteMode::Unknown);
+        let recipient = test_session_id(&supervisor, "claude");
+        let original_run = current_run_id(&supervisor, "claude");
+        let room = supervisor.create_room(CreateRoomRequest { brief_on_join: false, brief_template: None,
+            label: Some("Held run".into()), member_ids: vec![recipient] }).unwrap();
+        // A106: an unready member's message waits queued; it is held, bound to
+        // the run current at that moment, only once the wait limit passes.
+        supervisor.set_room_wake_max_wait_for_tests(Duration::ZERO);
+        let result = supervisor.deliver_room_message(DeliverRoomMessageRequest { request_id: None,
+            room_id: room.room_id, recipients: RoomRecipientSelection::All {}, content: "held without writing".into() }).unwrap();
+        assert_eq!(result.receipts[0].status, RoomDeliveryStatus::Stored);
+        let held = wait_for_room_receipt(&supervisor, room.room_id, result.message_id, recipient, RoomDeliveryStatus::Held);
+        let RoomFeedItem::Delivery { run_id, bytes_written, error, .. } = &held.item else { unreachable!() };
+        assert_eq!(*run_id, Some(original_run));
+        assert_eq!(*bytes_written, 0);
+        assert!(error.as_deref().unwrap().contains("use Retry wake"));
+        wait_for_no_queued_room_wake(&supervisor, recipient);
+        let (replacement, replacement_inputs) = recording_pty_session(std::process::id());
+        install_mock_room_wake_recipient(&supervisor, "claude", replacement);
+        assert!(supervisor.retry_room_delivery(shared_types::RetryRoomDeliveryRequest {
+            room_id: room.room_id, message_id: result.message_id, recipient_id: recipient,
+            expected_receipt: held.cursor,
+        }).unwrap_err().to_string().contains("restarted since this wake"));
+        assert_eq!(supervisor.queued_room_wake_count_for_tests(recipient), 0, "the refused retry queues nothing");
+        assert!(inputs.lock().is_empty());
+        assert!(replacement_inputs.lock().is_empty(), "the held message never reaches the replacement run");
+    }
+
+    #[test]
+    fn room_fetch_during_retry_does_not_advertise_new_retry_proof_after_zero_write_failure() {
+        let supervisor = test_supervisor();
+        let (pty, attempts) = write_failing_pty_session(0, "no bytes written");
+        install_mock_room_wake_recipient(&supervisor, "claude", pty);
+        let recipient = test_session_id(&supervisor, "claude");
+        let room = supervisor.create_room(CreateRoomRequest { brief_on_join: false, brief_template: None,
+            label: Some("Fetch race".into()), member_ids: vec![recipient] }).unwrap();
+        let original = supervisor.deliver_room_message(DeliverRoomMessageRequest { request_id: None,
+            room_id: room.room_id, recipients: RoomRecipientSelection::All {}, content: "read while wake fails".into() }).unwrap();
+        let page = supervisor.read_room_feed(ReadRoomFeedRequest { room_id: room.room_id, cursor: None }).unwrap();
+        let hook_supervisor = supervisor.clone();
+        supervisor.set_room_event_after_append_for_tests(move || {
+            // Model a recipient's committed fetch between Pending and the
+            // transport failure; this is independent of PTY acceptance.
+            hook_supervisor.inner.rooms.lock().get_mut(room.room_id).unwrap().append(RoomFeedItem::Delivery { app_server_turn: None, title_busy: None, already_read: false, readmit: false, pointer: None,
+                message_id: original.message_id, recipient_id: recipient, status: RoomDeliveryStatus::Fetched,
+                bytes_written: 0, zero_write_confirmed: false, error: None, run_id: None, generation: None,
+            }).unwrap();
+        });
+        let result = supervisor.retry_room_delivery(shared_types::RetryRoomDeliveryRequest {
+            room_id: room.room_id, message_id: original.message_id, recipient_id: recipient,
+            expected_receipt: page.events.last().unwrap().cursor,
+        }).unwrap();
+        assert_eq!(result.receipts[0].status, RoomDeliveryStatus::Fetched);
+        // v3 W3 (Claude PRIM-1, 26a7f92 walk): a fetch before the first byte
+        // makes the retried pointer moot, so the transport is not attempted
+        // again; still no new retry proof after the fetch.
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        let page = supervisor.read_room_feed(ReadRoomFeedRequest { room_id: room.room_id, cursor: None }).unwrap();
+        assert!(matches!(page.events.last().unwrap().item, RoomFeedItem::Delivery {
+            status: RoomDeliveryStatus::Failed, bytes_written: 0, zero_write_confirmed: false, already_read: true, ..
+        }));
+    }
+
+    #[test]
+    fn room_pending_sync_failure_never_wakes_and_replay_stays_nonrepeatable() {
+        let root = tempfile::tempdir().unwrap();
+        let supervisor = test_supervisor_with_root(root.path().to_path_buf());
+        let (pty, inputs) = recording_pty_session(std::process::id());
+        install_mock_room_wake_recipient(&supervisor, "claude", pty);
+        let recipient = test_session_id(&supervisor, "claude");
+        let room = supervisor.create_room(CreateRoomRequest { brief_on_join: false, brief_template: None,
+            label: Some("Uncertain claim".into()), member_ids: vec![recipient] }).unwrap();
+        let hook_supervisor = supervisor.clone();
+        supervisor.set_room_event_after_append_for_tests(move || {
+            hook_supervisor.inner.rooms.lock().get_mut(room.room_id).unwrap().fail_next_commit_for_tests(true);
+        });
+        let result = supervisor.deliver_room_message(DeliverRoomMessageRequest { request_id: Some("claim-failure".into()),
+            room_id: room.room_id, recipients: RoomRecipientSelection::All {}, content: "stored, never written".into() }).unwrap();
+        assert_eq!(result.receipts[0].status, RoomDeliveryStatus::Held);
+        assert_eq!(result.failures.len(), 1);
+        assert!(result.receipts[0].error.as_deref().unwrap().contains("Wake not attempted"));
+        assert!(!result.receipts[0].recorded);
+        assert!(inputs.lock().is_empty());
+        drop(supervisor);
+        let reopened = SupervisorHandle::new(test_supervisor_config(root.path())).unwrap();
+        let page = reopened.read_room_feed(ReadRoomFeedRequest { room_id: room.room_id, cursor: None }).unwrap();
+        let pending = page.events.iter().find(|e| matches!(e.item, RoomFeedItem::Delivery { status: RoomDeliveryStatus::Pending, .. })).unwrap();
+        assert!(reopened.retry_room_delivery(shared_types::RetryRoomDeliveryRequest {
+            room_id: room.room_id, message_id: result.message_id, recipient_id: recipient, expected_receipt: pending.cursor,
+        }).unwrap_err().to_string().contains("cannot be safely retried"));
+        assert!(inputs.lock().is_empty());
     }
 
     #[test]
@@ -23881,17 +30912,9 @@ mod tests {
         let (claude_pty, claude_inputs) = recording_pty_session(std::process::id());
         let (codex_pty, codex_send_count) =
             write_failing_pty_session(23, "synthetic room partial failure");
-        install_mock_running_session_with_bracketed_paste_enabled(
-            &supervisor,
-            "claude",
-            DriverKind::Claude,
-            claude_pty,
+        install_mock_room_wake_recipient(&supervisor, "claude", claude_pty,
         );
-        install_mock_running_session_with_bracketed_paste_enabled(
-            &supervisor,
-            "codex",
-            DriverKind::Codex,
-            codex_pty,
+        install_mock_room_wake_recipient(&supervisor, "codex", codex_pty,
         );
         let room = supervisor
             .create_room(CreateRoomRequest {
@@ -23907,6 +30930,7 @@ mod tests {
 
         let result = supervisor
             .deliver_room_message(DeliverRoomMessageRequest {
+                request_id: None,
                 room_id: room.room_id,
                 recipients: RoomRecipientSelection::All {},
                 content: "partial truth".into(),
@@ -23939,6 +30963,56 @@ mod tests {
                 ..
             } if error.contains("synthetic room partial failure")
         )));
+        let expected_receipt = page.events.last().unwrap().cursor;
+        assert!(supervisor.retry_room_delivery(shared_types::RetryRoomDeliveryRequest {
+            room_id: room.room_id, message_id: result.message_id,
+            recipient_id: test_session_id(&supervisor, "codex"), expected_receipt,
+        }).is_err());
+        assert_eq!(codex_send_count.load(Ordering::SeqCst), 1);
+        assert_eq!(claude_inputs.lock().len(), 2);
+    }
+
+    #[test]
+    fn room_delete_erases_only_its_owned_files_and_reports_partial_cleanup_after_catalog_commit() {
+        for fail_cleanup in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let supervisor = test_supervisor_with_root(root.path().to_path_buf());
+            let recipient = test_session_id(&supervisor, "claude");
+            let room = supervisor.create_room(CreateRoomRequest { brief_on_join: false, brief_template: None,
+                label: Some("Erase me".into()), member_ids: vec![recipient] }).unwrap();
+            let other = supervisor.create_room(CreateRoomRequest { brief_on_join: false, brief_template: None,
+                label: Some("Keep me".into()), member_ids: vec![] }).unwrap();
+            supervisor.post_room_message(PostRoomMessageRequest { room_id: room.room_id, request_id: None,
+                content: "private test fixture body".into() }).unwrap();
+            let directory = supervisor.runtime_dir().join("rooms");
+            let log = directory.join(format!("{}.jsonl", room.room_id));
+            let tail = directory.join(format!("{}.torn-{}.bin", room.room_id, Uuid::new_v4()));
+            let foreign = directory.join(format!("{}.torn-not-a-uuid.bin", room.room_id));
+            let other_tail = directory.join(format!("{}.torn-{}.bin", other.room_id, Uuid::new_v4()));
+            let matching_directory = directory.join(format!("{}.torn-{}.bin", room.room_id, Uuid::new_v4()));
+            fs::write(&tail, b"own torn evidence").unwrap();
+            fs::write(&foreign, b"not an owned name").unwrap();
+            fs::write(&other_tail, b"another room").unwrap();
+            if fail_cleanup { fs::create_dir(&matching_directory).unwrap(); }
+            let events = capture_runtime_events(&supervisor);
+            let result = supervisor.delete_room(DeleteRoomRequest { room_id: room.room_id });
+            if fail_cleanup {
+                assert!(result.unwrap_err().to_string().contains("room deleted; history cleanup incomplete"));
+                assert!(matching_directory.is_dir(), "never recursively erase a matching directory");
+            } else { result.unwrap(); }
+            assert!(!log.exists());
+            assert!(!tail.exists());
+            assert_eq!(fs::read(&foreign).unwrap(), b"not an owned name");
+            assert_eq!(fs::read(&other_tail).unwrap(), b"another room");
+            assert!(directory.join(format!("{}.jsonl", other.room_id)).exists());
+            assert!(events.lock().iter().any(|event| matches!(event, RuntimeEvent::RoomDeleted { room_id, .. } if *room_id == room.room_id)));
+            assert!(!supervisor.snapshot().rooms.iter().any(|r| r.room_id == room.room_id));
+            assert!(!supervisor.inner.rooms.lock().room_by_session.contains_key(&recipient));
+            drop(supervisor);
+            let reopened = SupervisorHandle::new(test_supervisor_config(root.path())).unwrap();
+            assert!(!reopened.snapshot().rooms.iter().any(|r| r.room_id == room.room_id));
+            assert!(reopened.snapshot().rooms.iter().any(|r| r.room_id == other.room_id));
+        }
     }
 
     #[test]
@@ -23948,11 +31022,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let (write_entered_tx, write_entered_rx) = mpsc::sync_channel(1);
         let release = Arc::new((Mutex::new(false), Condvar::new()));
-        install_mock_running_session_with_bracketed_paste_enabled(
-            &supervisor,
-            "claude",
-            DriverKind::Claude,
-            Box::new(FirstWriteBlockingPtySession {
+        install_mock_room_wake_recipient(&supervisor, "claude", Box::new(FirstWriteBlockingPtySession {
                 process_id: std::process::id(),
                 inputs,
                 calls,
@@ -23976,6 +31046,7 @@ mod tests {
         let delivery_supervisor = supervisor.clone();
         let delivery = thread::spawn(move || {
             delivery_supervisor.deliver_room_message(DeliverRoomMessageRequest {
+                request_id: None,
                 room_id: room.room_id,
                 recipients: RoomRecipientSelection::One {
                     session_id: recipient_id,
@@ -24013,6 +31084,131 @@ mod tests {
     }
 
     #[test]
+    fn room_join_floor_survives_restart_with_durable_feed() {
+        let root = tempfile::tempdir().unwrap();
+        let supervisor = test_supervisor_with_root(root.path().to_path_buf());
+        let claude = test_session_id(&supervisor, "claude");
+        let codex = test_session_id(&supervisor, "codex");
+        let room = supervisor.create_room(CreateRoomRequest { label: Some("Join floor".into()),
+            member_ids: vec![claude], brief_on_join: false, brief_template: None }).unwrap();
+        let before = supervisor.post_room_message(PostRoomMessageRequest { room_id: room.room_id,
+            request_id: None, content: "before join".into() }).unwrap();
+        supervisor.add_room_member(AddRoomMemberRequest { room_id: room.room_id, session_id: codex }).unwrap();
+        supervisor.post_room_message(PostRoomMessageRequest { room_id: room.room_id,
+            request_id: None, content: "after join".into() }).unwrap();
+        drop(supervisor);
+        let reopened = SupervisorHandle::new(test_supervisor_config(root.path())).unwrap();
+        let rooms = reopened.inner.rooms.lock();
+        let restored = rooms.get(room.room_id).unwrap();
+        let floor = restored.join_floor_by_session[&codex];
+        assert_eq!(floor, before.cursor.sequence);
+        let page = restored.read(None, floor).unwrap();
+        assert!(!page.events.iter().any(|e| matches!(&e.item, RoomFeedItem::Message { content, .. } if content == "before join")));
+        assert!(page.events.iter().any(|e| matches!(&e.item, RoomFeedItem::Message { content, .. } if content == "after join")));
+    }
+
+    #[test]
+    fn room_fetch_records_once_for_returned_message_and_never_for_receipt_only_pages() {
+        let supervisor = test_supervisor();
+        let claude = test_session_id(&supervisor, "claude");
+        let room = supervisor.create_room(CreateRoomRequest { label: Some("Fetch".into()),
+            member_ids: vec![claude], brief_on_join: false, brief_template: None }).unwrap();
+        let (pty, inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_process_id_and_mode(&supervisor, "claude", DriverKind::Claude,
+            Some(std::process::id()), pty, BracketedPasteMode::Unknown);
+        for index in 0..3 {
+            let result = supervisor.deliver_room_message(DeliverRoomMessageRequest { request_id: Some(format!("fetch-once-{index}")),
+                room_id: room.room_id, recipients: RoomRecipientSelection::All {}, content: "fetch me".into() }).unwrap();
+            // A106: unknown paste mode keeps it Stored and queued, never Held.
+            assert_eq!(result.receipts[0].status, RoomDeliveryStatus::Stored);
+        }
+        let caller = supervisor.resolve_pane_caller(TestPaneProcess::new(9001, [std::process::id()])).unwrap();
+        let first = supervisor.read_room_feed_from_pane(&caller, None).unwrap();
+        let next = supervisor.inner.rooms.lock().get(room.room_id).unwrap().next_sequence;
+        let receipts = supervisor.read_room_feed_from_pane(&caller, Some(first.cursor)).unwrap();
+        assert_eq!(first.events.iter().filter(|event| matches!(event.item, RoomFeedItem::Message { .. })).count(), 3);
+        assert_eq!(receipts.events.len(), 3);
+        assert!(receipts.events.iter().all(|event| matches!(event.item, RoomFeedItem::Delivery { status: RoomDeliveryStatus::Fetched, .. })));
+        assert!(supervisor.read_room_feed_from_pane(&caller, Some(receipts.cursor)).unwrap().events.is_empty());
+        supervisor.read_room_feed_from_pane(&caller, None).unwrap();
+        assert_eq!(supervisor.inner.rooms.lock().get(room.room_id).unwrap().next_sequence, next);
+        assert!(inputs.lock().is_empty());
+    }
+
+    #[test]
+    fn room_create_join_and_observed_idle_never_submit_automatic_briefs() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("work")).unwrap();
+        let mut config = test_supervisor_config(root.path());
+        config.room_brief_on_join = true;
+        let supervisor = SupervisorHandle::new(config).unwrap();
+        supervisor.set_executable_resolver_for_tests(Arc::new(TestExecutableResolver));
+        let first = create_test_session(&supervisor, "grok-a", DriverKind::Grok,
+            shared_types::PermissionProfile::Normal).session_id;
+        let second = create_test_session(&supervisor, "grok-b", DriverKind::Grok,
+            shared_types::PermissionProfile::Normal).session_id;
+        let (first_pty, first_inputs) = recording_pty_session(std::process::id());
+        let (second_pty, second_inputs) = recording_pty_session(std::process::id());
+        install_mock_room_wake_recipient(&supervisor, "grok-a", first_pty);
+        install_mock_room_wake_recipient(&supervisor, "grok-b", second_pty);
+        for member in [first, second] {
+            supervisor.resize_session_by_id(member, 197, 56).unwrap();
+            supervisor.inner.slots.lock().get_by_id_mut(member).unwrap().state = LifecycleState::Starting;
+        }
+        let events = capture_runtime_events(&supervisor);
+        let room = supervisor.create_room(CreateRoomRequest {
+            label: Some("No background brief".into()), member_ids: vec![first],
+            brief_on_join: true, brief_template: Some("Do not submit automatically".into()),
+        }).unwrap();
+        supervisor.add_room_member(AddRoomMemberRequest {
+            room_id: room.room_id, session_id: second,
+        }).unwrap();
+        for member in [first, second] {
+            let (generation, run_id) = {
+                let slots = supervisor.inner.slots.lock();
+                let slot = slots.get_by_id(member).unwrap();
+                (slot.generation, slot.run_id.unwrap())
+            };
+            // Exercise production output classification and lifecycle publication,
+            // not a direct assignment to Idle or the removed brief helper.
+            supervisor.handle_pty_event_by_id(member, generation, run_id,
+                PtyEvent::Output(room_empty_fixture()));
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id(member).unwrap();
+            assert_eq!(slot.state, LifecycleState::Idle);
+            assert_eq!(slot.work_state, WorkState::Idle);
+            assert!(slot.work_state_observed);
+        }
+        // Catch a revived asynchronous join/idle sender after its API returns.
+        std::thread::sleep(Duration::from_millis(350));
+        assert!(first_inputs.lock().is_empty(), "create/idle must not submit a brief");
+        assert!(second_inputs.lock().is_empty(), "join/idle must not submit a brief");
+        for member in [first, second] {
+            assert!(events.lock().iter().any(|event| matches!(event,
+                RuntimeEvent::SessionState { identity, state: LifecycleState::Idle, .. }
+                    if identity.session_id == member)), "expected an observed Idle event");
+        }
+        let page = supervisor.read_room_feed(ReadRoomFeedRequest { room_id: room.room_id, cursor: None }).unwrap();
+        assert!(!page.events.iter().any(|event| matches!(event.item, RoomFeedItem::Message { .. })),
+            "automatic brief attempts must not even create a stored or held message");
+    }
+
+    #[test]
+    fn room_brief_for_a_stopped_member_stays_queued_and_does_not_mark_the_membership_briefed() {
+        let supervisor = test_supervisor();
+        let member = test_session_id(&supervisor, "claude");
+        let room = supervisor.create_room(CreateRoomRequest { label: Some("Held brief".into()),
+            member_ids: vec![member], brief_on_join: false, brief_template: None }).unwrap();
+        let result = supervisor.brief_room_member(BriefRoomMemberRequest { room_id: room.room_id, session_id: member }).unwrap();
+        assert_eq!(result.written_count, 0);
+        // A106: a stopped member's brief waits queued, Stored, until it starts.
+        assert_eq!(result.receipts[0].status, RoomDeliveryStatus::Stored);
+        assert!(result.failures.is_empty());
+        assert_eq!(supervisor.queued_room_wake_count_for_tests(member), 1);
+        assert!(!supervisor.inner.rooms.lock().get(room.room_id).unwrap().definition.member_briefed(member));
+    }
+
+    #[test]
     fn pane_room_read_and_post_are_kernel_derived_future_only_and_revoked_on_removal() {
         let supervisor = test_supervisor();
         let grok = create_test_session(
@@ -24032,6 +31228,7 @@ mod tests {
             .unwrap();
         let before_join = supervisor
             .post_room_message(PostRoomMessageRequest {
+                request_id: None,
                 room_id: room.room_id,
                 content: "before-join-private".into(),
             })
@@ -24064,6 +31261,7 @@ mod tests {
         let posted = supervisor.apply_sideband_request(
             &caller,
             SidebandRequest::RoomPost {
+                request_id: None,
                 content: "after-join-visible".into(),
             },
         );
@@ -24073,7 +31271,7 @@ mod tests {
             panic!("missing room post payload")
         };
         let read =
-            supervisor.apply_sideband_request(&caller, SidebandRequest::RoomRead { cursor: None });
+            supervisor.apply_sideband_request(&caller, SidebandRequest::RoomRead { owed_after: None, cursor: None, expect_room: None });
         assert!(read.ok, "{}", read.message);
         let SidebandResponsePayload::RoomFeed { page } = read.payload.unwrap() else {
             panic!("missing room feed payload")
@@ -24092,7 +31290,7 @@ mod tests {
         for sequence in [0, before_join.cursor.sequence] {
             let explicit = supervisor.apply_sideband_request(
                 &caller,
-                SidebandRequest::RoomRead {
+                SidebandRequest::RoomRead { owed_after: None, expect_room: None,
                     cursor: Some(shared_types::RoomFeedCursor {
                         epoch: before_join.cursor.epoch,
                         sequence,
@@ -24116,7 +31314,10 @@ mod tests {
             let runtime = rooms.get_mut(room.room_id).unwrap();
             for index in 0..513 {
                 runtime
-                    .append(RoomFeedItem::Message {
+                    .append(RoomFeedItem::Message { guest_recipient_labels: Vec::new(), guest_recipient_ids: Vec::new(), ack_requested: false,
+                        fallback_origin: None,
+                        continuation_origin: None,
+                        request_id: Uuid::new_v4().to_string(),
                         message_id: Uuid::new_v4(),
                         sender: RoomMessageSender::Operator {},
                         content: format!("eviction-{index}"),
@@ -24128,7 +31329,7 @@ mod tests {
         }
         let evicted = supervisor.apply_sideband_request(
             &caller,
-            SidebandRequest::RoomRead {
+            SidebandRequest::RoomRead { owed_after: None, expect_room: None,
                 cursor: Some(pane_post.cursor),
             },
         );
@@ -24154,7 +31355,7 @@ mod tests {
         let events = capture_runtime_events(&supervisor);
         let audit_before = fs::read(supervisor.audit_log_path()).unwrap();
         let denied =
-            supervisor.apply_sideband_request(&caller, SidebandRequest::RoomRead { cursor: None });
+            supervisor.apply_sideband_request(&caller, SidebandRequest::RoomRead { owed_after: None, cursor: None, expect_room: None });
         assert!(!denied.ok);
         assert!(denied.request_id.is_none());
         assert!(events.lock().is_empty());
@@ -24447,6 +31648,9 @@ mod tests {
         assert_eq!(fs::read(&catalog_path).unwrap(), catalog_before);
         assert!(specs.lock().is_empty());
         assert!(events.lock().is_empty());
+        // v3 W4 (60384b19 (b)): the reason is kept in the audit file itself.
+        let audit = fs::read_to_string(supervisor.inner.audit.path()).unwrap();
+        assert!(audit.contains("did not start: injected unresolved Claude executable"), "{audit}");
         let snapshot = supervisor
             .snapshot()
             .sessions
@@ -24977,7 +32181,7 @@ mod tests {
             assert!(
                 error
                     .to_string()
-                    .contains("work state is blocked (approval_prompt)"),
+                    .contains("work state is blocked (modal:approval_prompt)"),
                 "{label}: {error:#}"
             );
             assert_eq!(slots_mutation_probe(&supervisor), before, "{label}");
@@ -25096,6 +32300,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parked_prime_startup_keeps_a_wsl_catalog_row_and_runs_no_wsl_command() {
+        let runtime = tempfile::tempdir().expect("create runtime root");
+        let catalog = SessionCatalogV1 {
+            schema_version: SESSION_CATALOG_SCHEMA_VERSION,
+            workspace_preference: QualifiedWorkingDirectory {
+                namespace: WorkingDirectoryNamespace::Windows,
+                canonical_path: runtime.path().display().to_string(),
+                identity: "windows:test".into(),
+            },
+            sessions: vec![PersistedSessionV1 { codex_transport: Default::default(),
+                session_id: Uuid::new_v4(),
+                label: "Prime".into(),
+                driver: DriverKind::Prime,
+                working_directory: QualifiedWorkingDirectory {
+                    namespace: WorkingDirectoryNamespace::WslUbuntu,
+                    canonical_path: "/home/test".into(),
+                    identity: "wsl_ubuntu:7:9".into(),
+                },
+                permission_profile: shared_types::PermissionProfile::Normal,
+                launch_choices: None,
+                last_launch: None,
+                harness_session_id: None,
+                recovery: None,
+                recovery_history: Vec::new(),
+                running_at_shutdown: true,
+                last_pty_cols: None,
+                last_pty_rows: None,
+                permissions: MemberPermissions::default(),
+                created_by: None,
+            }],
+            register_acks: BTreeMap::new(),
+            recovery_automation: BTreeMap::new(),
+        };
+        let control = FakeWslControl::new();
+        let revalidations = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&revalidations);
+        *control.revalidation_hook.lock() = Some(Arc::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        let mut parked = SessionRegistry::from_catalog(&catalog).expect("load the catalog");
+        revalidate_catalog_working_directories(&mut parked, runtime.path(), &control, false);
+        let row = parked
+            .ordered_slots()
+            .next()
+            .expect("the WSL row stays in the catalog");
+        assert_eq!(row.last_error.as_deref(), Some(PRIME_PARKED_REASON));
+        assert_eq!(revalidations.load(Ordering::SeqCst), 0);
+        assert_eq!(control.reconciliations.load(Ordering::SeqCst), 0);
+        assert_eq!(control.qualifications.load(Ordering::SeqCst), 0);
+
+        // The same probe sees the call when Prime is enabled, so the zero
+        // counts above are not vacuous.
+        let mut enabled = SessionRegistry::from_catalog(&catalog).expect("load the catalog");
+        revalidate_catalog_working_directories(&mut enabled, runtime.path(), &control, true);
+        assert_eq!(revalidations.load(Ordering::SeqCst), 1);
+        let row = enabled
+            .ordered_slots()
+            .next()
+            .expect("the WSL row is loaded");
+        assert_eq!(row.last_error, None);
+    }
+
     struct CapturingPreparedPtySpawner {
         session: Mutex<Option<Box<dyn PtySessionTrait>>>,
         plans: Arc<Mutex<Vec<PreparedLaunch>>>,
@@ -25164,7 +32432,8 @@ mod tests {
         supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
 
         let created = supervisor
-            .create_session(shared_types::CreateSessionRequest {
+            .create_session(shared_types::CreateSessionRequest { codex_transport: Default::default(), permissions: None,
+                launch_choices: None,
                 room_id: None,
                 label: Some("Prime & echo pwned".into()),
                 driver: DriverKind::Prime,
@@ -25236,7 +32505,8 @@ mod tests {
 
         assert!(
             supervisor
-                .create_session(shared_types::CreateSessionRequest {
+                .create_session(shared_types::CreateSessionRequest { codex_transport: Default::default(), permissions: None,
+                launch_choices: None,
                     room_id: None,
                     label: None,
                     driver: DriverKind::Prime,
@@ -25247,7 +32517,8 @@ mod tests {
         );
         assert!(
             supervisor
-                .create_session(shared_types::CreateSessionRequest {
+                .create_session(shared_types::CreateSessionRequest { codex_transport: Default::default(), permissions: None,
+                launch_choices: None,
                     room_id: None,
                     label: None,
                     driver: DriverKind::Claude,
@@ -25272,7 +32543,8 @@ mod tests {
         assert_eq!(control.qualifications.load(Ordering::SeqCst), 0);
 
         let prime = supervisor
-            .create_session(shared_types::CreateSessionRequest {
+            .create_session(shared_types::CreateSessionRequest { codex_transport: Default::default(), permissions: None,
+                launch_choices: None,
                 room_id: None,
                 label: Some("Route denied".into()),
                 driver: DriverKind::Prime,
@@ -25307,7 +32579,8 @@ mod tests {
         control.fail_reconciliation.store(true, Ordering::Release);
         let before = slots_mutation_probe(&supervisor);
         let error = supervisor
-            .create_session(shared_types::CreateSessionRequest {
+            .create_session(shared_types::CreateSessionRequest { codex_transport: Default::default(), permissions: None,
+                launch_choices: None,
                 room_id: None,
                 label: Some("Prime qualified".into()),
                 driver: DriverKind::Prime,
@@ -25320,7 +32593,8 @@ mod tests {
 
         control.fail_reconciliation.store(false, Ordering::Release);
         let session = supervisor
-            .create_session(shared_types::CreateSessionRequest {
+            .create_session(shared_types::CreateSessionRequest { codex_transport: Default::default(), permissions: None,
+                launch_choices: None,
                 room_id: None,
                 label: Some("Prime qualified".into()),
                 driver: DriverKind::Prime,
@@ -25384,7 +32658,8 @@ mod tests {
         let control = Arc::new(FakeWslControl::new());
         supervisor.set_wsl_control_for_tests(control.clone());
         let session = supervisor
-            .create_session(shared_types::CreateSessionRequest {
+            .create_session(shared_types::CreateSessionRequest { codex_transport: Default::default(), permissions: None,
+                launch_choices: None,
                 room_id: None,
                 label: Some("Prime concurrent start".into()),
                 driver: DriverKind::Prime,
@@ -25484,7 +32759,7 @@ mod tests {
         };
 
         let mut claude = base_spec(DriverKind::Claude);
-        augment_launch_spec_with_pane_mcp(&mut claude, PaneMcpClient::Claude, &executable)
+        let claude_pin = augment_launch_spec_with_pane_mcp(&mut claude, PaneMcpClient::Claude, &executable)
             .expect("augment Claude pane MCP launch");
         let config_index = claude
             .args
@@ -25506,14 +32781,22 @@ mod tests {
             .iter()
             .position(|argument| argument == "--allowedTools")
             .expect("Claude launch must pre-approve the exact pane MCP tools");
+        // Exactly these tools: no wildcard, and post_card is not pre-approved.
+        // The roaming four, upgrade_request and the six member tools are listed
+        // only to members granted roam, maintain and manage respectively.
+        assert_eq!(
+            claude.args[allowed_tools_index + 1],
+            "mcp__prim1_pane__ping,mcp__prim1_pane__room_read,mcp__prim1_pane__room_wait,mcp__prim1_pane__room_post,mcp__prim1_pane__room_ack,mcp__prim1_pane__room_deliver,mcp__prim1_pane__room_directory,mcp__prim1_pane__tasks,mcp__prim1_pane__rooms_list,mcp__prim1_pane__room_peek,mcp__prim1_pane__room_join,mcp__prim1_pane__room_leave,mcp__prim1_pane__upgrade_request,mcp__prim1_pane__member_create,mcp__prim1_pane__member_start,mcp__prim1_pane__member_stop,mcp__prim1_pane__member_restart,mcp__prim1_pane__member_brief,mcp__prim1_pane__member_input,mcp__prim1_pane__member_remove,mcp__prim1_pane__room_fallbacks,mcp__prim1_pane__members_list,mcp__prim1_pane__member_update,mcp__prim1_pane__member_delete,mcp__prim1_pane__member_add,mcp__prim1_pane__room_create,mcp__prim1_pane__room_settings,mcp__prim1_pane__room_delete,mcp__prim1_pane__room_guests,mcp__prim1_pane__room_start,mcp__prim1_pane__room_stop,mcp__prim1_pane__room_retry,mcp__prim1_pane__local_conversations,mcp__prim1_pane__room_package,mcp__prim1_pane__runtime_settings,mcp__prim1_pane__upgrade_control,mcp__prim1_pane__telemetry"
+        );
         assert_eq!(
             claude.args[allowed_tools_index + 1],
             PANE_MCP_CLAUDE_ALLOWED_TOOLS.join(",")
         );
         assert!(!claude.args[allowed_tools_index + 1].contains('*'));
+        assert!(!claude.args[allowed_tools_index + 1].contains("post_card"));
 
         let mut codex = base_spec(DriverKind::Codex);
-        augment_launch_spec_with_pane_mcp(&mut codex, PaneMcpClient::Codex, &executable)
+        let codex_pin = augment_launch_spec_with_pane_mcp(&mut codex, PaneMcpClient::Codex, &executable)
             .expect("augment Codex pane MCP launch");
         let codex_arguments = codex.args.join("\n");
         assert!(codex_arguments.contains(&format!(
@@ -25530,6 +32813,16 @@ mod tests {
         assert!(
             codex_arguments.contains(&format!("mcp_servers.{PANE_MCP_SERVER_NAME}.required=true"))
         );
+
+        assert_eq!(claude_pin.program, expected_executable);
+        assert_eq!(claude_pin.allowed_tools, PANE_MCP_CLAUDE_ALLOWED_TOOLS);
+        assert!(claude_pin.environment_names.is_empty());
+        assert_eq!(codex_pin.program, expected_executable);
+        assert_eq!(codex_pin.environment_names, PANE_MCP_ENVIRONMENT_VARIABLES);
+        assert_eq!(codex_pin.args, vec![PANE_MCP_MODE_ARGUMENT]);
+        assert_eq!(codex_pin.required, Some(true));
+        assert!(codex_pin.allowed_tools.is_empty());
+        assert_eq!(codex_pin, augment_launch_spec_with_pane_mcp(&mut base_spec(DriverKind::Codex), PaneMcpClient::Codex, &executable).unwrap(), "stable MCP pins contain no minted run state");
 
         for payload in [claude.args.join("\n"), codex_arguments] {
             let lower = payload.to_ascii_lowercase();
@@ -25645,7 +32938,8 @@ mod tests {
         }));
         let home = control.default_working_directory().unwrap();
         let session = supervisor
-            .create_session(shared_types::CreateSessionRequest {
+            .create_session(shared_types::CreateSessionRequest { codex_transport: Default::default(), permissions: None,
+                launch_choices: None,
                 room_id: None,
                 label: Some("Prime missing scope".into()),
                 driver: DriverKind::Prime,
@@ -25696,7 +32990,8 @@ mod tests {
         let events = capture_runtime_events(&supervisor);
 
         let session = supervisor
-            .create_session(shared_types::CreateSessionRequest {
+            .create_session(shared_types::CreateSessionRequest { codex_transport: Default::default(), permissions: None,
+                launch_choices: None,
                 room_id: None,
                 label: Some("Prime integration".into()),
                 driver: DriverKind::Prime,
@@ -25785,7 +33080,7 @@ mod tests {
                 Uuid::new_v4().simple()
             ),
         };
-        let definition = SessionDefinition {
+        let definition = SessionDefinition { codex_transport: Default::default(),
             session_id: Uuid::new_v4(),
             alias: "prime-adversarial".into(),
             label: "Prime adversarial lifecycle".into(),
@@ -25881,8 +33176,935 @@ mod tests {
         );
     }
 
+    #[test]
+    fn s5_codex_identify_is_durable_run_bound_and_keeps_freshness_hold() {
+        let root = tempfile::tempdir().unwrap();
+        let supervisor = test_supervisor_with_root(root.path().join("runtime"));
+        let (pty, _) = recording_pty_session(102);
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            Some(102),
+            pty,
+        );
+        let caller = supervisor
+            .resolve_pane_caller(TestPaneProcess::new(7001, [102]))
+            .unwrap();
+        let id = Uuid::new_v4().to_string();
+        let cwd = supervisor
+            .inner
+            .slots
+            .lock()
+            .get_by_id(caller.session_id)
+            .unwrap()
+            .definition
+            .working_dir
+            .clone();
+        let sessions = root.path().join("codex-sessions");
+        session::write_codex_fixture(&sessions, &id, &cwd);
+        let message = supervisor
+            .identify_codex_from_pane(&caller, &id, &sessions)
+            .unwrap();
+        assert!(message.contains("remain held"));
+        let snapshot = supervisor
+            .snapshot()
+            .sessions
+            .into_iter()
+            .find(|slot| slot.session_id == caller.session_id)
+            .unwrap();
+        assert!(!snapshot.resume_available);
+        assert!(supervisor.codex_native_wake_identity(caller.session_id, caller.run_id, caller.generation).is_err());
+        assert!(supervisor.codex_native_wake_identity(caller.session_id, Uuid::new_v4(), caller.generation).unwrap_err().to_string().contains("stale"));
+        let catalog =
+            read_session_catalog(&session_catalog_path(supervisor.runtime_dir())).unwrap();
+        let row = catalog
+            .sessions
+            .iter()
+            .find(|row| row.session_id == caller.session_id)
+            .unwrap();
+        assert_eq!(row.harness_session_id.as_deref(), Some(id.as_str()));
+        let evidence = row
+            .recovery
+            .as_ref()
+            .unwrap()
+            .reported_codex
+            .as_ref()
+            .unwrap();
+        assert_eq!(evidence.run_id, caller.run_id);
+        assert_eq!(evidence.generation, caller.generation);
+        assert_eq!(evidence.thread_id, id);
+        assert!(row.recovery.as_ref().unwrap().reason.contains("/new"));
+        let definition = supervisor
+            .inner
+            .slots
+            .lock()
+            .get_by_id(caller.session_id)
+            .unwrap()
+            .definition
+            .clone();
+        assert!(
+            supervisor
+                .resolve_harness_launch_session(&definition, false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn s5_codex_identify_rejects_secret_stale_wrong_driver_and_duplicate_id() {
+        let root = tempfile::tempdir().unwrap();
+        let supervisor = test_supervisor_with_root(root.path().join("runtime"));
+        let (pty, _) = recording_pty_session(102);
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            Some(102),
+            pty,
+        );
+        let caller = supervisor
+            .resolve_pane_caller(TestPaneProcess::new(7001, [102]))
+            .unwrap();
+        let id = Uuid::new_v4().to_string();
+        let cwd = supervisor
+            .inner
+            .slots
+            .lock()
+            .get_by_id(caller.session_id)
+            .unwrap()
+            .definition
+            .working_dir
+            .clone();
+        let sessions = root.path().join("codex-sessions");
+        session::write_codex_fixture(&sessions, &id, &cwd);
+        let before = fs::read(session_catalog_path(supervisor.runtime_dir())).unwrap();
+        let secret = mint_pane_secret();
+        set_test_pane_secret(&supervisor, "codex", &secret);
+        let mut secret_caller = caller.clone();
+        secret_caller.identity = PaneCallerIdentity::Secret(secret);
+        assert!(
+            supervisor
+                .identify_codex_from_pane(&secret_caller, &id, &sessions)
+                .unwrap_err()
+                .to_string()
+                .contains("native process")
+        );
+        // A16 D2: once the follower has bound this run to exactly that
+        // conversation, a secret-only report is answered, and nothing changes.
+        let original = {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id_mut(caller.session_id).unwrap();
+            let original = (slot.recovery.take(), slot.harness_session_id.replace(id.to_uppercase()));
+            original
+        };
+        let proved = supervisor.identify_codex_from_pane(&secret_caller, &id, &sessions).unwrap();
+        assert!(proved.contains("already proved"), "{proved}");
+        assert_eq!(fs::read(session_catalog_path(supervisor.runtime_dir())).unwrap(), before, "nothing is written");
+        assert!(supervisor.identify_codex_from_pane(&secret_caller, &Uuid::new_v4().to_string(), &sessions)
+            .unwrap_err().to_string().contains("say so in the room"), "another conversation is still refused");
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id_mut(caller.session_id).unwrap();
+            (slot.recovery, slot.harness_session_id) = original;
+        }
+        let mut stale = caller.clone();
+        stale.run_id = Uuid::new_v4();
+        assert!(
+            supervisor
+                .identify_codex_from_pane(&stale, &id, &sessions)
+                .is_err()
+        );
+        {
+            let mut slots = supervisor.inner.slots.lock();
+            slots
+                .get_by_id_mut(caller.session_id)
+                .unwrap()
+                .definition
+                .driver = DriverKind::Claude;
+        }
+        assert!(
+            supervisor
+                .identify_codex_from_pane(&caller, &id, &sessions)
+                .is_err()
+        );
+        supervisor
+            .inner
+            .slots
+            .lock()
+            .get_by_id_mut(caller.session_id)
+            .unwrap()
+            .definition
+            .driver = DriverKind::Codex;
+        {
+            let mut catalog = supervisor.inner.catalog.lock();
+            let other = catalog
+                .sessions
+                .iter_mut()
+                .find(|row| row.session_id != caller.session_id)
+                .unwrap();
+            other.driver = DriverKind::Codex;
+            other.harness_session_id = Some(id.clone());
+        }
+        assert!(
+            supervisor
+                .identify_codex_from_pane(&caller, &id, &sessions)
+                .unwrap_err()
+                .to_string()
+                .contains("already bound")
+        );
+        assert_eq!(
+            fs::read(session_catalog_path(supervisor.runtime_dir())).unwrap(),
+            before
+        );
+        assert!(
+            supervisor
+                .inner
+                .slots
+                .lock()
+                .get_by_id(caller.session_id)
+                .unwrap()
+                .harness_session_id
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn s5_codex_identify_persistence_failure_preserves_original_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let supervisor = test_supervisor_with_root(root.path().join("runtime"));
+        let (pty, _) = recording_pty_session(102);
+        install_mock_running_session_with_process_id(
+            &supervisor,
+            "codex",
+            DriverKind::Codex,
+            Some(102),
+            pty,
+        );
+        let caller = supervisor
+            .resolve_pane_caller(TestPaneProcess::new(7001, [102]))
+            .unwrap();
+        let id = Uuid::new_v4().to_string();
+        let original = Uuid::new_v4().to_string();
+        let cwd = {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id_mut(caller.session_id).unwrap();
+            slot.harness_session_id = Some(original.clone());
+            slot.recovery = Some(RecoveryReference::unresolved_codex(
+                Some(original.clone()),
+                true,
+            ));
+            slot.definition.working_dir.clone()
+        };
+        supervisor.persist_slot_harness_state(caller.session_id);
+        let sessions = root.path().join("codex-sessions");
+        session::write_codex_fixture(&sessions, &id, &cwd);
+        let before = fs::read(session_catalog_path(supervisor.runtime_dir())).unwrap();
+        supervisor
+            .inner
+            .fail_next_catalog_write
+            .store(true, Ordering::Release);
+        assert!(
+            supervisor
+                .identify_codex_from_pane(&caller, &id, &sessions)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(session_catalog_path(supervisor.runtime_dir())).unwrap(),
+            before
+        );
+        assert_eq!(
+            supervisor
+                .inner
+                .slots
+                .lock()
+                .get_by_id(caller.session_id)
+                .unwrap()
+                .harness_session_id
+                .as_deref(),
+            Some(original.as_str())
+        );
+        supervisor
+            .identify_codex_from_pane(&caller, &id, &sessions)
+            .unwrap();
+        let catalog =
+            read_session_catalog(&session_catalog_path(supervisor.runtime_dir())).unwrap();
+        let row = catalog
+            .sessions
+            .iter()
+            .find(|row| row.session_id == caller.session_id)
+            .unwrap();
+        assert_eq!(
+            row.recovery.as_ref().unwrap().original_id.as_deref(),
+            Some(original.as_str())
+        );
+    }
+
+    #[test]
+    fn s5_room_restart_selection_is_explicit_durable_and_never_spawns() {
+        let root = tempfile::tempdir().unwrap();
+        let supervisor = test_supervisor_with_root(root.path().to_path_buf());
+        let (spawner, specs) = CapturingPtySpawner::new(Vec::new());
+        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+        let create = |member| {
+            supervisor.create_room(CreateRoomRequest {
+                label: Some("Same label".into()),
+                member_ids: vec![member],
+                brief_on_join: false,
+                brief_template: None,
+            }).unwrap()
+        };
+        let first = create(test_session_id(&supervisor, "claude"));
+        let second = create(test_session_id(&supervisor, "codex"));
+        assert!(!first.resume_on_restart && !second.resume_on_restart);
+        let selected = supervisor.set_room_resume_on_restart(SetRoomResumeRequest {
+            room_id: first.room_id,
+            resume_on_restart: true,
+        }).unwrap();
+        assert!(selected.resume_on_restart);
+        supervisor.rename_room(RenameRoomRequest {
+            room_id: first.room_id,
+            label: "Renamed".into(),
+        }).unwrap();
+        supervisor.move_room(MoveRoomRequest {
+            room_id: second.room_id,
+            new_index: 0,
+        }).unwrap();
+        let catalog = read_room_catalog(&room_catalog_path(supervisor.runtime_dir())).unwrap();
+        assert!(catalog.rooms.iter().find(|r| r.room_id == first.room_id).unwrap().resume_on_restart);
+        assert!(!catalog.rooms.iter().find(|r| r.room_id == second.room_id).unwrap().resume_on_restart);
+        supervisor.set_room_resume_on_restart(SetRoomResumeRequest {
+            room_id: first.room_id,
+            resume_on_restart: false,
+        }).unwrap();
+        assert!(supervisor.snapshot().rooms.iter().all(|r| !r.resume_on_restart));
+        assert!(specs.lock().is_empty(), "changing restart choices never launches members");
+    }
+
+    #[test]
+    fn s5_custom_brief_is_saved_but_omitted_from_metadata_audit() {
+        let supervisor = empty_test_supervisor();
+        let choices = SessionLaunchChoices {
+            brief: SessionBriefChoice::Custom { text: "private task text".into() },
+            ..SessionLaunchChoices::default()
+        };
+        let created = supervisor.create_session(shared_types::CreateSessionRequest { codex_transport: Default::default(), permissions: None,
+            label: None, driver: DriverKind::Claude,
+            permission_profile: shared_types::PermissionProfile::Normal,
+            linux_working_directory: None, room_id: None, launch_choices: Some(choices.clone()),
+        }).unwrap();
+        assert_eq!(created.launch_choices, choices);
+        let audit = fs::read_to_string(supervisor.audit_log_path()).unwrap();
+        assert!(!audit.contains("private task text"));
+        assert!(audit.contains("[content omitted]"));
+    }
+
+    #[test]
+    fn s5_actual_driver_specs_keep_resume_ids_and_final_prompt_separate() {
+        for driver in [DriverKind::Claude, DriverKind::Codex, DriverKind::Grok] {
+            let definition = SessionDefinition { codex_transport: Default::default(),
+                session_id: Uuid::new_v4(), alias: "fixture".into(), label: "fixture".into(),
+                driver, working_dir: r"C:\fixture".into(),
+                permission_profile: shared_types::PermissionProfile::Normal,
+            };
+            let resolved = TestExecutableResolver.resolve(driver).unwrap();
+            for conversation in [HarnessLaunchSession::Fresh, HarnessLaunchSession::Resume { session_id: "saved-root".into() }] {
+                let mut spec = build_launch_spec(&definition, &resolved, &conversation).unwrap();
+                let original = spec.args.clone();
+                let choices = SessionLaunchChoices {
+                    model: Some("deliberate-model".into()), effort: Some("max".into()),
+                    brief: SessionBriefChoice::Custom { text: "--safe task".into() },
+                };
+                session::apply_launch_choices(&mut spec, driver, &choices, Some("--safe task".into())).unwrap();
+                assert_eq!(&spec.args[..original.len()], original.as_slice());
+                let expected = session::initial_prompt_argument(driver, "--safe task".into()).unwrap();
+                assert_eq!(&spec.args[spec.args.len()-2..], &["--", expected.as_str()]);
+            }
+        }
+    }
+
+    #[test]
+    fn s5_launch_pins_preview_is_read_only_and_records_exact_run_inputs() {
+        let root = tempfile::tempdir().unwrap();
+        let supervisor = test_supervisor_with_root(root.path().to_path_buf());
+        let id = test_session_id(&supervisor, "codex");
+        let resolved = ResolvedLaunchProgram {
+            program: TestExecutableResolver.resolve(DriverKind::Codex).unwrap().program,
+            prefix_args: vec![r"C:\fixture space\codex entry.js".into()],
+        };
+        *supervisor.inner.executable_resolver.write() = Arc::new(FixedExecutableResolver(resolved.clone()));
+        let (pty, inputs) = recording_pty_session(std::process::id());
+        let (spawner, specs) = CapturingPtySpawner::new(vec![pty]);
+        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+        let choices = SessionLaunchChoices {
+            model: Some("deliberate-model".into()), effort: Some("high".into()),
+            brief: SessionBriefChoice::Custom { text: "private task must not enter launch pins".into() },
+        };
+        let request = StartSessionRequest { session_id: id, fresh: true, search: false, launch_choices: Some(choices.clone()) };
+        let before = fs::read(session_catalog_path(supervisor.runtime_dir())).unwrap();
+        let preview = supervisor.preview_session_launch(request.clone()).unwrap();
+        assert!(preview.previous.is_none());
+        assert_eq!(preview.proposed.prefix_args, resolved.prefix_args);
+        assert_eq!(fs::read(session_catalog_path(supervisor.runtime_dir())).unwrap(), before);
+        assert!(specs.lock().is_empty());
+        assert!(supervisor.inner.slots.lock().get_by_id(id).unwrap().harness_session_id.is_none());
+
+        let started = supervisor.start_session_with_launch_choices(id, true, false, Some(choices.clone())).unwrap();
+        let record = started.last_launch.clone().unwrap();
+        assert_eq!(record.inputs, preview.proposed);
+        assert_eq!(record.effective, SessionEffectiveSettings::default());
+        assert_eq!(record.run_id, started.run_id.unwrap());
+        assert_eq!(record.generation, started.generation);
+        assert!(!serde_json::to_string(&record).unwrap().contains("private task"));
+        assert_eq!(supervisor.current_run_launch_program(id, record.run_id, record.generation).unwrap(), (resolved.program.clone(), resolved.prefix_args.clone()));
+        assert!(supervisor.current_run_launch_program(id, Uuid::new_v4(), record.generation).is_err());
+        assert!(supervisor.codex_native_wake_identity(id, record.run_id, record.generation).is_err(), "argv provenance must not unlock freshness");
+
+        let mut changed = request;
+        changed.launch_choices.as_mut().unwrap().model = Some("changed-model".into());
+        let while_running = supervisor.preview_session_launch(changed).unwrap();
+        assert_eq!(while_running.previous.as_ref(), Some(&record));
+        assert_eq!(while_running.proposed.model.as_deref(), Some("changed-model"));
+        assert_eq!(supervisor.inner.slots.lock().get_by_id(id).unwrap().launch_choices, choices);
+        assert_eq!(specs.lock().len(), 1);
+        assert!(inputs.lock().is_empty());
+        assert!(supervisor.inner.slots.lock().get_by_id(id).unwrap().running.is_some());
+        supervisor.stop_session_by_id(id).unwrap();
+        assert!(supervisor.current_run_launch_program(id, record.run_id, record.generation).is_err());
+
+        *supervisor.inner.executable_resolver.write() = Arc::new(FailingExecutableResolver);
+        assert!(supervisor.start_session_by_id_with_mode(id, true).is_err());
+        assert_eq!(supervisor.inner.slots.lock().get_by_id(id).unwrap().last_launch.as_ref(), Some(&record));
+        supervisor.shutdown().unwrap();
+        drop(supervisor);
+        let rebooted = SupervisorHandle::new(test_supervisor_config(root.path())).unwrap();
+        assert_eq!(rebooted.inner.slots.lock().get_by_id(id).unwrap().last_launch.as_ref(), Some(&record));
+        assert!(rebooted.current_run_launch_program(id, record.run_id, record.generation).is_err());
+    }
+
+    #[test]
+    fn s5_launch_choices_persist_and_brief_is_only_an_initial_conversation_argument() {
+        let supervisor = test_supervisor();
+        let claude = test_session_id(&supervisor, "claude");
+        let (first, first_inputs) = recording_pty_session(std::process::id());
+        let (second, second_inputs) = recording_pty_session(std::process::id());
+        let (spawner, specs) = CapturingPtySpawner::new(vec![first, second]);
+        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+        let choices = SessionLaunchChoices {
+            model: Some("opus".into()), effort: Some("max".into()),
+            brief: SessionBriefChoice::Custom { text: "--option\nExact task \"quoted\"".into() },
+        };
+        let started = supervisor.start_session_with_launch_choices(
+            claude, false, false, Some(choices.clone()),
+        ).unwrap();
+        assert_eq!(started.launch_choices, choices);
+        assert!(first_inputs.lock().is_empty());
+        let catalog = read_session_catalog(&session_catalog_path(supervisor.runtime_dir())).unwrap();
+        let restored = SessionRegistry::from_catalog(&catalog).unwrap();
+        assert_eq!(restored.get_by_id(claude).unwrap().launch_choices, choices);
+        assert!(supervisor.start_session_with_launch_choices(
+            claude, false, false, Some(SessionLaunchChoices::default()),
+        ).unwrap_err().to_string().contains("running"));
+        supervisor.stop_session_by_id(claude).unwrap();
+        supervisor.start_session_by_id(claude).unwrap();
+        let specs = specs.lock();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(&specs[0].args[specs[0].args.len()-2..], &["--", "PRIM-1 initial brief:\n\n--option\nExact task \"quoted\""]);
+        for spec in specs.iter() {
+            assert!(spec.args.windows(2).any(|args| args == ["--model", "opus"]));
+        }
+        assert!(!specs[1].args.iter().any(|arg| arg == "--" || arg.contains("Exact task") || arg.contains("PRIM-1 initial brief")));
+        assert!(specs[1].args.iter().any(|arg| arg.starts_with("--resume=")));
+        assert!(second_inputs.lock().is_empty());
+    }
+
+    #[test]
+    fn s5_room_default_resolves_each_launch_and_join_never_types_a_brief() {
+        let supervisor = test_supervisor();
+        let claude = test_session_id(&supervisor, "claude");
+        let (pty, inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_bracketed_paste_enabled(
+            &supervisor, "claude", DriverKind::Claude, pty,
+        );
+        let room = supervisor.create_room(CreateRoomRequest {
+            label: Some("Launch room".into()), member_ids: vec![claude],
+            brief_on_join: true, brief_template: Some("First for {your_label}".into()),
+        }).unwrap();
+        assert!(inputs.lock().is_empty(), "joining must never submit PTY input");
+        let choices = SessionLaunchChoices::default();
+        assert_eq!(supervisor.resolve_launch_brief(claude, &choices).unwrap().as_deref(), Some("First for claude"));
+        let (definition, directory) = {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id(claude).unwrap();
+            (slot.definition.clone(), slot.qualified_working_directory.clone().unwrap())
+        };
+        let mut prepared = supervisor.prepare_launch_spec_for_spawn(&definition, &directory, true, false, &choices).unwrap();
+        // Simulates a settings update after creation: launch reads the current template.
+        supervisor.inner.rooms.lock().get_mut(room.room_id).unwrap().definition.brief_template = Some("Revised".into());
+        assert_eq!(supervisor.resolve_launch_brief(claude, &choices).unwrap().as_deref(), Some("Revised"));
+        supervisor.refresh_prepared_launch_brief(claude, &mut prepared).unwrap();
+        assert_eq!(&prepared.spec.args[prepared.spec.args.len()-2..], &["--", "PRIM-1 initial brief:\n\nRevised"]);
+        for template in ["nul\0task".to_string(), "{your_label}".repeat(1700)] {
+            supervisor.inner.rooms.lock().get_mut(room.room_id).unwrap().definition.brief_template = Some(template);
+            assert!(format!("{:#}", supervisor.restart_session_by_id(claude).unwrap_err()).contains("rendered brief"));
+            assert!(supervisor.inner.slots.lock().get_by_id(claude).unwrap().running.is_some(), "invalid brief must be refused before stopping the healthy run");
+        }
+        supervisor.inner.rooms.lock().get_mut(room.room_id).unwrap().definition.brief_template = Some("Revised".into());
+        let none = SessionLaunchChoices { brief: SessionBriefChoice::None {}, ..choices.clone() };
+        assert_eq!(supervisor.resolve_launch_brief(claude, &none).unwrap(), None);
+        supervisor.inner.rooms.lock().get_mut(room.room_id).unwrap().definition.brief_on_join = false;
+        assert_eq!(supervisor.resolve_launch_brief(claude, &choices).unwrap(), None);
+        // Explicit Brief now still returns the actual delivery result when the room default is off.
+        let result = supervisor.brief_room_member(BriefRoomMemberRequest {
+            room_id: room.room_id, session_id: claude,
+        }).unwrap();
+        // A106: an explicit Brief is typed into the running Claude member;
+        // only the join above never types.
+        assert_eq!(result.written_count, 1);
+        assert_eq!(result.receipts[0].status, RoomDeliveryStatus::Written);
+        assert!(result.receipts[0].recorded);
+        assert_eq!(last_stored_room_body(&supervisor, claude), "Revised");
+        assert_eq!(*inputs.lock(), vec![typed_room_message("operator", "Revised"), "\r".to_string()]);
+    }
+
+    #[test]
+    fn s5_legacy_terminal_without_launch_choices_imports_and_starts_without_brief() {
+        let root = tempfile::tempdir().unwrap();
+        let seed = empty_test_supervisor_with_root(root.path().to_path_buf());
+        let terminal = create_test_session(
+            &seed, "Legacy terminal", DriverKind::GenericTerminal,
+            shared_types::PermissionProfile::Normal,
+        );
+        seed.create_room(CreateRoomRequest {
+            label: Some("Enabled room default".into()), member_ids: vec![terminal.session_id],
+            brief_on_join: true, brief_template: Some("This task must never be sent to a terminal".into()),
+        }).unwrap();
+        let path = session_catalog_path(seed.runtime_dir());
+        seed.shutdown().unwrap();
+        drop(seed);
+        let mut legacy: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        legacy["sessions"][0].as_object_mut().unwrap().remove("launch_choices");
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let supervisor = SupervisorHandle::new(test_supervisor_config(root.path())).unwrap();
+        supervisor.set_executable_resolver_for_tests(Arc::new(TestExecutableResolver));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let imported = supervisor.snapshot().sessions.into_iter().find(|s| s.session_id == terminal.session_id).unwrap();
+        assert_eq!(imported.launch_choices, SessionLaunchChoices {
+            model: None, effort: None, brief: SessionBriefChoice::None {},
+        });
+        let (pty, inputs) = recording_pty_session(std::process::id());
+        let (spawner, specs) = CapturingPtySpawner::new(vec![pty]);
+        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+        let started = supervisor.start_session_by_id(terminal.session_id).unwrap();
+        assert!(started.running);
+        assert_eq!(started.launch_choices, imported.launch_choices);
+        let specs = specs.lock();
+        assert_eq!(specs.len(), 1);
+        assert!(!specs[0].args.iter().any(|arg| arg == "--model" || arg == "--effort" || arg.contains("This task")));
+        assert!(inputs.lock().is_empty());
+        drop(specs);
+        supervisor.stop_session_by_id(terminal.session_id).unwrap();
+        supervisor.shutdown().unwrap();
+    }
+
+    #[test]
+    fn s5_terminals_have_no_brief_and_invalid_choices_create_nothing() {
+        let supervisor = test_supervisor();
+        let before = fs::read(session_catalog_path(supervisor.runtime_dir())).unwrap();
+        let request = shared_types::CreateSessionRequest { codex_transport: Default::default(), permissions: None,
+            label: None, driver: DriverKind::GenericTerminal,
+            permission_profile: shared_types::PermissionProfile::Normal,
+            linux_working_directory: None, room_id: None,
+            launch_choices: Some(SessionLaunchChoices::default()),
+        };
+        assert!(supervisor.create_session(request.clone()).is_err());
+        assert_eq!(fs::read(session_catalog_path(supervisor.runtime_dir())).unwrap(), before);
+        let terminal = supervisor.create_session(shared_types::CreateSessionRequest { permissions: None,
+            launch_choices: None, ..request
+        }).unwrap();
+        assert_eq!(terminal.launch_choices.brief, SessionBriefChoice::None {});
+        let room = supervisor.create_room(CreateRoomRequest {
+            label: None, member_ids: vec![terminal.session_id], brief_on_join: true,
+            brief_template: None,
+        }).unwrap();
+        assert!(supervisor.brief_room_member(BriefRoomMemberRequest {
+            room_id: room.room_id, session_id: terminal.session_id,
+        }).unwrap_err().to_string().contains("never briefed"));
+    }
+
+    #[test]
+    fn s5_launch_choice_write_failure_changes_neither_catalog_nor_running_state() {
+        let supervisor = test_supervisor();
+        let claude = test_session_id(&supervisor, "claude");
+        let before = fs::read(session_catalog_path(supervisor.runtime_dir())).unwrap();
+        let (spawner, specs) = CapturingPtySpawner::new(Vec::new());
+        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+        supervisor.fail_next_catalog_write_for_tests();
+        assert!(supervisor.start_session_with_launch_choices(claude, false, false, Some(SessionLaunchChoices {
+            model: Some("opus".into()), ..SessionLaunchChoices::default()
+        })).unwrap_err().to_string().contains("persistence failure"));
+        assert!(specs.lock().is_empty());
+        let slots = supervisor.inner.slots.lock();
+        let slot = slots.get_by_id(claude).unwrap();
+        assert_eq!(slot.launch_choices, SessionLaunchChoices::default());
+        assert!(slot.running.is_none());
+        assert_eq!(fs::read(session_catalog_path(supervisor.runtime_dir())).unwrap(), before);
+    }
+
+    #[test]
+    fn s5_room_brief_settings_are_readable_durable_and_never_type_input() {
+        let supervisor = test_supervisor();
+        let claude = test_session_id(&supervisor, "claude");
+        let (pty, inputs) = recording_pty_session(std::process::id());
+        install_mock_running_session_with_bracketed_paste_enabled(&supervisor, "claude", DriverKind::Claude, pty);
+        let room = supervisor.create_room(CreateRoomRequest {
+            label: Some("Editable".into()), member_ids: vec![claude],
+            brief_on_join: false, brief_template: None,
+        }).unwrap();
+        let read = shared_types::ReadRoomBriefRequest { room_id: room.room_id };
+        assert_eq!(supervisor.read_room_brief(read.clone()).unwrap().brief_template, None);
+        let updated = supervisor.update_room_brief(shared_types::UpdateRoomBriefRequest {
+            room_id: room.room_id, brief_on_join: true,
+            brief_template: Some("  Task for {your_label}\r\nNext line.  ".into()),
+        }).unwrap();
+        assert_eq!(updated.brief_template.as_deref(), Some("Task for {your_label}\nNext line."));
+        assert_eq!(supervisor.read_room_brief(read.clone()).unwrap(), updated);
+        assert_eq!(supervisor.resolve_launch_brief(claude, &SessionLaunchChoices::default()).unwrap().as_deref(), Some("Task for claude\nNext line."));
+        let catalog = read_room_catalog(&room_catalog_path(supervisor.runtime_dir())).unwrap();
+        let persisted = catalog.rooms.iter().find(|row| row.room_id == room.room_id).unwrap();
+        assert_eq!(persisted.brief_template, updated.brief_template);
+        assert!(persisted.brief_on_join);
+        let disabled = supervisor.update_room_brief(shared_types::UpdateRoomBriefRequest {
+            brief_on_join: false, ..updated
+        }).unwrap();
+        assert_eq!(supervisor.read_room_brief(read).unwrap(), disabled);
+        assert_eq!(supervisor.resolve_launch_brief(claude, &SessionLaunchChoices::default()).unwrap(), None);
+        assert!(inputs.lock().is_empty());
+        assert!(supervisor.inner.slots.lock().get_by_id(claude).unwrap().running.is_some());
+    }
+
+    #[test]
+    fn s5_room_brief_settings_fail_before_visible_mutation() {
+        let supervisor = test_supervisor();
+        let room = supervisor.create_room(CreateRoomRequest {
+            label: None, member_ids: vec![], brief_on_join: false, brief_template: Some("Original".into()),
+        }).unwrap();
+        let request = shared_types::UpdateRoomBriefRequest {
+            room_id: room.room_id, brief_on_join: true, brief_template: Some("Revised".into()),
+        };
+        let read = shared_types::ReadRoomBriefRequest { room_id: room.room_id };
+        let before = supervisor.read_room_brief(read.clone()).unwrap();
+        let path = room_catalog_path(supervisor.runtime_dir());
+        let bytes = fs::read(&path).unwrap();
+        supervisor.fail_next_room_catalog_write_for_tests();
+        assert!(supervisor.update_room_brief(request.clone()).is_err());
+        for invalid in ["nul\0task".to_owned(), "x".repeat(8193)] {
+            assert!(supervisor.update_room_brief(shared_types::UpdateRoomBriefRequest {
+                brief_template: Some(invalid), ..request.clone()
+            }).is_err());
+        }
+        assert!(supervisor.update_room_brief(shared_types::UpdateRoomBriefRequest {
+            room_id: Uuid::new_v4(), ..request
+        }).is_err());
+        assert_eq!(supervisor.read_room_brief(read).unwrap(), before);
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn s5_room_restart_persistence_failure_keeps_memory_and_disk_unchanged() {
+        let root = tempfile::tempdir().unwrap();
+        let supervisor = test_supervisor_with_root(root.path().to_path_buf());
+        let room = supervisor.create_room(CreateRoomRequest {
+            label: Some("Selected explicitly".into()),
+            member_ids: Vec::new(),
+            brief_on_join: false,
+            brief_template: None,
+        }).unwrap();
+        let path = room_catalog_path(supervisor.runtime_dir());
+        let before = fs::read(&path).unwrap();
+        supervisor.fail_next_room_catalog_write_for_tests();
+        assert!(supervisor.set_room_resume_on_restart(SetRoomResumeRequest {
+            room_id: room.room_id,
+            resume_on_restart: true,
+        }).is_err());
+        assert!(!supervisor.snapshot().rooms[0].resume_on_restart);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(supervisor.set_room_resume_on_restart(SetRoomResumeRequest {
+            room_id: Uuid::new_v4(),
+            resume_on_restart: true,
+        }).is_err());
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn s5_real_codex_stall_holds_before_reserving_restart_or_stopping() {
+        let supervisor = test_supervisor_with_wrapper_defaults(
+            None, Some(vec!["codex".into()]), Some(Duration::from_secs(3600)),
+        );
+        let id = test_session_id(&supervisor, "codex");
+        let (pty, _, kill_count) = mock_pty_session(None, MockKillBehavior::Immediate);
+        let (spawner, specs) = CapturingPtySpawner::new(vec![pty]);
+        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+        let started = supervisor.start_session_by_id(id).unwrap();
+        let events = capture_runtime_events(&supervisor);
+        let reserved = Arc::new(AtomicBool::new(false));
+        let probe = reserved.clone();
+        supervisor.set_stall_after_reservation_for_tests(move || { probe.store(true, Ordering::SeqCst); });
+        handle_current_pty_event(&supervisor, "codex", started.generation,
+            PtyEvent::Output("You've hit your usage limit.".into()));
+        let (run_id, entered_at) = {
+            let slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id(id).unwrap();
+            assert_eq!(slot.work_state, WorkState::Blocked);
+            assert_eq!(slot.state, LifecycleState::Ready);
+            assert!(slot.recovery.is_some());
+            (slot.run_id.unwrap(), slot.stall_detector.as_ref().unwrap().entered_at)
+        };
+        supervisor.inner.background_runtime.0.as_ref().unwrap().block_on(supervisor.fire_stall_detector(
+            id, started.generation, run_id, WorkState::Blocked, entered_at,
+        ));
+        assert!(!reserved.load(Ordering::SeqCst));
+        assert!(!supervisor.inner.auto_restart_history.lock().contains_key(&id));
+        assert_eq!(kill_count.load(Ordering::SeqCst), 0);
+        assert_eq!(specs.lock().len(), 1);
+        assert!(session_exit_events(&events).is_empty());
+        let alerts = supervisor_alert_events(&events);
+        assert_eq!(alerts.len(), 1);
+        assert!(matches!(&alerts[0], RuntimeEvent::SupervisorAlert { severity: AlertSeverity::Warn, message, .. }
+            if message.contains("Auto-restart skipped") && message.contains("Stop this run")));
+        let slots = supervisor.inner.slots.lock();
+        let slot = slots.get_by_id(id).unwrap();
+        assert_eq!(slot.run_id, Some(run_id));
+        assert_eq!(slot.generation, started.generation);
+        assert!(slot.running.is_some());
+    }
+
+    #[test]
+    fn s5_search_retry_preserves_explicit_fresh_and_launch_choices() {
+        struct SearchOnly;
+        impl DriverExecutableResolver for SearchOnly {
+            fn resolve(&self, _: DriverKind) -> Result<ResolvedLaunchProgram> {
+                Err(anyhow!("fixture executable not found on PATH"))
+            }
+            fn resolve_searching(&self, driver: DriverKind) -> Result<ResolvedLaunchProgram> {
+                TestExecutableResolver.resolve(driver)
+            }
+        }
+        let supervisor = test_supervisor();
+        let id = test_session_id(&supervisor, "codex");
+        supervisor.inner.slots.lock().get_by_id_mut(id).unwrap().recovery = Some(
+            RecoveryReference::unresolved_codex(Some("prior-root".into()), true));
+        supervisor.set_executable_resolver_for_tests(Arc::new(SearchOnly));
+        let choices = SessionLaunchChoices { model: Some("chosen-model".into()),
+            brief: SessionBriefChoice::Custom { text: "chosen task".into() }, effort: None };
+        let (pty, _) = recording_pty_session(std::process::id());
+        let (spawner, specs) = CapturingPtySpawner::new(vec![pty]);
+        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+        assert!(supervisor.start_session_with_launch_choices(id, true, false, Some(choices.clone())).unwrap_err().to_string().contains("PATH"));
+        // A search retry is the original request plus search=true. Omitting fresh must not bypass a hold.
+        assert!(supervisor.start_session_with_launch_choices(id, false, true, Some(choices.clone())).is_err());
+        assert!(specs.lock().is_empty());
+        let started = supervisor.start_session_with_launch_choices(id, true, true, Some(choices.clone())).unwrap();
+        assert_eq!(started.launch_choices, choices);
+        assert!(started.last_error.is_none());
+        let specs = specs.lock();
+        assert_eq!(&specs[0].args[specs[0].args.len()-2..], &["--", "chosen task"]);
+    }
+
+    #[test]
+    fn s5_imported_codex_id_is_retained_but_not_trusted_or_rewritten() {
+        let root = tempfile::tempdir().unwrap();
+        let supervisor = test_supervisor_with_root(root.path().to_path_buf());
+        let id = test_session_id(&supervisor, "codex");
+        supervisor
+            .inner
+            .slots
+            .lock()
+            .get_by_id_mut(id)
+            .unwrap()
+            .harness_session_id = Some("old-unproven-id".into());
+        supervisor.persist_slot_harness_state(id);
+        let path = session_catalog_path(supervisor.runtime_dir());
+        let before = fs::read(&path).unwrap();
+
+        supervisor.shutdown().unwrap();
+        drop(supervisor);
+        let restored = SupervisorHandle::new(test_supervisor_config(root.path())).unwrap();
+        let slots = restored.inner.slots.lock();
+        let slot = slots.get_by_id(id).unwrap();
+        assert_eq!(slot.harness_session_id.as_deref(), Some("old-unproven-id"));
+        let recovery = slot.recovery.as_ref().unwrap();
+        assert_eq!(recovery.original_id.as_deref(), Some("old-unproven-id"));
+        assert_eq!(recovery.provenance, "legacy_catalog");
+        assert!(!slot.snapshot().resume_available);
+        assert!(slot.snapshot().last_error.is_none());
+        assert!(slot.snapshot().recovery.unwrap().reason.contains("no verified launch binding"));
+        assert_eq!(
+            fs::read(path).unwrap(),
+            before,
+            "boot import must not rewrite a catalog"
+        );
+    }
+
+    #[test]
+    fn s5_recovery_blocks_ordinary_launch_and_preserves_original_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let supervisor = test_supervisor_with_root(root.path().to_path_buf());
+        let id = test_session_id(&supervisor, "codex");
+        let definition = {
+            let mut slots = supervisor.inner.slots.lock();
+            let slot = slots.get_by_id_mut(id).unwrap();
+            slot.harness_session_id = Some("dead-original-id".into());
+            slot.recovery = Some(RecoveryReference::resume_refused(
+                slot.harness_session_id.clone(),
+                "rollout missing".into(),
+            ));
+            slot.definition.clone()
+        };
+        let error = supervisor
+            .resolve_harness_launch_session(&definition, false)
+            .unwrap_err();
+        assert!(error.to_string().contains("rollout missing"));
+        assert_eq!(
+            supervisor
+                .resolve_harness_launch_session(&definition, true)
+                .unwrap(),
+            HarnessLaunchSession::Fresh,
+        );
+        supervisor.persist_slot_harness_state(id);
+        let persisted =
+            read_session_catalog(&session_catalog_path(supervisor.runtime_dir())).unwrap();
+        let row = persisted
+            .sessions
+            .iter()
+            .find(|row| row.session_id == id)
+            .unwrap();
+        assert_eq!(row.harness_session_id.as_deref(), Some("dead-original-id"));
+        let recovery = row.recovery.as_ref().unwrap();
+        assert_eq!(recovery.original_id.as_deref(), Some("dead-original-id"));
+        assert_eq!(recovery.provenance, "harness_resume_refusal");
+        assert_eq!(recovery.reason, "rollout missing");
+        let (pty, _) = recording_pty_session(std::process::id());
+        let (spawner, specs) = CapturingPtySpawner::new(vec![pty]);
+        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+        assert!(supervisor.start_session_by_id(id).is_err());
+        assert!(specs.lock().is_empty());
+        assert!(supervisor.inner.slots.lock().get_by_id(id).unwrap().snapshot().last_error.is_none());
+        let fresh = supervisor.start_session_by_id_with_mode(id, true).unwrap();
+        assert!(fresh.last_error.is_none());
+        assert_eq!(fresh.recovery_history.len(), 1);
+        assert_eq!(fresh.recovery_history[0].original_id.as_deref(), Some("dead-original-id"));
+        let stopped = supervisor.stop_session_by_id(id).unwrap();
+        assert!(stopped.last_error.is_none());
+        assert!(stopped.recovery.is_some());
+        supervisor.shutdown().unwrap();
+        drop(supervisor);
+        let rebooted = SupervisorHandle::new(test_supervisor_config(root.path())).unwrap();
+        let slots = rebooted.inner.slots.lock();
+        let recovered = slots.get_by_id(id).unwrap();
+        assert_eq!(recovered.recovery_history.len(), 1);
+        assert_eq!(recovered.recovery_history[0].original_id.as_deref(), Some("dead-original-id"));
+        assert_eq!(recovered.recovery_history[0].provenance, "harness_resume_refusal");
+        assert_eq!(recovered.recovery_history[0].reason, "rollout missing");
+        assert!(recovered.snapshot().last_error.is_none());
+    }
+
+    #[test]
+    fn s5_duplicate_imports_hold_all_same_driver_owners_and_preserve_evidence() {
+        for driver in [DriverKind::Claude, DriverKind::Codex, DriverKind::Grok] {
+            let root = tempfile::tempdir().unwrap();
+            let seed = empty_test_supervisor_with_root(root.path().to_path_buf());
+            let first = create_test_session(&seed, "first", driver, shared_types::PermissionProfile::Normal).session_id;
+            let second = create_test_session(&seed, "second", driver, shared_types::PermissionProfile::Normal).session_id;
+            let other_driver = if driver == DriverKind::Claude { DriverKind::Grok } else { DriverKind::Claude };
+            let unrelated = create_test_session(&seed, "unrelated", other_driver, shared_types::PermissionProfile::Normal).session_id;
+            let mut catalog = seed.inner.catalog.lock().clone();
+            seed.shutdown().unwrap();
+            drop(seed);
+            let original = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+            for row in &mut catalog.sessions {
+                row.harness_session_id = Some(if row.session_id == second { original.to_uppercase() } else { original.into() });
+                if row.session_id == first {
+                    row.recovery = Some(RecoveryReference::resume_refused(Some(original.into()), "original failure evidence".into()));
+                }
+            }
+            let runtime = root.path().join("runtime");
+            persist_session_catalog(&runtime, &catalog).unwrap();
+            let before = fs::read(session_catalog_path(&runtime)).unwrap();
+            let supervisor = SupervisorHandle::new(test_supervisor_config(root.path())).unwrap();
+            supervisor.set_executable_resolver_for_tests(Arc::new(TestExecutableResolver));
+            let (pty, inputs) = recording_pty_session(std::process::id());
+            let (spawner, specs) = CapturingPtySpawner::new(vec![pty]);
+            supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+            assert_eq!(fs::read(session_catalog_path(&runtime)).unwrap(), before, "import never rewrites the original catalog");
+            for id in [first, second] {
+                let held = supervisor.start_session_by_id(id).unwrap_err();
+                assert!(held.downcast_ref::<session::RecoveryHold>().is_some());
+                let slots = supervisor.inner.slots.lock();
+                let slot = slots.get_by_id(id).unwrap();
+                assert!(!slot.snapshot().resume_available);
+                assert!(slot.snapshot().last_error.is_none());
+                assert_eq!(slot.recovery.as_ref().unwrap().provenance, "duplicate_catalog_identity");
+                assert_eq!(slot.recovery.as_ref().unwrap().original_id, slot.harness_session_id);
+            }
+            assert!(specs.lock().is_empty());
+            {
+                let slots = supervisor.inner.slots.lock();
+                assert!(slots.get_by_id(unrelated).unwrap().recovery.is_none(), "different harnesses own independent ID namespaces");
+                let history = &slots.get_by_id(first).unwrap().recovery_history;
+                assert_eq!(history.len(), 1);
+                assert_eq!(history[0].reason, "original failure evidence");
+            }
+            let saved = supervisor.inner.catalog.lock().clone();
+            let restored = SessionRegistry::from_catalog(&saved).unwrap();
+            assert_eq!(restored.get_by_id(first).unwrap().recovery_history.len(), 1, "reloading the same hold must not duplicate prior evidence");
+            let fresh = supervisor.start_session_by_id_with_mode(first, true).unwrap();
+            assert_eq!(fresh.recovery_history.len(), 2);
+            assert_eq!(fresh.recovery_history[0].reason, "original failure evidence");
+            assert_eq!(fresh.recovery_history[1].original_id.as_deref(), Some(original));
+            assert!(inputs.lock().is_empty());
+            supervisor.stop_session_by_id(first).unwrap();
+            supervisor.shutdown().unwrap();
+            drop(supervisor);
+            let rebooted = SupervisorHandle::new(test_supervisor_config(root.path())).unwrap();
+            let slots = rebooted.inner.slots.lock();
+            assert_eq!(slots.get_by_id(first).unwrap().recovery_history.len(), 2);
+            assert_eq!(slots.get_by_id(second).unwrap().harness_session_id.as_deref(), Some(original.to_uppercase().as_str()));
+            assert_eq!(slots.get_by_id(second).unwrap().recovery.as_ref().unwrap().provenance, "duplicate_catalog_identity");
+            assert!(!slots.get_by_id(second).unwrap().snapshot().resume_available, "Fresh on one owner must not assign the original conversation to the other");
+            assert_eq!(slots.get_by_id(first).unwrap().recovery_history[1].provenance, "duplicate_catalog_identity");
+        }
+    }
+
+    #[test]
+    fn s5_real_codex_launch_reports_identity_hold_separately_from_process_error() {
+        let root = tempfile::tempdir().unwrap();
+        let supervisor = test_supervisor_with_root(root.path().to_path_buf());
+        let (pty, _inputs) = recording_pty_session(std::process::id());
+        let (spawner, specs) = CapturingPtySpawner::new(vec![pty]);
+        supervisor.set_pty_spawner_for_tests(Arc::new(spawner));
+        let snapshot = start_test_session(&supervisor, "codex").unwrap();
+        assert!(!snapshot.resume_available);
+        assert!(snapshot.last_error.is_none());
+        assert!(snapshot.recovery.unwrap().reason.contains("identity is unresolved"));
+        let restart_error = supervisor.restart_session_by_id(snapshot.session_id).unwrap_err();
+        assert!(restart_error.to_string().contains("Stop this run"));
+        assert!(supervisor.inner.slots.lock().get_by_id(snapshot.session_id).unwrap().snapshot().last_error.is_none());
+        assert_eq!(specs.lock().len(), 1);
+        let catalog = read_session_catalog(&session_catalog_path(supervisor.runtime_dir())).unwrap();
+        let row = catalog
+            .sessions
+            .iter()
+            .find(|row| row.session_id == snapshot.session_id)
+            .unwrap();
+        assert!(row.harness_session_id.is_none());
+        assert_eq!(row.recovery.as_ref().unwrap().provenance, "codex_launch");
+        supervisor.shutdown().unwrap();
+    }
+
     fn diagnosis_slot(driver: DriverKind) -> SessionSlot {
-        closed_session_slot(SessionDefinition {
+        closed_session_slot(SessionDefinition { codex_transport: Default::default(),
             session_id: SessionId::new_v4(),
             alias: "session-diagnosis".into(),
             label: "Codex".into(),
@@ -25937,8 +34159,129 @@ mod tests {
         );
     }
 
+    /// v3 (Claude PRIM-1, f0dfecc walk 3): Claude's own refusal of a resume,
+    /// for exactly the resumed id, is named with its next step and marked.
     #[test]
-    fn codex_resume_refusal_is_named_and_the_dead_id_is_dropped() {
+    fn v3_claude_refusing_a_resume_it_has_no_conversation_for_is_named_and_marked() {
+        let id = "7a0b836e-1111-4222-8333-444455556666";
+        let mut slot = diagnosis_slot(DriverKind::Claude);
+        slot.run_resume_id = Some(id.into());
+        append_run_output_tail(&mut slot.run_output_tail, &format!("No conversation found with session ID: {id}\r\n"));
+        let diagnosis = diagnose_terminal_run(&slot, Some(&crash_exit_classification()));
+        assert!(diagnosis.needs_recovery);
+        assert_eq!(diagnosis.missing_conversation.as_deref(), Some(id));
+        let message = diagnosis.last_error.unwrap();
+        assert!(message.contains("no conversation") && message.contains("Start fresh session"), "{message}");
+        assert!(claude_has_no_conversation(&format!("No conversation found with session ID {id}"), id));
+        // The exact line Claude printed on candidate-f0dfecc (Claude PRIM-1, 7a0b836e).
+        let seen = "7a0b836e-3bfe-4efb-a083-b2d9062b5ef0";
+        assert!(claude_has_no_conversation(&format!("No conversation found with session ID: {seen}"), seen));
+        assert!(!claude_has_no_conversation(&format!("No conversation found with session ID: {id}0"), id), "a longer id");
+        assert!(!claude_has_no_conversation("No conversation found with session ID: 00000000-0000-4000-8000-000000000000", id));
+        assert!(!claude_has_no_conversation(&format!("resumed session {id}"), id));
+        let mut crash = diagnosis_slot(DriverKind::Claude);
+        crash.run_resume_id = Some(id.into());
+        append_run_output_tail(&mut crash.run_output_tail, "something else failed\r\n");
+        assert!(diagnose_terminal_run(&crash, Some(&crash_exit_classification())).missing_conversation.is_none());
+    }
+
+    /// v3 (Claude PRIM-1, f0dfecc walk 3): only a minted, never-used,
+    /// never-imported id starts fresh by itself, once. Claude PRIM-1 72a26ffe
+    /// (Reviewer b87359eb): a mark never survives a PRIM-1 restart, so after
+    /// one nothing starts fresh by itself and the refusal is named instead.
+    #[test]
+    fn v3_only_a_minted_never_used_never_imported_claude_id_starts_fresh_once_by_itself() {
+        let supervisor = test_supervisor();
+        let control = &supervisor.inner.identity_tracker;
+        let member = test_session_id(&supervisor, "claude");
+        let id = "7a0b836e-1111-4222-8333-444455556666";
+        let mut slot = diagnosis_slot(DriverKind::Claude);
+        slot.session_id = member;
+        assert!(!supervisor.claude_fresh_allowed(&slot, id), "an id PRIM-1 never minted");
+        control.note_minted_claude(member, id.into());
+        assert!(supervisor.claude_fresh_allowed(&slot, id));
+        let restarted = identity_tracker::TrackerControl::default();
+        assert!(!restarted.never_used_minted(member, id), "not across a restart");
+        assert!(!control.never_used_minted(member, "another-id"));
+        slot.recovery_history.push(RecoveryReference { original_id: Some(id.into()),
+            provenance: "room_import_in_use".into(), reason: "imported".into(), reported_codex: None });
+        assert!(!supervisor.claude_fresh_allowed(&slot, id), "an imported conversation");
+        slot.recovery_history.clear();
+        slot.claude_auto_fresh_attempted = true;
+        assert!(!supervisor.claude_fresh_allowed(&slot, id), "one attempt only");
+        slot.claude_auto_fresh_attempted = false;
+        control.revoke_minted_claude_conversation(member, Some("another-conversation"));
+        assert!(supervisor.claude_fresh_allowed(&slot, id), "use of another conversation is not use of this one");
+        control.revoke_minted_claude_conversation(member, Some(id));
+        assert!(!supervisor.claude_fresh_allowed(&slot, id), "used once");
+        assert!(!supervisor.inner.runtime_dir.join("claude-minted-v1.json").exists(), "nothing is saved");
+    }
+
+    #[test]
+    fn a_claude_below_its_minimum_version_exits_with_the_update_step_named() {
+        let mut slot = diagnosis_slot(DriverKind::Claude);
+        append_run_output_tail(
+            &mut slot.run_output_tail,
+            "\x1b[33mIt looks like your version of Claude Code (2.1.200) needs an update.\x1b[0m\r\nA newer version (2.1.300 or higher) is required to continue.\r\n\r\nTo update, please run:\r\n    claude update\r\n",
+        );
+        let diagnosis = diagnose_terminal_run(&slot, Some(&crash_exit_classification()));
+        let message = diagnosis.last_error.expect("a crash carries a message");
+        assert!(message.contains("older than the minimum version"), "{message}");
+        assert!(message.contains("Run claude update, then press Launch"), "{message}");
+        assert!(message.ends_with("[process exited with code 1]"), "{message}");
+        assert!(!diagnosis.needs_recovery);
+
+        // A work state that saw the notice keeps it through an Exited report.
+        let run_id = Uuid::new_v4();
+        transition_work_state_locked(
+            "claude",
+            &mut slot,
+            run_id,
+            WorkState::Blocked,
+            Some("version_required".into()),
+        );
+        transition_work_state_locked("claude", &mut slot, run_id, WorkState::Exited, None);
+        assert_eq!(slot.work_detail.as_deref(), Some("version_required"));
+        let (reason, action) =
+            describe_work_state_block(slot.work_state, slot.work_detail.as_deref());
+        assert!(reason.contains("minimum version"), "{reason}");
+        assert!(action.contains("claude update"), "{action}");
+        assert_eq!(
+            describe_work_state_block(WorkState::Exited, None).1,
+            "start it again from its tab"
+        );
+    }
+
+    #[test]
+    fn a_codex_without_no_daemon_is_named_with_its_version_and_the_update_step() {
+        const CLAP_REFUSAL: &str = "error: unexpected argument '--no-daemon' found\r\n\r\n  tip: to pass '--no-daemon' as a value, use '-- --no-daemon'\r\n\r\nUsage: codex [OPTIONS] [PROMPT]\r\n\r\nFor more information, try '--help'.\r\n";
+        let root = std::env::temp_dir();
+        let standalone = root
+            .join("releases")
+            .join("0.150.0-x86_64-pc-windows-msvc")
+            .join("bin")
+            .join("codex.exe");
+        let node = root.join("nodejs").join("node.exe");
+        for (program, named) in [
+            (Some(standalone.clone()), format!("Codex 0.150.0 ({})", standalone.display())),
+            (Some(node.clone()), format!("The Codex at {}", node.display())),
+            (None, "This Codex".to_string()),
+        ] {
+            let mut slot = diagnosis_slot(DriverKind::Codex);
+            slot.run_program = program;
+            slot.run_resume_id = Some("00000000-0000-4000-8000-000000000002".into());
+            append_run_output_tail(&mut slot.run_output_tail, CLAP_REFUSAL);
+            let diagnosis = diagnose_terminal_run(&slot, Some(&crash_exit_classification()));
+            let message = diagnosis.last_error.expect("a crash carries a message");
+            assert!(message.starts_with(&named), "{message}");
+            assert!(message.contains("does not accept --no-daemon"), "{message}");
+            assert!(message.contains("Update Codex (codex update"), "{message}");
+            assert!(!diagnosis.needs_recovery, "a refused flag is not a lost conversation");
+        }
+    }
+
+    #[test]
+    fn codex_resume_refusal_is_named_and_requires_explicit_recovery() {
         let mut slot = diagnosis_slot(DriverKind::Codex);
         slot.harness_session_id = Some("00000000-0000-4000-8000-000000000002".into());
         slot.run_resume_id = slot.harness_session_id.clone();
@@ -25957,14 +34300,14 @@ mod tests {
             "{message}"
         );
         assert!(
-            message.contains("right-click the tab → Start fresh session"),
+            message.contains("The original ID is retained. After stopping the run, choose Start fresh session"),
             "{message}"
         );
         assert!(
             message.ends_with("[process exited with code 1]"),
             "{message}"
         );
-        assert!(diagnosis.drop_harness_session_id);
+        assert!(diagnosis.needs_recovery);
     }
 
     #[test]
@@ -25976,7 +34319,7 @@ mod tests {
             "the docs say you cannot resume a closed thread\r\n",
         );
         let diagnosis = diagnose_terminal_run(&slot, Some(&crash_exit_classification()));
-        assert!(!diagnosis.drop_harness_session_id);
+        assert!(!diagnosis.needs_recovery);
         assert_eq!(
             diagnosis.last_error.as_deref(),
             Some(
@@ -25992,7 +34335,7 @@ mod tests {
         };
         let quiet = diagnose_terminal_run(&slot, Some(&requested));
         assert_eq!(quiet.last_error, None);
-        assert!(!quiet.drop_harness_session_id);
+        assert!(!quiet.needs_recovery);
     }
 
     #[test]
@@ -26023,63 +34366,6 @@ mod tests {
                 "Grok updated itself (now 1.0.24) and exited to be restarted — press Launch. [process exited with code 1]"
             )
         );
-        assert!(!updated.drop_harness_session_id);
-    }
-
-    #[test]
-    fn codex_rollout_capture_skips_sub_agent_threads_and_keeps_newest_root() {
-        let sessions = tempfile::tempdir().unwrap();
-        let day = sessions.path().join("2026").join("09").join("08");
-        fs::create_dir_all(&day).unwrap();
-        let cwd = r"C:\Users\dev\project";
-        let write = |name: &str, meta: serde_json::Value| {
-            let line = serde_json::json!({
-                "timestamp": "2026-09-08T10:29:31.000Z",
-                "type": "session_meta",
-                "payload": meta,
-            });
-            fs::write(day.join(name), format!("{line}\n")).unwrap();
-        };
-        let started = std::time::SystemTime::now() - Duration::from_secs(120);
-        write(
-            "rollout-2026-09-08T04-27-18-child.jsonl",
-            serde_json::json!({
-                "id": "child-thread",
-                "session_id": "root-thread",
-                "parent_thread_id": "root-thread",
-                "cwd": cwd,
-            }),
-        );
-        write(
-            "rollout-2026-09-08T10-29-31-agent.jsonl",
-            serde_json::json!({
-                "id": "agent-thread",
-                "thread_source": "subagent",
-                "cwd": cwd,
-            }),
-        );
-        write(
-            "rollout-2026-09-08T10-29-30-user.jsonl",
-            serde_json::json!({
-                "id": "user-thread",
-                "thread_source": "user",
-                "cwd": cwd,
-            }),
-        );
-
-        assert_eq!(
-            newest_codex_rollout_for_cwd(sessions.path(), cwd, started).as_deref(),
-            Some("user-thread"),
-            "child and sub-agent rollouts are never the pane's conversation"
-        );
-        assert!(codex_rollout_is_resumable_root(
-            &serde_json::json!({ "id": "x", "cwd": cwd })
-        ));
-        assert!(!codex_rollout_is_resumable_root(
-            &serde_json::json!({ "id": "x", "parent_thread_id": "p" })
-        ));
-        assert!(!codex_rollout_is_resumable_root(
-            &serde_json::json!({ "id": "x", "thread_source": "SubAgent" })
-        ));
+        assert!(!updated.needs_recovery);
     }
 }

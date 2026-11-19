@@ -343,6 +343,9 @@ button, input, select, textarea { font: inherit; }
 
 .topbar-status {
   flex: 1;
+  /* Room for the telemetry line's figures; its labels need 260px. */
+  min-width: 150px;
+  container-type: inline-size;
   display: flex;
   align-items: center;
   gap: 0.4rem;
@@ -627,7 +630,8 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
   user-select: none;
 }
 
-.state-pill[data-state="failed"] {
+.state-pill[data-state="failed"],
+.state-pill[data-state="blocked"] {
   color: var(--red);
   border-color: var(--red);
   text-shadow: 0 0 5px rgba(230, 41, 58, 0.5);
@@ -664,13 +668,15 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
   grid-template-rows: minmax(0, 1fr);
 }
 
-/* Views: sessions (terminals), rooms, settings, help — one occupies the middle row. */
+/* Views: sessions (terminals), rooms, tasks, settings, help, telemetry — one occupies the middle row. */
 .app-shell:not([data-view="sessions"]) .workspace-shell {
   display: none;
 }
 .rooms-view,
+.tasks-view,
 .settings-view,
-.help-view {
+.help-view,
+.telemetry-view {
   min-height: 0;
   display: grid;
   grid-template-rows: minmax(0, 1fr);
@@ -823,6 +829,492 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
   font-size: 11px;
 }
 
+/* Settings → Keys: action | your key | one column per harness */
+.keys-table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+}
+.keys-table {
+  border-collapse: collapse;
+  font-size: 11px;
+  line-height: 1.4;
+}
+.keys-table th,
+.keys-table td {
+  padding: 0.35rem 0.6rem;
+  border: 1px solid var(--frame-inner);
+  text-align: left;
+  vertical-align: top;
+}
+.keys-table thead th {
+  color: var(--copper-hot);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.keys-table tbody th {
+  color: var(--text-primary);
+  font-weight: 700;
+  white-space: nowrap;
+}
+.keys-table tbody th small,
+.keys-table td small {
+  display: block;
+  margin-top: 0.15rem;
+  color: var(--text-secondary);
+  font-weight: 400;
+  white-space: normal;
+}
+.keys-table td {
+  background: var(--bg-inset);
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+.keys-table td.keys-muted {
+  color: var(--text-secondary);
+  font-style: italic;
+}
+.keys-table .keys-bytes {
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 10px;
+}
+.key-chord {
+  padding: 0.2rem 0.55rem;
+  text-transform: none;
+  letter-spacing: 0;
+  white-space: nowrap;
+}
+.key-chord kbd {
+  pointer-events: none;
+}
+.key-chord[data-capturing="true"] {
+  --btn-color: var(--prim1);
+  --btn-glow: var(--prim1-glow);
+  font-size: 11px;
+}
+.keys-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-top: 0.5rem;
+}
+.keys-status {
+  min-height: 1.4em;
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.4;
+}
+.keys-status[data-tone="error"] {
+  color: var(--red-bright);
+}
+
+/* Settings → Task folder */
+.settings-facts dd.task-folder-state {
+  white-space: normal;
+}
+.settings-facts dd.task-folder-state[data-tone="error"] {
+  color: var(--red-bright);
+}
+.task-folder-form {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  max-width: 52rem;
+  margin-top: 0.6rem;
+}
+.task-folder-form input {
+  flex: 1;
+  min-width: 0;
+  font-family: "JetBrains Mono", Consolas, monospace;
+  letter-spacing: 0;
+}
+.task-folder-form button {
+  flex: 0 0 auto;
+}
+.task-folder-result {
+  min-height: 1.4em;
+  margin: 0.4rem 0 0;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.4;
+}
+.task-folder-result[data-tone="ok"] {
+  color: var(--text-primary);
+}
+.task-folder-result[data-tone="error"] {
+  color: var(--red-bright);
+}
+
+/* Tasks view: read-only list grouped by state | the chosen task. */
+.tasks-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.view-body.tasks-body {
+  max-width: none;
+  overflow: hidden;
+  align-content: stretch;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 0.6rem;
+}
+.tasks-top {
+  display: grid;
+  gap: 0.5rem;
+}
+.tasks-note {
+  margin: 0;
+}
+.tasks-folder {
+  margin-left: 0.6rem;
+  color: var(--text-tertiary);
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+.tasks-problem {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.5rem 0.7rem;
+  border: 1px solid var(--red);
+  background: var(--bg-inset);
+}
+.tasks-problem p {
+  flex: 1;
+  margin: 0;
+  color: var(--red-bright);
+  font-size: 12px;
+  line-height: 1.4;
+}
+.tasks-unreadable {
+  padding: 0.4rem 0.7rem;
+  border: 1px solid var(--frame-inner);
+  background: var(--bg-inset);
+  font-size: 12px;
+}
+.tasks-unreadable summary {
+  color: var(--copper-hot);
+  cursor: pointer;
+}
+/* A long list scrolls on its own, so the task area below always keeps its room. */
+.tasks-unreadable ul {
+  max-height: min(10rem, 25vh);
+  margin: 0.4rem 0;
+  padding-left: 1.2rem;
+  overflow-y: auto;
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+.tasks-unreadable-file {
+  font-family: "JetBrains Mono", Consolas, monospace;
+}
+.tasks-layout {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(18rem, 28rem) minmax(0, 1fr);
+  gap: 1rem;
+}
+.tasks-list,
+.tasks-detail {
+  min-height: 0;
+  overflow: auto;
+}
+.tasks-list {
+  display: grid;
+  align-content: start;
+  gap: 0.7rem;
+  padding-right: 0.3rem;
+}
+.tasks-group summary {
+  padding: 0.2rem 0;
+  color: var(--copper-hot);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.tasks-rows {
+  margin: 0.3rem 0 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 0.25rem;
+}
+.tasks-row {
+  width: 100%;
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 0.1rem 0.6rem;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--frame-inner);
+  background: var(--bg-panel);
+  color: var(--text-primary);
+  clip-path: none;
+  box-shadow: none;
+  text-shadow: none;
+  text-align: left;
+  text-transform: none;
+  letter-spacing: normal;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.tasks-row:hover {
+  border-color: var(--frame-soft);
+  background: var(--bg-hover);
+  box-shadow: none;
+}
+.tasks-row[aria-current="true"] {
+  border-color: var(--copper-hot);
+  box-shadow: inset 0 0 0 1px var(--copper-hot);
+}
+.tasks-row-id {
+  grid-row: 1 / span 2;
+  padding-top: 0.1rem;
+  color: var(--copper-hot);
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 10px;
+}
+.tasks-row-title,
+.tasks-row-meta {
+  grid-column: 2;
+  overflow-wrap: anywhere;
+}
+.tasks-row-meta {
+  color: var(--text-secondary);
+  font-size: 10px;
+}
+.tasks-pager {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.4rem;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+.tasks-pager button {
+  padding: 0.2rem 0.6rem;
+  font-size: 10px;
+}
+.tasks-status {
+  min-height: 1.4em;
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+.tasks-status[data-tone="error"],
+.tasks-list [data-tone="error"],
+.tasks-detail [data-tone="error"] {
+  color: var(--red-bright);
+}
+.tasks-detail {
+  padding: 0.1rem 0.4rem 0.6rem 0;
+}
+.task-detail-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.3rem 0.7rem;
+}
+.task-detail-head h3 {
+  flex: 1 1 16rem;
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 16px;
+  overflow-wrap: anywhere;
+}
+.task-detail-id {
+  color: var(--copper-hot);
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 11px;
+}
+.tasks-detail h4 {
+  margin: 0.9rem 0 0.35rem;
+  color: var(--copper-hot);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+/* The original request, verbatim: every line break and space, never cut. */
+.task-request {
+  margin: 0;
+  padding: 0.6rem 0.7rem;
+  border: 1px solid var(--frame-inner);
+  background: var(--bg-inset);
+  color: var(--text-primary);
+  font: 12px/1.5 "JetBrains Mono", Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.task-facts {
+  margin: 0.8rem 0 0;
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 0.35rem 1rem;
+  font-size: 12px;
+}
+.task-facts dt {
+  padding-top: 0.15rem;
+  color: var(--copper-hot);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.task-facts dd {
+  min-width: 0;
+  margin: 0;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.task-evidence {
+  margin: 0;
+  padding-left: 1.1rem;
+  white-space: normal;
+}
+.task-parent {
+  padding: 0.1rem 0.5rem;
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  text-transform: none;
+}
+.task-log {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 0.4rem;
+}
+.task-log li {
+  display: grid;
+  gap: 0.1rem;
+  padding: 0.3rem 0.6rem;
+  border-left: 2px solid var(--frame-inner);
+}
+.task-log-meta {
+  color: var(--text-secondary);
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 10px;
+}
+.task-log-what {
+  color: var(--text-primary);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.task-log-note {
+  color: var(--text-secondary);
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* Telemetry: the top-bar line and the page's table. */
+.telemetry-line {
+  --btn-color: var(--text-secondary);
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  padding: 0.2rem 0.55rem;
+  border-color: var(--frame-inner);
+  clip-path: none;
+  box-shadow: none;
+  text-shadow: none;
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  text-overflow: ellipsis;
+  text-transform: none;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.telemetry-line:hover {
+  --btn-color: var(--text-primary);
+  border-color: var(--copper-hot);
+  box-shadow: none;
+}
+.app-shell[data-view="telemetry"] .telemetry-line {
+  --btn-color: var(--prim1);
+  border-color: var(--frame);
+}
+.telemetry-line[data-state="error"] {
+  --btn-color: var(--red);
+}
+@container (max-width: 259px) {
+  .telemetry-label {
+    display: none;
+  }
+}
+.telemetry-table {
+  width: 100%;
+  max-width: 56rem;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.telemetry-table th,
+.telemetry-table td {
+  padding: 0.3rem 0.6rem;
+  border-bottom: 1px solid var(--frame-inner);
+  text-align: right;
+  white-space: nowrap;
+}
+.telemetry-table th:first-child,
+.telemetry-table td:first-child,
+.telemetry-table th:nth-child(2),
+.telemetry-table td:nth-child(2) {
+  text-align: left;
+}
+.telemetry-table thead th {
+  color: var(--copper-hot);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.telemetry-table tbody th,
+.telemetry-table tfoot th {
+  max-width: 18rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 600;
+}
+.telemetry-table td {
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+}
+.telemetry-table td:nth-child(2) {
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.telemetry-table tbody tr[data-kind="app"] th {
+  color: var(--text-secondary);
+}
+.telemetry-table tbody tr[data-kind="app"] + tr[data-kind="agent"] > * {
+  border-top: 1px solid var(--frame-soft);
+}
+.telemetry-table tfoot th,
+.telemetry-table tfoot td {
+  border-top: 1px solid var(--frame);
+  border-bottom: 0;
+  color: var(--prim1);
+  font-weight: 700;
+}
+.telemetry-foot {
+  margin: 0;
+}
+
 .workspace-shell {
   min-height: 0;
   display: grid;
@@ -861,6 +1353,9 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
   padding: 0;
   min-height: 30px;
   scrollbar-width: thin;
+  /* The default thin bar is a bright track across the dark title bar when
+     tabs overflow; keep the scroll affordance in the theme's frame colour. */
+  scrollbar-color: var(--frame-soft) transparent;
 }
 
 /* Compact, terminal-style tabs: harness monogram + label + state dot. Working
@@ -988,7 +1483,8 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
   box-shadow: 0 0 6px var(--bronze-glow);
 }
 .session-tab-badge[data-badge-kind="lifecycle"][data-badge-value="stalled"],
-.session-tab-badge[data-badge-kind="lifecycle"][data-badge-value="failed"] {
+.session-tab-badge[data-badge-kind="lifecycle"][data-badge-value="failed"],
+.session-tab-badge[data-badge-kind="lifecycle"][data-badge-value="blocked"] {
   background: var(--red);
   box-shadow: 0 0 6px rgba(230, 41, 58, 0.6);
 }
@@ -1162,6 +1658,36 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
   color: var(--prim1);
 }
 
+.session-launch-choices {
+  min-width: 0;
+  display: grid;
+  gap: 0.45rem;
+  margin: 0;
+  padding: 0.45rem 0.6rem 0.55rem;
+  border: 1px solid var(--frame);
+}
+
+.session-launch-choices[hidden] {
+  display: none;
+}
+
+.session-launch-choices legend {
+  padding-inline: 0.3rem;
+  color: var(--copper-hot);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.session-launch-choices legend small {
+  color: var(--text-tertiary);
+  font-size: 9px;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
 .session-form label,
 .session-path-field {
   min-width: 0;
@@ -1183,6 +1709,34 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
   font-size: 9px;
   letter-spacing: 0;
   text-transform: none;
+}
+
+.session-form label.session-grant {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45rem;
+  cursor: pointer;
+}
+
+.session-form label.session-grant > span {
+  color: var(--text-primary);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: normal;
+  text-transform: none;
+  line-height: 1.45;
+}
+
+.session-form label.session-grant small {
+  display: block;
+  font-size: 10px;
+  font-weight: 400;
+}
+
+.session-grant input {
+  width: auto;
+  margin: 0.15rem 0 0;
+  accent-color: var(--prim1);
 }
 
 .session-path-field {
@@ -1392,6 +1946,49 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
   margin-top: 0.35rem;
 }
 
+/* A108: the self-upgrade banner floats above the shell; it never takes a grid row. */
+.upgrade-banner {
+  position: fixed;
+  top: 3.6rem;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 60;
+  width: min(46rem, calc(100vw - 2rem));
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding: 0.7rem 0.9rem;
+  color: var(--copper-hot);
+  background: var(--terminal-session-bg);
+  border: 1px solid var(--copper-hot);
+  box-shadow: 0 0 18px color-mix(in srgb, var(--copper-hot) 30%, transparent);
+  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.upgrade-banner[hidden],
+.upgrade-banner [hidden] {
+  display: none;
+}
+
+.upgrade-banner strong,
+.upgrade-banner-countdown {
+  color: var(--prim1);
+}
+
+.upgrade-banner[data-stage="held"],
+.upgrade-banner[data-stage="failed"] {
+  border-color: var(--red);
+}
+
+.upgrade-banner-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin-top: 0.35rem;
+}
+
 .system-card { position: relative; }
 
 .room-card {
@@ -1446,7 +2043,8 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
 
 .room-create-form label > span,
 .room-create-form legend,
-.room-composer-label {
+.room-composer-label,
+.room-feed-label {
   color: var(--copper-hot);
   font-size: 10px;
   font-weight: 700;
@@ -1542,7 +2140,8 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
 
 .room-content {
   display: grid;
-  grid-template-rows: auto minmax(74px, 1fr) auto auto auto;
+  /* brief settings, resume note, members, feed head, feed, label, composer, actions */
+  grid-template-rows: auto auto auto auto minmax(74px, 1fr) auto auto auto;
   gap: 0.4rem;
 }
 
@@ -1561,27 +2160,6 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
   align-items: center;
   gap: 0.3rem;
   overflow-x: auto;
-}
-
-.room-member-chip {
-  flex: 0 0 auto;
-  display: inline-flex;
-  align-items: center;
-  border: 1px solid var(--frame);
-  color: var(--text-secondary);
-  font-family: "JetBrains Mono", Consolas, monospace;
-  font-size: 9px;
-}
-
-.room-member-chip > span {
-  padding: 0.3rem 0.45rem;
-}
-
-.room-member-remove {
-  min-width: 24px;
-  padding: 0.25rem;
-  border-width: 0 0 0 1px;
-  clip-path: none;
 }
 
 #room-add-member-select {
@@ -1608,12 +2186,31 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
 .room-feed-meta,
 .room-feed-empty,
 .room-feed-error,
+.room-feed-note,
 .room-status {
   margin: 0;
   color: var(--text-secondary);
   font-family: "JetBrains Mono", Consolas, monospace;
   font-size: 9px;
   line-height: 1.35;
+}
+
+.room-feed-actions {
+  margin-top: 0.25rem;
+  font: 9px/1.35 "JetBrains Mono", Consolas, monospace;
+  color: var(--text-secondary);
+}
+
+.room-feed-actions form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin-top: 0.25rem;
+}
+
+.room-feed-actions input[type="text"] {
+  flex: 1 1 12rem;
+  min-width: 0;
 }
 
 .room-feed-entry pre {
@@ -1631,6 +2228,173 @@ button.primary:active { background: color-mix(in srgb, var(--red) 22%, transpare
 
 .room-status[data-level="warn"] {
   color: var(--copper-hot);
+}
+
+/* ── Readable feed: one card per message in a reading font, 16 / 24 px.
+   Colours derive from the current theme's tokens; failures stay visible. ── */
+.room-feed[data-view="readable"] {
+  --readable-ink: color-mix(in srgb, var(--text-primary) 90%, var(--bg-inset));
+  --readable-card: color-mix(in srgb, var(--text-primary) 4%, var(--bg-inset));
+  --readable-edge: color-mix(in srgb, var(--text-primary) 14%, var(--bg-inset));
+  --readable-warn: color-mix(in srgb, var(--amber) 55%, var(--text-primary));
+  padding: 0.75rem;
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  font-weight: 400;
+}
+
+.room-feed[data-view="readable"] > * + * {
+  margin-top: 0.6rem;
+}
+
+.room-feed[data-view="readable"] > .room-feed-error {
+  font: 14px/20px "Segoe UI", system-ui, sans-serif;
+}
+
+.room-readable-card {
+  padding: 0.6rem 0.9rem 0.75rem;
+  border: 1px solid var(--readable-edge);
+  border-left-width: 3px;
+  background: var(--readable-card);
+}
+
+.room-readable-card[data-author="you"] {
+  border-left-color: var(--prim1);
+}
+
+/* PRIM-1's own posts carry a cue no member card can get, whatever its label. */
+.room-readable-card[data-author="prim1"] {
+  border-style: dashed;
+  border-left-style: solid;
+  border-left-color: var(--copper-hot);
+}
+
+/* An invited outside agent: its own edge colour and a Guest badge, whatever its name. */
+.room-readable-card[data-author="guest"] {
+  border-style: dashed;
+  border-left-style: solid;
+  border-left-color: var(--bronze);
+}
+
+.room-readable-system.room-readable-guest {
+  border-color: var(--bronze-dim);
+  color: var(--bronze);
+}
+
+.room-readable-system {
+  padding: 0 0.4rem;
+  border: 1px solid var(--readable-edge);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 16px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.room-readable-meta,
+.room-readable-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.15rem 0.6rem;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.room-readable-note {
+  margin: 0;
+  padding: 0 0.25rem;
+}
+
+.room-readable-sender {
+  color: var(--readable-ink);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.room-readable-time {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+
+.room-readable-body {
+  margin-top: 0.3rem;
+  color: var(--readable-ink);
+  font-size: 16px;
+  line-height: 24px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+button.room-readable-more {
+  --btn-color: var(--text-secondary);
+  margin-top: 0.3rem;
+  padding: 0;
+  border: 0;
+  background: none;
+  box-shadow: none;
+  clip-path: none;
+  text-shadow: none;
+  color: var(--text-secondary);
+  font: 600 13px/20px "Segoe UI", system-ui, sans-serif;
+  letter-spacing: normal;
+  text-transform: none;
+  cursor: pointer;
+}
+
+button.room-readable-more:hover {
+  background: none;
+  box-shadow: none;
+  color: var(--readable-ink);
+  text-decoration: underline;
+}
+
+/* v3 W6: one quiet line of per-recipient state under the message. */
+.room-readable-states {
+  margin-top: 0.45rem;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 18px;
+  overflow-wrap: anywhere;
+}
+
+.room-readable-problem {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem 0.7rem;
+  margin-top: 0.55rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--readable-edge);
+  color: var(--readable-warn);
+  font-size: 14px;
+  line-height: 20px;
+}
+
+.room-readable-problem[data-level="error"] {
+  color: var(--red-bright);
+}
+
+.room-readable-problem > span::before {
+  content: "\26A0\FE0E";
+  margin-right: 0.4rem;
+}
+
+/* A problem whose message left the window stands alone, framed like a card. */
+.room-feed[data-view="readable"] > .room-readable-problem {
+  padding: 0.5rem 0.9rem;
+  border: 1px solid var(--readable-edge);
+}
+
+.room-readable-problem .room-feed-error {
+  color: var(--text-secondary);
+  font: inherit;
+}
+
+.room-readable-problem button {
+  padding: 0.15rem 0.65rem;
+  font-size: 11px;
 }
 
 .room-composer-label {
@@ -2746,15 +3510,20 @@ textarea:focus-visible {
 }
 .rooms-view .room-content {
   grid-template-columns: minmax(0, 1fr) minmax(260px, 340px);
-  grid-template-rows: minmax(0, 1fr) auto auto auto auto;
+  grid-template-rows: auto minmax(96px, 1fr) auto auto auto auto auto auto;
   grid-template-areas:
+    "note members"
     "feed members"
     "label members"
     "composer members"
     "actions members"
-    "status members";
+    "status members"
+    "history members"
+    "brief members";
   column-gap: 0.8rem;
 }
+.rooms-view #room-resume-note { grid-area: note; }
+.rooms-view #room-brief-settings { grid-area: brief; }
 .rooms-view #room-feed { grid-area: feed; }
 .rooms-view .room-composer-label { grid-area: label; }
 .rooms-view #room-message { grid-area: composer; }
@@ -2770,21 +3539,72 @@ textarea:focus-visible {
   border: 1px solid var(--frame-inner);
   background: var(--bg-inset);
 }
-.rooms-view .room-members-row::before {
-  content: "Members";
-  color: var(--copper-hot);
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
+.rooms-view .room-content[data-members="closed"] {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+.rooms-view .room-content[data-members="closed"] .room-members-row {
+  display: none;
+}
+/* PRIM-1's fixed corner button (64 px at right/bottom 24 px) sits over the
+   panel's foot; keep "Add member" above it. */
+.rooms-view .room-members-row {
+  padding-bottom: 84px;
+}
+/* The task detail column runs to the window's right edge, so at the end of
+   a long history its last lines would scroll under the same button; give the
+   scroll area the same foot clearance. The list column stays left of it. */
+.tasks-detail {
+  padding-bottom: 84px;
+}
+/* The same 64 px button (inset 24 px) over the right end of the bottom rows:
+   Create-room's right-aligned Cancel, and, with Members closed, the composer
+   actions, status, history notice and brief. */
+.rooms-view .room-form-actions {
+  padding-inline-end: 88px;
+}
+.rooms-view .room-content[data-members="closed"] :is(.room-composer-actions, #room-status, #room-history-replay, #room-brief-settings) {
+  padding-inline-end: 88px;
 }
 .rooms-view .room-members {
-  flex: 1 1 auto;
+  flex: 0 0 auto;
   flex-wrap: wrap;
   align-items: flex-start;
   align-content: flex-start;
-  overflow: auto;
+  overflow: visible;
 }
+.room-side-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  scrollbar-gutter: stable;
+}
+.room-side-section { min-width: 0; border-top: 1px solid var(--frame-inner); }
+.room-side-section > summary {
+  cursor: pointer;
+  padding: 0.55rem 0;
+  color: var(--text-primary);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.room-side-section-body { display: flex; flex-direction: column; gap: 0.5rem; padding-bottom: 0.65rem; }
+.room-fallback-editor label { display: flex; flex-direction: column; align-items: stretch; gap: 0.25rem; font-size: 11px; }
+.room-fallback-editor label:has(input[type="checkbox"]) { flex-direction: row-reverse; align-items: center; justify-content: flex-end; gap: 0.4rem; }
+.room-fallback-editor :is(select, textarea) { width: 100%; min-width: 0; box-sizing: border-box; }
+.room-fallback-editor textarea { resize: vertical; }
+.room-fallback-member { border-top: 1px solid var(--frame-inner); padding: 0.4rem 0; min-width: 0; }
+.room-fallback-member > summary { cursor: pointer; font-size: 11px; overflow-wrap: anywhere; }
+.room-fallback-member > :not(summary) { margin-top: 0.45rem; }
+.room-fallback-custom { display: flex; flex-direction: column; gap: 0.45rem; }
+.room-fallback-custom[hidden], .room-fallback-member label[hidden] { display: none; }
+.room-fallback-actions { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+.room-fallback-help, .room-fallback-status, .room-fallback-unavailable p {
+  margin: 0;
+  font-size: 10px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+.room-fallback-status[data-level="error"] { color: var(--text-primary); }
 .rooms-view #room-add-member-select { max-width: none; }
 .rooms-view .room-empty { min-height: 200px; }
 .rooms-view .room-create-form { align-content: start; }
@@ -2876,6 +3696,12 @@ textarea:focus-visible {
   gap: 0.9rem;
   padding: 0.9rem 0.4rem;
   align-content: start;
+}
+
+/* A failed Load room… line lines up with the cards above it. */
+#rooms-load-problem {
+  padding: 0 0.4rem 0.9rem;
+  overflow-wrap: anywhere;
 }
 
 .rooms-overview-card {
@@ -3001,17 +3827,299 @@ textarea:focus-visible {
   display: none;
 }
 
-.room-member-chip > .readiness-dot {
+/* ── Members side panel (Victor, room 117: the one kept visual improvement) ── */
+.room-members-head {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--copper-hot);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.room-members-count {
+  color: var(--text-tertiary);
+}
+.room-members-close {
+  margin-left: auto;
+  min-width: 26px;
+  padding: 0.1rem 0.4rem;
+  font-size: 12px;
+  letter-spacing: 0;
+}
+.room-member-card {
+  width: 100%;
+  display: grid;
+  gap: 0.22rem;
+  padding: 0.45rem 0.5rem 0.5rem;
+  border: 1px solid var(--frame-inner);
+  background: var(--bg-panel);
+}
+.room-member-who {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.room-member-tag {
+  flex: 0 0 auto;
+  padding: 0.12rem 0.25rem;
+  border: 1px solid var(--frame-soft);
+  color: var(--text-secondary);
+  font: 700 9px/1 "JetBrains Mono", Consolas, monospace;
+}
+.room-member-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+}
+.room-member-id {
+  margin-left: auto;
+  color: var(--text-tertiary);
+  font: 9px "JetBrains Mono", Consolas, monospace;
+}
+.room-member-state {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--text-primary);
+  font-size: 12px;
+}
+.room-member-state > [data-readiness-text] {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.room-member-dot {
+  flex: 0 0 auto;
   padding: 0;
-  margin-left: 0.45rem;
+}
+.room-member-usage {
+  margin: 0;
+  min-height: 1.3em;
+  color: var(--text-secondary);
+  font: 9px/1.4 "JetBrains Mono", Consolas, monospace;
+}
+.room-member-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin-top: 0.1rem;
+}
+.room-member-actions button {
+  padding: 0.2rem 0.55rem;
+  font-size: 10px;
+}
+.room-members-reopen {
+  grid-area: members;
+  align-self: start;
+  writing-mode: vertical-rl;
+  padding: 0.6rem 0.3rem;
+  font-size: 10px;
 }
 
-.room-member-brief {
+/* Outside agents sit under the members in the same card language, dashed:
+   a guest is never a member. */
+.room-guests,
+.room-guest-list {
   min-width: 0;
-  padding: 0.25rem 0.4rem;
-  border-width: 0 0 0 1px;
-  clip-path: none;
-  font-size: 9px;
+  display: grid;
+  gap: 0.3rem;
+}
+.room-guest-card {
+  border-style: dashed;
+}
+.room-guest-card .room-member-state {
+  color: var(--text-secondary);
+}
+
+/* The invitation is the native modal dialog, in PRIM-1's tokens. */
+.guest-invite-dialog {
+  width: min(640px, calc(100vw - 4rem));
+  padding: 1rem 1.1rem;
+  border: 1px solid var(--frame-soft);
+  background: var(--bg-panel);
+  color: var(--text-primary);
+}
+.guest-invite-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.6);
+}
+.guest-invite-dialog h3 {
+  margin: 0 0 0.6rem;
+  font-size: 15px;
+}
+.guest-invite-form,
+.guest-invite-result,
+.guest-invite-cli {
+  display: grid;
+  gap: 0.5rem;
+}
+.guest-invite-form label {
+  display: grid;
+  gap: 0.25rem;
+}
+.guest-invite-note {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.4;
+}
+.guest-invite-dialog textarea {
+  width: 100%;
+  resize: vertical;
+  border: 1px solid var(--frame-inner);
+  background: var(--bg-inset);
+  color: var(--text-primary);
+  font: 12px/1.4 "JetBrains Mono", Consolas, monospace;
+}
+.guest-invite-cli summary {
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+/* Functional safeguards kept from the withdrawn design layer (Codex review
+   165), in PRIM-1's own tokens: room placement, bounded expanders, the held
+   trial label and the effect pause. None of these changes the public look. */
+.rooms-view #room-history-replay { grid-area: history; }
+/* Several open expanders at the 1280×780 minimum scroll the room instead of
+   collapsing the feed below its 96 px floor. */
+.rooms-view .room-content { overflow: auto; }
+.rooms-view .room-brief-settings[open] {
+  max-block-size: min(160px, 20vh);
+  overflow: auto;
+}
+.rooms-view #room-brief-text {
+  block-size: min(96px, 12vh);
+  min-block-size: 64px;
+  max-block-size: min(128px, 16vh);
+  resize: vertical;
+}
+#room-status-detail-text {
+  max-block-size: min(96px, 12vh);
+  overflow: auto;
+  overflow-wrap: anywhere;
+}
+.trial-hold {
+  color: var(--text-primary);
+  font-size: 12px;
+  line-height: 1.35;
+  white-space: normal;
+  text-align: right;
+}
+/* Keep the effects, but stop background work while hidden or under reduced
+   motion (syncThemeEffects sets data-theme-effects and pauses the SVG). */
+:root[data-theme-effects="paused"] body::after,
+:root[data-theme-effects="paused"] .topbar::before,
+:root[data-theme-effects="paused"] .topbar h1::after,
+:root[data-theme-effects="paused"] :is(.panel, .prim1-ticker-track, .theme-toggle, .corner-button, .corner-button-particles > span) {
+  animation-play-state: paused !important;
+}
+:root[data-theme-effects="paused"] :is(.topbar h1, .terminal-card .card-head h2, .corner-button-glyph) { filter: none !important; }
+@media (prefers-reduced-motion: reduce) {
+  .panel { animation: none !important; }
+  .corner-button, .corner-button-particles { animation: none !important; transition: none !important; }
+  .corner-button-particles, .topbar h1::after { display: none !important; }
+}
+
+/* Delivery details: one inline disclosure on PRIM-1's mono status line. */
+#room-status-details {
+  display: inline;
+  margin-left: 0.4rem;
+}
+#room-status-details > summary {
+  display: inline;
+  cursor: pointer;
+  color: var(--copper-hot);
+}
+#room-status-detail-text {
+  margin: 0.25rem 0 0;
+  white-space: pre-wrap;
+}
+#room-status-details[open] {
+  display: block;
+}
+
+/* Room brief settings for an existing room (S5). */
+.room-brief-settings {
+  margin-bottom: 0.45rem;
+  border: 1px solid var(--frame);
+  padding: 0.3rem 0.55rem;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.room-brief-settings > summary {
+  cursor: pointer;
+  color: var(--text-primary, inherit);
+}
+
+.room-brief-settings textarea {
+  width: 100%;
+  margin-top: 0.4rem;
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 11px;
+}
+
+.room-brief-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin-top: 0.4rem;
+}
+
+.room-brief-state {
+  margin-left: auto;
+}
+
+/* Resume on restart: the room's explicit choice (PLAN §5-3). */
+.room-resume-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding-inline: 0.45rem;
+  color: var(--text-secondary);
+  font-size: 11px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.room-resume-toggle[hidden] {
+  display: none;
+}
+
+.room-resume-toggle input {
+  width: auto;
+  margin: 0;
+  accent-color: var(--prim1);
+}
+
+.room-resume-note {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 0.45rem;
+  padding: 0.35rem 0.55rem;
+  border: 1px solid var(--frame);
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.room-resume-note[hidden] {
+  display: none;
+}
+
+.room-resume-note button {
+  margin-left: auto;
+  padding: 0.2rem 0.55rem;
 }
 
 .room-member-choices-empty {
@@ -3020,3 +4128,12 @@ textarea:focus-visible {
   color: var(--text-secondary);
   font-size: 11px;
 }
+
+.local-conversations summary { cursor: pointer; }
+#local-conversations-results { overflow-wrap: anywhere; }
+#local-conversations-results > details { margin-block: 0.8rem; }
+#local-conversations-results li { margin-block: 0.5rem; }
+#local-conversations-results p { margin-block: 0.4rem; }
+.local-conversation-attach { display: flex; flex-wrap: wrap; align-items: end; gap: 0.5rem; margin-block: 0.6rem; }
+.local-conversation-attach label { display: grid; gap: 0.3rem; flex: 1 1 15rem; min-width: 0; max-width: 32rem; }
+.local-conversation-attach select { width: 100%; min-width: 0; }

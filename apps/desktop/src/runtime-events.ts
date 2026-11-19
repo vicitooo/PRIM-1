@@ -11,7 +11,8 @@
  * live DOM + supervisor; tests construct a mock ctx with spy functions.
  */
 
-import type { RuntimeEvent, SessionSnapshot } from "./types";
+import type { OutputCredit, RuntimeEvent, SessionSnapshot, UpgradeStatus, WorkState } from "./types";
+import type { OutputDisposition } from "./output-credit";
 
 /** Pane bytes buffered while the pane is not attached yet (the boot window
     between event subscription and terminal construction). Byte-bounded, not
@@ -30,6 +31,7 @@ const SESSION_CATALOG_EVENT_SCHEMA_VERSION = 1;
 
 export interface PendingBuffer {
   chunks: string[];
+  credits?: (OutputCredit | undefined)[];
   bytes: number;
   /** Times the entire buffer was shed on byte-cap overflow. Non-zero means
       the accumulated stream is missing its head: the flush must discard it
@@ -71,13 +73,17 @@ export interface RuntimeEventContext {
   pendingOutput: Map<string, PendingBuffer>;
   runEventGate: RunEventGateState;
   /** Returns true if a pane exists for `sessionId` and the chunk was written. */
-  writeToPane: (sessionId: string, chunk: string) => boolean;
+  writeToPane: (sessionId: string, chunk: string, onParsed?: () => void) => boolean;
+  admitOutput?: (credit: OutputCredit) => boolean;
+  settleOutput?: (credit: OutputCredit, disposition: OutputDisposition) => void;
   applyPaneSnapshot: (sessionId: string, snapshot: SessionSnapshot) => void;
   setControlEndpoint: (endpoint: string) => void;
   handleRoomEvent?: (event: RoomRuntimeEvent) => void;
   /** The UI bridge shed display bytes for this session: force a full
       harness repaint so the diff-painted terminal heals. */
   requestRepaintResync?: (sessionId: string) => void;
+  /** A108: the self-upgrade banner. */
+  showUpgradeStatus?: (status: UpgradeStatus | null) => void;
 }
 
 export type RoomRuntimeEvent = Extract<
@@ -90,6 +96,9 @@ export type RoomRuntimeEvent = Extract<
       | "room_member_added"
       | "room_member_removed"
       | "room_deleted"
+      | "room_history_changed"
+      | "room_guests_changed"
+      | "room_fallbacks_changed"
       | "room_feed_event";
   }
 >;
@@ -99,6 +108,7 @@ export type RunDerivedRuntimeEvent = Extract<
   {
     event:
       | "session_state"
+      | "session_output_draining"
       | "session_output"
       | "session_exit"
       | "session_work_state";
@@ -352,6 +362,7 @@ function isRunDerivedRuntimeEvent(
 ): event is RunDerivedRuntimeEvent {
   return (
     event.event === "session_state" ||
+    event.event === "session_output_draining" ||
     event.event === "session_output" ||
     event.event === "session_exit" ||
     event.event === "session_work_state"
@@ -493,6 +504,7 @@ function acceptRunDerivedEvent(
     ...current,
     generation: event.identity.generation,
     run_id: event.identity.run_id,
+    output_draining: sameGeneration ? current.output_draining : false,
     run_event_sequence: sameGeneration
       ? Math.max(current.run_event_sequence, event.identity.sequence)
       : event.identity.sequence,
@@ -576,7 +588,13 @@ function queueBootstrapRunEvent(
 ): void {
   const gate = ctx.runEventGate;
   if (gate.queued.length === MAX_BOOTSTRAP_RUN_EVENTS) {
-    gate.queued.shift();
+    // At most 256 charged producer items exist across the whole app. Preserve
+    // every one in this 512-event boot window; only the pre-existing bounded
+    // control/legacy policy may evict an event, never admitted display bytes.
+    const disposable = gate.queued.findIndex((queued) =>
+      queued.event !== "session_output" || !queued.output_credit);
+    if (disposable < 0) throw new Error("credited bootstrap output exceeds backend admission bound");
+    gate.queued.splice(disposable, 1);
     gate.dropped += 1;
     if (gate.dropped === 1 || gate.dropped % 64 === 0) {
       ctx.writeSystem(
@@ -598,7 +616,7 @@ export function completeInitialRunEventReconciliation(
   ctx.runEventGate.initialized = true;
   const queued = ctx.runEventGate.queued.splice(0);
   for (const event of queued) {
-    handleRuntimeEvent(event, ctx);
+    handleRuntimeEvent(event, ctx, true);
   }
 }
 
@@ -629,10 +647,23 @@ function flushContentAdoptionWarnings(ctx: RuntimeEventContext): void {
   );
 }
 
+/** The work states a member's `blocked_reason` names. */
+/** A16 D5: thinking or a tool call; the readiness dot says Working. */
+function worksActively(state: WorkState | null | undefined): boolean {
+  return state === "thinking" || state === "tool_call";
+}
+
+function waitsOnPerson(state: WorkState): boolean {
+  return state === "blocked" || state === "error_loop";
+}
+
 export function handleRuntimeEvent(
   event: RuntimeEvent,
   ctx: RuntimeEventContext,
+  bootstrapReplay = false,
 ): void {
+  if (!bootstrapReplay && event.event === "session_output" && event.output_credit
+    && ctx.admitOutput && !ctx.admitOutput(event.output_credit)) return;
   if (isRunDerivedRuntimeEvent(event)) {
     if (!ctx.runEventGate.initialized) {
       queueBootstrapRunEvent(event, ctx);
@@ -646,6 +677,9 @@ export function handleRuntimeEvent(
     flushRunEventGateWarnings(ctx);
     flushContentAdoptionWarnings(ctx);
     if (!accepted) {
+      if (event.event === "session_output" && event.output_credit) {
+        ctx.settleOutput?.(event.output_credit, "stale_run");
+      }
       return;
     }
   }
@@ -653,7 +687,15 @@ export function handleRuntimeEvent(
   switch (event.event) {
     case "session_output": {
       const sessionId = event.identity.session_id;
-      if (ctx.writeToPane(sessionId, event.chunk)) {
+      const onParsed = event.output_credit
+        ? () => ctx.settleOutput?.(event.output_credit!, "parsed") : undefined;
+      try {
+        if (onParsed ? ctx.writeToPane(sessionId, event.chunk, onParsed)
+          : ctx.writeToPane(sessionId, event.chunk)) break;
+      } catch (error) {
+        if (event.output_credit) ctx.settleOutput?.(event.output_credit, "write_failed");
+        ctx.writeSystem("error", `Terminal output was not parsed: ${String(error)}; display is incomplete.`);
+        ctx.requestRepaintResync?.(sessionId);
         break;
       }
 
@@ -667,11 +709,17 @@ export function handleRuntimeEvent(
         );
       }
 
+      if (event.output_credit && !entry.credits) entry.credits = entry.chunks.map(() => undefined);
+      entry.credits?.push(event.output_credit);
       entry.chunks.push(event.chunk);
       entry.bytes += event.chunk.length;
       if (entry.bytes > MAX_PENDING_BYTES_PER_SESSION) {
         // Never keep a headless tail of a TUI paint stream: shed everything
         // and let the attach-time flush trigger a full-repaint resync.
+        for (const credit of entry.credits ?? []) {
+          if (credit) ctx.settleOutput?.(credit, "unattached_overflow");
+        }
+        delete entry.credits;
         entry.chunks = [];
         entry.bytes = 0;
         entry.shed += 1;
@@ -680,6 +728,16 @@ export function handleRuntimeEvent(
           `session_output buffer overflow: ${event.session} shed the entire buffered stream (${entry.shed}×); full repaint scheduled on attach`,
         );
       }
+      break;
+    }
+    case "session_output_draining": {
+      const previous = ctx.snapshotById.get(event.identity.session_id);
+      if (previous) {
+        const next = { ...previous, output_draining: true };
+        ctx.snapshotById.set(previous.session_id, next);
+        ctx.applyPaneSnapshot(previous.session_id, next);
+      }
+      ctx.writeSystem("info", `${event.session}: process ended; draining terminal output. Input is closed. Stop discards any remaining output; a descendant may keep the pipe open.`);
       break;
     }
     case "ui_output_gap": {
@@ -696,6 +754,16 @@ export function handleRuntimeEvent(
           ...previous,
           lifecycle_state: event.state,
           running: event.state !== "closed" && event.state !== "failed",
+          output_draining: event.state === "closed" || event.state === "failed" || event.state === "starting"
+            ? false : previous.output_draining,
+          // A new or ended run has no question on screen yet.
+          blocked_reason: event.state === "closed" || event.state === "failed" || event.state === "starting"
+            ? null : previous.blocked_reason,
+          // Nor an observed work state.
+          work_state: event.state === "closed" || event.state === "failed" || event.state === "starting"
+            ? null : previous.work_state,
+          work_state_from_record: event.state === "closed" || event.state === "failed" || event.state === "starting"
+            ? false : previous.work_state_from_record,
           last_activity_at: event.timestamp,
           last_error:
             event.state === "failed" ? event.reason : previous.last_error,
@@ -709,6 +777,11 @@ export function handleRuntimeEvent(
         "info",
         `${event.session} -> ${event.state} (${event.reason})`,
       );
+      if (event.state === "starting" || event.state === "restarting" || event.state === "closed" || event.state === "failed") {
+        // Lifecycle events carry no hibernation/hold metadata. Read native state;
+        // never infer wake eligibility from a stopped process or the reason text.
+        ctx.refreshSnapshotFromEvent();
+      }
       break;
     }
     case "session_exit": {
@@ -723,22 +796,54 @@ export function handleRuntimeEvent(
           run_id: null,
           process_id: null,
           running: false,
+          output_draining: false,
+          blocked_reason: null,
+          work_state: null,
+          work_state_from_record: false,
+          was_running_at_shutdown: false,
           last_activity_at: event.timestamp,
           last_error: lastError,
           last_error_kind: null,
         };
         ctx.snapshotById.set(sessionId, next);
         ctx.applyPaneSnapshot(sessionId, next);
+        // Holds and hibernation are native metadata absent from this event.
+        // Re-read even an ordinary exit: it may have completed idle hibernation.
+        ctx.refreshSnapshotFromEvent();
       }
       break;
     }
-    case "session_work_state":
+    case "session_work_state": {
+      // A16 D5: the card, tab and dots say Working while a ready member thinks
+      // or runs a tool. Repaint only when that changes; keep the field current.
+      const sessionId = event.identity.session_id;
+      const previous = ctx.snapshotById.get(sessionId);
+      // v3 W2: a quiet screen does not end a turn the member's own record shows
+      // open; session_presentation_changed re-reads the snapshot when it closes.
+      const keepsRecord = previous?.work_state_from_record === true && event.state === "idle";
+      if (previous && !keepsRecord && previous.run_id === event.identity.run_id && previous.work_state !== event.state) {
+        const next: SessionSnapshot = { ...previous, work_state: event.state, work_state_from_record: false };
+        ctx.snapshotById.set(sessionId, next);
+        if (worksActively(previous.work_state) !== worksActively(event.state)) {
+          ctx.applyPaneSnapshot(sessionId, next);
+        }
+      }
       if (event.state === "blocked" || event.state === "error_loop") {
         ctx.writeSystem(
           event.state === "error_loop" ? "error" : "warn",
           `${event.session} work state: ${event.state}${event.detail ? ` (${event.detail})` : ""}`,
         );
       }
+      // Entering or leaving a question changes what the member card and the
+      // pane header say; the snapshot carries the operator line for it.
+      if (waitsOnPerson(event.state) || (event.previous_state !== null && waitsOnPerson(event.previous_state))) {
+        ctx.refreshSnapshotFromEvent();
+      }
+      break;
+    }
+    case "session_presentation_changed":
+      // v3: the snapshot presents something new (an expired notice, a provider error).
+      if (ctx.snapshotById.get(event.session_id)?.run_id === event.run_id) ctx.refreshSnapshotFromEvent();
       break;
     case "supervisor_heartbeat":
       break;
@@ -785,6 +890,16 @@ export function handleRuntimeEvent(
       );
       ctx.refreshSnapshotFromEvent();
       break;
+    case "session_member_permissions_changed":
+      if (!acceptSessionCatalogEventVersion(event.schema_version, ctx)) {
+        break;
+      }
+      ctx.writeSystem(
+        "info",
+        `member grants changed: ${event.session_id.slice(0, 8)} (roam ${event.new_permissions.roam ? "on" : "off"}, upgrade ${event.new_permissions.maintain ? "on" : "off"}, manage ${event.new_permissions.manage ? "on" : "off"})`,
+      );
+      ctx.refreshSnapshotFromEvent();
+      break;
     case "session_working_directory_changed":
       if (!acceptSessionCatalogEventVersion(event.schema_version, ctx)) {
         break;
@@ -811,6 +926,9 @@ export function handleRuntimeEvent(
     case "room_member_added":
     case "room_member_removed":
     case "room_deleted":
+    case "room_history_changed":
+    case "room_guests_changed":
+    case "room_fallbacks_changed":
     case "room_feed_event":
       if (ctx.handleRoomEvent) {
         ctx.handleRoomEvent(event);
@@ -866,6 +984,12 @@ export function handleRuntimeEvent(
     case "control_plane_ready":
       ctx.setControlEndpoint(event.endpoint);
       ctx.writeSystem("info", `control plane ready: ${event.endpoint}`);
+      break;
+    case "upgrade_status_changed":
+      if (event.status && ["cancelled", "resumed", "failed", "held"].includes(event.status.stage)) {
+        ctx.writeSystem(event.status.stage === "resumed" || event.status.stage === "cancelled" ? "info" : "warn", event.status.message);
+      }
+      ctx.showUpgradeStatus?.(event.status);
       break;
     default: {
       const _exhaustive: never = event;

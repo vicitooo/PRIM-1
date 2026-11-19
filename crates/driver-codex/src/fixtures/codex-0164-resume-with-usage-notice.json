@@ -1,0 +1,904 @@
+{
+"source": "cx-resume-01",
+"harness": "codex-0.164",
+"cols": 120,
+"rows": 40,
+"chunks": [
+{
+"t": 0.038,
+"data": "\u001b[1t"
+},
+{
+"t": 0.039,
+"data": "\u001b[c\u001b[?1004h\u001b[?9001h"
+},
+{
+"t": 0.11,
+"data": "\u001b[?2004h"
+},
+{
+"t": 0.111,
+"data": "\u001b[?1004l\u001b[?1004h"
+},
+{
+"t": 0.114,
+"data": "\u001b[?2026h\u001b[?2026h\u001b[1;1H"
+},
+{
+"t": 0.116,
+"data": "\u001b[J"
+},
+{
+"t": 0.118,
+"data": "\u001b[?25l"
+},
+{
+"t": 0.119,
+"data": "\u001b[1;2H\u001b[0m\u001b[49m\u001b[K\u001b[2;29H\u001b[0m\u001b[49m\u001b[K\u001b[3;13H\u001b[0m\u001b[49m\u001b[K\u001b[4;20H\u001b[0m\u001b[49m\u001b[K\u001b[5;2H\u001b[0m\u001b[49m\u001b[K\u001b[6;27H\u001b[0m\u001b[49m\u001b[K\u001b[7;2H\u001b[0m\u001b[49m\u001b[K\u001b[8;2H\u001b[0m\u001b[49m\u001b[K\u001b[1;1H \u001b[2;1H  \u001b[38;2;99;168;248;49m>_ \u001b[1m\u001b[39;49mOpenAI Codex\u001b[22m\u001b[2m\u001b[2m (v0.164.0)\u001b[3;1H\u001b[22m     \u001b[2mloading\u001b[4;1H  Resuming session\u2026\u001b[5;1H\u001b[22m \u001b[6;1H\u001b[1m\u203a\u001b[22m \u001b[2mAsk Codex to do anything\u001b[7;1H\u001b[22m \u001b[8;1H \u001b[39m\u001b[49m\u001b[0m\u001b[1;1H"
+},
+{
+"t": 0.121,
+"data": "\u001b[0 q\u001b[1;1H \u001b[39m\u001b[49m\u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.123,
+"data": "\u001b[?25h\u001b[?2026l"
+},
+{
+"t": 0.124,
+"data": "\u001b[?2026l"
+},
+{
+"t": 0.126,
+"data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.128,
+"data": "\u001b[?25h\u001b[?2026l"
+},
+{
+"t": 0.129,
+"data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.131,
+"data": "\u001b[?25h\u001b[?2026l"
+},
+{
+"t": 0.133,
+"data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.134,
+"data": "\u001b[?25h"
+},
+{
+"t": 0.136,
+"data": "\u001b[?2026l"
+},
+{
+"t": 0.137,
+"data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.139,
+"data": "\u001b[?25h\u001b[?2026l"
+},
+{
+"t": 0.141,
+"data": "\u001b[?2026h\u001b[?25l"
+},
+{
+"t": 0.142,
+"data": "\u001b[3;6H\u001b[2mD:\\prim1-qa-20261019-combined\\personal-repo\u001b[39m\u001b[49m\u001b[0m\u001b[6;3H\u001b[?25h"
+},
+{
+"t": 0.144,
+"data": "\u001b[?2026l"
+},
+{
+"t": 0.145,
+"data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.147,
+"data": "\u001b[?25h\u001b[?2026l"
+},
+{
+"t": 0.148,
+"data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.15,
+"data": "\u001b[?25h"
+},
+{
+"t": 0.152,
+"data": "\u001b[?2026l"
+},
+{
+"t": 0.153,
+"data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.155,
+"data": "\u001b[?25h"
+},
+{
+"t": 0.157,
+"data": "\u001b[?2026l"
+},
+{
+"t": 0.289,
+"data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.29,
+"data": "\u001b[?25h\u001b[?2026l"
+},
+{
+"t": 0.293,
+"data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.294,
+"data": "\u001b[?25h"
+},
+{
+"t": 0.296,
+"data": "\u001b[?2026l"
+},
+{
+"t": 0.454,
+"data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.456,
+"data": "\u001b[?25h"
+},
+{
+"t": 0.458,
+"data": "\u001b[?2026l"
+},
+{
+"t": 0.786,
+"data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.788,
+"data": "\u001b[?25h\u001b[?2026l"
+},
+{
+"t": 0.789,
+"data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.791,
+"data": "\u001b[?25h"
+},
+{
+"t": 0.792,
+"data": "\u001b[?2026l"
+},
+{
+"t": 0.796,
+"data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.797,
+"data": "\u001b[?25h"
+},
+{
+"t": 0.799,
+"data": "\u001b[?2026l"
+},
+{
+"t": 0.801,
+"data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.803,
+"data": "\u001b[?25h\u001b[?2026l"
+},
+{
+"t": 0.804,
+"data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.806,
+"data": "\u001b[?25h\u001b[?2026l"
+},
+{
+"t": 0.808,
+"data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.809,
+"data": "\u001b[?25h\u001b[?2026l"
+},
+{
+"t": 0.811,
+"data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.813,
+"data": "\u001b[?25h\u001b[?2026l"
+},
+{
+"t": 0.814,
+"data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.816,
+"data": "\u001b[?25h"
+},
+{
+"t": 0.817,
+"data": "\u001b[?2026l"
+},
+{
+"t": 0.826,
+"data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.828,
+"data": "\u001b[?25h\u001b[?2026l"
+},
+{
+"t": 0.829,
+"data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.831,
+"data": "\u001b[?25h"
+},
+{
+"t": 0.832,
+"data": "\u001b[?2026l"
+},
+{
+"t": 1.056,
+"data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[6;3H"
+},
+{
+"t": 1.058,
+"data": "\u001b[?25h"
+},
+{
+"t": 1.059,
+"data": "\u001b[?2026l"
+},
+{
+"t": 1.839,
+"data": "\u001b]0;personal-repo\u0007"
+},
+{
+"t": 1.841,
+"data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[6;3H"
+},
+{
+"t": 1.842,
+"data": "\u001b[?25h"
+},
+{
+"t": 1.844,
+"data": "\u001b[?2026l"
+},
+{
+"t": 1.846,
+"data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[6;3H"
+},
+{
+"t": 1.847,
+"data": "\u001b[?25h\u001b[?2026l"
+},
+{
+"t": 1.852,
+"data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[6;3H"
+},
+{
+"t": 1.853,
+"data": "\u001b[?25h\u001b[?2026l"
+},
+{
+"t": 1.855,
+"data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[6;3H"
+},
+{
+"t": 1.856,
+"data": "\u001b[?25h"
+},
+{
+"t": 1.858,
+"data": "\u001b[?2026l"
+},
+{
+"t": 1.859,
+"data": "\u001b]7501;state=idle:app=codex\u001b\\"
+},
+{
+"t": 1.861,
+"data": "\u001b[?2026h\u001b[1;1H"
+},
+{
+"t": 1.862,
+"data": "\u001b[J"
+},
+{
+"t": 1.864,
+"data": "\u001b[?25l"
+},
+{
+"t": 1.866,
+"data": "\u001b[1;2H\u001b[0m\u001b[49m\u001b[K\u001b[2;2H\u001b[0m\u001b[49m\u001b[K\u001b[3;27H\u001b[0m\u001b[49m\u001b[K\u001b[4;2H\u001b[0m\u001b[49m\u001b[K\u001b[5;67H\u001b[0m\u001b[49m\u001b[K\u001b[1;1H \u001b[2;1H \u001b[3;1H\u001b[1m\u203a\u001b[22m \u001b[2mAsk Codex to do anything\u001b[4;1H\u001b[22m \u001b[5;1H  \u001b[38;2;246;226;183;49mGPT-6-Astra medium\u001b[39;49m \u00b7 \u001b[38;2;171;223;167;49mD:\\prim1-qa-20261019-combined\\personal-repo\u001b[39m\u001b[49m\u001b[0m\u001b[1;1H\u001b[0 q\u001b[1;1H \u001b[39m\u001b[49m\u001b[0m\u001b[3;3H"
+},
+{
+"t": 1.872,
+"data": "\u001b[?25h\u001b[?2026l"
+},
+{
+"t": 2.107,
+"data": "\u001b]10;?\u001b\\\u001b]11;?\u001b\\"
+},
+{
+"t": 2.364,
+"data": "\u001b]0;\u2834 personal-repo\u0007"
+},
+{
+"t": 2.365,
+"data": "\u001b[6n"
+},
+{
+"t": 2.874,
+"data": "\u001b]0;\u280b personal-repo\u0007"
+},
+{
+"t": 2.876,
+"data": "\u001b]7501;state=working:app=codex\u001b\\"
+},
+{
+"t": 2.878,
+"data": "\u001b[?2026h\u001b[1;40r\u001b[1;1H\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001bM\u001b[r\u001b[1;35r\u001b[1;1H"
+},
+{
+"t": 2.88,
+"data": "\r\n"
+},
+{
+"t": 2.881,
+"data": "\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K  \u001b[38;2;99;168;248;49m>_ \u001b[1m\u001b[39;49mOpenAI Codex\u001b[22m\u001b[2m\u001b[2m (v0.164.0)\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.883,
+"data": "\r\n\u001b[39;49m\u001b[K     \u001b[2mD:\\prim1-qa-20261019-combined\\personal-repo\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.884,
+"data": "\r\n\u001b[39;49m\u001b[K\u001b[2m  permissions: \u001b[22m\u001b[1m\u001b[38;5;5;49mYOLO mode\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.885,
+"data": "\r\n\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.887,
+"data": "\r\n"
+},
+{
+"t": 2.889,
+"data": "\u001b[39;49m\u001b[K  \u001b[1m\u001b[38;2;243;139;168;49mTip:\u001b[22m\u001b[39;49m Use the \u001b[1m\u001b[38;2;243;139;168;49mdesktop app\u001b[22m\u001b[39;49m. Install it from \u001b[4m\u001b[38;2;137;180;250;49m\u001b]8;;https://chatgpt.com/codex?app-landing-page=true\u0007https://chatgpt.com/codex?app-landing-page=true\u001b]8;;\u0007\u001b[24m\u001b[39;49m and run \u001b[38;2;166;227;161;49mcodex app\u001b[39;49m.\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.891,
+"data": "\r\n\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.892,
+"data": "\r\n\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 2.894,
+"data": "\u001b[39;49m\u001b[K\u001b[1m\u001b[2m\u203a \u001b[22m\u001b[22m[PRIM-1] 1 new room message for you in room 74d09d98-ed65-43da-9d3e-684e6ab0bf4f (newest c3ad2c5a). Run room_read\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 2.895,
+"data": "\u001b[39;49m\u001b[K  with that room_id, then room_ack each.\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 2.897,
+"data": "\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 2.898,
+"data": "\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 2.9,
+"data": "\u001b[39;49m\u001b[K\u001b[1m\u001b[38;5;2;49m\u2022\u001b[22m\u001b[39;49m \u001b[1mCalled\u001b[22m \u001b[38;2;99;168;248;49mprim1_pane\u001b[39;49m.\u001b[38;2;99;168;248;49mroom_read\u001b[39;49m(\u001b[2m{\"room_id\":\"74d09d98-ed65-43da-9d3e-684e6ab0bf4f\"}\u001b[22m)\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 2.901,
+"data": "\u001b[39;49m\u001b[K\u001b[2m  \u2514 {\"content\":[{\"type\":\"text\",\"text\":\"{\\\"message\\\":\\\"room feed read\\\",\\\"ok\\\":true,\\\"payload\\\":{\\\"kind\\\":\\\"room_feed\\\",\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K    \u001b[2m\\\"page\\\":{\\\"cards\\\":[],\\\"cards_cursor\\\":{\\\"epoch\\\":\\\"4734e44f-c87d-465d-86ca-b60146f8d5ee\\\",\\\"sequence\\\":152},\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.904,
+"data": "\r\n"
+},
+{
+"t": 2.905,
+"data": "\u001b[39;49m\u001b[K    \u001b[2m\\\"cursor\\\":{\\\"epoch\\\":\\\"4734e44f-c87d-465d-86ca-b60146f8d5ee\\\",\\\"sequence\\\":65},\\\"events\\\":[{\\\"cursor\\\":{\\\"epoch\\\":\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K    \u001b[2m+1 line (ctrl+t to view transcript)\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.907,
+"data": "\r\n"
+},
+{
+"t": 2.908,
+"data": "\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 2.91,
+"data": "\u001b[39;49m\u001b[K\u001b[1m\u001b[38;5;2;49m\u2022\u001b[22m\u001b[39;49m \u001b[1mCalled\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 2.911,
+"data": "\u001b[39;49m\u001b[K\u001b[2m  \u2514 \u001b[22m\u001b[38;2;99;168;248;49mprim1_pane\u001b[39;49m.\u001b[38;2;99;168;248;49mroom_read\u001b[39;49m(\u001b[2m{\"room_id\":\"74d09d98-ed65-43da-9d3e-684e6ab0bf4f\",\"cursor\":{\"epoch\":\"4734e44f-c87d-465d-86ca-\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K        \u001b[2mb60146f8d5ee\",\"sequence\":65}}\u001b[22m)\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.913,
+"data": "\r\n\u001b[39;49m\u001b[K    \u001b[2m{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"message\\\":\\\"room feed read\\\",\\\"ok\\\":true,\\\"payload\\\":{\\\"kind\\\":\\\"room_feed\\\",\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.915,
+"data": "\r\n\u001b[39;49m\u001b[K    \u001b[2m\\\"page\\\":{\\\"cards\\\":[],\\\"cards_cursor\\\":{\\\"epoch\\\":\\\"4734e44f-c87d-465d-86ca-b60146f8d5ee\\\",\\\"sequence\\\":153},\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.916,
+"data": "\r\n\u001b[39;49m\u001b[K    \u001b[2m\\\"cursor\\\":{\\\"epoch\\\":\\\"4734e44f-c87d-465d-86ca-b60146f8d5ee\\\",\\\"sequence\\\":129},\\\"events\\\":[{\\\"cursor\\\":{\\\"epoch\\\":\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.917,
+"data": "\r\n"
+},
+{
+"t": 2.919,
+"data": "\u001b[39;49m\u001b[K    \u001b[2m+1 line (ctrl+t to view transcript)\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 2.921,
+"data": "\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 2.922,
+"data": "\u001b[39;49m\u001b[K\u001b[1m\u001b[38;5;2;49m\u2022\u001b[22m\u001b[39;49m \u001b[1mCalled\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.924,
+"data": "\r\n\u001b[39;49m\u001b[K\u001b[2m  \u2514 \u001b[22m\u001b[38;2;99;168;248;49mprim1_pane\u001b[39;49m.\u001b[38;2;99;168;248;49mroom_read\u001b[39;49m(\u001b[2m{\"room_id\":\"74d09d98-ed65-43da-9d3e-684e6ab0bf4f\",\"cursor\":{\"epoch\":\"4734e44f-c87d-465d-86ca-\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.926,
+"data": "\r\n\u001b[39;49m\u001b[K        \u001b[2mb60146f8d5ee\",\"sequence\":129}}\u001b[22m)\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.928,
+"data": "\r\n\u001b[39;49m\u001b[K    \u001b[2m{\"message\": \"room feed read\", \"ok\": true, \"payload\": {\"kind\": \"room_feed\", \"page\": {\"cards\": [], \"cards_cursor\":\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.93,
+"data": "\r\n\u001b[39;49m\u001b[K    \u001b[2m{\"epoch\": \"4734e44f-c87d-465d-86ca-b60146f8d5ee\", \"sequence\": 153}, \"cursor\": {\"epoch\":\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.931,
+"data": "\r\n\u001b[39;49m\u001b[K    \u001b[2m\"4734e44f-c87d-465d-86ca-b60146f8d5ee\", \"sequence\": 153}, \"events\": [{\"cursor\": {\"epoch\":\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.933,
+"data": "\r\n\u001b[39;49m\u001b[K    \u001b[2m+1 line (ctrl+t to view transcript)\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.934,
+"data": "\r\n\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K\u001b[1m\u001b[38;5;2;49m\u2022\u001b[22m\u001b[39;49m \u001b[1mCalled\u001b[22m \u001b[38;2;99;168;248;49mprim1_pane\u001b[39;49m.\u001b[38;2;99;168;248;49mroom_ack\u001b[39;49m(\u001b[2m{\"message_id\":\"c3ad2c5a-6aaf-4938-a951-2dec3d4686d0\",\"next_action\":\"journey-1 received\"}\u001b[22m)\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.937,
+"data": "\r\n\u001b[39;49m\u001b[K\u001b[2m  \u2514 {\"message\": \"room ack stored\", \"ok\": true, \"payload\": {\"kind\": \"room_ack\", \"result\": {\"cursor\": {\"epoch\":\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 2.938,
+"data": "\u001b[39;49m\u001b[K    \u001b[2m\"4734e44f-c87d-465d-86ca-b60146f8d5ee\", \"sequence\": 155}, \"message_id\": \"c3ad2c5a-6aaf-4938-a951-2dec3d4686d0\",\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K    \u001b[2m\"replayed\": false, \"request_id\": \"2b2d6ca3-6bef-4b10-8ef5-19c6b95c4c53\", \"room_id\":\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.94,
+"data": "\r\n\u001b[39;49m\u001b[K    \u001b[2m+1 line (ctrl+t to view transcript)\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 2.942,
+"data": "\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.943,
+"data": "\r\n"
+},
+{
+"t": 2.945,
+"data": "\u001b[39;49m\u001b[K\u001b[2m\u2022 \u001b[22mAcknowledged: journey-1 received.\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.947,
+"data": "\r\n"
+},
+{
+"t": 2.948,
+"data": "\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.95,
+"data": "\r\n\u001b[39;49m\u001b[K\u001b[2m  Worked for 24s \u2022 8:01 PM\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.952,
+"data": "\r\n"
+},
+{
+"t": 2.953,
+"data": "\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.955,
+"data": "\r\n"
+},
+{
+"t": 2.957,
+"data": "\u001b[39;49m\u001b[K\u001b[1m\u001b[2m\u203a \u001b[22m\u001b[22m[PRIM-1] 1 new room message for you in room 74d09d98-ed65-43da-9d3e-684e6ab0bf4f (newest 8bdb5ab6). Run room_read\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.958,
+"data": "\r\n\u001b[39;49m\u001b[K  with that room_id, then room_ack each.\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.96,
+"data": "\r\n\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 2.962,
+"data": "\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 2.963,
+"data": "\u001b[39;49m\u001b[K\u001b[1m\u001b[38;5;2;49m\u2022\u001b[22m\u001b[39;49m \u001b[1mCalled\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K\u001b[2m  \u2514 \u001b[22m\u001b[38;2;99;168;248;49mprim1_pane\u001b[39;49m.\u001b[38;2;99;168;248;49mroom_read\u001b[39;49m(\u001b[2m{\"room_id\":\"74d09d98-ed65-43da-9d3e-684e6ab0bf4f\",\"cursor\":{\"epoch\":\"4734e44f-c87d-465d-86ca-\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.966,
+"data": "\r\n\u001b[39;49m\u001b[K        \u001b[2mb60146f8d5ee\",\"sequence\":155}}\u001b[22m)\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.967,
+"data": "\r\n\u001b[39;49m\u001b[K    \u001b[2m{\"message\": \"room feed read\", \"ok\": true, \"payload\": {\"kind\": \"room_feed\", \"page\": {\"cards\": [], \"cards_cursor\":\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.969,
+"data": "\r\n\u001b[39;49m\u001b[K    \u001b[2m{\"epoch\": \"4734e44f-c87d-465d-86ca-b60146f8d5ee\", \"sequence\": 161}, \"cursor\": {\"epoch\":\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 2.97,
+"data": "\u001b[39;49m\u001b[K    \u001b[2m\"4734e44f-c87d-465d-86ca-b60146f8d5ee\", \"sequence\": 161}, \"events\": [{\"cursor\": {\"epoch\":\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 2.972,
+"data": "\u001b[39;49m\u001b[K    \u001b[2m+1 line (ctrl+t to view transcript)\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.974,
+"data": "\r\n\u001b[39;49m\u001b[K\u001b[1m\u001b[38;5;2;49m\u2022\u001b[22m\u001b[39;49m \u001b[1mCalled\u001b[22m \u001b[38;2;99;168;248;49mprim1_pane\u001b[39;49m.\u001b[38;2;99;168;248;49mroom_ack\u001b[39;49m(\u001b[2m{\"message_id\":\"8bdb5ab6-b72b-40a4-88b4-030f69094824\",\"next_action\":\"journey-1 received\"}\u001b[22m)\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 2.975,
+"data": "\u001b[39;49m\u001b[K\u001b[2m  \u2514 {\"message\": \"room ack stored\", \"ok\": true, \"payload\": {\"kind\": \"room_ack\", \"result\": {\"cursor\": {\"epoch\":\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 2.977,
+"data": "\u001b[39;49m\u001b[K    \u001b[2m\"4734e44f-c87d-465d-86ca-b60146f8d5ee\", \"sequence\": 164}, \"message_id\": \"8bdb5ab6-b72b-40a4-88b4-030f69094824\",\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K    \u001b[2m\"replayed\": false, \"request_id\": \"32c0b16e-9e11-4486-9444-2f0fd7375034\", \"room_id\":\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.978,
+"data": "\r\n\u001b[39;49m\u001b[K    \u001b[2m+1 line (ctrl+t to view transcript)\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.98,
+"data": "\r\n\u001b[39;49m\u001b[K\u001b[2m\u2022 \u001b[22mAcknowledged: journey-1 received.\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 2.981,
+"data": "\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K\u001b[2m  Worked for 11s \u2022 8:02 PM\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 2.983,
+"data": "\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 2.984,
+"data": "\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K\u001b[1m\u001b[2m\u203a \u001b[22m\u001b[22m[PRIM-1] 1 new room message for you in room 74d09d98-ed65-43da-9d3e-684e6ab0bf4f (newest ff152388). Run room_read\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 2.986,
+"data": "\u001b[39;49m\u001b[K  with that room_id, then room_ack each.\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.988,
+"data": "\r\n\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.989,
+"data": "\r\n"
+},
+{
+"t": 2.991,
+"data": "\u001b[39;49m\u001b[K\u001b[1m\u001b[38;5;2;49m\u2022\u001b[22m\u001b[39;49m \u001b[1mCalled\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 2.992,
+"data": "\u001b[39;49m\u001b[K\u001b[2m  \u2514 \u001b[22m\u001b[38;2;99;168;248;49mprim1_pane\u001b[39;49m.\u001b[38;2;99;168;248;49mroom_read\u001b[39;49m(\u001b[2m{\"room_id\":\"74d09d98-ed65-43da-9d3e-684e6ab0bf4f\",\"cursor\":{\"epoch\":\"4734e44f-c87d-465d-86ca-\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K        \u001b[2mb60146f8d5ee\",\"sequence\":164}}\u001b[22m)\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.995,
+"data": "\r\n\u001b[39;49m\u001b[K    \u001b[2m{\"message\": \"room feed read\", \"ok\": true, \"payload\": {\"kind\": \"room_feed\", \"page\": {\"cards\": [], \"cards_cursor\":\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.996,
+"data": "\r\n\u001b[39;49m\u001b[K    \u001b[2m{\"epoch\": \"4734e44f-c87d-465d-86ca-b60146f8d5ee\", \"sequence\": 167}, \"cursor\": {\"epoch\":\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 2.997,
+"data": "\r\n\u001b[39;49m\u001b[K    \u001b[2m\"4734e44f-c87d-465d-86ca-b60146f8d5ee\", \"sequence\": 167}, \"events\": [{\"cursor\": {\"epoch\":\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 2.999,
+"data": "\u001b[39;49m\u001b[K    \u001b[2m+1 line (ctrl+t to view transcript)\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 3.0,
+"data": "\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 3.002,
+"data": "\u001b[39;49m\u001b[K\u001b[1m\u001b[38;5;2;49m\u2022\u001b[22m\u001b[39;49m \u001b[1mRan\u001b[22m \u001b[38;2;137;180;250;49mStart-Sleep\u001b[38;2;147;153;178;49m -\u001b[38;2;235;160;172;49mSeconds\u001b[38;2;205;214;244;49m 40\u001b[38;2;148;226;213;49m;\u001b[38;2;205;214;244;49m \u001b[38;2;137;180;250;49mWrite-Output\u001b[38;2;205;214;244;49m finished\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K\u001b[2m  \u2514 finished\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 3.003,
+"data": "\r\n"
+},
+{
+"t": 3.005,
+"data": "\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 3.007,
+"data": "\u001b[39;49m\u001b[K\u001b[1m\u001b[38;5;2;49m\u2022\u001b[22m\u001b[39;49m \u001b[1mCalled\u001b[22m \u001b[38;2;99;168;248;49mprim1_pane\u001b[39;49m.\u001b[38;2;99;168;248;49mroom_ack\u001b[39;49m(\u001b[2m{\"message_id\":\"ff152388-715b-41da-85b3-65a4c54bc77e\",\"next_action\":\"busy done\"}\u001b[22m)\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 3.009,
+"data": "\u001b[39;49m\u001b[K\u001b[2m  \u2514 {\"message\": \"room ack stored\", \"ok\": true, \"payload\": {\"kind\": \"room_ack\", \"result\": {\"cursor\": {\"epoch\":\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 3.01,
+"data": "\u001b[39;49m\u001b[K    \u001b[2m\"4734e44f-c87d-465d-86ca-b60146f8d5ee\", \"sequence\": 175}, \"message_id\": \"ff152388-715b-41da-85b3-65a4c54bc77e\",\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K    \u001b[2m\"replayed\": false, \"request_id\": \"b0b63dec-b48c-48de-af06-eaddf52b2337\", \"room_id\":\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 3.012,
+"data": "\r\n\u001b[39;49m\u001b[K    \u001b[2m+1 line (ctrl+t to view transcript)\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 3.013,
+"data": "\r\n\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 3.015,
+"data": "\r\n\u001b[39;49m\u001b[K\u001b[2m\u2022 \u001b[22mFinished; acknowledged \u201cbusy done\u201d.\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 3.017,
+"data": "\r\n\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 3.019,
+"data": "\u001b[39;49m\u001b[K\u001b[2m  Worked for 54s \u2022 8:03 PM\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 3.02,
+"data": "\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 3.022,
+"data": "\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K\u001b[1m\u001b[2m\u203a \u001b[22m\u001b[22m[PRIM-1] 1 new room message for you in room 74d09d98-ed65-43da-9d3e-684e6ab0bf4f (newest 96e8975c). Run room_read\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 3.023,
+"data": "\r\n\u001b[39;49m\u001b[K  with that room_id, then room_ack each.\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 3.025,
+"data": "\r\n\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 3.027,
+"data": "\r\n\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 3.028,
+"data": "\r\n\u001b[39;49m\u001b[K\u001b[1m\u001b[38;5;2;49m\u2022\u001b[22m\u001b[39;49m \u001b[1mCalled\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 3.03,
+"data": "\r\n"
+},
+{
+"t": 3.032,
+"data": "\u001b[39;49m\u001b[K\u001b[2m  \u2514 \u001b[22m\u001b[38;2;99;168;248;49mprim1_pane\u001b[39;49m.\u001b[38;2;99;168;248;49mroom_read\u001b[39;49m(\u001b[2m{\"room_id\":\"74d09d98-ed65-43da-9d3e-684e6ab0bf4f\",\"cursor\":{\"epoch\":\"4734e44f-c87d-465d-86ca-\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K        \u001b[2mb60146f8d5ee\",\"sequence\":167}}\u001b[22m)\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 3.033,
+"data": "\r\n\u001b[39;49m\u001b[K    \u001b[2m{\"message\": \"room feed read\", \"ok\": true, \"payload\": {\"kind\": \"room_feed\", \"page\": {\"cards\": [], \"cards_cursor\":\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 3.035,
+"data": "\u001b[39;49m\u001b[K    \u001b[2m{\"epoch\": \"4734e44f-c87d-465d-86ca-b60146f8d5ee\", \"sequence\": 177}, \"cursor\": {\"epoch\":\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 3.037,
+"data": "\u001b[39;49m\u001b[K    \u001b[2m\"4734e44f-c87d-465d-86ca-b60146f8d5ee\", \"sequence\": 177}, \"events\": [{\"cursor\": {\"epoch\":\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K    \u001b[2m+1 line (ctrl+t to view transcript)\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 3.038,
+"data": "\r\n\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 3.04,
+"data": "\u001b[39;49m\u001b[K\u001b[1m\u001b[38;5;2;49m\u2022\u001b[22m\u001b[39;49m \u001b[1mCalled\u001b[22m \u001b[38;2;99;168;248;49mprim1_pane\u001b[39;49m.\u001b[38;2;99;168;248;49mroom_ack\u001b[39;49m(\u001b[2m{\"message_id\":\"96e8975c-4e8a-4236-b7f1-f802f2e76845\",\"next_action\":\"journey-1 received\"}\u001b[22m)\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K\u001b[2m  \u2514 {\"message\": \"room ack stored\", \"ok\": true, \"payload\": {\"kind\": \"room_ack\", \"result\": {\"cursor\": {\"epoch\":\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 3.042,
+"data": "\r\n\u001b[39;49m\u001b[K    \u001b[2m\"4734e44f-c87d-465d-86ca-b60146f8d5ee\", \"sequence\": 179}, \"message_id\": \"96e8975c-4e8a-4236-b7f1-f802f2e76845\",\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 3.043,
+"data": "\u001b[39;49m\u001b[K    \u001b[2m\"replayed\": false, \"request_id\": \"909284e4-0364-4f67-b6ed-d72405796551\", \"room_id\":\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K    \u001b[2m+1 line (ctrl+t to view transcript)\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 3.045,
+"data": "\r\n\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 3.047,
+"data": "\u001b[39;49m\u001b[K\u001b[2m\u2022 \u001b[22mAcknowledged: journey-1 received.\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 3.048,
+"data": "\r\n\u001b[39;49m\u001b[K\u001b[2m  Worked for 9s \u2022 8:03 PM\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 3.05,
+"data": "\r\n\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 3.051,
+"data": "\r\n\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 3.053,
+"data": "\u001b[39;49m\u001b[K\u001b[1m\u001b[2m\u203a \u001b[22m\u001b[22m[PRIM-1] 1 new room message for you in room 74d09d98-ed65-43da-9d3e-684e6ab0bf4f (newest 6cf7985e). Run room_read\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K  with that room_id, then room_ack each.\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 3.055,
+"data": "\r\n\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 3.056,
+"data": "\r\n\u001b[39;49m\u001b[K\u001b[1m\u001b[38;5;2;49m\u2022\u001b[22m\u001b[39;49m \u001b[1mCalled\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K\u001b[2m  \u2514 \u001b[22m\u001b[38;2;99;168;248;49mprim1_pane\u001b[39;49m.\u001b[38;2;99;168;248;49mroom_read\u001b[39;49m(\u001b[2m{\"room_id\":\"74d09d98-ed65-43da-9d3e-684e6ab0bf4f\",\"cursor\":{\"epoch\":\"4734e44f-c87d-465d-86ca-\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 3.058,
+"data": "\r\n\u001b[39;49m\u001b[K        \u001b[2mb60146f8d5ee\",\"sequence\":179}}\u001b[22m)\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K    \u001b[2m{\"message\": \"room feed read\", \"ok\": true, \"payload\": {\"kind\": \"room_feed\", \"page\": {\"cards\": [], \"cards_cursor\":\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 3.06,
+"data": "\r\n\u001b[39;49m\u001b[K    \u001b[2m{\"epoch\": \"4734e44f-c87d-465d-86ca-b60146f8d5ee\", \"sequence\": 193}, \"cursor\": {\"epoch\":\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K    \u001b[2m\"4734e44f-c87d-465d-86ca-b60146f8d5ee\", \"sequence\": 193}, \"events\": [{\"cursor\": {\"epoch\":\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 3.062,
+"data": "\r\n\u001b[39;49m\u001b[K    \u001b[2m+1 line (ctrl+t to view transcript)\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 3.064,
+"data": "\r\n\u001b[39;49m\u001b[K\u001b[1m\u001b[38;5;2;49m\u2022\u001b[22m\u001b[39;49m \u001b[1mCalled\u001b[22m \u001b[38;2;99;168;248;49mprim1_pane\u001b[39;49m.\u001b[38;2;99;168;248;49mroom_ack\u001b[39;49m(\u001b[2m{\"message_id\":\"6cf7985e-44d4-4697-aad1-7f4a94f91873\",\"next_action\":\"journey-1 received\"}\u001b[22m)\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K\u001b[2m  \u2514 {\"message\": \"room ack stored\", \"ok\": true, \"payload\": {\"kind\": \"room_ack\", \"result\": {\"cursor\": {\"epoch\":\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 3.066,
+"data": "\r\n\u001b[39;49m\u001b[K    \u001b[2m\"4734e44f-c87d-465d-86ca-b60146f8d5ee\", \"sequence\": 195}, \"message_id\": \"6cf7985e-44d4-4697-aad1-7f4a94f91873\",\u001b[39m\u001b[49m\u001b[0m\r\n"
+},
+{
+"t": 3.067,
+"data": "\u001b[39;49m\u001b[K    \u001b[2m\"replayed\": false, \"request_id\": \"97ef725f-bafa-4079-aa0d-3b6167da53b4\", \"room_id\":\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K    \u001b[2m+1 line (ctrl+t to view transcript)\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 3.069,
+"data": "\r\n\u001b[39;49m\u001b[K\u001b[2m\u2022 \u001b[22mAcknowledged: journey-1 received.\u001b[39m\u001b[49m\u001b[0m\r\n\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 3.071,
+"data": "\r\n"
+},
+{
+"t": 3.072,
+"data": "\u001b[39;49m\u001b[K\u001b[2m  Worked for 9s \u2022 8:04 PM\u001b[39m\u001b[49m\u001b[0m\u001b[r\u001b[3;3H\u001b[?25l\u001b[36;2H\u001b[0m\u001b[49m\u001b[K\u001b[37;2H\u001b[0m\u001b[49m\u001b[K\u001b[38;27H\u001b[0m\u001b[49m\u001b[K\u001b[39;2H\u001b[0m\u001b[49m\u001b[K\u001b[40;67H\u001b[0m\u001b[49m\u001b[K\u001b[36;1H \u001b[37;1H \u001b[38;1H\u001b[1m\u203a\u001b[22m \u001b[2mAsk Codex to do anything\u001b[39;1H\u001b[22m \u001b[40;1H  \u001b[38;2;246;226;183;49mGPT-6-Astra medium\u001b[39;49m \u00b7 \u001b[38;2;171;223;167;49mD:\\prim1-qa-20261019-combined\\personal-repo\u001b[39m\u001b[49m\u001b[0m\u001b[36;1H"
+},
+{
+"t": 3.074,
+"data": "\u001b[0 q\u001b[36;1H \u001b[39m\u001b[49m\u001b[0m\u001b[38;3H\u001b[?25h\u001b[?2026l"
+},
+{
+"t": 3.076,
+"data": "\u001b]0;personal-repo\u0007"
+},
+{
+"t": 3.077,
+"data": "\u001b]7501;state=idle:app=codex\u001b\\"
+},
+{
+"t": 3.079,
+"data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[38;3H\u001b[?25h\u001b[?2026l"
+},
+{
+"t": 3.081,
+"data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[38;3H"
+},
+{
+"t": 3.082,
+"data": "\u001b[?25h\u001b[?2026l"
+},
+{
+"t": 3.084,
+"data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[38;3H"
+},
+{
+"t": 3.085,
+"data": "\u001b[?25h\u001b[?2026l"
+},
+{
+"t": 3.087,
+"data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[38;3H"
+},
+{
+"t": 3.089,
+"data": "\u001b[?25h\u001b[?2026l"
+},
+{
+"t": 3.187,
+"data": "\u001b[?2026h\u001b[1;35r\u001b[35;1H"
+},
+{
+"t": 3.188,
+"data": "\r\n\u001b[39;49m\u001b[K\u001b[39m\u001b[49m\u001b[0m"
+},
+{
+"t": 3.19,
+"data": "\r\n"
+},
+{
+"t": 3.191,
+"data": "\u001b[39;49m\u001b[K\u001b[1m\u26a0 Heads up, you have less than 25% of your weekly limit left. Run /status for a breakdown.\u001b[39m\u001b[49m\u001b[0m\u001b[r\u001b[38;3H\u001b[?25l\u001b[40;96H\u26a0\u001b[40;98H\u001b[38;2;196;167;103;49m1 warning\u001b[40;108H\u001b[39;49m\u00b7\u001b[40;110H\u001b[1mf2\u001b[40;113H\u001b[22mto\u001b[40;116Hview\u001b[39m\u001b[49m\u001b[0m\u001b[38;3H\u001b[?25h"
+},
+{
+"t": 3.193,
+"data": "\u001b[?2026l"
+},
+{
+"t": 33.533,
+"data": "\u001b[?2026h\u001b[39m\u001b[49m\u001b[0m\u001b[38;3H"
+},
+{
+"t": 33.535,
+"data": "\u001b[?25h\u001b[?2026l"
+}
+]
+}

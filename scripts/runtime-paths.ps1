@@ -43,7 +43,7 @@ function Resolve-Prim1RuntimeDirectory {
       throw "Cannot resolve the PRIM-1 runtime directory: LOCALAPPDATA is not set. Set PRIM1_RUNTIME_DIR explicitly."
     }
 
-    return ConvertTo-Prim1AbsolutePath -Path (Join-Path $env:LOCALAPPDATA "io.prim1.runtime\runtime")
+    return ConvertTo-Prim1AbsolutePath -Path (Join-Path $env:LOCALAPPDATA "io.prim1.v2\runtime")
   }
 
   $userProfile = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
@@ -53,7 +53,7 @@ function Resolve-Prim1RuntimeDirectory {
 
   $isMacOSVariable = Get-Variable -Name IsMacOS -ErrorAction SilentlyContinue
   if ($isMacOSVariable -and [bool]$isMacOSVariable.Value) {
-    return ConvertTo-Prim1AbsolutePath -Path (Join-Path $userProfile "Library/Application Support/io.prim1.runtime/runtime")
+    return ConvertTo-Prim1AbsolutePath -Path (Join-Path $userProfile "Library/Application Support/io.prim1.v2/runtime")
   }
 
   $dataRoot = $env:XDG_DATA_HOME
@@ -61,7 +61,7 @@ function Resolve-Prim1RuntimeDirectory {
     $dataRoot = Join-Path $userProfile ".local/share"
   }
 
-  return ConvertTo-Prim1AbsolutePath -Path (Join-Path $dataRoot "io.prim1.runtime/runtime")
+  return ConvertTo-Prim1AbsolutePath -Path (Join-Path $dataRoot "io.prim1.v2/runtime")
 }
 
 function Resolve-Prim1ControlPlaneEndpoint {

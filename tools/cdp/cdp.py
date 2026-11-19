@@ -10,13 +10,17 @@ Usage:
     python tools/cdp/cdp.py console-dump
     python tools/cdp/cdp.py targets
 
-Requires wrapper launched with PRIM1_CDP_PORT=9222 env var.
+Remote debugging is off by default. Start the wrapper with
+PRIM1_DEBUG_CDP_PORT=<port>, then pass the same port with --port or export
+PRIM1_DEBUG_CDP_PORT in this shell. There is no default port: on a machine
+that also runs an installed v1, 9222 belongs to that live app.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 import urllib.request
@@ -25,7 +29,7 @@ from typing import Any
 import websocket  # type: ignore
 
 
-DEFAULT_PORT = 9222
+PORT_ENV = "PRIM1_DEBUG_CDP_PORT"
 
 
 def list_targets(port: int) -> list[dict[str, Any]]:
@@ -228,7 +232,7 @@ def cmd_console_dump(port: int) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="PRIM-1 CDP helper.")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--port", type=int, default=os.environ.get(PORT_ENV) or None)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("targets")
@@ -251,6 +255,8 @@ def main() -> int:
     subparsers.add_parser("console-dump")
 
     args = parser.parse_args()
+    if args.port is None:
+        parser.error(f"pass --port, or set {PORT_ENV}; there is no default port")
 
     try:
         if args.command == "targets":

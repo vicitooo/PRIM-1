@@ -1,12 +1,12 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     ffi::OsString,
     fs::{File, OpenOptions, TryLockError},
     io::Write,
     panic,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -17,19 +17,31 @@ use std::{
 use shared_types::{
     AddRoomMemberRequest, BriefRoomMemberRequest, ChooseSessionWorkingDirectoryRequest,
     CreateRoomRequest, CreateSessionRequest, DeleteRoomRequest, DeleteSessionRequest,
-    DeliverRoomMessageRequest, MoveRoomRequest, MoveSessionRequest, OperatorRouteMessageRequest,
-    PostRoomMessageRequest, ReadRoomFeedRequest, RemoveRoomMemberRequest, RenameRoomRequest,
-    RenameSessionRequest, RestartSessionRequest, RoomDeliveryResult, RoomFeedPage, RoomPostResult,
-    RoomSnapshot, RunEventIdentity, RuntimeSnapshot, SendInputRequest, SessionId, SessionSnapshot,
-    SetSessionLinuxWorkingDirectoryRequest, SetSessionPermissionRequest, StartSessionRequest,
-    StopSessionRequest,
+    DeliverRoomMessageRequest, InviteRoomGuestRequest, ListRoomGuestsRequest, MoveRoomRequest,
+    MoveSessionRequest, OperatorRouteMessageRequest, RevokeRoomGuestRequest, RoomGuest,
+    PostRoomMessageRequest, ReadRoomFeedRequest, ReadRoomBriefRequest, RoomBriefSettings,
+    UpdateRoomBriefRequest, RemoveRoomMemberRequest, RenameRoomRequest,
+    RenameSessionRequest, RestartSessionRequest, RetryRoomDeliveryRequest, RoomDeliveryResult, RoomFeedPage, RoomPostResult,
+    RoomExportReport, RoomId, RoomImportReport, RoomSourceSummary,
+    RoomSnapshot, RoomFallbackSnapshot, SetRoomFallbacksRequest,
+    RunEventIdentity, RunId, RuntimeSnapshot, SendInputRequest, SessionGeneration,
+    SessionId, SessionSnapshot,
+    SetRoomResumeRequest, SetSessionLinuxWorkingDirectoryRequest, SetSessionPermissionRequest,
+    StartSessionRequest, StopSessionRequest, SessionLaunchPreview, TelemetrySnapshot,
+    MemberPermissions, SetMemberPermissionsRequest,
 };
 use supervisor::{
-    RendererEventProjector, SupervisorConfig, SupervisorHandle, default_room_brief_template,
-    validate_runtime_storage_paths,
+    PersonalRepoStatus, RendererEventProjector, SupervisorConfig, SupervisorHandle, TaskFolderStatus,
+    default_room_brief_template, validate_runtime_storage_paths,
 };
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
-use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+use supervisor::output_credit::{OutputCredit, OutputCreditLedger, OutputCreditMetrics, RendererReset, TOTAL_ITEMS};
+use supervisor::trial::{TRIAL_ADMISSION_HELD, TrialChallenge, TrialHealthReceipt, TrialStartup};
+use supervisor::upgrade_flow::{UpgradeEnvironment, UpgradeHost, UpgradeStartup};
+mod trial_desktop;
+mod upgrade_launcher;
+pub use trial_desktop::WEBVIEW_PROFILE_ENV;
 
 const DESKTOP_INSTANCE_LOCK_FILE: &str = "desktop-instance.lock";
 const DESKTOP_INSTANCE_ALREADY_RUNNING: &str = "PRIM-1 is already running for this user";
@@ -124,11 +136,21 @@ impl DesktopDiagnostics {
 
 struct DesktopState {
     supervisor: SupervisorHandle,
+    trial: Option<Arc<TrialStartup>>,
     diagnostics: DesktopDiagnostics,
     automation_mode: bool,
     shutdown_started: AtomicBool,
     shutdown_succeeded: AtomicBool,
     fullscreen_on_first_focus: AtomicBool,
+    /// T-36: the main window's configuration, to rebuild it after its WebView2
+    /// browser process exited. None in a held trial, which is never rebuilt.
+    main_window_config: Option<tauri::utils::config::WindowConfig>,
+    /// T-36: the main window is being rebuilt, so the moment without a window
+    /// is not an exit request.
+    ui_rebuilding: AtomicBool,
+    /// T-36: the rebuilt window opens minimized when the old one was.
+    rebuild_minimized: AtomicBool,
+    renderer_recovery: Mutex<RendererRecoveryLedger>,
     _instance_lock: DesktopInstanceLock,
 }
 
@@ -141,14 +163,65 @@ impl DesktopState {
         {
             return self.shutdown_succeeded.load(Ordering::SeqCst);
         }
+        self.run_shutdown(reason, false).is_ok()
+    }
+
+    /// A108: the same single shutdown for an upgrade close, strict about the
+    /// final session-catalog write. It cannot vouch for a shutdown that some
+    /// other path already started.
+    fn shutdown_for_upgrade(&self) -> Result<(), String> {
+        if self
+            .shutdown_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("PRIM-1 is already shutting down".into());
+        }
+        self.run_shutdown("upgrade", true)
+    }
+
+    /// A16: tao turns WM_ENDSESSION straight into `RunEvent::Exit`, with no
+    /// close or exit request first, and Windows may end this process as soon
+    /// as that returns. Unless an ordinary shutdown already ran, a session end
+    /// gets the supervisor's `end_session_now`: the catalog checkpoint first,
+    /// nothing waited for.
+    fn end_session_unless_shut_down(&self) {
+        if self
+            .shutdown_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        self.diagnostics.log(
+            "info",
+            "session_end_started",
+            "exit without a close or exit request: Windows is ending the session",
+        );
+        match self.supervisor.end_session_now() {
+            Ok(()) => self.diagnostics.log(
+                "info",
+                "session_end_checkpoint",
+                "running members saved for Resume on restart; agents told to end",
+            ),
+            Err(error) => self.diagnostics.log("error", "session_end_checkpoint_failed", format!("{error:#}")),
+        }
+    }
+
+    fn run_shutdown(&self, reason: &str, strict: bool) -> Result<(), String> {
         self.diagnostics
             .log("info", "shutdown_started", format!("reason={reason}"));
-        match self.supervisor.shutdown() {
+        let outcome = if strict {
+            self.supervisor.shutdown_for_upgrade()
+        } else {
+            self.supervisor.shutdown()
+        };
+        match outcome {
             Ok(()) => {
                 self.shutdown_succeeded.store(true, Ordering::SeqCst);
                 self.diagnostics
                     .log("info", "shutdown_complete", format!("reason={reason}"));
-                true
+                Ok(())
             }
             Err(error) => {
                 self.diagnostics.log(
@@ -156,8 +229,324 @@ impl DesktopState {
                     "shutdown_failed",
                     format!("reason={reason}: {error:#}"),
                 );
-                false
+                Err(format!("{error:#}"))
             }
+        }
+    }
+}
+
+/// What the desktop does for a self-upgrade (A108): its own strict close,
+/// process exit, and the stable launcher after the new build is shown.
+struct DesktopUpgradeHost {
+    app: AppHandle,
+    diagnostics: DesktopDiagnostics,
+    runtime_dir: PathBuf,
+}
+
+impl UpgradeHost for DesktopUpgradeHost {
+    fn strict_shutdown(&self) -> anyhow::Result<()> {
+        let state = self
+            .app
+            .try_state::<DesktopState>()
+            .ok_or_else(|| anyhow::anyhow!("the desktop state is not available"))?;
+        state.shutdown_for_upgrade().map_err(anyhow::Error::msg)
+    }
+
+    fn exit_for_upgrade(&self) {
+        self.diagnostics.log(
+            "info",
+            "upgrade_exit",
+            "clean shutdown recorded; exiting so the new build can start",
+        );
+        self.app.exit(0);
+    }
+
+    fn resume_consumed(&self, record: &supervisor::upgrade::UpgradeRecord) {
+        let runtime_dir = self.runtime_dir.clone();
+        let source = record.request.source.exe_path.clone();
+        let candidate = record.request.candidate.exe_path.clone();
+        let sha256 = record.request.candidate.exe_sha256.clone();
+        let app = self.app.clone();
+        let diagnostics = self.diagnostics.clone();
+        let spawned = thread::Builder::new()
+            .name("prim1-upgrade-launcher".into())
+            .spawn(move || {
+                let (level, message) = match upgrade_launcher::follow_new_build(
+                    &runtime_dir,
+                    &source,
+                    &candidate,
+                    &sha256,
+                ) {
+                    Ok(done) => (shared_types::LogLevel::Info, format!("Desktop launcher: {done}.")),
+                    Err(error) => (
+                        shared_types::LogLevel::Warn,
+                        format!("Desktop launcher unchanged: {error}"),
+                    ),
+                };
+                diagnostics.log("info", "upgrade_launcher", message.clone());
+                emit_runtime_event(
+                    &app,
+                    &diagnostics,
+                    shared_types::RuntimeEvent::SystemLog {
+                        level,
+                        message,
+                        timestamp: shared_types::now_rfc3339(),
+                    },
+                );
+            });
+        if let Err(error) = spawned {
+            self.diagnostics
+                .log("warn", "upgrade_launcher_unchanged", error.to_string());
+        }
+    }
+}
+
+/// The WebView2 user data folder this process uses: the environment's
+/// override, else Tauri's per-user application folder.
+fn effective_webview_profile(app: &AppHandle) -> Result<PathBuf, String> {
+    match std::env::var_os(WEBVIEW_PROFILE_ENV).filter(|value| !value.is_empty()) {
+        Some(folder) => {
+            let folder = PathBuf::from(folder);
+            if folder.is_absolute() {
+                Ok(folder)
+            } else {
+                std::env::current_dir()
+                    .map(|cwd| cwd.join(folder))
+                    .map_err(|error| error.to_string())
+            }
+        }
+        None => app
+            .path()
+            .app_local_data_dir()
+            .map_err(|error| error.to_string()),
+    }
+}
+
+/// Not for a held trial. An unavailable upgrade store leaves PRIM-1 working.
+fn install_upgrade(app: &AppHandle, diagnostics: &DesktopDiagnostics, startup: &StartupConfig) {
+    let Some(state) = app.try_state::<DesktopState>() else {
+        return;
+    };
+    let profile_dir = match effective_webview_profile(app) {
+        Ok(profile_dir) => profile_dir,
+        Err(error) => {
+            diagnostics.log("warn", "upgrade_unavailable", format!("profile: {error}"));
+            return;
+        }
+    };
+    let host = Arc::new(DesktopUpgradeHost {
+        app: app.clone(),
+        diagnostics: diagnostics.clone(),
+        runtime_dir: state.supervisor.runtime_dir().to_path_buf(),
+    });
+    let environment = UpgradeEnvironment {
+        profile_dir,
+        personal_repo_override: startup.personal_repo_override.clone(),
+        startup: startup.upgrade_startup.clone(),
+    };
+    match state.supervisor.install_upgrade(environment, host) {
+        Ok(()) => diagnostics.log(
+            "info",
+            "upgrade_ready",
+            format!(
+                "stage={:?}",
+                state.supervisor.upgrade_status().map(|status| status.stage)
+            ),
+        ),
+        Err(error) => diagnostics.log("info", "upgrade_unavailable", format!("{error:#}")),
+    }
+}
+
+/// T-36 (Victor, room 3073: PC3's PRIM-1 window went black while its agents
+/// kept working). WebView2 reports a failed process through ProcessFailed,
+/// which neither Tauri nor wry handles, so a renderer or browser process that
+/// died left the window black for good. The agents, rooms and their state live
+/// in this process, not in the page, so reloading the page or rebuilding the
+/// window recovers the UI without touching them; the page reattaches through
+/// the same renderer epoch as a manual reload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RendererFailure {
+    /// The WebView2 browser process exited: the WebView is closed for good.
+    BrowserExited,
+    /// The page's render process exited: the WebView survives a reload.
+    RendererExited,
+    /// The page's render process stopped responding but is alive.
+    RendererUnresponsive,
+    /// GPU, utility, frame and other helpers, which WebView2 restarts itself.
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RendererRecovery {
+    Rebuild,
+    Reload,
+    /// Log only: the failure recovers by itself, or reloading would discard a
+    /// page that may still answer.
+    Wait,
+    /// The recovery budget is spent, or the window cannot be rebuilt: log an
+    /// error and leave the window as it is. Closing it still shuts down
+    /// gracefully.
+    GiveUp,
+}
+
+/// At most three recoveries in any ten minutes, so a renderer that dies on
+/// every load cannot spin.
+const RENDERER_RECOVERY_LIMIT: usize = 3;
+const RENDERER_RECOVERY_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+#[derive(Debug, Default)]
+struct RendererRecoveryLedger {
+    recent: VecDeque<Instant>,
+}
+
+impl RendererRecoveryLedger {
+    fn decide(&mut self, failure: RendererFailure, rebuild_allowed: bool, now: Instant) -> RendererRecovery {
+        let action = match failure {
+            RendererFailure::BrowserExited if rebuild_allowed => RendererRecovery::Rebuild,
+            RendererFailure::BrowserExited => return RendererRecovery::GiveUp,
+            RendererFailure::RendererExited => RendererRecovery::Reload,
+            RendererFailure::RendererUnresponsive | RendererFailure::Other => return RendererRecovery::Wait,
+        };
+        while self.recent.front().is_some_and(|at| now.duration_since(*at) >= RENDERER_RECOVERY_WINDOW) {
+            self.recent.pop_front();
+        }
+        if self.recent.len() >= RENDERER_RECOVERY_LIMIT {
+            return RendererRecovery::GiveUp;
+        }
+        self.recent.push_back(now);
+        action
+    }
+}
+
+/// T-36: the window-less moment of a rebuild asks to exit with no code; an
+/// explicit exit (a code) is never held back.
+fn exit_request_is_ui_rebuild(code: Option<i32>, rebuilding: bool) -> bool {
+    code.is_none() && rebuilding
+}
+
+#[cfg(windows)]
+fn renderer_failure(kind: webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_PROCESS_FAILED_KIND) -> RendererFailure {
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED, COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED,
+        COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE,
+    };
+    if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED {
+        RendererFailure::BrowserExited
+    } else if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED {
+        RendererFailure::RendererExited
+    } else if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE {
+        RendererFailure::RendererUnresponsive
+    } else {
+        RendererFailure::Other
+    }
+}
+
+/// T-36: watch the main WebView's processes. Called for every main window,
+/// the first and each rebuilt one.
+fn watch_renderer(window: &WebviewWindow, diagnostics: &DesktopDiagnostics) {
+    #[cfg(windows)]
+    {
+        let handle = window.app_handle().clone();
+        let log = diagnostics.clone();
+        let watched = window.with_webview(move |platform| {
+            use webview2_com::{Microsoft::Web::WebView2::Win32::COREWEBVIEW2_PROCESS_FAILED_KIND, ProcessFailedEventHandler};
+            // SAFETY: called on the main thread with the live controller Tauri hands over.
+            let registered = unsafe { platform.controller().CoreWebView2() }.and_then(|webview| {
+                let handler = ProcessFailedEventHandler::create(Box::new(move |_, args| {
+                    let Some(args) = args else { return Ok(()) };
+                    let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND::default();
+                    // SAFETY: `args` is the event's own argument object.
+                    unsafe { args.ProcessFailedKind(&mut kind) }?;
+                    on_renderer_failure(&handle, renderer_failure(kind));
+                    Ok(())
+                }));
+                let mut token = 0i64;
+                // SAFETY: as above; the handler lives as long as the WebView.
+                unsafe { webview.add_ProcessFailed(&handler, &mut token) }
+            });
+            if let Err(error) = registered {
+                log.log("error", "renderer_watch_failed", error.to_string());
+            }
+        });
+        if let Err(error) = watched {
+            diagnostics.log("error", "renderer_watch_failed", error.to_string());
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (window, diagnostics);
+}
+
+/// T-36: WebView2 raises ProcessFailed on the main thread. A reload runs
+/// inside the event, as Microsoft's WebView2 sample does; a rebuild only posts
+/// the window's destruction (`destroy` always goes through the event loop), so
+/// a WebView is never torn down inside its own callback.
+fn on_renderer_failure(handle: &AppHandle, failure: RendererFailure) {
+    let Some(state) = handle.try_state::<DesktopState>() else { return };
+    if state.shutdown_started.load(Ordering::SeqCst) {
+        return;
+    }
+    let action = state.renderer_recovery.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        .decide(failure, state.main_window_config.is_some(), Instant::now());
+    let level = if action == RendererRecovery::GiveUp { "error" } else { "warn" };
+    state.diagnostics.log(level, "renderer_failed", format!("{failure:?}; recovery {action:?}"));
+    match action {
+        RendererRecovery::Reload => reload_main_window(handle),
+        RendererRecovery::Rebuild => begin_main_window_rebuild(handle),
+        RendererRecovery::Wait | RendererRecovery::GiveUp => {}
+    }
+}
+
+fn reload_main_window(handle: &AppHandle) {
+    let Some(state) = handle.try_state::<DesktopState>() else { return };
+    match handle.get_webview_window("main").map(|window| window.reload()) {
+        Some(Ok(())) => state.diagnostics.log("info", "renderer_reloaded", "main page reloaded after its render process exited"),
+        Some(Err(error)) => state.diagnostics.log("error", "renderer_recovery_failed", error.to_string()),
+        None => state.diagnostics.log("error", "renderer_recovery_failed", "no main window to reload"),
+    }
+}
+
+/// T-36: a WebView whose browser process exited cannot be revived; the window
+/// is destroyed (no close request, so no shutdown) and rebuilt from
+/// `RunEvent::WindowEvent` `Destroyed`, which Tauri delivers after releasing
+/// the label "main" and without holding its window store.
+fn begin_main_window_rebuild(handle: &AppHandle) {
+    let Some(state) = handle.try_state::<DesktopState>() else { return };
+    let Some(window) = handle.get_webview_window("main") else { return };
+    if state.shutdown_started.load(Ordering::SeqCst)
+        || state.ui_rebuilding.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err()
+    {
+        return;
+    }
+    state.rebuild_minimized.store(window.is_minimized().unwrap_or(false), Ordering::SeqCst);
+    if let Err(error) = window.destroy() {
+        state.ui_rebuilding.store(false, Ordering::SeqCst);
+        state.diagnostics.log("error", "ui_rebuild_failed", error.to_string());
+    }
+}
+
+fn finish_main_window_rebuild(handle: &AppHandle) {
+    let Some(state) = handle.try_state::<DesktopState>() else { return };
+    let minimized = state.rebuild_minimized.load(Ordering::SeqCst);
+    let built = state.main_window_config.as_ref().ok_or_else(|| "no main window configuration".to_string())
+        .and_then(|config| tauri::WebviewWindowBuilder::from_config(handle, config)
+            .and_then(|builder| builder.build()).map_err(|error| error.to_string()))
+        .and_then(|window| {
+            watch_renderer(&window, &state.diagnostics);
+            if minimized {
+                state.fullscreen_on_first_focus.store(true, Ordering::SeqCst);
+            }
+            present_main_window(&window, minimized)
+        });
+    state.ui_rebuilding.store(false, Ordering::SeqCst);
+    match built {
+        Ok(()) => state.diagnostics.log("info", "ui_rebuilt",
+            "main window rebuilt after its WebView2 browser process exited; agents and rooms untouched"),
+        Err(error) => {
+            state.diagnostics.log("error", "ui_rebuild_failed", error);
+            // Without a window the operator has no control left: shut down as a
+            // window close does, which records the running members for resume.
+            let code = if state.shutdown_once("ui_rebuild_failed") { 0 } else { 1 };
+            handle.exit(code);
         }
     }
 }
@@ -179,6 +568,7 @@ struct PendingSessionOutput {
     chunk: String,
     synthetic: bool,
     timestamp: String,
+    credit: Option<OutputCredit>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,12 +576,14 @@ struct UiOutputGap {
     identity: RunEventIdentity,
     session: String,
     dropped_events: u64,
+    observer_only: bool,
 }
 
 #[derive(Default)]
 struct UiEventIngressMutable {
     terminal_streams: HashMap<RunOutputKey, RendererTerminalStream>,
     output_gaps: BTreeMap<RunOutputKey, UiOutputGap>,
+    next_order: u64,
 }
 
 #[derive(Default)]
@@ -212,11 +604,17 @@ impl UiEventIngressState {
             .into_values()
             .collect()
     }
+
+    fn take_reportable_output_gaps(&self, credit: &OutputCreditLedger) -> Vec<UiOutputGap> {
+        take_reportable_gaps(&mut self.lock().output_gaps, Some(credit), None)
+    }
 }
 
 struct QueuedUiEvent {
     event: shared_types::RuntimeEvent,
     output_gaps_before: Vec<UiOutputGap>,
+    order: u64,
+    credit: Option<OutputCredit>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,10 +628,17 @@ enum UiEventEnqueueResult {
 #[derive(Clone)]
 struct UiEventIngress {
     sender: mpsc::SyncSender<QueuedUiEvent>,
+    output_sender: mpsc::SyncSender<QueuedUiEvent>,
     state: Arc<UiEventIngressState>,
+    credit: Option<Arc<OutputCreditLedger>>,
+    wake: Arc<(Mutex<()>, Condvar)>,
 }
 
 impl UiEventIngress {
+    fn notify(&self) {
+        let _guard = self.wake.0.lock().unwrap_or_else(|p| p.into_inner());
+        self.wake.1.notify_one();
+    }
     fn enqueue(&self, event: shared_types::RuntimeEvent) -> UiEventEnqueueResult {
         let mut state = self.state.lock();
         match event {
@@ -244,18 +649,50 @@ impl UiEventIngress {
                 synthetic,
                 timestamp,
             } => {
+                let credit = self.credit.as_ref().and_then(|ledger| ledger.take_published(identity));
                 let run_key = RunOutputKey::from(identity);
-                let filtered = state
+                let observer_only = self.credit.is_some() && credit.is_none();
+                let stream = state
                     .terminal_streams
                     .entry(run_key)
-                    .or_insert_with(|| RendererTerminalStream::new(identity, session.clone()))
-                    .push(identity, &chunk, synthetic, &timestamp);
+                    .or_insert_with(|| RendererTerminalStream::new(identity, session.clone()));
+                let filtered = stream.push(identity, &chunk, synthetic, &timestamp);
+                // A page reload starts a new renderer epoch with fresh xterm
+                // panes: treat its first output like a gap so the recovery
+                // prefix restores the run's tracked modes (review D9C-4).
+                if let Some(credit) = &credit {
+                    let epoch = credit.epoch.as_u128();
+                    if stream.display_epoch.is_some_and(|previous| previous != epoch) {
+                        stream.display_missing = true;
+                    }
+                    stream.display_epoch = Some(epoch);
+                }
+                let filtered = stream.prepare_display(filtered, observer_only);
                 if filtered.is_empty() {
+                    if let (Some(ledger), Some(credit)) = (&self.credit, &credit) { ledger.discard_native(credit); }
+                    return UiEventEnqueueResult::FilteredOutput;
+                }
+
+                if observer_only {
+                    // No uncredited payload enters either WebView queue. Keep
+                    // one counter per live run, not a log/event per raw read.
+                    record_output_gap(&mut state.output_gaps, run_key, identity, session);
+                    state.output_gaps.get_mut(&run_key).unwrap().observer_only = true;
+                    return UiEventEnqueueResult::DroppedOutputFull;
+                }
+
+                if let (Some(ledger), Some(credit)) = (&self.credit, &credit)
+                    && !ledger.is_current(credit)
+                {
+                    ledger.discard_native(credit); // Explicit renderer reset; sanitizer still advanced.
+                    state.terminal_streams.get_mut(&run_key).unwrap().display_missing = true;
                     return UiEventEnqueueResult::FilteredOutput;
                 }
 
                 let output_gaps_before = state.output_gaps.remove(&run_key).into_iter().collect();
                 let queued = QueuedUiEvent {
+                    order: state.next_order,
+                    credit,
                     event: shared_types::RuntimeEvent::SessionOutput {
                         identity,
                         session: session.clone(),
@@ -265,8 +702,20 @@ impl UiEventIngress {
                     },
                     output_gaps_before,
                 };
+                if queued.credit.is_some() {
+                    // Every queue item still owns one of <=TOTAL_ITEMS global
+                    // reservations. No credit wait or pressure shedding here.
+                    return match self.output_sender.try_send(queued) {
+                        Ok(()) => { state.next_order += 1; self.notify(); UiEventEnqueueResult::Enqueued }
+                        Err(mpsc::TrySendError::Disconnected(queued)) => {
+                            if let (Some(ledger), Some(credit)) = (&self.credit, queued.credit) { ledger.discard_native(&credit); }
+                            UiEventEnqueueResult::Disconnected
+                        }
+                        Err(mpsc::TrySendError::Full(_)) => panic!("reserved output queue capacity invariant violated"),
+                    };
+                }
                 match self.sender.try_send(queued) {
-                    Ok(()) => UiEventEnqueueResult::Enqueued,
+                    Ok(()) => { state.next_order += 1; self.notify(); UiEventEnqueueResult::Enqueued },
                     Err(mpsc::TrySendError::Full(queued)) => {
                         restore_output_gaps(&mut state.output_gaps, queued.output_gaps_before);
                         record_output_gap(&mut state.output_gaps, run_key, identity, session);
@@ -280,6 +729,7 @@ impl UiEventIngress {
                 }
             }
             event => {
+                let mut closing = None;
                 if let shared_types::RuntimeEvent::SessionState {
                     identity,
                     state:
@@ -290,22 +740,24 @@ impl UiEventIngress {
                         .terminal_streams
                         .remove(&RunOutputKey::from(*identity))
                 {
+                    closing = Some(RunOutputKey::from(*identity));
                     let _discarded_incomplete_control_tail = stream.finish();
                 }
 
-                let output_gaps_before = std::mem::take(&mut state.output_gaps)
-                    .into_values()
-                    .collect::<Vec<_>>();
+                let output_gaps_before = take_reportable_gaps(
+                    &mut state.output_gaps, self.credit.as_deref(), closing,
+                );
                 let queued = QueuedUiEvent {
+                    order: state.next_order,
+                    credit: None,
                     event,
                     output_gaps_before,
                 };
-                // Lifecycle/control events are lossless. Supervisor mutations
-                // release their state locks before publication, so bounded
-                // backpressure can delay a publisher without leaving renderer
-                // state stale or holding a lifecycle mutation lock.
+                // Preserve the existing bounded, lossless control lane. Some
+                // callers still hold lifecycle locks during publication; this
+                // pre-existing blocking debt is not a parser-credit wait.
                 match self.sender.send(queued) {
-                    Ok(()) => UiEventEnqueueResult::Enqueued,
+                    Ok(()) => { state.next_order += 1; self.notify(); UiEventEnqueueResult::Enqueued },
                     Err(mpsc::SendError(queued)) => {
                         restore_output_gaps(&mut state.output_gaps, queued.output_gaps_before);
                         UiEventEnqueueResult::Disconnected
@@ -326,6 +778,7 @@ fn record_output_gap(
         identity,
         session: session.clone(),
         dropped_events: 0,
+        observer_only: false,
     });
     gap.identity = identity;
     gap.session = session;
@@ -339,33 +792,111 @@ fn restore_output_gaps(gaps: &mut BTreeMap<RunOutputKey, UiOutputGap>, restored:
             identity: gap.identity,
             session: gap.session.clone(),
             dropped_events: 0,
+            observer_only: gap.observer_only,
         });
         if gap.identity.sequence >= current.identity.sequence {
             current.identity = gap.identity;
             current.session = gap.session;
         }
         current.dropped_events = current.dropped_events.saturating_add(gap.dropped_events);
+        current.observer_only |= gap.observer_only;
     }
+}
+
+fn take_reportable_gaps(
+    gaps: &mut BTreeMap<RunOutputKey, UiOutputGap>,
+    credit: Option<&OutputCreditLedger>,
+    closing: Option<RunOutputKey>,
+) -> Vec<UiOutputGap> {
+    let ready = gaps.iter().filter_map(|(key, gap)| {
+        (!gap.observer_only || closing == Some(*key)
+            || credit.is_some_and(|ledger| ledger.can_report_display_gap(gap.identity.into())))
+            .then_some(*key)
+    }).collect::<Vec<_>>();
+    ready.into_iter().filter_map(|key| gaps.remove(&key)).collect()
 }
 
 fn ui_event_channel(
     capacity: usize,
 ) -> (
     UiEventIngress,
-    mpsc::Receiver<QueuedUiEvent>,
+    UiEventReceiver,
     Arc<UiEventIngressState>,
 ) {
     assert!(capacity > 0, "UI event queue capacity must be positive");
     let (sender, receiver) = mpsc::sync_channel(capacity);
+    let (output_sender, output_receiver) = mpsc::sync_channel(TOTAL_ITEMS);
+    let wake = Arc::new((Mutex::new(()), Condvar::new()));
     let state = Arc::new(UiEventIngressState::default());
     (
         UiEventIngress {
             sender,
+            output_sender,
             state: state.clone(),
+            credit: None,
+            wake: wake.clone(),
         },
-        receiver,
+        UiEventReceiver { controls: receiver, outputs: output_receiver, wake,
+            heads: std::cell::RefCell::new((None, None, 0)) },
         state,
     )
+}
+
+/// Two fixed-capacity lanes, one admission order. A control barrier cannot pass
+/// preceding output; neither lane ever waits for a parser ACK. The existing
+/// bounded control send policy remains unchanged (including its lock debt).
+struct UiEventReceiver {
+    controls: mpsc::Receiver<QueuedUiEvent>,
+    outputs: mpsc::Receiver<QueuedUiEvent>,
+    heads: std::cell::RefCell<(Option<QueuedUiEvent>, Option<QueuedUiEvent>, u64)>,
+    wake: Arc<(Mutex<()>, Condvar)>,
+}
+impl UiEventReceiver {
+    #[cfg(test)]
+    fn try_iter(&self) -> impl Iterator<Item = QueuedUiEvent> + '_ {
+        std::iter::from_fn(|| self.try_recv().ok())
+    }
+    fn try_recv(&self) -> Result<QueuedUiEvent, mpsc::TryRecvError> {
+        let mut heads = self.heads.borrow_mut();
+        let control_closed = if heads.0.is_none() { match self.controls.try_recv() {
+            Ok(event) => { heads.0 = Some(event); false },
+            Err(mpsc::TryRecvError::Disconnected) => true,
+            Err(_) => false,
+        } } else { false };
+        let output_closed = if heads.1.is_none() { match self.outputs.try_recv() {
+            Ok(event) => { heads.1 = Some(event); false },
+            Err(mpsc::TryRecvError::Disconnected) => true,
+            Err(_) => false,
+        } } else { false };
+        let next = if heads.0.as_ref().is_some_and(|e| e.order == heads.2) { heads.0.take() }
+            else if heads.1.as_ref().is_some_and(|e| e.order == heads.2) { heads.1.take() }
+            else { None };
+        if let Some(event) = next { heads.2 += 1; return Ok(event); }
+        Err(if control_closed && output_closed { mpsc::TryRecvError::Disconnected }
+            else { mpsc::TryRecvError::Empty })
+    }
+    fn recv_timeout(&self, timeout: Duration) -> Result<QueuedUiEvent, mpsc::RecvTimeoutError> {
+        let deadline = Instant::now() + timeout;
+        let mut wake = self.wake.0.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            match self.try_recv() {
+                Ok(event) => return Ok(event),
+                Err(mpsc::TryRecvError::Disconnected) => return Err(mpsc::RecvTimeoutError::Disconnected),
+                Err(_) => {}
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() { return Err(mpsc::RecvTimeoutError::Timeout); }
+            wake = self.wake.1.wait_timeout(wake, remaining).unwrap_or_else(|p| p.into_inner()).0;
+        }
+    }
+    #[cfg(test)]
+    fn recv(&self) -> Result<QueuedUiEvent, mpsc::RecvError> {
+        loop { match self.recv_timeout(Duration::from_secs(60)) {
+            Ok(event) => return Ok(event),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(mpsc::RecvError),
+            Err(_) => {}
+        } }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -475,6 +1006,12 @@ struct RendererTerminalStream {
     sanitizer: TerminalOutputSanitizer,
     last_synthetic: bool,
     last_timestamp: String,
+    boundary: DisplayControlBoundary,
+    modes: DisplayModeSnapshot,
+    display_missing: bool,
+    /// Renderer epoch (as u128) of the last credited output, so the first
+    /// output to a reloaded page replays the tracked terminal modes.
+    display_epoch: Option<u128>,
 }
 
 impl RendererTerminalStream {
@@ -485,6 +1022,10 @@ impl RendererTerminalStream {
             sanitizer: TerminalOutputSanitizer::default(),
             last_synthetic: false,
             last_timestamp: String::new(),
+            boundary: DisplayControlBoundary::default(),
+            modes: DisplayModeSnapshot::default(),
+            display_missing: false,
+            display_epoch: None,
         }
     }
 
@@ -508,12 +1049,183 @@ impl RendererTerminalStream {
 
     fn finish(self) -> PendingSessionOutput {
         PendingSessionOutput {
+            credit: None,
             identity: self.identity,
             session: self.session,
             chunk: self.sanitizer.finish(),
             synthetic: self.last_synthetic,
             timestamp: self.last_timestamp,
         }
+    }
+
+    fn prepare_display(&mut self, filtered: String, dropping: bool) -> String {
+        if dropping || !self.display_missing {
+            for character in filtered.chars() { self.boundary.observe(character, &mut self.modes); }
+            if dropping && !filtered.is_empty() { self.display_missing = true; }
+            return filtered;
+        }
+        let mut start = 0;
+        if !matches!(self.boundary, DisplayControlBoundary::Normal) {
+            for (offset, character) in filtered.char_indices() {
+                self.boundary.observe(character, &mut self.modes);
+                start = offset + character.len_utf8();
+                if matches!(self.boundary, DisplayControlBoundary::Normal) { break; }
+            }
+        }
+        let suffix = &filtered[start..];
+        if suffix.is_empty() { return String::new(); }
+        // Capture modes at the recovery boundary, before suffix commands can
+        // change them. Replaying final-chunk modes here would reorder the TUI.
+        let prefix = self.modes.recovery_prefix();
+        for character in suffix.chars() { self.boundary.observe(character, &mut self.modes); }
+        self.display_missing = false;
+        // CAN cancels xterm's pre-gap partial sequence; SGR resets attributes.
+        // Neither reconstructs cursor/screen state or lost text: keep the gap
+        // warning and request a full redraw in the renderer.
+        format!("{prefix}{suffix}")
+    }
+}
+
+/// Constant state only. OSC/DCS/other strings have already been consumed by
+/// TerminalOutputSanitizer; track the CSI/ESC sequences it passes to xterm.
+#[derive(Clone, Copy, Default)]
+enum DisplayControlBoundary { #[default] Normal, Escape, Intermediate, Csi(DisplayModeCsi) }
+impl DisplayControlBoundary {
+    fn observe(&mut self, character: char, modes: &mut DisplayModeSnapshot) {
+        if matches!(character, '\u{18}' | '\u{1a}') { *self = Self::Normal; return; }
+        if character == '\u{1b}' { *self = Self::Escape; return; }
+        if character == '\u{009b}' { *self = Self::Csi(DisplayModeCsi::default()); return; }
+        match *self {
+            Self::Normal => {},
+            Self::Escape => match character {
+                '[' => *self = Self::Csi(DisplayModeCsi::default()),
+                'c' => { modes.reset_full(); *self = Self::Normal; },
+                '\u{20}'..='\u{2f}' => *self = Self::Intermediate,
+                '\u{30}'..='\u{7e}' => *self = Self::Normal,
+                _ => {},
+            },
+            Self::Intermediate if matches!(character, '\u{30}'..='\u{7e}') => *self = Self::Normal,
+            Self::Csi(mut csi) => {
+                if matches!(character, '\u{40}'..='\u{7e}') {
+                    csi.finish_parameter();
+                    if !csi.invalid && csi.private && !csi.soft_reset && matches!(character, 'h' | 'l') {
+                        csi.selected.apply(modes, character == 'h');
+                    } else if !csi.invalid && !csi.private && csi.soft_reset && character == 'p' {
+                        modes.reset_soft();
+                    }
+                    *self = Self::Normal;
+                } else {
+                    csi.observe(character);
+                    *self = Self::Csi(csi);
+                }
+            },
+            _ => {},
+        }
+    }
+}
+
+/// Renderer state only, never permission/routing authority. These are the
+/// reviewed input-affecting modes supported by installed xterm 6; unknown modes
+/// stay untracked. Protocol/encoding aliases are last-wins, not independent bits.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct DisplayModeSnapshot {
+    cursor_keys: Option<bool>,
+    cursor_visible: Option<bool>,
+    focus: Option<bool>,
+    bracketed_paste: Option<bool>,
+    alternate: Option<bool>,
+    mouse_protocol: Option<u16>, // 0=off, 9/1000/1002/1003
+    mouse_encoding: Option<u16>, // 0=default, 1006/1016
+}
+impl DisplayModeSnapshot {
+    fn select(&mut self, parameter: u16) {
+        match parameter {
+            1 => self.cursor_keys = Some(true),
+            25 => self.cursor_visible = Some(true),
+            1004 => self.focus = Some(true),
+            2004 => self.bracketed_paste = Some(true),
+            47 | 1047 | 1049 => self.alternate = Some(true),
+            9 | 1000 | 1002 | 1003 => self.mouse_protocol = Some(parameter),
+            1006 | 1016 => self.mouse_encoding = Some(parameter),
+            _ => {}, // xterm ignores 1001/1005/1015; do not invent support.
+        }
+    }
+    fn apply(self, target: &mut Self, enabled: bool) {
+        if self.cursor_keys.is_some() { target.cursor_keys = Some(enabled); }
+        if self.cursor_visible.is_some() { target.cursor_visible = Some(enabled); }
+        if self.focus.is_some() { target.focus = Some(enabled); }
+        if self.bracketed_paste.is_some() { target.bracketed_paste = Some(enabled); }
+        if self.alternate.is_some() { target.alternate = Some(enabled); }
+        if let Some(mode) = self.mouse_protocol { target.mouse_protocol = Some(if enabled { mode } else { 0 }); }
+        if let Some(mode) = self.mouse_encoding { target.mouse_encoding = Some(if enabled { mode } else { 0 }); }
+    }
+    fn reset_soft(&mut self) {
+        self.cursor_keys = Some(false);
+        self.cursor_visible = Some(true);
+        self.focus = Some(false);
+        self.bracketed_paste = Some(false);
+        // xterm DECSTR does not reset its mouse service or active buffer.
+    }
+    fn reset_full(&mut self) {
+        self.cursor_keys = Some(false);
+        self.focus = Some(false);
+        self.bracketed_paste = Some(false);
+        self.alternate = Some(false);
+        self.mouse_protocol = Some(0);
+        self.mouse_encoding = Some(0);
+        // Installed xterm RIS retains CoreService.isCursorHidden; unlike
+        // DECSTR, it does not promise to show a previously hidden cursor.
+    }
+    fn recovery_prefix(self) -> String {
+        let mut prefix = String::from("\x18\x1b[0m");
+        // Canonical 47 selects the buffer without inventing 1049's saved
+        // cursor, which cannot be reconstructed from omitted display output.
+        for (mode, enabled) in [(47, self.alternate), (1, self.cursor_keys),
+            (25, self.cursor_visible), (1004, self.focus), (2004, self.bracketed_paste)]
+        {
+            if let Some(enabled) = enabled { prefix.push_str(&format!("\x1b[?{mode}{}", if enabled { 'h' } else { 'l' })); }
+        }
+        for (selected, reset_mode) in [(self.mouse_protocol, 1000), (self.mouse_encoding, 1006)] {
+            if let Some(mode) = selected {
+                let parameter = if mode == 0 { reset_mode } else { mode };
+                prefix.push_str(&format!("\x1b[?{parameter}{}", if mode == 0 { 'l' } else { 'h' }));
+            }
+        }
+        // Seven controls of <=8 bytes + CAN/SGR + one carried ESC <=62 bytes.
+        debug_assert!(prefix.len() + 1 <= supervisor::output_credit::DISPLAY_OVERHEAD);
+        prefix
+    }
+}
+
+/// Fixed CSI parameter accumulator. Like the supervisor's private-mode
+/// scanner, changes commit only at a complete valid DECSET/DECRST final byte.
+#[derive(Clone, Copy, Default)]
+struct DisplayModeCsi {
+    started: bool,
+    private: bool,
+    soft_reset: bool,
+    invalid: bool,
+    current: Option<u16>,
+    selected: DisplayModeSnapshot,
+}
+impl DisplayModeCsi {
+    fn finish_parameter(&mut self) {
+        if let Some(parameter) = self.current.take() { self.selected.select(parameter); }
+    }
+    fn observe(&mut self, character: char) {
+        if character <= '\u{1f}' || character == '\u{7f}' { return; }
+        match character {
+            '?' if !self.started => self.private = true,
+            '0'..='9' if !self.soft_reset => {
+                self.current = self.current.unwrap_or(0).checked_mul(10)
+                    .and_then(|value| value.checked_add(character as u16 - '0' as u16));
+                if self.current.is_none() { self.invalid = true; }
+            },
+            ';' if !self.soft_reset => self.finish_parameter(),
+            '!' if !self.private && !self.soft_reset => self.soft_reset = true,
+            _ => self.invalid = true,
+        }
+        self.started = true;
     }
 }
 
@@ -591,9 +1303,69 @@ impl TerminalOutputSanitizer {
     }
 }
 
+/// A108: the current self-upgrade attempt for the banner, if any.
+#[tauri::command]
+fn upgrade_status(state: State<'_, DesktopState>) -> Option<shared_types::UpgradeStatus> {
+    state.supervisor.upgrade_status()
+}
+
+/// The window is shown: the new build resumes its recorded members once.
+/// Returns the status naming them; the restart resume leaves them alone.
+#[tauri::command]
+fn begin_upgrade_resume(state: State<'_, DesktopState>) -> Option<shared_types::UpgradeStatus> {
+    state.supervisor.begin_upgrade_resume()
+}
+
+/// Operator Cancel during the upgrade notice.
+#[tauri::command]
+async fn cancel_upgrade(state: State<'_, DesktopState>, attempt_id: RunId) -> Result<(), String> {
+    state.diagnostics.log("info", "cancel_upgrade", attempt_id.to_string());
+    let supervisor = state.supervisor.clone();
+    tauri::async_runtime::spawn_blocking(move || supervisor.cancel_upgrade(attempt_id))
+        .await
+        .map_err(|error| format!("upgrade worker failed: {error}"))?
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Operator-only, after the confirm gate: a terminal note on a held attempt.
+#[tauri::command]
+async fn abandon_held_upgrade(state: State<'_, DesktopState>, attempt_id: RunId) -> Result<(), String> {
+    state.diagnostics.log("warn", "abandon_held_upgrade", attempt_id.to_string());
+    let supervisor = state.supervisor.clone();
+    tauri::async_runtime::spawn_blocking(move || supervisor.abandon_held_upgrade(attempt_id))
+        .await
+        .map_err(|error| format!("upgrade worker failed: {error}"))?
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Whether any room composer holds unsent text; an upgrade waits while it does.
+#[tauri::command]
+fn report_room_drafts(state: State<'_, DesktopState>, open: bool) {
+    state.supervisor.report_operator_room_drafts(open);
+}
+
 #[tauri::command]
 fn automation_mode(state: State<'_, DesktopState>) -> bool {
     state.automation_mode
+}
+
+#[tauri::command]
+fn trial_status(window: WebviewWindow, state: State<'_, DesktopState>) -> Result<Option<trial_desktop::TrialStatus>, String> {
+    if window.label() != "main" { return Err("trial status is available only to the main WebView".into()); }
+    Ok(state.trial.as_ref().map(|trial| trial_desktop::TrialStatus {
+        challenge: trial.challenge(), admission: "held", backend_initialized: true,
+    }))
+}
+
+#[tauri::command]
+async fn trial_renderer_acknowledged(
+    window: WebviewWindow, state: State<'_, DesktopState>, challenge: TrialChallenge,
+) -> Result<TrialHealthReceipt, String> {
+    let label = window.label().to_owned();
+    let trial = state.trial.clone().ok_or("this desktop is not a held trial")?;
+    let supervisor = state.supervisor.clone();
+    tauri::async_runtime::spawn_blocking(move || trial.record_renderer_acknowledged(&supervisor, &label, &challenge))
+        .await.map_err(|error| error.to_string())?.map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -602,6 +1374,88 @@ fn bootstrap(state: State<'_, DesktopState>) -> Result<RuntimeSnapshot, String> 
         .diagnostics
         .log("info", "bootstrap", "runtime snapshot requested");
     Ok(state.supervisor.snapshot())
+}
+
+/// Metadata discovery never launches or attaches a provider conversation.
+#[tauri::command]
+async fn discover_local_sessions(state: State<'_, DesktopState>) -> Result<supervisor::session_inventory::Inventory, String> {
+    static BUSY: AtomicBool = AtomicBool::new(false);
+    if BUSY.swap(true, Ordering::AcqRel) {
+        return Err("A local conversation scan is already running".into());
+    }
+    struct Reset;
+    impl Drop for Reset { fn drop(&mut self) { BUSY.store(false, Ordering::Release); } }
+    let reset = Reset;
+    let personal_repo = state.supervisor.personal_repo_status();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _reset = reset;
+        supervisor::session_inventory::discover_personal_repo(&personal_repo)
+    }).await.map_err(|error| error.to_string())?
+}
+
+/// Operator-only metadata binding. The supervisor always retains a recovery
+/// hold; this command never launches or resumes a provider conversation.
+#[tauri::command]
+async fn attach_local_session(
+    window: WebviewWindow,
+    state: State<'_, DesktopState>,
+    request: supervisor::session_inventory::AttachLocalSessionRequest,
+) -> Result<(), String> {
+    if window.label() != "main" {
+        return Err("Local conversations can be attached only from the main WebView".into());
+    }
+    let supervisor = state.supervisor.clone();
+    tauri::async_runtime::spawn_blocking(move || supervisor.attach_local_session(request))
+        .await.map_err(|error| error.to_string())?.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn begin_output_renderer(state: State<'_, DesktopState>) -> RendererReset {
+    state.supervisor.output_credit().begin_renderer()
+}
+
+#[tauri::command]
+async fn output_renderer_ready(state: State<'_, DesktopState>, epoch: String) -> Result<(), String> {
+    let epoch = epoch.parse().map_err(|_| "invalid renderer epoch".to_string())?;
+    let ledger = state.supervisor.output_credit();
+    tauri::async_runtime::spawn_blocking(move || ledger.renderer_ready(epoch, Duration::from_secs(5)))
+        .await.map_err(|error| error.to_string())?.map_err(str::to_string)
+}
+
+#[tauri::command]
+async fn acknowledge_output(state: State<'_, DesktopState>, credit: OutputCredit) -> Result<usize, String> {
+    // No slots, lifecycle, publisher, UI ingress, or event emission.
+    state.supervisor.output_credit().acknowledge(&credit).map_err(str::to_string)
+}
+
+#[tauri::command]
+async fn output_credit_metrics(state: State<'_, DesktopState>) -> Result<OutputCreditMetrics, String> {
+    Ok(state.supervisor.output_credit().metrics())
+}
+
+#[tauri::command]
+async fn discard_output(state: State<'_, DesktopState>, credit: OutputCredit, reason: String) -> Result<(), String> {
+    if !matches!(reason.as_str(), "stale_epoch" | "stale_run" | "pane_disposed" | "write_failed" | "bootstrap_overflow" | "unattached_overflow") {
+        return Err("unknown output disposal reason".into());
+    }
+    if credit.tickets.len() > TOTAL_ITEMS { return Err("too many output tickets".into()); }
+    let dropped = state.supervisor.output_credit().discard(&credit);
+    if dropped.items > 0 {
+        state.diagnostics.log("warn", "display_output_discarded", format!("reason={reason} items={} bytes={} (not parsed)", dropped.items, dropped.bytes));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn preview_session_launch(
+    state: State<'_, DesktopState>,
+    request: StartSessionRequest,
+) -> Result<SessionLaunchPreview, String> {
+    let supervisor = state.supervisor.clone();
+    match tauri::async_runtime::spawn_blocking(move || supervisor.preview_session_launch(request)).await {
+        Ok(result) => result.map_err(|error| format!("{error:#}")),
+        Err(error) => Err(format!("launch preview worker failed: {error}")),
+    }
 }
 
 #[tauri::command]
@@ -616,7 +1470,9 @@ fn start_session(
     );
     state
         .supervisor
-        .start_session_by_id_with_options(request.session_id, request.fresh, request.search)
+        .start_session_with_launch_choices(
+            request.session_id, request.fresh, request.search, request.launch_choices,
+        )
         .map_err(|error| {
             let detail = format!("{error:#}");
             state.diagnostics.log(
@@ -626,6 +1482,45 @@ fn start_session(
             );
             detail
         })
+}
+
+/// Boot resume has native once-only eligibility; ordinary Start never promotes
+/// an interrupted task. No caller-supplied launch choices cross this boundary.
+#[tauri::command]
+async fn resume_session_after_restart(
+    state: State<'_, DesktopState>,
+    session_id: SessionId,
+) -> Result<SessionSnapshot, String> {
+    state.diagnostics.log("info", "resume_session_after_restart", format!("requested {session_id}"));
+    let supervisor = state.supervisor.clone();
+    let outcome = match tauri::async_runtime::spawn_blocking(move || supervisor.resume_session_after_restart(session_id)).await {
+        Ok(result) => result.map_err(|error| format!("{error:#}")),
+        Err(error) => Err(format!("restart resume worker failed: {error}")),
+    };
+    outcome.map_err(|error| {
+        state.diagnostics.log("error", "restart_resume_failed", format!("{session_id}: {error}"));
+        error
+    })
+}
+
+/// "Resume here" on a member copied from the live PRIM-1 (A106 move).
+#[tauri::command]
+async fn resume_held_conversation(
+    state: State<'_, DesktopState>,
+    request: StopSessionRequest,
+) -> Result<SessionSnapshot, String> {
+    state.diagnostics.log("info", "resume_held_conversation", format!("requested {}", request.session_id));
+    // The Codex rollout search and the catalog write stay off the UI thread.
+    let supervisor = state.supervisor.clone();
+    let session_id = request.session_id;
+    let outcome = match tauri::async_runtime::spawn_blocking(move || supervisor.resume_held_conversation(session_id)).await {
+        Ok(result) => result.map_err(|error| format!("{error:#}")),
+        Err(error) => Err(format!("resume worker failed: {error}")),
+    };
+    outcome.map_err(|error| {
+        state.diagnostics.log("error", "resume_held_conversation_failed", format!("{session_id}: {error}"));
+        error
+    })
 }
 
 #[tauri::command]
@@ -638,9 +1533,13 @@ fn stop_session(
         "stop_session",
         format!("requested {}", request.session_id),
     );
-    state
+    // Admission stays on this ordered (main-thread) command, so a later Start,
+    // Restart or Delete sees the declared Stop. Only the bounded termination
+    // wait, up to the kill timeout, moves off the UI thread; the final state
+    // arrives as runtime events and a late failure as a system log event.
+    let (ticket, admitted) = state
         .supervisor
-        .stop_session_by_id(request.session_id)
+        .begin_stop_session(request.session_id)
         .map_err(|error| {
             state.diagnostics.log(
                 "error",
@@ -648,7 +1547,33 @@ fn stop_session(
                 format!("{}: {}", request.session_id, error),
             );
             error.to_string()
-        })
+        })?;
+    // A dedicated thread, so a dispatch failure is observable: the admitted
+    // Stop is then finished here rather than left declared forever.
+    let pending = Arc::new(Mutex::new(Some(ticket)));
+    let worker_ticket = pending.clone();
+    let supervisor = state.supervisor.clone();
+    let dispatched = thread::Builder::new()
+        .name("prim1-stop-finish".into())
+        .spawn(move || {
+            if let Some(ticket) = worker_ticket.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
+                supervisor.finish_stop_session_detached(ticket);
+            }
+        });
+    if let Err(error) = dispatched {
+        state.diagnostics.log(
+            "warn",
+            "stop_session_dispatch_failed",
+            format!("{}: {error}; finishing on the command thread", request.session_id),
+        );
+        if let Some(ticket) = pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
+            return state
+                .supervisor
+                .finish_stop_session(ticket)
+                .map_err(|error| error.to_string());
+        }
+    }
+    Ok(admitted)
 }
 
 #[tauri::command]
@@ -694,6 +1619,12 @@ fn create_session(
             .log("error", "create_session_failed", error.to_string());
         error.to_string()
     })
+}
+
+/// Prime/WSL is parked in v2 unless `PRIM1_ENABLE_PRIME=1`; the UI hides it.
+#[tauri::command]
+fn prime_enabled() -> bool {
+    supervisor::prime_enabled()
 }
 
 #[tauri::command]
@@ -763,6 +1694,32 @@ fn set_session_permission_profile(
         })
 }
 
+/// Operator-only (A109, A110): the member's roam, maintain and manage grants. No pane
+/// sideband request can change them.
+#[tauri::command]
+fn set_member_permissions(
+    state: State<'_, DesktopState>,
+    request: SetMemberPermissionsRequest,
+) -> Result<SessionSnapshot, String> {
+    state.diagnostics.log(
+        "info",
+        "set_member_permissions",
+        format!("{} roam={} maintain={} manage={}", request.session_id, request.roam, request.maintain, request.manage),
+    );
+    let permissions = MemberPermissions { roam: request.roam, maintain: request.maintain, manage: request.manage };
+    state
+        .supervisor
+        .set_member_permissions(request.session_id, permissions)
+        .map_err(|error| {
+            state.diagnostics.log(
+                "error",
+                "set_member_permissions_failed",
+                format!("{}: {}", request.session_id, error),
+            );
+            error.to_string()
+        })
+}
+
 #[tauri::command]
 fn move_session(
     state: State<'_, DesktopState>,
@@ -795,13 +1752,25 @@ fn delete_session(
         .supervisor
         .delete_session(request.session_id)
         .map_err(|error| {
-            state.diagnostics.log(
-                "error",
-                "delete_session_failed",
-                format!("{}: {}", request.session_id, error),
-            );
-            error.to_string()
+            let message = error.to_string();
+            // A16 D4 (PC3, 20 Oct): right after a stop, Close retries these
+            // two transient refusals (main.ts deleteSessionOnceClosed); each
+            // attempt is a wait, not a failure, and was read as one.
+            let (level, event) = if delete_refusal_is_transient(&message) {
+                ("info", "delete_session_waiting")
+            } else {
+                ("error", "delete_session_failed")
+            };
+            state.diagnostics.log(level, event, format!("{}: {}", request.session_id, message));
+            message
         })
+}
+
+/// The supervisor's refusals that Close retries (the same two phrases as
+/// main.ts deleteSessionOnceClosed): the stop is still finishing, or the
+/// stopped session's event stream is still draining.
+fn delete_refusal_is_transient(message: &str) -> bool {
+    message.contains("must be fully closed") || message.contains("still draining")
 }
 
 #[tauri::command]
@@ -810,117 +1779,283 @@ fn default_room_brief() -> String {
 }
 
 #[tauri::command]
-fn create_room(
+async fn create_room(
     state: State<'_, DesktopState>,
     request: CreateRoomRequest,
 ) -> Result<RoomSnapshot, String> {
-    state.supervisor.create_room(request).map_err(|error| {
-        state
-            .diagnostics
-            .log("error", "create_room_failed", error.to_string());
-        error.to_string()
-    })
+    let supervisor = state.supervisor.clone();
+    let diagnostics = state.diagnostics.clone();
+    match tauri::async_runtime::spawn_blocking(move || supervisor.create_room(request)).await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(error)) => {
+            diagnostics.log("error", "create_room_failed", error.to_string());
+            Err(error.to_string())
+        }
+        Err(error) => {
+            let message = format!("room creation worker failed: {error}");
+            diagnostics.log("error", "create_room_failed", &message);
+            Err(message)
+        }
+    }
 }
 
 #[tauri::command]
-fn rename_room(
+async fn rename_room(
     state: State<'_, DesktopState>,
     request: RenameRoomRequest,
 ) -> Result<RoomSnapshot, String> {
-    state.supervisor.rename_room(request).map_err(|error| {
-        state
-            .diagnostics
-            .log("error", "rename_room_failed", error.to_string());
-        error.to_string()
-    })
+    let supervisor = state.supervisor.clone();
+    let diagnostics = state.diagnostics.clone();
+    match tauri::async_runtime::spawn_blocking(move || supervisor.rename_room(request)).await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(error)) => {
+            diagnostics.log("error", "rename_room_failed", error.to_string());
+            Err(error.to_string())
+        }
+        Err(error) => {
+            let message = format!("room rename worker failed: {error}");
+            diagnostics.log("error", "rename_room_failed", &message);
+            Err(message)
+        }
+    }
 }
 
 #[tauri::command]
-fn move_room(
+async fn set_room_resume_on_restart(
+    state: State<'_, DesktopState>,
+    request: SetRoomResumeRequest,
+) -> Result<RoomSnapshot, String> {
+    let supervisor = state.supervisor.clone();
+    let diagnostics = state.diagnostics.clone();
+    match tauri::async_runtime::spawn_blocking(move || {
+        supervisor.set_room_resume_on_restart(request)
+    })
+    .await
+    {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(error)) => {
+            diagnostics.log("error", "set_room_resume_on_restart_failed", error.to_string());
+            Err(error.to_string())
+        }
+        Err(error) => {
+            let message = format!("room restart setting worker failed: {error}");
+            diagnostics.log("error", "set_room_resume_on_restart_failed", &message);
+            Err(message)
+        }
+    }
+}
+
+#[tauri::command]
+async fn read_room_brief(
+    state: State<'_, DesktopState>,
+    request: ReadRoomBriefRequest,
+) -> Result<RoomBriefSettings, String> {
+    let supervisor = state.supervisor.clone();
+    let diagnostics = state.diagnostics.clone();
+    match tauri::async_runtime::spawn_blocking(move || supervisor.read_room_brief(request)).await {
+        Ok(result) => result.map_err(|error| error.to_string()),
+        Err(error) => {
+            let message = format!("room brief read worker failed: {error}");
+            diagnostics.log("error", "read_room_brief_failed", &message);
+            Err(message)
+        }
+    }
+}
+
+#[tauri::command]
+async fn update_room_brief(
+    state: State<'_, DesktopState>,
+    request: UpdateRoomBriefRequest,
+) -> Result<RoomBriefSettings, String> {
+    let supervisor = state.supervisor.clone();
+    let diagnostics = state.diagnostics.clone();
+    match tauri::async_runtime::spawn_blocking(move || supervisor.update_room_brief(request)).await {
+        Ok(Ok(settings)) => Ok(settings),
+        Ok(Err(error)) => {
+            diagnostics.log("error", "update_room_brief_failed", error.to_string());
+            Err(error.to_string())
+        }
+        Err(error) => {
+            let message = format!("room brief settings worker failed: {error}");
+            diagnostics.log("error", "update_room_brief_failed", &message);
+            Err(message)
+        }
+    }
+}
+
+#[tauri::command]
+async fn get_room_fallbacks(
+    state: State<'_, DesktopState>,
+    room_id: RoomId,
+) -> Result<RoomFallbackSnapshot, String> {
+    let supervisor = state.supervisor.clone();
+    let diagnostics = state.diagnostics.clone();
+    match tauri::async_runtime::spawn_blocking(move || supervisor.get_room_fallbacks(room_id)).await {
+        Ok(result) => result.map_err(|error| error.to_string()),
+        Err(error) => {
+            let message = format!("room fallbacks read worker failed: {error}");
+            diagnostics.log("error", "get_room_fallbacks_failed", &message);
+            Err(message)
+        }
+    }
+}
+
+#[tauri::command]
+async fn set_room_fallbacks(
+    state: State<'_, DesktopState>,
+    request: SetRoomFallbacksRequest,
+) -> Result<RoomFallbackSnapshot, String> {
+    let supervisor = state.supervisor.clone();
+    let diagnostics = state.diagnostics.clone();
+    match tauri::async_runtime::spawn_blocking(move || supervisor.set_room_fallbacks(request)).await {
+        Ok(Ok(snapshot)) => Ok(snapshot),
+        Ok(Err(error)) => {
+            diagnostics.log("error", "set_room_fallbacks_failed", error.to_string());
+            Err(error.to_string())
+        }
+        Err(error) => {
+            let message = format!("room fallbacks save worker failed: {error}");
+            diagnostics.log("error", "set_room_fallbacks_failed", &message);
+            Err(message)
+        }
+    }
+}
+
+#[tauri::command]
+async fn move_room(
     state: State<'_, DesktopState>,
     request: MoveRoomRequest,
 ) -> Result<RuntimeSnapshot, String> {
-    state.supervisor.move_room(request).map_err(|error| {
-        state
-            .diagnostics
-            .log("error", "move_room_failed", error.to_string());
-        error.to_string()
-    })
+    let supervisor = state.supervisor.clone();
+    let diagnostics = state.diagnostics.clone();
+    match tauri::async_runtime::spawn_blocking(move || supervisor.move_room(request)).await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(error)) => {
+            diagnostics.log("error", "move_room_failed", error.to_string());
+            Err(error.to_string())
+        }
+        Err(error) => {
+            let message = format!("room move worker failed: {error}");
+            diagnostics.log("error", "move_room_failed", &message);
+            Err(message)
+        }
+    }
 }
 
 #[tauri::command]
-fn add_room_member(
+async fn add_room_member(
     state: State<'_, DesktopState>,
     request: AddRoomMemberRequest,
 ) -> Result<RoomSnapshot, String> {
-    state.supervisor.add_room_member(request).map_err(|error| {
-        state
-            .diagnostics
-            .log("error", "add_room_member_failed", error.to_string());
-        error.to_string()
-    })
+    let supervisor = state.supervisor.clone();
+    let diagnostics = state.diagnostics.clone();
+    match tauri::async_runtime::spawn_blocking(move || supervisor.add_room_member(request)).await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(error)) => {
+            diagnostics.log("error", "add_room_member_failed", error.to_string());
+            Err(error.to_string())
+        }
+        Err(error) => {
+            let message = format!("room member addition worker failed: {error}");
+            diagnostics.log("error", "add_room_member_failed", &message);
+            Err(message)
+        }
+    }
 }
 
 #[tauri::command]
-fn remove_room_member(
+async fn remove_room_member(
     state: State<'_, DesktopState>,
     request: RemoveRoomMemberRequest,
 ) -> Result<RoomSnapshot, String> {
-    state
-        .supervisor
-        .remove_room_member(request)
-        .map_err(|error| {
-            state
-                .diagnostics
-                .log("error", "remove_room_member_failed", error.to_string());
-            error.to_string()
-        })
+    let supervisor = state.supervisor.clone();
+    let diagnostics = state.diagnostics.clone();
+    match tauri::async_runtime::spawn_blocking(move || supervisor.remove_room_member(request)).await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(error)) => {
+            diagnostics.log("error", "remove_room_member_failed", error.to_string());
+            Err(error.to_string())
+        }
+        Err(error) => {
+            let message = format!("room member removal worker failed: {error}");
+            diagnostics.log("error", "remove_room_member_failed", &message);
+            Err(message)
+        }
+    }
 }
 
 #[tauri::command]
-fn delete_room(state: State<'_, DesktopState>, request: DeleteRoomRequest) -> Result<(), String> {
-    state.supervisor.delete_room(request).map_err(|error| {
-        state
-            .diagnostics
-            .log("error", "delete_room_failed", error.to_string());
-        error.to_string()
-    })
+async fn delete_room(state: State<'_, DesktopState>, request: DeleteRoomRequest) -> Result<(), String> {
+    let supervisor = state.supervisor.clone();
+    let diagnostics = state.diagnostics.clone();
+    match tauri::async_runtime::spawn_blocking(move || supervisor.delete_room(request)).await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(error)) => {
+            diagnostics.log("error", "delete_room_failed", error.to_string());
+            Err(error.to_string())
+        }
+        Err(error) => {
+            let message = format!("room deletion worker failed: {error}");
+            diagnostics.log("error", "delete_room_failed", &message);
+            Err(message)
+        }
+    }
 }
 
 #[tauri::command]
-fn read_room_feed(
+async fn read_room_feed(
     state: State<'_, DesktopState>,
     request: ReadRoomFeedRequest,
 ) -> Result<RoomFeedPage, String> {
-    state.supervisor.read_room_feed(request).map_err(|error| {
-        state
-            .diagnostics
-            .log("error", "read_room_feed_failed", error.to_string());
-        error.to_string()
-    })
+    let supervisor = state.supervisor.clone();
+    let diagnostics = state.diagnostics.clone();
+    match tauri::async_runtime::spawn_blocking(move || supervisor.read_room_feed(request)).await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(error)) => {
+            diagnostics.log("error", "read_room_feed_failed", error.to_string());
+            Err(error.to_string())
+        }
+        Err(error) => {
+            let message = format!("room feed read worker failed: {error}");
+            diagnostics.log("error", "read_room_feed_failed", &message);
+            Err(message)
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct RoomRequestError {
+    kind: &'static str,
+    message: String,
 }
 
 #[tauri::command]
-fn post_room_message(
+async fn post_room_message(
     state: State<'_, DesktopState>,
     request: PostRoomMessageRequest,
-) -> Result<RoomPostResult, String> {
-    state
-        .supervisor
-        .post_room_message(request)
-        .map_err(|error| {
-            state
-                .diagnostics
-                .log("error", "post_room_message_failed", error.to_string());
-            error.to_string()
-        })
+) -> Result<RoomPostResult, RoomRequestError> {
+    let supervisor = state.supervisor.clone();
+    let diagnostics = state.diagnostics.clone();
+    match tauri::async_runtime::spawn_blocking(move || supervisor.post_room_message(request)).await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(error)) => {
+            diagnostics.log("error", "post_room_message_failed", error.to_string());
+            Err(RoomRequestError { kind: supervisor::room_request_error_kind(&error),
+                message: error.to_string() })
+        }
+        Err(error) => {
+            let message = format!("room post worker failed: {error}");
+            diagnostics.log("error", "post_room_message_failed", &message);
+            Err(RoomRequestError { kind: "worker_failed", message })
+        }
+    }
 }
 
 #[tauri::command]
 async fn brief_room_member(
     state: State<'_, DesktopState>,
     request: BriefRoomMemberRequest,
-) -> Result<RoomDeliveryResult, String> {
+) -> Result<RoomDeliveryResult, RoomRequestError> {
     let supervisor = state.supervisor.clone();
     let diagnostics = state.diagnostics.clone();
     match tauri::async_runtime::spawn_blocking(move || supervisor.brief_room_member(request)).await
@@ -928,21 +2063,59 @@ async fn brief_room_member(
         Ok(Ok(result)) => Ok(result),
         Ok(Err(error)) => {
             diagnostics.log("error", "brief_room_member_failed", error.to_string());
-            Err(error.to_string())
+            Err(RoomRequestError { kind: supervisor::room_request_error_kind(&error), message: error.to_string() })
         }
         Err(error) => {
             let message = format!("room brief worker failed: {error}");
             diagnostics.log("error", "brief_room_member_failed", &message);
-            Err(message)
+            Err(RoomRequestError { kind: "worker_failed", message })
         }
     }
+}
+
+/// v3 W3 (b): the operator's own disposition of a message for one recipient.
+#[tauri::command]
+async fn dispose_room_message(
+    state: State<'_, DesktopState>,
+    request: shared_types::DisposeRoomMessageRequest,
+) -> Result<shared_types::RoomAckResult, RoomRequestError> {
+    let supervisor = state.supervisor.clone();
+    tauri::async_runtime::spawn_blocking(move || supervisor.dispose_room_message_as_operator(request))
+        .await.map_err(|error| RoomRequestError { kind: "worker_failed", message: format!("room disposition worker failed: {error}") })?
+        .map_err(|error| RoomRequestError { kind: supervisor::room_request_error_kind(&error),
+            message: error.to_string() })
+}
+
+/// v3 W3 (D6): the operator withdraws a message.
+#[tauri::command]
+async fn cancel_room_message(
+    state: State<'_, DesktopState>,
+    request: shared_types::CancelRoomMessageRequest,
+) -> Result<shared_types::RoomCancelResult, RoomRequestError> {
+    let supervisor = state.supervisor.clone();
+    tauri::async_runtime::spawn_blocking(move || supervisor.cancel_room_message_as_operator(request))
+        .await.map_err(|error| RoomRequestError { kind: "worker_failed", message: format!("room withdrawal worker failed: {error}") })?
+        .map_err(|error| RoomRequestError { kind: supervisor::room_request_error_kind(&error),
+            message: error.to_string() })
+}
+
+#[tauri::command]
+async fn retry_room_delivery(
+    state: State<'_, DesktopState>,
+    request: RetryRoomDeliveryRequest,
+) -> Result<RoomDeliveryResult, RoomRequestError> {
+    let supervisor = state.supervisor.clone();
+    tauri::async_runtime::spawn_blocking(move || supervisor.retry_room_delivery(request))
+        .await.map_err(|error| RoomRequestError { kind: "worker_failed", message: format!("room retry worker failed: {error}") })?
+        .map_err(|error| RoomRequestError { kind: supervisor::room_request_error_kind(&error),
+            message: error.to_string() })
 }
 
 #[tauri::command]
 async fn deliver_room_message(
     state: State<'_, DesktopState>,
     request: DeliverRoomMessageRequest,
-) -> Result<RoomDeliveryResult, String> {
+) -> Result<RoomDeliveryResult, RoomRequestError> {
     let supervisor = state.supervisor.clone();
     let diagnostics = state.diagnostics.clone();
     match tauri::async_runtime::spawn_blocking(move || supervisor.deliver_room_message(request))
@@ -951,20 +2124,100 @@ async fn deliver_room_message(
         Ok(Ok(result)) => Ok(result),
         Ok(Err(error)) => {
             diagnostics.log("error", "deliver_room_message_failed", error.to_string());
-            Err(error.to_string())
+            Err(RoomRequestError { kind: supervisor::room_request_error_kind(&error),
+                message: error.to_string() })
         }
         Err(error) => {
             let message = format!("room delivery worker failed: {error}");
             diagnostics.log("error", "deliver_room_message_failed", &message);
+            Err(RoomRequestError { kind: "worker_failed", message })
+        }
+    }
+}
+
+/// Shown once after an invitation: the token, the one block to paste into an
+/// agent, and the MCP config and script inside it. Nothing here is logged;
+/// revoking the guest is the only way to retire it.
+#[derive(serde::Serialize)]
+struct RoomGuestInvitationView {
+    guest: RoomGuest,
+    guest_id: String,
+    token: String,
+    mcp_config_json: String,
+    cli_example: String,
+    agent_invitation: String,
+}
+
+#[tauri::command]
+async fn invite_room_guest(
+    state: State<'_, DesktopState>,
+    request: InviteRoomGuestRequest,
+) -> Result<RoomGuestInvitationView, String> {
+    let supervisor = state.supervisor.clone();
+    let diagnostics = state.diagnostics.clone();
+    let invitation = match tauri::async_runtime::spawn_blocking(move || supervisor.invite_room_guest(request)).await {
+        Ok(Ok(invitation)) => invitation,
+        Ok(Err(error)) => {
+            diagnostics.log("error", "invite_room_guest_failed", error.to_string());
+            return Err(error.to_string());
+        }
+        Err(error) => {
+            let message = format!("guest invitation worker failed: {error}");
+            diagnostics.log("error", "invite_room_guest_failed", &message);
+            return Err(message);
+        }
+    };
+    let output = state.supervisor.guest_invitation_output(&invitation).map_err(|error| error.to_string())?;
+    Ok(RoomGuestInvitationView {
+        guest_id: invitation.guest.guest_id.to_string(),
+        mcp_config_json: output.mcp_config_json,
+        cli_example: output.cli_example,
+        agent_invitation: output.agent_invitation,
+        guest: invitation.guest,
+        token: invitation.token,
+    })
+}
+
+#[tauri::command]
+async fn revoke_room_guest(state: State<'_, DesktopState>, request: RevokeRoomGuestRequest) -> Result<(), String> {
+    let supervisor = state.supervisor.clone();
+    let diagnostics = state.diagnostics.clone();
+    match tauri::async_runtime::spawn_blocking(move || supervisor.revoke_room_guest(request)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            diagnostics.log("error", "revoke_room_guest_failed", error.to_string());
+            Err(error.to_string())
+        }
+        Err(error) => {
+            let message = format!("guest revocation worker failed: {error}");
+            diagnostics.log("error", "revoke_room_guest_failed", &message);
             Err(message)
         }
     }
 }
 
-fn pick_directory(app: &AppHandle, title: &str) -> Result<Option<PathBuf>, String> {
-    app.dialog()
-        .file()
-        .set_title(title)
+#[tauri::command]
+fn list_room_guests(state: State<'_, DesktopState>, request: ListRoomGuestsRequest) -> Result<Vec<RoomGuest>, String> {
+    state.supervisor.list_room_guests(request).map_err(|error| error.to_string())
+}
+
+/// The folder a picker opens at: the current one, or its nearest existing
+/// parent when it was removed. None leaves the dialog at the system default.
+fn picker_start(current: Option<&str>) -> Option<PathBuf> {
+    let current = current?;
+    // Trim only to detect a blank value; the path keeps its exact characters.
+    if current.trim().is_empty() {
+        return None;
+    }
+    Path::new(current).ancestors().find(|candidate| candidate.is_dir()).map(Path::to_path_buf)
+}
+
+fn pick_directory(app: &AppHandle, title: &str, start: Option<PathBuf>) -> Result<Option<PathBuf>, String> {
+    let mut dialog = app.dialog().file().set_title(title);
+    if let Some(start) = start {
+        dialog = dialog.set_directory(start);
+    }
+    dialog
         .blocking_pick_folder()
         .map(|path| {
             path.into_path().map_err(|error| {
@@ -979,7 +2232,8 @@ fn choose_workspace_directory(
     app: AppHandle,
     state: State<'_, DesktopState>,
 ) -> Result<Option<RuntimeSnapshot>, String> {
-    let Some(path) = pick_directory(&app, "Choose PRIM-1 workspace")? else {
+    let start = picker_start(Some(&state.supervisor.snapshot().workspace_preference));
+    let Some(path) = pick_directory(&app, "Choose PRIM-1 workspace", start)? else {
         return Ok(None);
     };
     state
@@ -1002,7 +2256,10 @@ fn choose_session_working_directory(
     state: State<'_, DesktopState>,
     request: ChooseSessionWorkingDirectoryRequest,
 ) -> Result<Option<SessionSnapshot>, String> {
-    let Some(path) = pick_directory(&app, "Choose session working directory")? else {
+    let current = state.supervisor.snapshot().sessions.into_iter()
+        .find(|session| session.session_id == request.session_id)
+        .map(|session| session.working_dir);
+    let Some(path) = pick_directory(&app, "Choose session working directory", picker_start(current.as_deref()))? else {
         return Ok(None);
     };
     state
@@ -1042,17 +2299,221 @@ fn set_session_linux_working_directory(
         })
 }
 
+/// Settings → Task folder: the selected folder and whether it is open.
 #[tauri::command]
-fn send_input(
+fn get_task_folder(state: State<'_, DesktopState>) -> TaskFolderStatus {
+    state.supervisor.task_folder_status()
+}
+
+/// Opens and locks the new folder before the choice is saved; any failure
+/// keeps the current folder. Nothing is copied or moved between folders.
+#[tauri::command]
+async fn set_task_folder(
     state: State<'_, DesktopState>,
-    request: SendInputRequest,
-) -> Result<SessionSnapshot, String> {
-    state.supervisor.send_input(request).map_err(|error| {
-        state
-            .diagnostics
-            .log("error", "send_input_failed", error.to_string());
-        error.to_string()
+    path: String,
+) -> Result<TaskFolderStatus, String> {
+    let supervisor = state.supervisor.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || supervisor.select_task_folder(&path))
+        .await
+        .map_err(|error| format!("task folder worker failed: {error}"))?;
+    match &result {
+        Ok(status) => state.diagnostics.log(
+            "info",
+            "task_folder_selected",
+            format!("folder={}", status.folder.as_deref().unwrap_or("-")),
+        ),
+        Err(error) => state.diagnostics.log("warn", "task_folder_selection_failed", error.clone()),
+    }
+    result
+}
+
+/// Settings → Task folder → Browse…: the native folder picker only; the
+/// choice is then made through `set_task_folder`. A held trial refuses
+/// before the picker opens.
+#[tauri::command]
+fn choose_task_folder(app: AppHandle, state: State<'_, DesktopState>) -> Result<Option<String>, String> {
+    if state.supervisor.trial_admission_held() {
+        return Err(TRIAL_ADMISSION_HELD.into());
+    }
+    let start = picker_start(state.supervisor.task_folder_status().folder.as_deref());
+    Ok(pick_directory(&app, "Choose the task folder", start)?.map(|path| path.display().to_string()))
+}
+
+/// Settings → Personal repository: where the session register is written,
+/// where it comes from, and why it is off when it is.
+#[tauri::command]
+fn get_personal_repo(state: State<'_, DesktopState>) -> PersonalRepoStatus {
+    state.supervisor.personal_repo_status()
+}
+
+/// Saves the choice and moves the register's writes there; the folder must
+/// exist. Refused while PRIM1_PERSONAL_REPO decides. Nothing is moved.
+#[tauri::command]
+async fn set_personal_repo(
+    state: State<'_, DesktopState>,
+    path: String,
+) -> Result<PersonalRepoStatus, String> {
+    let supervisor = state.supervisor.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || supervisor.select_personal_repo(&path))
+        .await
+        .map_err(|error| format!("personal repository worker failed: {error}"))?;
+    match &result {
+        Ok(status) => state.diagnostics.log(
+            "info",
+            "personal_repo_selected",
+            format!("folder={}", status.folder.as_deref().unwrap_or("-")),
+        ),
+        Err(error) => state.diagnostics.log("warn", "personal_repo_selection_failed", error.clone()),
+    }
+    result
+}
+
+/// Settings → Personal repository → Browse…: the native folder picker only;
+/// the choice is then made through `set_personal_repo`. A held trial refuses
+/// before the picker opens.
+#[tauri::command]
+fn choose_personal_repo(app: AppHandle, state: State<'_, DesktopState>) -> Result<Option<String>, String> {
+    if state.supervisor.trial_admission_held() {
+        return Err(TRIAL_ADMISSION_HELD.into());
+    }
+    let start = picker_start(state.supervisor.personal_repo_status().folder.as_deref());
+    Ok(pick_directory(&app, "Choose the personal repository", start)?.map(|path| path.display().to_string()))
+}
+
+/// A native OK/Cancel question for every confirmation gate. The dialog
+/// plugin replaces `window.confirm` with an async invoke whose Promise is
+/// always truthy, so the renderer awaits this instead. Cancel, a closed
+/// dialog and any failure all mean no. The dialog waits off the main thread.
+#[tauri::command]
+async fn confirm_action(app: AppHandle, message: String, ok_label: String) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut dialog = app.dialog().message(message).title("PRIM-1").kind(MessageDialogKind::Warning)
+            .buttons(MessageDialogButtons::OkCancelCustom(ok_label, "Cancel".into()));
+        if let Some(window) = app.get_webview_window("main") {
+            dialog = dialog.parent(&window);
+        }
+        dialog.blocking_show()
     })
+    .await
+    .map_err(|error| format!("confirmation dialog failed: {error}"))
+}
+
+/// Rooms → Save…: the native save dialog only; `export_room` then writes.
+/// A held trial refuses before the dialog opens.
+#[tauri::command]
+fn choose_room_save_path(app: AppHandle, state: State<'_, DesktopState>, label: String) -> Result<Option<String>, String> {
+    if state.supervisor.trial_admission_held() {
+        return Err(TRIAL_ADMISSION_HELD.into());
+    }
+    let stem: String = label.chars().map(|c| if c.is_control() || r#"<>:"/\|?*"#.contains(c) { '-' } else { c })
+        .take(100).collect::<String>().trim_matches([' ', '.']).to_owned();
+    let Some(path) = app.dialog().file().set_title("Save room").add_filter("PRIM-1 room", &["prim1room"])
+        .set_file_name(format!("{}.prim1room", if stem.is_empty() { "room" } else { &stem }))
+        .blocking_save_file() else { return Ok(None) };
+    let path = path.into_path().map_err(|error| format!("selected file is not a local filesystem path: {error}"))?;
+    let path = if path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("prim1room")) { path } else {
+        let mut name = path.file_name().unwrap_or_default().to_os_string();
+        name.push(".prim1room");
+        path.with_file_name(name)
+    };
+    Ok(Some(path.display().to_string()))
+}
+
+/// Rooms → Load room…: the native open dialog only, for a room file or a
+/// copied runtime's room catalog; `inspect_room_source` and `import_room` act.
+#[tauri::command]
+fn choose_room_source(app: AppHandle, state: State<'_, DesktopState>) -> Result<Option<String>, String> {
+    if state.supervisor.trial_admission_held() {
+        return Err(TRIAL_ADMISSION_HELD.into());
+    }
+    app.dialog().file().set_title("Load room")
+        .add_filter("PRIM-1 room (*.prim1room)", &["prim1room"])
+        .add_filter("PRIM-1 runtime copy (room-catalog-v1.json)", &["json"])
+        .blocking_pick_file()
+        .map(|path| path.into_path().map(|path| path.display().to_string())
+            .map_err(|error| format!("selected file is not a local filesystem path: {error}")))
+        .transpose()
+}
+
+#[tauri::command]
+async fn export_room(state: State<'_, DesktopState>, room_id: RoomId, path: String) -> Result<RoomExportReport, String> {
+    let supervisor = state.supervisor.clone();
+    let diagnostics = state.diagnostics.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || supervisor.export_room(room_id, Path::new(&path)))
+        .await
+        .map_err(|error| format!("room save worker failed: {error}"))
+        .and_then(|result| result.map_err(|error| error.to_string()));
+    match &result {
+        Ok(report) => diagnostics.log("info", "room_exported",
+            format!("room={room_id} records={} bytes={} paused_ms={}", report.records, report.bytes, report.paused_ms)),
+        Err(error) => diagnostics.log("error", "export_room_failed", error.clone()),
+    }
+    result
+}
+
+/// The rooms a file or runtime copy offers, read only, for the confirm step.
+#[tauri::command]
+async fn inspect_room_source(state: State<'_, DesktopState>, path: String) -> Result<Vec<RoomSourceSummary>, String> {
+    let supervisor = state.supervisor.clone();
+    let diagnostics = state.diagnostics.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || supervisor.inspect_room_source(Path::new(&path)))
+        .await
+        .map_err(|error| format!("room inspect worker failed: {error}"))
+        .and_then(|result| result.map_err(|error| error.to_string()));
+    if let Err(error) = &result {
+        diagnostics.log("warn", "inspect_room_source_failed", error.clone());
+    }
+    result
+}
+
+/// Creates a new room with new members; nothing starts.
+#[tauri::command]
+async fn import_room(
+    state: State<'_, DesktopState>,
+    path: String,
+    source_room_id: Option<RoomId>,
+) -> Result<RoomImportReport, String> {
+    let supervisor = state.supervisor.clone();
+    let diagnostics = state.diagnostics.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || supervisor.import_room(Path::new(&path), source_room_id))
+        .await
+        .map_err(|error| format!("room load worker failed: {error}"))
+        .and_then(|result| result.map_err(|error| error.to_string()));
+    match &result {
+        Ok(report) => diagnostics.log("info", "room_imported",
+            format!("room={} members={} warnings={}", report.room.room_id, report.members.len(), report.warnings.len())),
+        Err(error) => diagnostics.log("error", "import_room_failed", error.clone()),
+    }
+    result
+}
+
+/// The read-only Tasks panel: GraphQL `{data, errors}` from a schema with no
+/// mutation type. Agents change tasks through their pane `tasks` tool.
+#[tauri::command]
+async fn tasks_query(
+    state: State<'_, DesktopState>,
+    query: String,
+    variables: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let supervisor = state.supervisor.clone();
+    tauri::async_runtime::spawn_blocking(move || supervisor.read_tasks(&query, variables.as_ref(), None))
+        .await
+        .map_err(|error| format!("task query worker failed: {error}"))
+}
+
+/// D9 step 5: admits the input and returns at once; the run's worker writes
+/// it in order, so this sync command never holds the UI thread on a PTY write.
+#[tauri::command]
+fn send_input(state: State<'_, DesktopState>, request: SendInputRequest) -> Result<(), String> {
+    state
+        .supervisor
+        .enqueue_operator_input(request)
+        .map_err(|error| {
+            state
+                .diagnostics
+                .log("error", "send_input_failed", error.to_string());
+            error.to_string()
+        })
 }
 
 #[tauri::command]
@@ -1087,16 +2548,29 @@ async fn route_message(
     }
 }
 
+/// Polled every 2 s while the telemetry line or page is on screen. Process
+/// queries take milliseconds, so they run off the main thread.
+#[tauri::command]
+async fn telemetry_snapshot(state: State<'_, DesktopState>) -> Result<TelemetrySnapshot, String> {
+    let supervisor = state.supervisor.clone();
+    match tauri::async_runtime::spawn_blocking(move || supervisor.telemetry_snapshot()).await {
+        Ok(result) => result.map_err(|error| format!("{error:#}")),
+        Err(error) => Err(format!("telemetry worker failed: {error}")),
+    }
+}
+
 #[tauri::command]
 fn resize_session(
     state: State<'_, DesktopState>,
     session_id: SessionId,
+    expected_run_id: RunId,
+    expected_generation: SessionGeneration,
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
     state
         .supervisor
-        .resize_session_by_id(session_id, cols, rows)
+        .resize_session_for_run(session_id, expected_run_id, expected_generation, cols, rows)
         .map_err(|error| {
             state.diagnostics.log(
                 "error",
@@ -1122,16 +2596,48 @@ pub struct StartupConfig {
     runtime_dir_override: Option<PathBuf>,
     cdp_port: Option<u16>,
     start_minimized: bool,
+    trial: Option<Arc<TrialStartup>>,
+    /// A108: the new build's one-time upgrade variables (both or neither).
+    upgrade_startup: Result<Option<UpgradeStartup>, String>,
+    /// `PRIM1_PERSONAL_REPO` as set (QA's `off` included), for a later upgrade.
+    personal_repo_override: Option<String>,
 }
 
 impl StartupConfig {
+    pub fn trial_webview_profile(&self) -> Option<&Path> {
+        self.trial.as_ref().map(|trial| trial.webview_profile_dir())
+    }
+
     pub fn cdp_port(&self) -> Option<u16> {
         self.cdp_port
     }
+
+    /// The value this process gives [`WEBVIEW2_BROWSER_ARGUMENTS_ENV`] before
+    /// its WebView exists. `None` means the variable must be removed: PRIM-1
+    /// owns that switch, so a value inherited from the launching shell (every
+    /// v1 pane exports one) can never turn remote debugging on.
+    pub fn webview_browser_arguments(&self) -> Option<String> {
+        self.cdp_port.map(cdp_browser_arguments)
+    }
 }
+
+/// The process-wide switch WebView2 reads when the WebView is created. Panes
+/// never inherit it (see `pty-host`).
+pub const WEBVIEW2_BROWSER_ARGUMENTS_ENV: &str = "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS";
+
+/// R9: remote debugging is an explicit, temporary QA mode, off by default.
+/// Only this variable turns it on. v1's `PRIM1_CDP_PORT` is ignored on
+/// purpose: the live v1 app exports it into every pane it hosts.
+pub const DEBUG_CDP_PORT_ENV: &str = "PRIM1_DEBUG_CDP_PORT";
 
 pub fn cdp_browser_arguments(port: u16) -> String {
     format!("--remote-debugging-port={port} --remote-debugging-address=127.0.0.1")
+}
+
+fn cdp_port_from_environment(
+    lookup: impl Fn(&str) -> Option<OsString>,
+) -> Result<Option<u16>, String> {
+    parse_cdp_port(lookup(DEBUG_CDP_PORT_ENV))
 }
 
 pub fn load_startup_config() -> Result<StartupConfig, String> {
@@ -1161,8 +2667,21 @@ pub fn load_startup_config() -> Result<StartupConfig, String> {
     )?;
     let runtime_dir_override =
         resolve_runtime_dir_override(std::env::var_os("PRIM1_RUNTIME_DIR"), &startup_cwd);
-    let cdp_port = parse_cdp_port(std::env::var_os("PRIM1_CDP_PORT"))?;
+    let cdp_port = cdp_port_from_environment(|name| std::env::var_os(name))?;
     let start_minimized = parse_start_minimized(std::env::var_os("PRIM1_START_MINIMIZED"))?;
+    let trial = trial_desktop::parse_settings(|name| std::env::var_os(name))?
+        .map(|settings| TrialStartup::prepare(settings.attempt_id, &settings.root, settings.health_window)
+            .map(Arc::new).map_err(|error| error.to_string()))
+        .transpose()?;
+    // An invalid pair is shown after startup and ignored: ordinary start,
+    // nothing replayed.
+    let upgrade_startup = supervisor::upgrade_flow::parse_upgrade_startup(
+        std::env::var_os(supervisor::upgrade_flow::ATTEMPT_ENV),
+        std::env::var_os(supervisor::upgrade_flow::REQUEST_FILE_ENV),
+    );
+    let personal_repo_override = std::env::var("PRIM1_PERSONAL_REPO")
+        .ok()
+        .filter(|value| !value.is_empty());
 
     Ok(StartupConfig {
         agent_working_root,
@@ -1170,6 +2689,9 @@ pub fn load_startup_config() -> Result<StartupConfig, String> {
         runtime_dir_override,
         cdp_port,
         start_minimized,
+        trial,
+        upgrade_startup,
+        personal_repo_override,
     })
 }
 
@@ -1244,11 +2766,10 @@ fn parse_cdp_port(value: Option<OsString>) -> Result<Option<u16>, String> {
         return Ok(None);
     };
     let text = value.to_string_lossy();
-    let port = text
-        .parse::<u16>()
-        .map_err(|_| "PRIM1_CDP_PORT must be a non-zero TCP port".to_string())?;
+    let invalid = || format!("{DEBUG_CDP_PORT_ENV} must be a non-zero TCP port");
+    let port = text.parse::<u16>().map_err(|_| invalid())?;
     if port == 0 {
-        return Err("PRIM1_CDP_PORT must be a non-zero TCP port".into());
+        return Err(invalid());
     }
     Ok(Some(port))
 }
@@ -1262,6 +2783,12 @@ fn parse_start_minimized(value: Option<OsString>) -> Result<bool, String> {
         "0" | "false" => Ok(false),
         _ => Err("PRIM1_START_MINIMIZED must be one of: 1, true, 0, false".into()),
     }
+}
+
+/// A window started minimized gets its deferred fullscreen only once the
+/// operator has restored it: focused and no longer minimized.
+fn operator_restored(focused: bool, minimized: bool) -> bool {
+    focused && !minimized
 }
 
 fn present_main_window(window: &WebviewWindow, start_minimized: bool) -> Result<(), String> {
@@ -1289,6 +2816,30 @@ fn default_runtime_dir(app: &AppHandle) -> Result<PathBuf, String> {
         .map(|path| path.join("runtime"))
         .map_err(|error| format!("failed to resolve per-user application data: {error}"))
 }
+
+/// v3 W7 (Claude PRIM-1): what the person sees when this build stopped before
+/// writing. The previous build restarts without its members, so it says so.
+fn startup_refusal_text(reason: &str, restarted: bool) -> String {
+    const MEMBERS: &str = "Your members are stopped: start each one again; each resumes its own conversation.";
+    if restarted {
+        format!("PRIM-1 could not start the new version and restarted your previous version. {MEMBERS}\n\nWhy: {reason}")
+    } else {
+        format!("PRIM-1 could not start the new version. Start your previous version again. {MEMBERS}\n\nWhy: {reason}")
+    }
+}
+
+/// v3 W7: the reason the person sees; this happens before any window exists.
+#[cfg(windows)]
+fn show_startup_refusal(text: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONWARNING, MB_OK, MessageBoxW};
+    let wide = |value: &str| value.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let (body, title) = (wide(text), wide("PRIM-1"));
+    // SAFETY: NUL-terminated UTF-16 strings that outlive the call; no owner window.
+    unsafe { MessageBoxW(std::ptr::null_mut(), body.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING); }
+}
+
+#[cfg(not(windows))]
+fn show_startup_refusal(_text: &str) {}
 
 fn validate_and_lock_desktop_runtime(
     requested_runtime_dir: &Path,
@@ -1331,10 +2882,11 @@ fn init_supervisor(
     runtime_dir: PathBuf,
     agent_working_root: PathBuf,
     diagnostics: &DesktopDiagnostics,
+    trial: Option<&TrialStartup>,
 ) -> Result<SupervisorHandle, String> {
     let pane_mcp_executable = std::env::current_exe()
         .map_err(|error| format!("failed to locate the PRIM-1 pane MCP executable: {error}"))?;
-    let supervisor = SupervisorHandle::new(SupervisorConfig {
+    let config = SupervisorConfig {
         working_root: agent_working_root,
         runtime_dir,
         pane_mcp_executable: Some(pane_mcp_executable),
@@ -1342,7 +2894,12 @@ fn init_supervisor(
         heartbeat_interval: None,
         auto_restart_on_stall_sessions: None,
         auto_restart_stall_threshold: None,
-    })
+        task_folder: None,
+    };
+    let supervisor = match trial {
+        Some(trial) => SupervisorHandle::new_with_startup_admission(config, trial.admission()),
+        None => SupervisorHandle::new(config),
+    }
     .map_err(|error| error.to_string())?;
     diagnostics.initialize(supervisor.runtime_dir())?;
     diagnostics.log(
@@ -1351,23 +2908,52 @@ fn init_supervisor(
         "storage=per_user_app_data session_authority=session_id",
     );
 
+    let output_credit = supervisor.output_credit();
+    output_credit.enable();
     let ui_event_tx = start_ui_event_bridge(
         app.clone(),
         diagnostics.clone(),
         supervisor.renderer_event_projector(),
+        output_credit,
     );
     supervisor.set_event_sink(move |event| {
         let _ = ui_event_tx.enqueue(event);
     });
-    let control_plane = supervisor.start_control_plane().map_err(|error| {
-        diagnostics.log("error", "control_plane_start_failed", error.to_string());
-        error.to_string()
-    })?;
+    let personal_repo = supervisor.personal_repo_status();
     diagnostics.log(
-        "info",
-        "control_plane_ready",
-        format!("endpoint={}", control_plane.endpoint),
+        if personal_repo.status == supervisor::PersonalRepoHealth::Error { "warn" } else { "info" },
+        "personal_repo",
+        format!(
+            "source={:?} status={:?} folder={}{}",
+            personal_repo.source,
+            personal_repo.status,
+            personal_repo.folder.as_deref().unwrap_or("-"),
+            personal_repo.message.map(|message| format!(" message={message}")).unwrap_or_default()
+        ),
     );
+    // The Settings choice, else the default, opened before any pane can reach
+    // the control plane. A held trial resolves the folder but never opens it.
+    let tasks = supervisor.open_task_folder_from_setting();
+    diagnostics.log(
+        if tasks.error.is_none() { "info" } else { "warn" },
+        "task_folder",
+        format!(
+            "source={:?} status={:?}{}",
+            tasks.source,
+            tasks.status,
+            tasks.error.map(|error| format!(" error={error}")).unwrap_or_default()
+        ),
+    );
+    if trial.is_none() {
+        let control_plane = supervisor.start_control_plane().map_err(|error| {
+            diagnostics.log("error", "control_plane_start_failed", error.to_string());
+            error.to_string()
+        })?;
+        diagnostics.log("info", "control_plane_ready", format!("endpoint={}", control_plane.endpoint));
+        // A106: room messages still waiting for a member before the restart.
+        let resumed = supervisor.resume_room_wake_queue();
+        diagnostics.log("info", "room_wake_queue_resumed", format!("queued={resumed}"));
+    }
 
     Ok(supervisor)
 }
@@ -1376,8 +2962,10 @@ fn start_ui_event_bridge(
     app: AppHandle,
     diagnostics: DesktopDiagnostics,
     projector: RendererEventProjector,
+    credit: Arc<OutputCreditLedger>,
 ) -> UiEventIngress {
-    let (ingress, rx, ingress_state) = ui_event_channel(UI_EVENT_QUEUE_CAPACITY);
+    let (mut ingress, rx, ingress_state) = ui_event_channel(UI_EVENT_QUEUE_CAPACITY);
+    ingress.credit = Some(credit.clone());
 
     thread::spawn(move || {
         let mut batcher = PendingOutputBatcher::default();
@@ -1386,9 +2974,9 @@ fn start_ui_event_bridge(
             match rx.recv_timeout(Duration::from_millis(16)) {
                 Ok(queued) => {
                     let now = Instant::now();
-                    emit_pending_session_outputs(&app, &diagnostics, batcher.flush_expired(now));
+                    emit_pending_session_outputs(&app, &diagnostics, batcher.flush_expired(now), &credit);
                     if !queued.output_gaps_before.is_empty() {
-                        emit_pending_session_outputs(&app, &diagnostics, batcher.flush());
+                        emit_pending_session_outputs(&app, &diagnostics, batcher.flush(), &credit);
                         emit_ui_output_gaps(&app, &diagnostics, queued.output_gaps_before);
                     }
                     let event = queued.event;
@@ -1405,6 +2993,7 @@ fn start_ui_event_bridge(
                                 &diagnostics,
                                 batcher.push(
                                     PendingSessionOutput {
+                                        credit: queued.credit,
                                         identity,
                                         session,
                                         chunk,
@@ -1413,20 +3002,21 @@ fn start_ui_event_bridge(
                                     },
                                     now,
                                 ),
+                                &credit,
                             );
                         }
                         event => {
-                            emit_pending_session_outputs(&app, &diagnostics, batcher.flush());
+                            emit_pending_session_outputs(&app, &diagnostics, batcher.flush(), &credit);
                             emit_runtime_event(&app, &diagnostics, projector.project(event));
                         }
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    emit_pending_session_outputs(&app, &diagnostics, batcher.flush());
-                    emit_ui_output_gaps(&app, &diagnostics, ingress_state.take_all_output_gaps());
+                    emit_pending_session_outputs(&app, &diagnostics, batcher.flush(), &credit);
+                    emit_ui_output_gaps(&app, &diagnostics, ingress_state.take_reportable_output_gaps(&credit));
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    emit_pending_session_outputs(&app, &diagnostics, batcher.flush());
+                    emit_pending_session_outputs(&app, &diagnostics, batcher.flush(), &credit);
                     emit_ui_output_gaps(&app, &diagnostics, ingress_state.take_all_output_gaps());
                     break;
                 }
@@ -1438,6 +3028,12 @@ fn start_ui_event_bridge(
 }
 
 fn ui_output_gap_message(gap: &UiOutputGap) -> String {
+    if gap.observer_only {
+        return format!(
+            "UI output gap: omitted {} display event(s) for session '{}' run {} (generation {}, through sequence {}) while renderer credit was unavailable after 2 seconds without progress or the 5-second wait ceiling. Native observation and control-string parsing continued. Display is incomplete; repaint cannot restore lost history or guarantee screen parity.",
+            gap.dropped_events, gap.session, gap.identity.run_id, gap.identity.generation, gap.identity.sequence,
+        );
+    }
     format!(
         "UI output gap: dropped {} sanitized display event(s) for session '{}' run {} (latest generation {}, sequence {}) under bounded-queue pressure. Terminal control parsing remained synchronized; visible output is incomplete.",
         gap.dropped_events,
@@ -1492,6 +3088,9 @@ fn queue_pending_session_output(
             buffer.synthetic &= output.synthetic;
             buffer.timestamp = output.timestamp;
             buffer.identity = output.identity;
+            if let (Some(buffer_credit), Some(next_credit)) = (&mut buffer.credit, output.credit) {
+                buffer_credit.tickets.extend(next_credit.tickets);
+            }
             *pending = Some(buffer);
             None
         }
@@ -1509,6 +3108,11 @@ fn pending_outputs_are_contiguous(
     next: &PendingSessionOutput,
 ) -> bool {
     buffered.session == next.session
+        && match (&buffered.credit, &next.credit) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.epoch == b.epoch && a.run == b.run,
+            _ => false,
+        }
         && RunOutputKey::from(buffered.identity) == RunOutputKey::from(next.identity)
         && buffered.identity.generation == next.identity.generation
         && buffered.identity.sequence.checked_add(1) == Some(next.identity.sequence)
@@ -1518,27 +3122,52 @@ fn emit_pending_session_output(
     app: &AppHandle,
     diagnostics: &DesktopDiagnostics,
     buffer: PendingSessionOutput,
+    ledger: &OutputCreditLedger,
 ) {
-    emit_runtime_event(
-        app,
-        diagnostics,
-        shared_types::RuntimeEvent::SessionOutput {
+    if let Some(credit) = &buffer.credit
+        && !ledger.dispatch(credit)
+    {
+        ledger.discard_native(credit);
+        return;
+    }
+    #[derive(serde::Serialize, Clone)]
+    struct OutputEnvelope {
+        #[serde(flatten)]
+        event: shared_types::RuntimeEvent,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_credit: Option<OutputCredit>,
+    }
+    let envelope = OutputEnvelope {
+        event: shared_types::RuntimeEvent::SessionOutput {
             identity: buffer.identity,
             session: buffer.session,
             chunk: buffer.chunk,
             synthetic: buffer.synthetic,
             timestamp: buffer.timestamp,
         },
-    );
+        output_credit: buffer.credit,
+    };
+    if let Err(error) = app.emit("runtime://event", &envelope) {
+        if let Some(credit) = &envelope.output_credit { ledger.discard_native(credit); }
+        diagnostics.log("error", "display_output_emit_failed", format!("{error}; output discarded, not parsed; reload resets display"));
+        // A successful later control emission must not hide a lost display
+        // batch. This is an explicit gap, never a synthetic parser ACK.
+        emit_runtime_event(app, diagnostics, shared_types::RuntimeEvent::SystemLog {
+            level: shared_types::LogLevel::Error,
+            message: "Terminal display output could not be delivered and was discarded without parsing. The display is incomplete; reload resets it but cannot recover lost scrollback.".into(),
+            timestamp: shared_types::now_rfc3339(),
+        });
+    }
 }
 
 fn emit_pending_session_outputs(
     app: &AppHandle,
     diagnostics: &DesktopDiagnostics,
     outputs: impl IntoIterator<Item = PendingSessionOutput>,
+    ledger: &OutputCreditLedger,
 ) {
     for buffer in outputs {
-        emit_pending_session_output(app, diagnostics, buffer);
+        emit_pending_session_output(app, diagnostics, buffer, ledger);
     }
 }
 
@@ -1579,23 +3208,80 @@ fn sanitize_terminal_output_for_ui(chunk: &str) -> String {
     output
 }
 
+/// A16: Windows ends processes from the highest shutdown level down. 0x380,
+/// in the applications' "shut down first" range (0x300-0x3FF) and above the
+/// 0x280 default that the agent CLIs and their console hosts keep, ends
+/// PRIM-1 before its agents, so their runs are still alive when the
+/// session-end checkpoint records them. Not 0x3FF: that top value is left to
+/// programs that must go before everything else.
+#[cfg(windows)]
+const PRIM1_SHUTDOWN_LEVEL: u32 = 0x380;
+/// `SHUTDOWN_NORETRY` (WindowsProgramming): a slow end is cut short, never
+/// answered with a retry dialog that holds up the OS.
+#[cfg(windows)]
+const SHUTDOWN_NORETRY: u32 = 0x1;
+
+#[cfg(windows)]
+fn set_shutdown_level(diagnostics: &DesktopDiagnostics) {
+    use windows_sys::Win32::System::Threading::SetProcessShutdownParameters;
+    if unsafe { SetProcessShutdownParameters(PRIM1_SHUTDOWN_LEVEL, SHUTDOWN_NORETRY) } == 0 {
+        diagnostics.log("warn", "shutdown_level", format!(
+            "SetProcessShutdownParameters(0x{PRIM1_SHUTDOWN_LEVEL:x}) failed: {}", std::io::Error::last_os_error()));
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run(startup: StartupConfig) {
     let diagnostics = DesktopDiagnostics::uninitialized();
     let setup_diagnostics = diagnostics.clone();
     let setup_startup = startup.clone();
+    let mut context = tauri::generate_context!();
+    let trial_window = startup.trial.as_ref().map(|_| trial_desktop::take_trial_main_config(context.config_mut()))
+        .transpose().unwrap_or_else(|error| panic!("trial window configuration: {error}"));
+    // T-36: a held trial's window is never rebuilt (its renderer acknowledgement
+    // belongs to the first WebView).
+    let main_window_config = startup.trial.is_none()
+        .then(|| context.config().app.windows.iter().find(|window| window.label == "main").cloned())
+        .flatten();
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
-            let requested_runtime_dir = match &setup_startup.runtime_dir_override {
-                Some(runtime_dir) => runtime_dir.clone(),
-                None => default_runtime_dir(app.handle())?,
+            let requested_runtime_dir = match setup_startup.trial.as_ref() {
+                Some(trial) => {
+                    let local = app.path().local_data_dir().map_err(|error| error.to_string())?;
+                    let root = trial.runtime_dir().parent().ok_or("trial runtime has no parent")?;
+                    trial_desktop::validate_known_local_root(root, &local)?;
+                    trial.runtime_dir().to_path_buf()
+                },
+                None => match &setup_startup.runtime_dir_override {
+                    Some(runtime_dir) => runtime_dir.clone(),
+                    None => default_runtime_dir(app.handle())?,
+                },
             };
             let (runtime_dir, instance_lock) = validate_and_lock_desktop_runtime(
                 &requested_runtime_dir,
                 &setup_startup.agent_working_root,
             )?;
+            // v3 W7: before anything writes, keep a verified copy of a runtime an
+            // earlier build wrote; a v2 build cannot read room history v3 writes.
+            // A refusal is shown, and the build this one replaced starts again.
+            let instance_lock = match supervisor::runtime_snapshot::ensure_pre_v3_snapshot_now(&runtime_dir) {
+                Ok(_) => instance_lock,
+                Err(error) => {
+                    let reason = format!("{error:#}");
+                    setup_diagnostics.log("error", "runtime_snapshot_refused", &reason);
+                    drop(instance_lock);
+                    let restarted = supervisor::runtime_snapshot::restart_replaced_build(&runtime_dir);
+                    if let Some(source) = &restarted {
+                        setup_diagnostics.log("info", "replaced_build_restarted", &source.display().to_string());
+                    }
+                    let text = startup_refusal_text(&reason, restarted.is_some());
+                    // Test instances start minimized and must never take focus.
+                    if !setup_startup.start_minimized { show_startup_refusal(&text); }
+                    return Err(reason.into());
+                }
+            };
             // Supervisor construction remains the next stateful step. It hardens
             // the runtime ACL before audit or control-plane state is created.
             let supervisor = init_supervisor(
@@ -1603,8 +3289,11 @@ pub fn run(startup: StartupConfig) {
                 runtime_dir,
                 setup_startup.agent_working_root.clone(),
                 &setup_diagnostics,
+                setup_startup.trial.as_deref(),
             )?;
             install_panic_hook(setup_diagnostics.clone());
+            #[cfg(windows)]
+            set_shutdown_level(&setup_diagnostics);
             setup_diagnostics.log(
                 "info",
                 "process_start",
@@ -1615,18 +3304,35 @@ pub fn run(startup: StartupConfig) {
             );
             setup_diagnostics.log("info", "tauri_setup", "starting setup");
             log_frontend_bundle_id(&setup_diagnostics);
+            if let Some(trial) = &setup_startup.trial {
+                trial.record_backend_initialized(&supervisor).map_err(|error| error.to_string())?;
+            }
             app.manage(DesktopState {
                 supervisor,
+                trial: setup_startup.trial.clone(),
                 diagnostics: setup_diagnostics.clone(),
                 automation_mode: setup_startup.cdp_port.is_some(),
                 shutdown_started: AtomicBool::new(false),
                 shutdown_succeeded: AtomicBool::new(false),
                 fullscreen_on_first_focus: AtomicBool::new(setup_startup.start_minimized),
+                main_window_config,
+                ui_rebuilding: AtomicBool::new(false),
+                rebuild_minimized: AtomicBool::new(false),
+                renderer_recovery: Mutex::new(RendererRecoveryLedger::default()),
                 _instance_lock: instance_lock,
             });
+            if setup_startup.trial.is_none() {
+                install_upgrade(app.handle(), &setup_diagnostics, &setup_startup);
+            }
+            if let (Some(config), Some(trial)) = (&trial_window, &setup_startup.trial) {
+                tauri::WebviewWindowBuilder::from_config(app, config)?
+                    .data_directory(trial.webview_profile_dir().to_path_buf())
+                    .build()?;
+            }
             let main_window = app
                 .get_webview_window("main")
                 .ok_or_else(|| "missing main window".to_string())?;
+            watch_renderer(&main_window, &setup_diagnostics);
             present_main_window(&main_window, setup_startup.start_minimized)?;
             if setup_startup.start_minimized {
                 setup_diagnostics.log(
@@ -1641,22 +3347,59 @@ pub fn run(startup: StartupConfig) {
         })
         .invoke_handler(tauri::generate_handler![
             automation_mode,
+            trial_status,
+            trial_renderer_acknowledged,
             bootstrap,
+            discover_local_sessions,
+            attach_local_session,
+            begin_output_renderer,
+            output_renderer_ready,
+            acknowledge_output,
+            output_credit_metrics,
+            discard_output,
             start_session,
+            resume_session_after_restart,
+            preview_session_launch,
             stop_session,
+            resume_held_conversation,
             restart_session,
             choose_workspace_directory,
             create_session,
+            prime_enabled,
             prime_default_working_directory,
             rename_session,
             choose_session_working_directory,
             set_session_linux_working_directory,
+            get_task_folder,
+            set_task_folder,
+            choose_task_folder,
+            get_personal_repo,
+            set_personal_repo,
+            choose_personal_repo,
+            confirm_action,
+            choose_room_save_path,
+            choose_room_source,
+            export_room,
+            inspect_room_source,
+            import_room,
+            tasks_query,
             set_session_permission_profile,
+            set_member_permissions,
+            upgrade_status,
+            begin_upgrade_resume,
+            cancel_upgrade,
+            abandon_held_upgrade,
+            report_room_drafts,
             move_session,
             delete_session,
             create_room,
             default_room_brief,
             rename_room,
+            set_room_resume_on_restart,
+            read_room_brief,
+            update_room_brief,
+            get_room_fallbacks,
+            set_room_fallbacks,
             move_room,
             add_room_member,
             remove_room_member,
@@ -1664,13 +3407,20 @@ pub fn run(startup: StartupConfig) {
             read_room_feed,
             post_room_message,
             deliver_room_message,
+            retry_room_delivery,
+            dispose_room_message,
+            cancel_room_message,
             brief_room_member,
+            invite_room_guest,
+            revoke_room_guest,
+            list_room_guests,
             send_input,
             route_message,
+            telemetry_snapshot,
             resize_session,
             toggle_fullscreen
         ])
-        .build(tauri::generate_context!())
+        .build(context)
         .unwrap_or_else(|error| panic!("error while building tauri application: {error}"));
 
     app.run(|handle, event| match event {
@@ -1689,21 +3439,31 @@ pub fn run(startup: StartupConfig) {
         }
         tauri::RunEvent::WindowEvent {
             label,
-            event: tauri::WindowEvent::Focused(true),
+            event: tauri::WindowEvent::Focused(true) | tauri::WindowEvent::Resized(_),
             ..
         } if label == "main" => {
+            // The deferred fullscreen waits for the operator's restore: a
+            // focus that reaches the window while it is still minimized (an
+            // accessibility Invoke, a page focus request) is not one, and
+            // tao activates the window to apply fullscreen (Claude PRIM-1,
+            // 26a7f92 walk). A restore arrives as a focus or a resize.
             if let Some(state) = handle.try_state::<DesktopState>()
+                && state.fullscreen_on_first_focus.load(Ordering::SeqCst)
+                && let Some(window) = handle.get_webview_window("main")
+                && operator_restored(
+                    window.is_focused().unwrap_or(false),
+                    window.is_minimized().unwrap_or(true),
+                )
                 && state
                     .fullscreen_on_first_focus
                     .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
-                && let Some(window) = handle.get_webview_window("main")
             {
                 match window.set_fullscreen(true) {
                     Ok(()) => state.diagnostics.log(
                         "info",
                         "window_restored",
-                        "main window restored fullscreen by operator focus",
+                        "main window restored fullscreen by operator restore",
                     ),
                     Err(error) => {
                         state
@@ -1713,13 +3473,32 @@ pub fn run(startup: StartupConfig) {
                 }
             }
         }
-        tauri::RunEvent::ExitRequested { .. } => {
+        tauri::RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::Destroyed,
+            ..
+        } if label == "main" => {
+            if handle.try_state::<DesktopState>().is_some_and(|state| state.ui_rebuilding.load(Ordering::SeqCst)) {
+                finish_main_window_rebuild(handle);
+            }
+        }
+        tauri::RunEvent::ExitRequested { code, api, .. } => {
             if let Some(state) = handle.try_state::<DesktopState>() {
-                state.shutdown_once("app_exit_requested");
+                if exit_request_is_ui_rebuild(code, state.ui_rebuilding.load(Ordering::SeqCst)) {
+                    api.prevent_exit();
+                    state.diagnostics.log("info", "ui_rebuild_exit_prevented", "no main window while it is rebuilt");
+                } else {
+                    state.shutdown_once("app_exit_requested");
+                }
             }
         }
         tauri::RunEvent::Exit => {
             if let Some(state) = handle.try_state::<DesktopState>() {
+                // Runs first in tauri's Exit, inside WM_ENDSESSION, before any
+                // cleanup that could pump messages, so the second window's
+                // WM_ENDSESSION (tao's "cannot move state from Destroyed"
+                // panic) cannot arrive before the checkpoint is written.
+                state.end_session_unless_shut_down();
                 state
                     .diagnostics
                     .log("info", "process_exit", "desktop process exiting");
@@ -1731,16 +3510,155 @@ pub fn run(startup: StartupConfig) {
 
 #[cfg(test)]
 mod tests {
+    /// Claude PRIM-1, 26a7f92 walk (findings 2-3): a focus reaching a still
+    /// minimized window is not the operator's restore, so it neither applies
+    /// the deferred fullscreen nor spends it.
+    #[test]
+    fn the_deferred_fullscreen_waits_for_a_focused_restored_window() {
+        assert!(super::operator_restored(true, false));
+        assert!(!super::operator_restored(true, true), "focused while minimized");
+        assert!(!super::operator_restored(false, false), "restored but another window has focus");
+        assert!(!super::operator_restored(false, true));
+    }
+
+    /// Claude PRIM-1 (after the pre-write failure leg): the refusal says the
+    /// previous version is back and that its members must be started again.
+    #[test]
+    fn the_startup_refusal_says_the_previous_version_restarted_and_the_members_are_stopped() {
+        assert_eq!(super::startup_refusal_text("no room for the copy", true),
+            "PRIM-1 could not start the new version and restarted your previous version. Your members are stopped: \
+             start each one again; each resumes its own conversation.\n\nWhy: no room for the copy");
+        let alone = super::startup_refusal_text("no room for the copy", false);
+        assert!(alone.starts_with("PRIM-1 could not start the new version. Start your previous version again. \
+            Your members are stopped:") && alone.ends_with("Why: no room for the copy"), "{alone}");
+    }
+
+    #[test]
+    fn t36_a_failed_renderer_is_recovered_within_a_budget_and_a_dead_browser_rebuilds_the_window() {
+        use super::{RendererFailure as F, RendererRecovery as R, RendererRecoveryLedger};
+        let start = std::time::Instant::now();
+        let mut ledger = RendererRecoveryLedger::default();
+        // A dead browser process (PC3, 20 Oct) rebuilds the window; a dead page reloads.
+        assert_eq!(ledger.decide(F::BrowserExited, true, start), R::Rebuild);
+        assert_eq!(ledger.decide(F::RendererExited, true, start), R::Reload);
+        // An unresponsive page and helper processes are logged only, and spend nothing.
+        for _ in 0..10 {
+            assert_eq!(ledger.decide(F::RendererUnresponsive, true, start), R::Wait);
+            assert_eq!(ledger.decide(F::Other, true, start), R::Wait);
+        }
+        assert_eq!(ledger.decide(F::RendererExited, true, start), R::Reload, "the third recovery");
+        // A renderer that dies on every load cannot spin: the fourth in ten minutes gives up.
+        let minute = std::time::Duration::from_secs(60);
+        assert_eq!(ledger.decide(F::RendererExited, true, start + minute), R::GiveUp);
+        assert_eq!(ledger.decide(F::BrowserExited, true, start + 9 * minute), R::GiveUp);
+        // Once the oldest recoveries are ten minutes old, the budget is back.
+        assert_eq!(ledger.decide(F::BrowserExited, true, start + 10 * minute), R::Rebuild);
+        // A held trial's window is never rebuilt.
+        assert_eq!(RendererRecoveryLedger::default().decide(F::BrowserExited, false, start), R::GiveUp);
+    }
+
+    #[test]
+    fn t36_only_the_window_less_moment_of_a_rebuild_is_kept_from_exiting() {
+        assert!(super::exit_request_is_ui_rebuild(None, true));
+        assert!(!super::exit_request_is_ui_rebuild(None, false), "closing the last window still exits");
+        assert!(!super::exit_request_is_ui_rebuild(Some(0), true), "an explicit exit is never held back");
+        assert!(!super::exit_request_is_ui_rebuild(Some(1), false));
+    }
+
+    #[test]
+    fn folder_pickers_open_at_the_current_folder_or_its_nearest_existing_parent() {
+        let root = unique_temp_dir("picker-start");
+        let existing = root.join("tasks");
+        std::fs::create_dir_all(&existing).expect("create tasks");
+        let existing_text = existing.display().to_string();
+        assert_eq!(super::picker_start(Some(&existing_text)), Some(existing.clone()));
+        let removed = existing.join("gone").join("deeper").display().to_string();
+        assert_eq!(super::picker_start(Some(&removed)), Some(existing));
+        // A trailing non-breaking space is part of the folder name, not padding.
+        let spaced = root.join("tasks\u{a0}");
+        std::fs::create_dir_all(&spaced).expect("create spaced");
+        let spaced_text = spaced.display().to_string();
+        assert_eq!(super::picker_start(Some(&spaced_text)), Some(spaced));
+        assert_eq!(super::picker_start(Some("  ")), None);
+        assert_eq!(super::picker_start(None), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn guest_invitation_config_runs_this_executable_in_guest_mode_with_the_token() {
+        let executable = std::path::PathBuf::from(r"C:\Program Files\PRIM-1 v2\O'Neil.exe");
+        let runtime = std::path::PathBuf::from(r"C:\Users\x\AppData\Local\io.prim1.v2\runtime");
+        let config: serde_json::Value =
+            serde_json::from_str(&supervisor::guest_mcp_config_json(&executable, &runtime, "prim1g_abc")).unwrap();
+        let server = &config["mcpServers"]["prim1_room"];
+        assert_eq!(server["command"], r"C:\Program Files\PRIM-1 v2\O'Neil.exe");
+        assert_eq!(server["args"], serde_json::json!(["--prim1-guest-mcp"]));
+        assert_eq!(server["env"]["PRIM1_GUEST_TOKEN"], "prim1g_abc");
+        assert_eq!(server["env"]["PRIM1_RUNTIME_DIR"], runtime.display().to_string());
+        let cli = supervisor::guest_cli_example(&executable, &runtime, "prim1g_abc");
+        assert!(cli.contains("$env:PRIM1_GUEST_TOKEN = 'prim1g_abc'"), "{cli}");
+        assert!(cli.contains(r"& 'C:\Program Files\PRIM-1 v2\O''Neil.exe' --prim1-guest rooms"), "{cli}");
+    }
+
+    #[test]
+    fn a16_a_delete_waiting_for_a_finishing_stop_is_not_logged_as_a_failure() {
+        assert!(super::delete_refusal_is_transient(
+            "session 'x' must be fully closed before this operation: a Stop lifecycle operation in progress (generation 2) is still finishing; try again in a moment"));
+        assert!(super::delete_refusal_is_transient("session 'x' is still draining its event stream; retry deletion"));
+        assert!(!super::delete_refusal_is_transient("session 'x' belongs to room 'y'; remove it from the room before deletion"));
+    }
+
+    #[test]
+    fn a16_the_agent_invitation_is_one_block_an_agent_can_join_and_take_part_with() {
+        let executable = std::path::PathBuf::from(r"C:\Program Files\PRIM-1 v2\O'Neil.exe");
+        let runtime = std::path::PathBuf::from(r"C:\Users\x\AppData\Local\io.prim1.v2\runtime");
+        let block = supervisor::guest_agent_invitation("PC3 Demo", "Grok helper", &executable, &runtime, "prim1g_abc");
+        // Who, where and for how long.
+        assert!(block.starts_with("You are invited into the PRIM-1 room \"PC3 Demo\" as the outside agent \"Grok helper\"."), "{block}");
+        assert!(block.contains("has no expiry: it ends when the operator revokes it"), "{block}");
+        // Where it can work, stated rather than implied.
+        assert!(block.contains("only for an agent running on this PC as the same Windows user, outside PRIM-1"), "{block}");
+        assert!(block.contains("a cloud agent or another PC cannot reach it"), "{block}");
+        // One self-contained command line: both variables, the quoted executable, piped.
+        let line = block.lines().find(|line| line.starts_with("$env:PRIM1_GUEST_TOKEN")).expect("the command line");
+        assert_eq!(line, format!(r"$env:PRIM1_GUEST_TOKEN = 'prim1g_abc'; $env:PRIM1_RUNTIME_DIR = '{}'; & 'C:\Program Files\PRIM-1 v2\O''Neil.exe' --prim1-guest <command> | Out-String",
+            runtime.display()));
+        // Every command the guest CLI parses, with the cursor as two arguments;
+        // the first read is bare (the Reviewer, a5bf07a: rooms' cursor is the
+        // tail and would skip what was posted since the invitation).
+        // v3 W5 (decision 11): profile first; status, ack and directory follow.
+        for command in ["1. profile 'a short name':", "2. rooms: your room, its members and other guests.",
+            "3. read: the first time with no cursor, everything posted since you were invited.",
+            "read --epoch <epoch> --sequence <sequence>.", "4. wait --epoch <epoch> --sequence <sequence>:",
+            "5. post --request-id <a new id> 'your message':", "6. status:",
+            "ack <message-id> --next 'what you will do next'", "ack <message-id> --decline 'why not'", "7. directory:",
+            // v3 W5 (Reviewer 6489d3b6): the retained page's continuation, as the MCP read says.
+            "read --owed-after <epoch>:<sequence> taken from retained_next"] {
+            assert!(block.contains(command), "{command}: {block}");
+        }
+        assert!(!block.contains("current cursor"), "rooms is discovery, never where reading starts: {block}");
+        // How to take part, and the trust boundary both ways.
+        for rule in ["there are no private messages", "start with its name and quote the line you answer",
+            "never as the operator's", "not instructions from the operator", "at most 32 KiB", "Never print or repeat its token"] {
+            assert!(block.contains(rule), "{rule}: {block}");
+        }
+        // The MCP alternative is the same config, kept out of the panes' configuration.
+        assert!(block.ends_with(&supervisor::guest_mcp_config_json(&executable, &runtime, "prim1g_abc")), "{block}");
+        assert!(block.contains(r"never to one PRIM-1's panes also read (Codex's %USERPROFILE%\.codex\config.toml"), "{block}");
+    }
+
     use super::{
-        DESKTOP_INSTANCE_ALREADY_RUNNING, DESKTOP_INSTANCE_LOCK_FILE, DesktopDiagnostics,
-        DesktopInstanceLock, MAX_UI_OUTPUT_BATCH_AGE, MAX_UI_OUTPUT_BATCH_BYTES,
-        PendingOutputBatcher, PendingSessionOutput, RendererTerminalStream,
-        TerminalOutputSanitizer, UI_EVENT_QUEUE_CAPACITY, UiEventEnqueueResult, UiOutputGap,
-        cdp_browser_arguments, close_main_window_gracefully, normalize_path_for_child_processes,
-        parse_cdp_port, parse_start_minimized, queue_pending_session_output,
-        resolve_agent_working_root_from, resolve_environment_source, resolve_runtime_dir_override,
-        sanitize_terminal_output_for_ui, ui_event_channel, ui_output_gap_runtime_event,
-        validate_and_lock_desktop_runtime, validate_runtime_storage_paths,
+        DEBUG_CDP_PORT_ENV, DESKTOP_INSTANCE_ALREADY_RUNNING, DESKTOP_INSTANCE_LOCK_FILE,
+        DesktopDiagnostics, DesktopInstanceLock, MAX_UI_OUTPUT_BATCH_AGE,
+        MAX_UI_OUTPUT_BATCH_BYTES, PendingOutputBatcher, PendingSessionOutput,
+        RendererTerminalStream, StartupConfig, TerminalOutputSanitizer, UI_EVENT_QUEUE_CAPACITY,
+        UiEventEnqueueResult, UiOutputGap, WEBVIEW2_BROWSER_ARGUMENTS_ENV, cdp_browser_arguments,
+        cdp_port_from_environment, close_main_window_gracefully,
+        normalize_path_for_child_processes, parse_cdp_port, parse_start_minimized,
+        queue_pending_session_output, resolve_agent_working_root_from, resolve_environment_source,
+        resolve_runtime_dir_override, sanitize_terminal_output_for_ui, ui_event_channel,
+        ui_output_gap_runtime_event, validate_and_lock_desktop_runtime,
+        validate_runtime_storage_paths,
     };
     use shared_types::{
         LifecycleState, LogLevel, OperatorRouteMessageRequest, RunEventIdentity, RuntimeEvent,
@@ -1784,6 +3702,7 @@ mod tests {
             chunk: chunk.into(),
             synthetic: false,
             timestamp: format!("sequence-{}", identity.sequence),
+            credit: None,
         }
     }
 
@@ -1941,6 +3860,264 @@ mod tests {
         );
     }
 
+    fn credited_ui_channel() -> (super::UiEventIngress, super::UiEventReceiver, std::sync::Arc<super::OutputCreditLedger>) {
+        let ledger = std::sync::Arc::new(super::OutputCreditLedger::default());
+        ledger.enable();
+        let reset = ledger.begin_renderer();
+        ledger.renderer_ready(reset.epoch, Duration::ZERO).unwrap();
+        let (mut ingress, receiver, _) = ui_event_channel(1);
+        ingress.credit = Some(ledger.clone());
+        if let RuntimeEvent::SessionOutput { identity, .. } = ui_output_event(1) {
+            ledger.open_run(identity.into());
+        }
+        (ingress, receiver, ledger)
+    }
+
+    fn enqueue_credited(ingress: &super::UiEventIngress, ledger: &std::sync::Arc<super::OutputCreditLedger>, event: RuntimeEvent) -> UiEventEnqueueResult {
+        if let RuntimeEvent::SessionOutput { identity, chunk, .. } = &event {
+            match ledger.reserve((*identity).into(), chunk.len()) {
+                supervisor::output_credit::Admission::Reserved(lease) => lease.publish(*identity),
+                _ => panic!("fixture has reserved capacity"),
+            }
+        } else { panic!("output fixture"); }
+        ingress.enqueue(event)
+    }
+
+    #[test]
+    fn output_credit_reload_replays_tracked_modes_without_an_in_flight_credit() {
+        let (ingress, receiver, ledger) = credited_ui_channel();
+        let first = ui_output_event_with_chunk(1, "\x1b[?1049h\x1b[?1hmenu");
+        assert_eq!(enqueue_credited(&ingress, &ledger, first), UiEventEnqueueResult::Enqueued);
+        let shown = receiver.try_recv().unwrap();
+        assert_eq!(ui_output_chunk(&shown.event), "\x1b[?1049h\x1b[?1hmenu", "first page shows output as written");
+        assert!(ledger.dispatch(shown.credit.as_ref().unwrap()));
+        ledger.acknowledge(shown.credit.as_ref().unwrap()).unwrap();
+        // Page reload: new epoch, nothing in flight.
+        let reset = ledger.begin_renderer();
+        ledger.renderer_ready(reset.epoch, Duration::ZERO).unwrap();
+        let next = ui_output_event_with_chunk(2, "after");
+        assert_eq!(enqueue_credited(&ingress, &ledger, next), UiEventEnqueueResult::Enqueued);
+        let replayed = receiver.try_recv().unwrap();
+        let chunk = ui_output_chunk(&replayed.event);
+        assert!(chunk.starts_with("\x18\x1b[0m") && chunk.contains("\x1b[?47h") && chunk.contains("\x1b[?1h"), "{chunk:?}");
+        assert!(chunk.ends_with("after"));
+        ledger.discard(replayed.credit.as_ref().unwrap());
+    }
+
+    #[test]
+    fn output_credit_lanes_preserve_control_barriers_without_waiting_for_parser() {
+        let (ingress, receiver, ledger) = credited_ui_channel();
+        assert_eq!(enqueue_credited(&ingress, &ledger, ui_output_event(1)), UiEventEnqueueResult::Enqueued);
+        assert_eq!(ingress.enqueue(RuntimeEvent::SystemLog {
+            level: LogLevel::Info, message: "barrier".into(), timestamp: "now".into(),
+        }), UiEventEnqueueResult::Enqueued);
+        // The one-item control lane is full; the independently reserved output
+        // lane still accepts the successor, with no display shedding or ACK.
+        assert_eq!(enqueue_credited(&ingress, &ledger, ui_output_event(2)), UiEventEnqueueResult::Enqueued);
+        let first = receiver.try_recv().unwrap();
+        assert_eq!(ui_output_chunk(&first.event), "output-1");
+        assert!(matches!(receiver.try_recv().unwrap().event, RuntimeEvent::SystemLog { message, .. } if message == "barrier"));
+        let last = receiver.try_recv().unwrap();
+        assert_eq!(ui_output_chunk(&last.event), "output-2");
+        assert!(ledger.acknowledge(first.credit.as_ref().unwrap()).is_err(), "dequeuing is not parsing");
+        ledger.discard(first.credit.as_ref().unwrap());
+        ledger.discard(last.credit.as_ref().unwrap());
+    }
+
+    #[test]
+    fn output_credit_batches_keep_every_ticket_until_one_actual_parser_ack() {
+        let (ingress, receiver, ledger) = credited_ui_channel();
+        for sequence in 1..=supervisor::output_credit::RUN_ITEMS {
+            assert_eq!(enqueue_credited(&ingress, &ledger, ui_output_event_with_chunk(sequence as u64, "x")), UiEventEnqueueResult::Enqueued);
+        }
+        let mut batcher = PendingOutputBatcher::default();
+        let now = Instant::now();
+        for _ in 0..supervisor::output_credit::RUN_ITEMS {
+            let queued = receiver.try_recv().unwrap();
+            let RuntimeEvent::SessionOutput { identity, session, chunk, synthetic, timestamp } = queued.event else { panic!("output") };
+            assert!(batcher.push(PendingSessionOutput { identity, session, chunk, synthetic, timestamp, credit: queued.credit }, now).is_empty());
+        }
+        let mut outputs = batcher.flush();
+        assert_eq!(outputs.len(), 1);
+        let output = outputs.pop().unwrap();
+        let credit = output.credit.unwrap();
+        assert_eq!(output.chunk.len(), supervisor::output_credit::RUN_ITEMS);
+        assert_eq!(credit.tickets.len(), supervisor::output_credit::RUN_ITEMS);
+        assert!(ledger.acknowledge(&credit).is_err());
+        assert!(ledger.dispatch(&credit));
+        assert_eq!(ledger.acknowledge(&credit).unwrap(), supervisor::output_credit::RUN_ITEMS);
+        assert_eq!(ledger.acknowledge(&credit).unwrap(), 0);
+    }
+
+    #[test]
+    fn output_credit_filtered_control_carry_is_disposed_without_parser_ack() {
+        let (ingress, receiver, ledger) = credited_ui_channel();
+        assert_eq!(enqueue_credited(&ingress, &ledger, ui_output_event_with_chunk(1, "\x1b]0;hidden title")), UiEventEnqueueResult::FilteredOutput);
+        assert_eq!(enqueue_credited(&ingress, &ledger, ui_output_event_with_chunk(2, "\x07")), UiEventEnqueueResult::FilteredOutput);
+        assert!(receiver.try_recv().is_err());
+        let reset = ledger.begin_renderer();
+        assert_eq!(reset.discarded.items, 0, "nothing was dispatched or parsed");
+        ledger.renderer_ready(reset.epoch, Duration::ZERO).expect("no filtered native charge leaked");
+        assert_eq!(enqueue_credited(&ingress, &ledger, ui_output_event_with_chunk(3, "visible")), UiEventEnqueueResult::Enqueued);
+        let output = receiver.try_recv().unwrap();
+        // The first output after begin_renderer is the new page's first
+        // display, so it carries the reload recovery prefix (CAN + SGR 0; no
+        // modes were tracked here). The filtered carry still leaks nothing.
+        assert_eq!(ui_output_chunk(&output.event), "\x18\x1b[0mvisible");
+        ledger.discard(output.credit.as_ref().unwrap());
+    }
+
+    #[test]
+    fn output_credit_observer_gap_is_coalesced_bounded_and_precedes_recovered_output() {
+        let (ingress, receiver, ledger) = credited_ui_channel();
+        for sequence in 1..=supervisor::output_credit::RUN_ITEMS {
+            enqueue_credited(&ingress, &ledger, ui_output_event_with_chunk(sequence as u64, "x"));
+        }
+        // Simulate the native observer path: no ticket, sanitizer still sees
+        // every read. A credit-backed ingress must never use the legacy lane.
+        for sequence in 65..=1064 {
+            assert_eq!(ingress.enqueue(ui_output_event_with_chunk(sequence, "omitted")),
+                UiEventEnqueueResult::DroppedOutputFull);
+        }
+        assert_eq!(ingress.state.lock().output_gaps.len(), 1);
+        assert!(ingress.state.take_reportable_output_gaps(&ledger).is_empty());
+        let first = receiver.try_recv().unwrap();
+        assert!(ledger.dispatch(first.credit.as_ref().unwrap()));
+        ledger.acknowledge(first.credit.as_ref().unwrap()).unwrap();
+        assert_eq!(enqueue_credited(&ingress, &ledger, ui_output_event_with_chunk(1065, "resumed")),
+            UiEventEnqueueResult::Enqueued);
+        for _ in 1..supervisor::output_credit::RUN_ITEMS {
+            let old = receiver.try_recv().unwrap();
+            assert!(old.output_gaps_before.is_empty());
+            ledger.discard(old.credit.as_ref().unwrap());
+        }
+        let resumed = receiver.try_recv().unwrap();
+        assert_eq!(resumed.output_gaps_before.len(), 1);
+        assert_eq!(resumed.output_gaps_before[0].dropped_events, 1000);
+        assert!(resumed.output_gaps_before[0].observer_only);
+        assert_eq!(ui_output_chunk(&resumed.event), "\x18\x1b[0mresumed");
+        assert!(receiver.try_recv().is_err(), "no per-read observer notifications");
+        assert!(ingress.state.take_all_output_gaps().is_empty());
+        ledger.discard(resumed.credit.as_ref().unwrap());
+    }
+
+    #[test]
+    fn output_credit_observer_control_fragments_do_not_leak_on_recovery() {
+        for (before, omitted, resumed, expected) in [
+            ("", "lost\x1b[31", "mnew", "new"),
+            ("\x1b[31", "mlost", "new", "new"),
+            ("", "lost\u{009b}31", "mnew", "new"),
+            ("", "lost\x1b(", "Bnew", "new"),
+            ("", "lost\x1b]title", "private\x07new", "new"),
+            ("", "lost\u{009d}title", "private\u{009c}new", "new"),
+            ("", "lost\x1bPpayload", "private\x1b\\new", "new"),
+            ("", "lost\u{0090}payload", "private\u{009c}new", "new"),
+            ("", "lost\x1b", "[31mnew", "\x1b[31mnew"),
+        ] {
+            let identity = match ui_output_event(1) { RuntimeEvent::SessionOutput { identity, .. } => identity, _ => unreachable!() };
+            let mut stream = RendererTerminalStream::new(identity, "fixture".into());
+            let clean = stream.push(identity, before, false, "before");
+            assert_eq!(stream.prepare_display(clean, false), before);
+            let dropped = stream.push(identity, omitted, false, "omitted");
+            stream.prepare_display(dropped, true);
+            let next = stream.push(identity, resumed, false, "resumed");
+            assert_eq!(stream.prepare_display(next, false), format!("\x18\x1b[0m{expected}"), "{omitted:?}");
+        }
+    }
+
+    #[test]
+    fn output_credit_observer_gap_flushes_at_close_even_without_parser_progress() {
+        let (ingress, receiver, ledger) = credited_ui_channel();
+        let reset = ledger.begin_renderer(); // not ready, zero capacity
+        let event = ui_output_event(1);
+        let identity = match &event { RuntimeEvent::SessionOutput { identity, .. } => *identity, _ => unreachable!() };
+        ingress.enqueue(event);
+        assert!(ingress.state.take_reportable_output_gaps(&ledger).is_empty());
+        let mut closed_identity = identity; closed_identity.sequence = 2;
+        ingress.enqueue(RuntimeEvent::SessionState { identity: closed_identity, session: "claude".into(),
+            state: LifecycleState::Closed, reason: "natural exit".into(), timestamp: "now".into() });
+        let closed = receiver.try_recv().unwrap();
+        assert_eq!(closed.output_gaps_before.len(), 1);
+        assert_eq!(closed.output_gaps_before[0].identity, identity);
+        assert!(matches!(closed.event, RuntimeEvent::SessionState { state: LifecycleState::Closed, .. }));
+        assert!(ingress.state.lock().terminal_streams.is_empty());
+        assert!(ingress.state.take_all_output_gaps().is_empty());
+        ledger.renderer_ready(reset.epoch, Duration::ZERO).unwrap();
+    }
+
+    #[test]
+    fn output_credit_observer_replays_known_modes_at_every_split_and_c1_boundary() {
+        let identity = match ui_output_event(1) { RuntimeEvent::SessionOutput { identity, .. } => identity, _ => unreachable!() };
+        for start in ["\x1b[", "\u{009b}"] {
+            let omitted = format!("lost{start}?1;25;1004;2004;1049;1000;1002;1003;1006;1016h");
+            let csi_prefix_len = "lost".len() + start.len();
+            for split in omitted.char_indices().map(|(offset, _)| offset).chain([omitted.len()]) {
+                let mut stream = RendererTerminalStream::new(identity, "fixture".into());
+                let first = stream.push(identity, &omitted[..split], false, "first");
+                stream.prepare_display(first, true);
+                let rest = format!("{}new\x1b[?1l", &omitted[split..]);
+                let filtered = stream.push(identity, &rest, false, "resume");
+                let recovered = stream.prepare_display(filtered, false);
+                // If the complete command fell in omitted output or its
+                // incomplete prefix, its final state must precede fresh text.
+                if split >= csi_prefix_len {
+                    let text_at = recovered.find("new").unwrap();
+                    assert!(recovered[..text_at].contains("\x1b[?1h"), "split={split} {recovered:?}");
+                    assert!(recovered[..text_at].contains("\x1b[?47h"), "canonical buffer replay: {recovered:?}");
+                    assert!(recovered[..text_at].contains("\x1b[?1003h"), "last protocol wins: {recovered:?}");
+                    assert!(recovered[..text_at].contains("\x1b[?1016h"), "last encoding wins: {recovered:?}");
+                }
+                assert!(recovered.ends_with("new\x1b[?1l"));
+                assert_eq!(stream.modes.cursor_keys, Some(false), "suffix updates future state, not its own prefix");
+                assert_eq!(stream.modes.alternate, Some(true));
+                assert_eq!(stream.modes.mouse_protocol, Some(1003));
+                assert_eq!(stream.modes.mouse_encoding, Some(1016));
+            }
+        }
+    }
+
+    #[test]
+    fn output_credit_mode_recovery_filters_strings_and_replays_alias_resets() {
+        let identity = match ui_output_event(1) { RuntimeEvent::SessionOutput { identity, .. } => identity, _ => unreachable!() };
+        let mut stream = RendererTerminalStream::new(identity, "fixture".into());
+        let visible = stream.push(identity, "\x1b[?1;25;1004;2004;1049;1003;1016h", false, "before");
+        stream.prepare_display(visible, false);
+        let omitted = stream.push(identity,
+            "lost\x1b[?1047;1000;1006;1;25;1004;2004l\x1b]title\x1b[?1h\x07\u{0090}private\x1b[?1003h\u{009c}\x1b[?1001;1005;1015h",
+            false, "omitted");
+        stream.prepare_display(omitted, true);
+        let suffix = stream.push(identity, "restored", false, "resume");
+        let recovered = stream.prepare_display(suffix, false);
+        assert_eq!(recovered,
+            "\x18\x1b[0m\x1b[?47l\x1b[?1l\x1b[?25l\x1b[?1004l\x1b[?2004l\x1b[?1000l\x1b[?1006lrestored");
+        assert!(!recovered.contains("1049"), "do not replay unknown cursor-save side effects");
+        assert!(recovered.len() - "restored".len() + 1 <= supervisor::output_credit::DISPLAY_OVERHEAD);
+    }
+
+    #[test]
+    fn output_credit_mode_resets_and_malformed_controls_cannot_replay_stale_settings() {
+        let identity = match ui_output_event(1) { RuntimeEvent::SessionOutput { identity, .. } => identity, _ => unreachable!() };
+        for reset in ["\x1bc", "\x1b[!p", "\u{009b}!p"] {
+            let mut stream = RendererTerminalStream::new(identity, "fixture".into());
+            let omitted = stream.push(identity, &format!("lost\x1b[?1;1004;2004;1049;1003;1016h\x1b[?25l{reset}"), false, "omitted");
+            stream.prepare_display(omitted, true);
+            let suffix = stream.push(identity, "next", false, "resume");
+            let recovered = stream.prepare_display(suffix, false);
+            assert!(recovered.contains("\x1b[?1l") && recovered.contains("\x1b[?1004l") && recovered.contains("\x1b[?2004l"));
+            if reset == "\x1bc" {
+                assert!(recovered.contains("\x1b[?47l") && recovered.contains("\x1b[?1000l") && recovered.contains("\x1b[?1006l"));
+                assert!(recovered.contains("\x1b[?25l"), "installed xterm RIS retains cursor visibility");
+            } else {
+                assert!(recovered.contains("\x1b[?47h") && recovered.contains("\x1b[?1003h") && recovered.contains("\x1b[?1016h"));
+                assert!(recovered.contains("\x1b[?25h"), "DECSTR explicitly shows cursor");
+            }
+        }
+        let mut stream = RendererTerminalStream::new(identity, "fixture".into());
+        let omitted = stream.push(identity, "lost\x1b[?1;999999999999999999999h\x1b[?25\x18h\x1b[?1004:1h", false, "omitted");
+        stream.prepare_display(omitted, true);
+        assert_eq!(stream.modes, super::DisplayModeSnapshot::default(), "invalid or cancelled control must not establish mode state");
+    }
+
     #[test]
     fn saturated_output_queue_preserves_survivor_order_and_inserts_a_per_run_gap() {
         let (ingress, receiver, _state) = ui_event_channel(2);
@@ -1980,6 +4157,7 @@ mod tests {
                 ),
                 session: "claude".into(),
                 dropped_events: 1,
+                observer_only: false,
             }]
         );
         let gap_event = ui_output_gap_runtime_event(&fourth.output_gaps_before[0]);
@@ -2261,6 +4439,7 @@ mod tests {
                         chunk: visible,
                         synthetic: false,
                         timestamp: "sequence-2".into(),
+                        credit: None,
                     },
                     started,
                 )
@@ -2310,6 +4489,7 @@ mod tests {
                         chunk: filtered,
                         synthetic: false,
                         timestamp: "sequence-2".into(),
+                        credit: None,
                     },
                 )
                 .is_none()
@@ -2816,6 +4996,71 @@ mod tests {
         );
         assert!(!arguments.contains("remote-allow-origins"));
         assert!(!arguments.contains("0.0.0.0"));
+    }
+
+    #[test]
+    fn only_the_explicit_debug_variable_turns_cdp_on() {
+        let environment = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| OsString::from(*value))
+            }
+        };
+
+        // A shell started from a live v1 pane carries both of these.
+        let inherited_from_v1_pane = environment(&[
+            ("PRIM1_CDP_PORT", "9222"),
+            (
+                "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+                "--remote-debugging-port=9222 --remote-debugging-address=127.0.0.1",
+            ),
+        ]);
+        assert_eq!(cdp_port_from_environment(inherited_from_v1_pane), Ok(None));
+        assert_eq!(cdp_port_from_environment(environment(&[])), Ok(None));
+        assert_eq!(
+            cdp_port_from_environment(environment(&[("PRIM1_DEBUG_CDP_PORT", "9333")])),
+            Ok(Some(9333))
+        );
+        assert_eq!(
+            cdp_port_from_environment(environment(&[("PRIM1_DEBUG_CDP_PORT", "0")])),
+            Err(format!("{DEBUG_CDP_PORT_ENV} must be a non-zero TCP port"))
+        );
+    }
+
+    #[test]
+    fn webview_switch_is_removed_unless_debugging_was_requested() {
+        let startup = |cdp_port| StartupConfig {
+            agent_working_root: PathBuf::from("ignored"),
+            environment_source: None,
+            runtime_dir_override: None,
+            cdp_port,
+            start_minimized: false,
+            trial: None,
+            upgrade_startup: Ok(None),
+            personal_repo_override: None,
+        };
+        assert_eq!(
+            WEBVIEW2_BROWSER_ARGUMENTS_ENV,
+            "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"
+        );
+        assert_eq!(startup(None).webview_browser_arguments(), None);
+        assert_eq!(
+            startup(Some(9333)).webview_browser_arguments().as_deref(),
+            Some("--remote-debugging-port=9333 --remote-debugging-address=127.0.0.1")
+        );
+    }
+
+    #[test]
+    fn v2_identity_is_disjoint_from_the_installed_v1_app() {
+        // The identifier owns the default runtime dir and the WebView2
+        // profile. Reverting it would make v2 share both with the live app.
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(config["identifier"], "io.prim1.v2");
+        assert_eq!(config["productName"], "PRIM-1 v2");
+        assert_eq!(config["app"]["windows"][0]["title"], "PRIM-1 v2");
     }
 
     #[test]

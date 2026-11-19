@@ -378,6 +378,9 @@ pub struct TerminalViewport {
     screen: Option<Screen>,
     cursor_visible: bool,
     observation_invalidated: bool,
+    synchronized_output_active: bool,
+    /// A glyph other than a blank has been drawn since the run began.
+    drew_visible: bool,
 }
 
 impl Default for TerminalViewport {
@@ -388,6 +391,8 @@ impl Default for TerminalViewport {
             screen: Screen::new(DEFAULT_COLS, DEFAULT_ROWS, true),
             cursor_visible: true,
             observation_invalidated: false,
+            synchronized_output_active: false,
+            drew_visible: false,
         }
     }
 }
@@ -437,10 +442,24 @@ impl TerminalViewport {
             })
     }
 
+    /// Whether the program has drawn any non-blank glyph since the run
+    /// began (A16: its first sign of life). Parsed from the stream, so a
+    /// control or title split across reads is never text, and text arriving
+    /// one character per read still is. A resize keeps it.
+    pub fn drew_visible_text(&self) -> bool {
+        self.drew_visible
+    }
+
     pub fn dimensions(&self) -> Option<(usize, usize)> {
         self.screen
             .as_ref()
             .map(|screen| (screen.cols, screen.rows))
+    }
+
+    /// DEC 2026 redraw state is boolean, not a nesting count. A repeated set
+    /// is observed in the captured Grok frames; one reset completes the frame.
+    pub fn synchronized_output_active(&self) -> bool {
+        self.synchronized_output_active
     }
 
     pub fn observe_character(&mut self, character: char) -> TerminalSignals {
@@ -619,6 +638,7 @@ impl TerminalViewport {
                     screen.reset();
                 }
                 self.cursor_visible = true;
+                self.synchronized_output_active = false;
                 ParserState::Ground
             }
             '\\' | '=' | '>' => ParserState::Ground,
@@ -775,7 +795,8 @@ impl TerminalViewport {
                     }
                 }
                 1049 => self.invalidate_projection(),
-                1003 | 1004 | 1006 | 2004 | 2026 | 9001 => {}
+                2026 => self.synchronized_output_active = enabled,
+                1003 | 1004 | 1006 | 2004 | 9001 => {}
                 _ => self.invalidate_projection(),
             }
         }
@@ -803,6 +824,11 @@ impl TerminalViewport {
             self.invalidate_projection();
             return;
         };
+        // A zero-width character (U+200B, a joiner, a lone combining mark)
+        // draws nothing, as `Screen::write` treats it (the Reviewer, 9780469).
+        if width > 0 && !character.is_whitespace() {
+            self.drew_visible = true;
+        }
         if self
             .screen
             .as_mut()
@@ -868,7 +894,44 @@ impl TerminalViewport {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn drawn_text_is_read_from_the_stream_not_from_its_read_boundaries() {
+        let feed = |viewport: &mut TerminalViewport, text: &str| for ch in text.chars() { viewport.observe_character(ch); };
+        let mut viewport = TerminalViewport::default();
+        // A new pseudoconsole's setup and a title, split across reads: no text.
+        feed(&mut viewport, "\x1b[?9001h\x1b[?1004h\x1b]0;");
+        feed(&mut viewport, "node.exe\x07\x1b[2J\x1b[H   \r\n");
+        assert!(!viewport.drew_visible_text());
+        // Zero-width characters draw nothing either.
+        feed(&mut viewport, "\u{200B}\u{200D}\u{0301}");
+        assert!(!viewport.drew_visible_text());
+        // One character per read is still text, and a resize keeps it.
+        feed(&mut viewport, "O");
+        assert!(viewport.drew_visible_text());
+        viewport.resize(100, 30);
+        assert!(viewport.drew_visible_text());
+        // A new run starts without it.
+        viewport.begin_run();
+        assert!(!viewport.drew_visible_text());
+    }
+
     use super::*;
+
+    #[test]
+    fn synchronized_redraw_is_boolean_and_survives_cursor_show_and_chunk_boundaries() {
+        let mut terminal = TerminalViewport::default();
+        for ch in "\x1b[?2026h\x1b[?2026h\x1b[?25h".chars() { terminal.observe_character(ch); }
+        assert!(terminal.synchronized_output_active());
+        for ch in "\x1b[?2026".chars() { terminal.observe_character(ch); }
+        assert!(terminal.synchronized_output_active());
+        terminal.observe_character('l');
+        assert!(!terminal.synchronized_output_active());
+        for ch in "\x1b[?2026h".chars() { terminal.observe_character(ch); }
+        terminal.resize(80, 24);
+        assert!(terminal.synchronized_output_active(), "resize cannot finish an active redraw");
+        terminal.begin_run();
+        assert!(!terminal.synchronized_output_active());
+    }
 
     #[test]
     fn cursor_hide_show_commits_a_trusted_screen() {

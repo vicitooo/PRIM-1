@@ -76,6 +76,26 @@ same bounds.
 Both consume the same endpoint environment variable and accept `-Endpoint` only
 for isolated tests.
 
+## v2 preview beside the live app
+
+`v2-preview.ps1` runs a v2 build next to an installed v1 without touching it.
+A process started inside a live pane joins that app's kill-on-close job, so the
+script never starts v2 itself: `start` stages the built exe as
+`D:\prim1-v2-scratch\bin\prim1-v2.exe`, writes the `.env` it loads from that
+folder (scratch runtime and working root, started minimized), registers the
+per-user task `PRIM1-v2-preview`, and runs it through the Schedule service.
+
+```powershell
+.\scripts\v2-preview.ps1 -Action start      # -SourceExe <built exe> to stage another build
+.\scripts\v2-preview.ps1 -Action status     # read-only: PID, parent chain, outside-job verdict
+.\scripts\v2-preview.ps1 -Action screenshot -Out .\plan\screens\v2.png
+.\scripts\v2-preview.ps1 -Action stop       # only processes whose image path is the staged exe
+```
+
+`status` proves the main process sits outside the live job from its parent
+chain: the Schedule service created it, and no v1 exe or pane is above it.
+Remote debugging stays off unless `PRIM1_DEBUG_CDP_PORT` is set.
+
 ## Metadata audit summary
 
 `agent-events-summary.py` reads the metadata-only JSONL audit directly. It does

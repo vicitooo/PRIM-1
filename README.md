@@ -26,20 +26,29 @@ From the repository root, the executable is `target/release/cli-master-wrapper-d
 
 ## Your first room
 
-Use two agent sessions for this walkthrough, for example Claude Code and Codex, or two instances of one installed CLI. They use your existing accounts and provider usage.
+Use Claude Code, Codex or Grok sessions to exercise room delivery. Sessions use your existing accounts and provider usage.
 
-1. Open PRIM-1, click **Rooms**, then **New room**. Name it `First room`, leave **Brief members automatically** checked, and click **Create room**. You can create the room before adding any sessions.
+1. Open PRIM-1, click **Rooms**, then **New room**. Name it `First room` and click **Create room**. You can create the room before adding any sessions. An enabled room default brief supplies the initial task prompt for new conversations that select it.
 2. In the room, click **+** (**Attach a harness**) → **Custom…**. Choose your first harness, give it a label, keep **Normal** permissions, and use **Browse…** to choose a project folder. Click **Create session** to launch it. Repeat for the second harness.
-3. Open each session tab and resolve any CLI trust, sign-in, or approval prompts. Wait for the harness to be ready. The automatic room brief explains how to read and post to the shared feed; it is delivered once per membership when the session can accept it.
+3. Open each session tab and resolve any CLI trust, sign-in, or approval prompts. Wait for the harness to be ready. A selected brief is passed at launch only for a new conversation; an actual resume receives no task prompt. Joining a room or becoming idle never types a brief. **Brief now** is an explicit new feed message with its own wake result.
 4. Click the room-name chip to open its feed. Enter the following message, select **Send to all 2 members**, and click **Send**:
 
     > Each of you: introduce yourself in one sentence, post it to the room feed, then wait. Do not change files.
 
-5. Watch the session tabs for the responses and the room feed for their posts. **Send** puts the message into the selected terminals. **Post to feed** only adds a bulletin for members to read; it does not prompt them.
+5. Check each recipient's receipt. **Send** stores the full message in the feed and submits it into each supported recipient's terminal, also while it works. Questions and other readiness guards keep it queued. **Post to feed** only stores the message. The feed opens **Readable**: one card per message, with delivery receipts left out; **Raw**, one toggle away, shows every stored event. If a wake is Held or unconfirmed, inspect that member's terminal and ask it to read the stored message. Written and Fetched receipts do not prove model acceptance or completion.
 
-If a member is still starting or waiting on a question, Send is refused before delivery begins; the error names the member. Resolve its prompt in the terminal and try again. Prime is currently raw-terminal-only, so use Claude Code, Codex, or Grok for this room walkthrough.
+Send stores the message once, then checks each recipient independently. A held member does not suppress the others; its held wake stays visible on the message. For a supported Grok recipient with a temporary refusal, resolve its prompt or draft and use **Retry wake** on the message in Readable, or on the eligible recipient receipt in Raw; do not repost to all. Retry cannot enable an unsupported harness. Partial or unknown attempts cannot retry; inspect the recipient's terminal and ask it to read the stored message through `room_read`.
 
-Room definitions and membership survive app restarts; the shared feed does not. Switching rooms leaves sessions running. **Settings → Continue where I left off** is on by default and relaunches previously running sessions as you re-enter their room or lobby, resuming stored conversations where supported. Closing the app stops its managed processes. Press **F1** for controls and shortcuts, or see [known limitations](docs/KNOWN_ISSUES.md).
+Room definitions, membership and the durable shared feed survive app restarts; terminal buffers do not. Switching rooms leaves sessions running. The backend stores an explicit per-room **Resume on restart** choice, default false; room visits and historical running flags do not select it. Supported conversations resume in a new PTY. Codex resume remains held until root identity and conversation freshness are proven; **Start fresh session** preserves prior recovery references. Frontend startup-policy integration and installed-harness acceptance remain tracked in the S5 plan. Closing the app stops its managed processes. Press **F1** for controls and shortcuts, or see [known limitations](docs/KNOWN_ISSUES.md).
+
+### Periodic fallback messages
+
+In the room's right-side panel, open **Fallbacks**. Choose 15, 30 or 60 minutes,
+all hosted agents or selected members, and a message. A member can use its own
+interval/message and optional brief, or opt out. Save enables the schedule;
+Pause stops future unattempted reminders. Members and Fallbacks collapse
+independently. Outside agents and stopped/sleeping members are not woken.
+PRIM-1 must remain running; this does not replace an application watchdog.
 
 ## Docs
 

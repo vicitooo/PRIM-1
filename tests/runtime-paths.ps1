@@ -103,7 +103,7 @@ try {
     [Environment]::SetEnvironmentVariable("PRIM1_RUNTIME_DIR", "  ", "Process")
     Assert-PathEqual `
       -Actual (Resolve-Prim1RuntimeDirectory) `
-      -Expected (Join-Path $localAppData "io.prim1.runtime\runtime") `
+      -Expected (Join-Path $localAppData "io.prim1.v2\runtime") `
       -Message "the Windows runtime default did not use LOCALAPPDATA"
   }
 

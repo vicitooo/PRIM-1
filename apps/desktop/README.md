@@ -21,6 +21,9 @@ The Windows Tauri desktop for PRIM-1. Start with the [first-room quickstart](../
 - exposes ordered `RoomId` create/rename/reorder/membership/delete controls, one
   bounded active-room feed, feed-only Post, and explicit one-member / Send All
   delivery
+- shows that feed as PRIM-1's own list of every stored event, with a members
+  side panel (live state, current-run CPU/RAM, Open/Wake/Brief/remove) that can
+  be closed to an edge tab
 - listens to the supervisor event bus in real time
 - optionally relaunches previously running sessions on context entry and resumes stored harness conversations
 - writes process diagnostics to `<runtime-dir>/desktop-events.jsonl`; errors may include harness text, so inspect before sharing

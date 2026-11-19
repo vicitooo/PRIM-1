@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Diagnose the Launch-broken regression via CDP.
-# Run after starting the wrapper with PRIM1_CDP_PORT=9222.
+# Run after starting the wrapper with PRIM1_DEBUG_CDP_PORT=<port>, with the
+# same PRIM1_DEBUG_CDP_PORT exported in this shell (cdp.py has no default port).
 
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

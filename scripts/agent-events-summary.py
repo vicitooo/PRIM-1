@@ -103,11 +103,11 @@ def default_runtime_dir() -> Path:
         local_app_data = os.environ.get("LOCALAPPDATA")
         if not local_app_data:
             raise ValueError("LOCALAPPDATA is required when PRIM1_RUNTIME_DIR is unset")
-        return Path(local_app_data) / "io.prim1.runtime" / "runtime"
+        return Path(local_app_data) / "io.prim1.v2" / "runtime"
     if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "io.prim1.runtime" / "runtime"
+        return Path.home() / "Library" / "Application Support" / "io.prim1.v2" / "runtime"
     data_home = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
-    return data_home / "io.prim1.runtime" / "runtime"
+    return data_home / "io.prim1.v2" / "runtime"
 
 
 def default_audit_path() -> Path:

@@ -1,0 +1,256 @@
+{
+"source": "cx-fresh-01",
+"harness": "codex-cli 0.164.0 standalone, new untrusted folder, ConPTY 120x40",
+"cols": 120,
+"rows": 40,
+"chunks": [
+{
+"t": 0.133,
+"data": "\u001b[1t"
+},
+{
+"t": 0.135,
+"data": "\u001b[c\u001b[?1004h\u001b[?9001h"
+},
+{
+"t": 0.301,
+"data": "\u001b[?2004h"
+},
+{
+"t": 0.313,
+"data": "\u001b[?1004l\u001b[?1004h"
+},
+{
+"t": 0.326,
+"data": "\u001b[?2026h\u001b[?2026h\u001b[1;1H"
+},
+{
+"t": 0.327,
+"data": "\u001b[J"
+},
+{
+"t": 0.33,
+"data": "\u001b[?25l"
+},
+{
+"t": 0.331,
+"data": "\u001b[1;2H\u001b[0m\u001b[K\u001b[2;29H\u001b[0m\u001b[K\u001b[3;13H\u001b[0m\u001b[K\u001b[4;2H\u001b[0m\u001b[K\u001b[5;2H\u001b[0m\u001b[K\u001b[6;27H\u001b[0m\u001b[K\u001b[7;2H\u001b[0m\u001b[K\u001b[8;2H\u001b[0m\u001b[K\u001b[1;1H \u001b[2;1H  >_ \u001b[1mOpenAI Codex\u001b[22m\u001b[2m\u001b[2m (v0.164.0)\u001b[3;1H\u001b[22m     \u001b[2mloading\u001b[4;1H\u001b[22m \u001b[5;1H \u001b[6;1H\u001b[1m\u203a\u001b[22m \u001b[2mAsk Codex to do anything\u001b[7;1H\u001b[22m \u001b[8;1H \u001b[0m\u001b[1;1H"
+},
+{
+"t": 0.333,
+"data": "\u001b[0 q\u001b[1;1H \u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.335,
+"data": "\u001b[?25h"
+},
+{
+"t": 0.336,
+"data": "\u001b[?2026l"
+},
+{
+"t": 0.338,
+"data": "\u001b[?2026l"
+},
+{
+"t": 0.34,
+"data": "\u001b[?2026h\u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.343,
+"data": "\u001b[?25h"
+},
+{
+"t": 0.344,
+"data": "\u001b[?2026l"
+},
+{
+"t": 0.346,
+"data": "\u001b[?2026h\u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.347,
+"data": "\u001b[?25h"
+},
+{
+"t": 0.349,
+"data": "\u001b[?2026l"
+},
+{
+"t": 0.351,
+"data": "\u001b[?2026h\u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.353,
+"data": "\u001b[?25h\u001b[?2026l"
+},
+{
+"t": 0.354,
+"data": "\u001b[?2026h\u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.356,
+"data": "\u001b[?25h\u001b[?2026l"
+},
+{
+"t": 0.372,
+"data": "\u001b[?2026h\u001b[?25l"
+},
+{
+"t": 0.373,
+"data": "\u001b[3;6H\u001b[2mD:\\prim1-v3-test-20261024\\work\\comm-builder\\cx-fresh-01\u001b[0m\u001b[6;3H\u001b[?25h"
+},
+{
+"t": 0.375,
+"data": "\u001b[?2026l"
+},
+{
+"t": 0.376,
+"data": "\u001b[?2026h\u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.378,
+"data": "\u001b[?25h\u001b[?2026l"
+},
+{
+"t": 0.38,
+"data": "\u001b[?2026h\u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.381,
+"data": "\u001b[?25h"
+},
+{
+"t": 0.383,
+"data": "\u001b[?2026l"
+},
+{
+"t": 0.384,
+"data": "\u001b[?2026h\u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.388,
+"data": "\u001b[?25h"
+},
+{
+"t": 0.39,
+"data": "\u001b[?2026l"
+},
+{
+"t": 0.391,
+"data": "\u001b[?2026h\u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.393,
+"data": "\u001b[?25h"
+},
+{
+"t": 0.394,
+"data": "\u001b[?2026l"
+},
+{
+"t": 0.881,
+"data": "\u001b[?2026h\u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.883,
+"data": "\u001b[?25h"
+},
+{
+"t": 0.885,
+"data": "\u001b[?2026l"
+},
+{
+"t": 0.886,
+"data": "\u001b[?2026h\u001b[0m\u001b[6;3H"
+},
+{
+"t": 0.89,
+"data": "\u001b[?25h"
+},
+{
+"t": 0.891,
+"data": "\u001b[?2026l"
+},
+{
+"t": 1.534,
+"data": "\u001b[?2026h\u001b[0m\u001b[6;3H"
+},
+{
+"t": 1.539,
+"data": "\u001b[?25h"
+},
+{
+"t": 1.541,
+"data": "\u001b[?2026l"
+},
+{
+"t": 1.703,
+"data": "\u001b[?2026h\u001b[0m\u001b[6;3H"
+},
+{
+"t": 1.704,
+"data": "\u001b[?25h\u001b[?2026l"
+},
+{
+"t": 1.706,
+"data": "\u001b[?2026h\u001b[0m\u001b[6;3H"
+},
+{
+"t": 1.707,
+"data": "\u001b[?25h"
+},
+{
+"t": 1.71,
+"data": "\u001b[?2026l"
+},
+{
+"t": 1.717,
+"data": "\u001b[?2026h\u001b[0m\u001b[6;3H"
+},
+{
+"t": 1.718,
+"data": "\u001b[?25h\u001b[?2026l"
+},
+{
+"t": 1.721,
+"data": "\u001b[?2026h\u001b[0m\u001b[6;3H\u001b[?25h"
+},
+{
+"t": 1.722,
+"data": "\u001b[?2026l"
+},
+{
+"t": 1.728,
+"data": "\u001b[?2026h\u001b[0m\u001b[6;3H"
+},
+{
+"t": 1.731,
+"data": "\u001b[?25h"
+},
+{
+"t": 1.732,
+"data": "\u001b[?2026l"
+},
+{
+"t": 1.873,
+"data": "\u001b[?2026h\u001b[1;1H"
+},
+{
+"t": 1.875,
+"data": "\u001b[J"
+},
+{
+"t": 1.877,
+"data": "\u001b[?25l"
+},
+{
+"t": 1.883,
+"data": "\u001b[1;2H\u001b[0m\u001b[K\u001b[2;16H\u001b[0m\u001b[K\u001b[3;119H\u001b[0m\u001b[K\u001b[4;2H\u001b[0m\u001b[K\u001b[5;116H\u001b[0m\u001b[K\u001b[6;111H\u001b[0m\u001b[K\u001b[7;26H\u001b[0m\u001b[K\u001b[8;2H\u001b[0m\u001b[K\u001b[1;1H \u001b[2;1H\u001b[1m  Folder access\u001b[3;1H\u001b[22m  \u001b[2mD:\\prim1-v3-test-20261024\\work\\comm-builder\\cx-fresh-01                                                             \u001b[4;1H\u001b[22m \u001b[5;1H  Trust this folder? Codex can read, edit, and run files here, subject to your permission settings. Folder settings\u001b[6;1H  can run code automatically, even without a model request. Continue only if you trust these files. Your trust\u001b[7;1H  decision will be saved.\u001b[8;1H \u001b[9;1H\u001b[7m\u001b[1m\u203a 1. Trust and continue                                                                                                 \u001b[10;3H\u001b[27m\u001b[22m2.\u001b[10;6HQuit\u001b[12;3H\u001b[1menter\u001b[22m\u001b[2m\u001b[2m continue \u00b7 \u001b[22m\u001b[1mesc\u001b[22m\u001b[2m\u001b[2m quit\u001b[0m"
+},
+{
+"t": 1.894,
+"data": "\u001b[?2026l"
+}
+]
+}

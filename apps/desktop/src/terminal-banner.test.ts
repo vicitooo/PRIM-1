@@ -36,3 +36,33 @@ describe("InitialTerminalBanner", () => {
     expect(events).toEqual(["remove", "write:child"]);
   });
 });
+
+it("reviewer hides a recovery overlay re-shown between runs", () => {
+  let overlayVisible = true;
+  const banner = new InitialTerminalBanner(
+    () => { overlayVisible = false; },
+    () => {},
+  );
+  banner.observeRunning(true);
+  expect(overlayVisible).toBe(false);
+  // TerminalPane.renderPrelaunch reuses this DOM element for a later recovery.
+  banner.observeRunning(false);
+  overlayVisible = true;
+  banner.observeRunning(true);
+  expect(overlayVisible).toBe(false);
+});
+
+it("late output of a stopped run keeps the recovery overlay shown for it", () => {
+  let overlayVisible = true;
+  const banner = new InitialTerminalBanner(
+    () => { overlayVisible = false; },
+    () => {},
+  );
+  banner.observeRunning(true);
+  banner.observeRunning(false);
+  overlayVisible = true; // renderPrelaunch shows the recovery
+  banner.forwardOutput("final tail of the stopped run");
+  expect(overlayVisible).toBe(true);
+  banner.observeRunning(true);
+  expect(overlayVisible).toBe(false);
+});

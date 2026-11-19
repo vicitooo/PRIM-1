@@ -20,6 +20,27 @@ pub const SESSION_STARTING_DETAIL: &str = "session_starting";
 pub use terminal_viewport::MAX_CELLS as STARTUP_SCREEN_MAX_CELLS;
 pub const MINIMAL_MODE_READY_MARKER: &str = "minimal · /help";
 
+/// Grok 1.0.62's folder-trust question ("y  Yes, proceed / n  No, quit /
+/// Enter or y to trust · n or Esc to quit"). Enter alone trusts the folder,
+/// and the session has not started while it is up, whatever chrome is
+/// painted around it. Answering it starts the session, so a starting splash
+/// after the question means it was answered (scrollback can keep the text).
+fn trust_question_pending(lower: &str) -> bool {
+    const MARKERS: [&str; 2] = [
+        "do you trust the contents of this directory?",
+        "enter or y to trust",
+    ];
+    let Some(question) = MARKERS
+        .iter()
+        .filter_map(|marker| lower.rfind(marker))
+        .max()
+    else {
+        return false;
+    };
+    let after = &lower[question..];
+    !after.contains("starting session") && !after.contains("starting your session")
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum StartupProgress {
     #[default]
@@ -46,6 +67,10 @@ pub struct StartupTracker {
     /// Tail of recently observed raw output, so the minimal statusline is
     /// recognised even when it spans a chunk boundary.
     raw_tail: String,
+    /// The trust question was seen and not yet answered. Latched because
+    /// later repaints can push it out of `raw_tail` while it is still up;
+    /// only a starting splash after it or a trusted screen without it clears.
+    trust_pending: bool,
 }
 
 impl Default for StartupTracker {
@@ -56,6 +81,7 @@ impl Default for StartupTracker {
             frame_active: false,
             frame_invalid: false,
             raw_tail: String::new(),
+            trust_pending: false,
         }
     }
 }
@@ -67,6 +93,7 @@ impl StartupTracker {
         self.frame_active = false;
         self.frame_invalid = false;
         self.raw_tail.clear();
+        self.trust_pending = false;
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
@@ -86,7 +113,22 @@ impl StartupTracker {
         bracketed_paste_enabled: bool,
     ) -> StartupProgress {
         if self.phase == StartupPhase::Complete {
-            return StartupProgress::None;
+            // /new can show the startup splash again inside the same PTY.
+            // The supervisor's semantic classifier blocks on that signal;
+            // observe its completion again instead of leaving that hold stuck.
+            // Ordinary output still skips viewport tracking after admission.
+            if !matches!(
+                classify_work_state(chunk),
+                Some((WorkState::Blocked, Some(detail))) if detail == SESSION_STARTING_DETAIL
+            ) {
+                return StartupProgress::None;
+            }
+            self.begin_run();
+            // The cached screen stopped following output at admission. Its
+            // old cells are unknown, not a blank current screen after /new.
+            if let Some((cols, rows)) = self.viewport.dimensions() {
+                self.viewport.resize(cols as u16, rows as u16);
+            }
         }
 
         let mut progress = StartupProgress::None;
@@ -142,16 +184,25 @@ impl StartupTracker {
             let paste_observed =
                 bracketed_paste_enabled || window.contains("\x1b[?2004h");
             let launcher_visible = window_lower.contains("new worktree");
-            // A window still showing the starting splash defers: input is not
-            // accepted yet. The next composer burst after startup admits.
+            // A window still showing the starting splash or the trust
+            // question defers: input is not accepted yet. The next composer
+            // burst after startup admits.
             let starting_visible = window_lower.contains("starting session")
                 || window_lower.contains("starting your session");
+            // Styled key names can split the hint in the raw stream.
+            if trust_question_pending(&strip_ansi_and_controls(&window_lower)) {
+                self.trust_pending = true;
+            } else if starting_visible {
+                // Answering the question starts the session.
+                self.trust_pending = false;
+            }
             let minimal_ready = window.contains(MINIMAL_MODE_READY_MARKER);
             let fullscreen_ready =
                 window_lower.contains("shift+tab") && window_lower.contains("ctrl+x");
             if paste_observed
                 && !launcher_visible
                 && !starting_visible
+                && !self.trust_pending
                 && (minimal_ready || fullscreen_ready)
             {
                 self.phase = StartupPhase::Complete;
@@ -200,6 +251,9 @@ impl StartupTracker {
         let has_starting = lower.contains("starting session...")
             || lower.contains("starting your session");
         let has_launcher = lower.contains("new worktree") || lower.contains("resume session");
+        // Every cell is freshly painted, so this screen settles the latch.
+        self.trust_pending = trust_question_pending(&lower);
+        let has_trust_question = self.trust_pending;
         // Glyph-free: without TERM in its env grok paints ">" instead of the
         // composer glyph. The footer chrome is the grok-unique signature; the
         // launcher screen also shows it and stays excluded by has_launcher.
@@ -211,6 +265,7 @@ impl StartupTracker {
             StartupPhase::AwaitingStarting | StartupPhase::StartingObserved
                 if bracketed_paste_enabled
                     && !has_launcher
+                    && !has_trust_question
                     && (has_minimal_interactive_composer
                         || (!has_starting && has_fullscreen_interactive_composer)) =>
             {
@@ -300,6 +355,12 @@ pub fn classify_work_state(chunk: &str) -> Option<(WorkState, Option<String>)> {
     let normalized = strip_ansi_and_controls(chunk).replace('\u{2026}', "...");
     let lower = normalized.to_ascii_lowercase();
 
+    if lower.contains("do you trust the contents of this directory?")
+        && lower.contains("yes, proceed")
+        && lower.contains("no, quit")
+    {
+        return Some((WorkState::Blocked, Some("workspace_trust".into())));
+    }
     if lower.contains("rate limit") || lower.contains("usage limit") {
         return Some((WorkState::ErrorLoop, Some("rate_limit".into())));
     }
@@ -428,6 +489,7 @@ mod tests {
             driver: DriverKind::Grok,
             working_dir: WORKSPACE_ROOT.into(),
             permission_profile,
+            codex_transport: Default::default(),
         }
     }
 
@@ -610,6 +672,100 @@ mod tests {
         tracker
     }
 
+    fn captured_after_new_repaint() -> String {
+        // Claude's production 0d1e1c0 walk, 2026-10-19 18:24:59Z:
+        // evidence/2026-10-19/combined-walk-claude/grok-after-new-plus-20s.json.
+        // These are verbatim xterm DOM rows (200x58), NOT a captured PTY
+        // stream. Positioning/clear/show below reconstructs their settled
+        // screen for the driver; it makes no claim about real chunk framing.
+        let capture: serde_json::Value = serde_json::from_str(include_str!(
+            "fixtures/grok-after-new-screen-20261019.json"
+        )).unwrap();
+        let rows = capture["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 58);
+        let mut paint = "\x1b[?25l\x1b[2J".to_string();
+        for (index, row) in rows.iter().enumerate() {
+            paint.push_str(&format!("\x1b[{};1H{}", index + 1, row.as_str().unwrap()));
+        }
+        paint.push_str("\x1b[?25h");
+        paint
+    }
+
+    #[test]
+    fn same_run_new_startup_completes_on_the_captured_ready_screen() {
+        let ready = captured_after_new_repaint();
+        // Exercise a split footer and split terminal control as well as the
+        // complete repaint. The fixture keeps the actual ASCII > composer.
+        for split in [0, ready.find("Ctrl+x").unwrap() + 4, ready.len() - 2, ready.len()] {
+            let mut tracker = StartupTracker::default();
+            tracker.resize(200, 58);
+            assert_eq!(tracker.observe_output(&ready_repaint(false)), StartupProgress::InteractiveReady);
+            assert_eq!(tracker.observe_output(&starting_repaint()), StartupProgress::StartingObserved);
+            assert!(!tracker.is_interactive_ready());
+            let first = tracker.observe_output(&ready[..split]);
+            let second = tracker.observe_output(&ready[split..]);
+            assert!(first == StartupProgress::InteractiveReady || second == StartupProgress::InteractiveReady,
+                "the captured ready screen must release the same-run startup hold; split {split}");
+            assert!(tracker.is_interactive_ready());
+            assert_eq!(tracker.observe_output(&ready), StartupProgress::None,
+                "ordinary footer repaints must not replace active work with Idle");
+        }
+    }
+
+    #[test]
+    fn same_run_rearm_matches_the_semantic_starting_signal_at_chunk_boundaries() {
+        let splash = "Signing in… starting your session.";
+        for split in 0..=splash.len() {
+            if !splash.is_char_boundary(split) { continue; }
+            let mut tracker = StartupTracker::default();
+            assert_eq!(tracker.observe_output(&ready_repaint(false)), StartupProgress::InteractiveReady);
+            let mut semantic_starting = false;
+            for chunk in [&splash[..split], &splash[split..]] {
+                semantic_starting |= matches!(classify_work_state(chunk),
+                    Some((WorkState::Blocked, Some(detail))) if detail == SESSION_STARTING_DETAIL);
+                assert_ne!(tracker.observe_output(chunk), StartupProgress::InteractiveReady);
+            }
+            assert_eq!(!tracker.is_interactive_ready(), semantic_starting,
+                "only a signal that can set the native startup hold re-arms it; split {split}");
+            assert_eq!(tracker.observe_output(&ready_repaint(false)),
+                if semantic_starting { StartupProgress::InteractiveReady } else { StartupProgress::None });
+        }
+    }
+
+    #[test]
+    fn same_run_new_keeps_trust_launcher_and_paste_guards() {
+        let blocked_frames = [
+            (trust_repaint_with_ready_chrome(), true),
+            (repaint("Grok Build New worktree Resume session > Shift+Tab:mode Ctrl+x:shortcuts"), true),
+            (ready_repaint(false), false),
+        ];
+        for (blocked_frame, paste) in blocked_frames {
+            let mut tracker = StartupTracker::default();
+            assert_eq!(tracker.observe_output(&ready_repaint(false)), StartupProgress::InteractiveReady);
+            assert_eq!(tracker.observe_output(&repaint("Starting session…")), StartupProgress::StartingObserved);
+            assert_ne!(tracker.observe_output_with_mode(&blocked_frame, paste), StartupProgress::InteractiveReady);
+            assert!(!tracker.is_interactive_ready());
+            assert_eq!(tracker.observe_output(&ready_repaint(false)), StartupProgress::InteractiveReady);
+        }
+        let mut tracker = StartupTracker::default();
+        assert_eq!(tracker.observe_output(&ready_repaint(false)), StartupProgress::InteractiveReady);
+        for chunk in ["Thinking…", TRUST_QUESTION, "request timed out"] {
+            assert_eq!(tracker.observe_output(chunk), StartupProgress::None,
+                "other semantic states must stay owned by the supervisor");
+        }
+    }
+
+    #[test]
+    fn same_run_new_does_not_reuse_the_frozen_pre_new_screen() {
+        let mut tracker = StartupTracker::default();
+        assert_eq!(tracker.observe_output(&ready_repaint(false)), StartupProgress::InteractiveReady);
+        assert_ne!(tracker.observe_output("Starting session…"), StartupProgress::InteractiveReady);
+        assert!(!tracker.is_interactive_ready());
+        assert_ne!(tracker.observe_output("\x1b[2K"), StartupProgress::InteractiveReady,
+            "erasing a partial splash must not expose the old frozen footer as current proof");
+        assert_eq!(tracker.observe_output(&ready_repaint(false)), StartupProgress::InteractiveReady);
+    }
+
     #[test]
     fn startup_tracker_admits_the_composer_with_or_without_a_prior_starting_frame() {
         // Measured 2026-08-29: fullscreen 1.0.5 paints no splash frame — the
@@ -637,9 +793,10 @@ mod tests {
         );
         assert_eq!(
             tracker.observe_output(&starting_repaint()),
-            StartupProgress::None,
-            "a completed tracker cannot re-enter startup"
+            StartupProgress::StartingObserved,
+            "a same-run startup splash must be observed again after /new"
         );
+        assert!(!tracker.is_interactive_ready());
     }
 
     #[test]
@@ -789,6 +946,178 @@ mod tests {
         );
     }
 
+    /// Grok 1.0.62's trust question as its binary strings lay it out, with
+    /// both kinds of ready chrome painted around it (the worst case).
+    const TRUST_QUESTION: &str = concat!(
+        "Do you trust the contents of this directory?\r\n",
+        "Grok Build may run or modify contents in this directory,\r\n",
+        "posing security risks.\r\n\r\n",
+        "y  Yes, proceed\r\n",
+        "n  No, quit\r\n\r\n",
+        "Enter or y to trust \u{b7} n or Esc to quit\r\n",
+    );
+
+    fn trust_repaint_with_ready_chrome() -> String {
+        format!(
+            "\x1b[?2004h{}",
+            repaint(&format!(
+                "{TRUST_QUESTION}minimal \u{b7} /help\r\n❯  Shift+Tab:mode  Ctrl+x:shortcuts"
+            ))
+        )
+    }
+
+    #[test]
+    fn classifies_the_trust_question_as_blocked_but_not_a_quote_of_it() {
+        assert_eq!(
+            classify_work_state(TRUST_QUESTION),
+            Some((WorkState::Blocked, Some("workspace_trust".into())))
+        );
+        assert_eq!(
+            classify_work_state("Grok asks: Do you trust the contents of this directory?"),
+            None
+        );
+    }
+
+    #[test]
+    fn startup_tracker_never_admits_while_the_trust_question_is_up() {
+        let stream = trust_repaint_with_ready_chrome();
+        for split in 0..=stream.len() {
+            if !stream.is_char_boundary(split) {
+                continue;
+            }
+            let mut tracker = StartupTracker::default();
+            assert_ne!(
+                tracker.observe_output(&stream[..split]),
+                StartupProgress::InteractiveReady
+            );
+            assert_ne!(
+                tracker.observe_output(&stream[split..]),
+                StartupProgress::InteractiveReady,
+                "split {split} admitted the trust screen"
+            );
+            assert!(!tracker.is_interactive_ready());
+        }
+
+        // Frameless raw output (a resumed replay shape) is held the same way,
+        // even with the hint's key names styled apart.
+        for question in [
+            TRUST_QUESTION.to_string(),
+            "y  Yes, proceed\r\n\x1b[1mEnter\x1b[0m or \x1b[1my\x1b[0m to trust\r\n".to_string(),
+        ] {
+            let mut raw = StartupTracker::default();
+            assert_eq!(
+                raw.observe_output_with_mode(
+                    &format!("\x1b[?2004h{question}minimal \u{b7} /help\r\n> "),
+                    true,
+                ),
+                StartupProgress::None,
+                "{question:?}"
+            );
+        }
+
+        // Once answered, the next composer repaint admits.
+        let mut answered = StartupTracker::default();
+        assert_ne!(
+            answered.observe_output(&stream),
+            StartupProgress::InteractiveReady
+        );
+        assert_eq!(
+            answered.observe_output(&ready_repaint(false)),
+            StartupProgress::InteractiveReady
+        );
+    }
+
+    #[test]
+    fn startup_tracker_holds_the_trust_question_after_it_leaves_the_raw_window() {
+        // More than the 1024-char raw window of in-place row repaints after
+        // the question, then ready chrome in the next read.
+        let rows: String = (0..12)
+            .map(|row| format!("\x1b[{};1H{}", 20 + row, "\u{2500}".repeat(100)))
+            .collect();
+        assert!(rows.chars().count() > 1024);
+        for chrome in [
+            "\x1b[34;1Hminimal \u{b7} /help\x1b[35;1H> ",
+            "\x1b[36;1H\u{276f}  Shift+Tab:mode  Ctrl+x:shortcuts",
+        ] {
+            let mut tracker = StartupTracker::default();
+            assert_ne!(
+                tracker.observe_output(&format!("\x1b[?2004h{TRUST_QUESTION}{rows}")),
+                StartupProgress::InteractiveReady
+            );
+            assert_ne!(
+                tracker.observe_output(chrome),
+                StartupProgress::InteractiveReady,
+                "{chrome:?} admitted the trust screen"
+            );
+            assert!(!tracker.is_interactive_ready());
+        }
+
+        // Footer-only repaints, "repainted on every activity", push the
+        // question out of the raw window one burst at a time.
+        let mut tracker = StartupTracker::default();
+        assert_ne!(
+            tracker.observe_output(&format!("\x1b[?2004h{TRUST_QUESTION}")),
+            StartupProgress::InteractiveReady
+        );
+        for repaint in 0..40 {
+            assert_ne!(
+                tracker.observe_output(
+                    "\x1b[?25l\x1b[30;1H\u{276f}  Shift+Tab:mode  Ctrl+x:shortcuts\x1b[?25h"
+                ),
+                StartupProgress::InteractiveReady,
+                "footer repaint {repaint} admitted the trust screen"
+            );
+        }
+        assert!(!tracker.is_interactive_ready());
+    }
+
+    #[test]
+    fn a_trust_question_seen_only_in_raw_output_clears_on_the_starting_splash() {
+        // After a resize the projection is unknown, so only the raw stream
+        // can see the question; its latch outlives the raw window.
+        let mut tracker = StartupTracker::default();
+        tracker.resize(120, 40);
+        let padding = "x".repeat(1100);
+        assert_eq!(
+            tracker.observe_output(&format!("\x1b[?2004h{TRUST_QUESTION}{padding}")),
+            StartupProgress::None
+        );
+        assert_eq!(
+            tracker.observe_output("minimal \u{b7} /help\r\n> "),
+            StartupProgress::None,
+            "the unanswered question still holds startup"
+        );
+        // The splash defers on its own until it, too, leaves the raw window.
+        assert_eq!(
+            tracker.observe_output(&format!(
+                "Signing in\u{2026} starting your session.\r\n{padding}"
+            )),
+            StartupProgress::None
+        );
+        assert_eq!(
+            tracker.observe_output("minimal \u{b7} /help\r\n> "),
+            StartupProgress::InteractiveReady,
+            "answering the question started the session"
+        );
+    }
+
+    #[test]
+    fn startup_tracker_admits_minimal_scrollback_that_kept_an_answered_trust_question() {
+        // Minimal mode keeps printed rows: the answered question stays above
+        // the starting splash and the statusline that follow it.
+        let mut tracker = StartupTracker::default();
+        assert_eq!(
+            tracker.observe_output(&format!(
+                "\x1b[?2004h{TRUST_QUESTION}Signing in\u{2026} starting your session.\r\n"
+            )),
+            StartupProgress::StartingObserved
+        );
+        assert_eq!(
+            tracker.observe_output(&minimal_ready_repaint()),
+            StartupProgress::InteractiveReady
+        );
+    }
+
     #[test]
     fn startup_tracker_observes_the_v105_splash_phrasing_as_starting() {
         let mut tracker = StartupTracker::default();
@@ -849,8 +1178,8 @@ mod tests {
         );
         assert_eq!(
             tracker.observe_output(&stream),
-            StartupProgress::None,
-            "an admitted run must not re-enter startup"
+            StartupProgress::InteractiveReady,
+            "a repeated startup splash and its completion must not leave the semantic startup hold stuck"
         );
     }
 

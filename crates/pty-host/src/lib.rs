@@ -14,8 +14,12 @@ use shared_types::{DriverKind, EnvVar, LaunchSpec};
 
 mod job;
 #[cfg(windows)]
-pub use job::PinnedProcess;
+mod usage;
 pub use job::ProcessJob;
+#[cfg(windows)]
+pub use job::{PinnedProcess, ProcessAlreadyExited, app_job, register_app_job};
+#[cfg(windows)]
+pub use usage::{current_process_usage, logical_processor_count};
 
 #[derive(Debug, Clone)]
 pub enum PtyEvent {
@@ -96,9 +100,17 @@ const INHERITED_CONTROL_ENV: [&str; 9] = [
     "CLAUDECODE",
     "CLAUDE_CODE_CHILD_SESSION",
 ];
+/// R9: WebView2 remote debugging belongs to the desktop process alone. No
+/// pane inherits the switch WebView2 reads or a port that asks for it (v2's
+/// explicit one, v1's ambient one), so nothing a pane starts opens CDP.
+const INHERITED_DEBUG_ENV: [&str; 3] = [
+    "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+    "PRIM1_DEBUG_CDP_PORT",
+    "PRIM1_CDP_PORT",
+];
 
 fn apply_launch_environment(command: &mut CommandBuilder, env: &[EnvVar]) -> Result<()> {
-    for key in INHERITED_CONTROL_ENV {
+    for key in INHERITED_CONTROL_ENV.into_iter().chain(INHERITED_DEBUG_ENV) {
         command.env_remove(key);
     }
     for env_var in env {
@@ -123,6 +135,37 @@ pub struct PtyExitStatus {
 pub struct ProcessIdentity {
     pub process_id: u32,
     pub image_name: Option<String>,
+}
+
+/// One process's resource use, every field read through the same handle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessUsage {
+    pub pid: u32,
+    /// Creation time in FILETIME ticks (100 ns since 1601-01-01 UTC). With
+    /// `pid` it identifies the process: Windows reuses process IDs.
+    pub created: u64,
+    /// User plus kernel CPU time, in 100 ns units.
+    pub cpu_time_100ns: u64,
+    /// Private bytes: the process's commit charge.
+    pub private_bytes: u64,
+    /// The executable's file name, when it was asked for.
+    pub image_name: Option<String>,
+}
+
+/// Resource accounting for one process scope (a Job), for telemetry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeAccounting {
+    /// User plus kernel CPU time of every process that ever ran in the scope,
+    /// exited ones included, in 100 ns units.
+    pub cpu_time_100ns: u64,
+    /// Peak commit charge of the scope since it was created, in bytes.
+    pub peak_memory_bytes: u64,
+    /// Members alive when read. Each was rechecked against the scope through
+    /// the handle it was read with, so a reused process ID is never counted.
+    pub members: Vec<ProcessUsage>,
+    /// IDs of members that were alive but could not be read; their use is
+    /// missing from `members`.
+    pub unreadable: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,6 +271,14 @@ pub trait PtySession: Send + Sync {
             "PTY session does not support isolated input-write cancellation"
         ))
     }
+    /// Complete the platform output producer only after its entire owned
+    /// process scope has naturally exited. Must not kill processes, cancel the
+    /// reader or synthesize EOF. May block while the reader drains final output;
+    /// call off reader/UI/supervisor locks. False defers for a later check (or
+    /// means this transport obtains EOF without an explicit producer close).
+    fn finish_output_if_scope_exited(&self) -> anyhow::Result<bool> {
+        Ok(false)
+    }
     fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()>;
     /// Terminates the complete process scope owned by this PTY session.
     ///
@@ -264,6 +315,11 @@ pub trait PtySession: Send + Sync {
     fn live_processes(&self) -> anyhow::Result<Vec<ProcessIdentity>> {
         Ok(Vec::new())
     }
+    /// CPU time, peak memory and members of this session's process scope, for
+    /// telemetry. `None` when the session has no accountable scope.
+    fn scope_accounting(&self) -> anyhow::Result<Option<ScopeAccounting>> {
+        Ok(None)
+    }
 }
 
 pub struct ConcretePtySession {
@@ -292,7 +348,7 @@ impl ConcretePtySession {
         size: Option<(u16, u16)>,
         handler: PtyEventHandler,
     ) -> anyhow::Result<Self> {
-        let (cols, rows) = size.unwrap_or((120, 40));
+        let (cols, rows) = size.unwrap_or(shared_types::DEFAULT_PTY_SIZE);
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -422,7 +478,10 @@ impl ConcretePtySession {
     }
 
     fn close_master(&self) {
-        self.master.lock().expect("pty master poisoned").take();
+        let master = { self.master.lock().expect("pty master poisoned").take() };
+        // ClosePseudoConsole may wait for output to drain. A concurrent Stop
+        // must still be able to take this mutex and cancel/terminate the run.
+        drop(master);
     }
 
     #[cfg(windows)]
@@ -471,20 +530,29 @@ impl ConcretePtySession {
 
     fn current_agent_processes(&self, driver: DriverKind) -> Result<Vec<ProcessIdentity>> {
         let live_processes = self.live_process_identities()?;
-        if driver == DriverKind::GenericTerminal {
-            return Ok(live_processes);
-        }
+        Ok(self.agent_processes_among(driver, &live_processes))
+    }
 
-        Ok(live_processes
-            .into_iter()
+    /// The live processes that are this PTY's agent, by the driver's image rule.
+    /// Claude Code's updater renames the running executable in place
+    /// (`claude.exe.old.<millis>.<pid>`); `expected_agent_image_name` reads that exact
+    /// shape as the original name, so the renamed agent is not taken for its exit.
+    /// A remembered bare PID is deliberately not used: a later job member could reuse
+    /// it and keep a dead agent looking alive.
+    fn agent_processes_among(&self, driver: DriverKind, live_processes: &[ProcessIdentity]) -> Vec<ProcessIdentity> {
+        if driver == DriverKind::GenericTerminal {
+            return live_processes.to_vec();
+        }
+        live_processes
+            .iter()
             .filter(|process| {
                 process
                     .image_name
                     .as_deref()
-                    .map(|name| expected_agent_image_name(driver, name))
-                    .unwrap_or(false)
+                    .is_some_and(|name| expected_agent_image_name(driver, name))
             })
-            .collect())
+            .cloned()
+            .collect()
     }
 
     fn record_agent_processes(&self, processes: &[ProcessIdentity]) {
@@ -537,6 +605,27 @@ impl PtySession for ConcretePtySession {
             })
             .context("failed to resize PTY")?;
         Ok(())
+    }
+
+    fn finish_output_if_scope_exited(&self) -> anyhow::Result<bool> {
+        #[cfg(windows)]
+        {
+            // Neither a missing/reused PID nor the root exiting alone proves
+            // that ConPTY has no live clients. Closing it would kill any such
+            // descendants. Query the exact child and the retained session Job.
+            if self.try_wait()?.is_none() || !self.job.has_exited()? {
+                return Ok(false);
+            }
+            // The independent cloned reader stays open and continues through
+            // credit admission + decoder tail to its own EOF. The master owns
+            // HPCON, whose retained lifetime otherwise prevents that EOF.
+            self.close_master();
+            Ok(true)
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(false)
+        }
     }
 
     fn kill(&self) -> anyhow::Result<()> {
@@ -604,6 +693,11 @@ impl PtySession for ConcretePtySession {
     }
 
     fn note_real_output(&self, driver: DriverKind) {
+        // Output only needs to establish that this PTY has hosted an agent.
+        // Fresh liveness and membership queries must not use this fast path.
+        if self.agent_seen.load(Ordering::SeqCst) {
+            return;
+        }
         if let Ok(processes) = self.current_agent_processes(driver) {
             self.record_agent_processes(&processes);
         }
@@ -613,23 +707,21 @@ impl PtySession for ConcretePtySession {
         self.live_process_identities()
     }
 
+    fn scope_accounting(&self) -> anyhow::Result<Option<ScopeAccounting>> {
+        #[cfg(windows)]
+        {
+            self.job.accounting(false).map(Some)
+        }
+
+        #[cfg(not(windows))]
+        {
+            Ok(None)
+        }
+    }
+
     fn agent_alive(&self, driver: DriverKind) -> anyhow::Result<AgentLiveness> {
         let live_processes = self.live_process_identities()?;
-        let agent_processes = if driver == DriverKind::GenericTerminal {
-            live_processes.clone()
-        } else {
-            live_processes
-                .iter()
-                .filter(|process| {
-                    process
-                        .image_name
-                        .as_deref()
-                        .map(|name| expected_agent_image_name(driver, name))
-                        .unwrap_or(false)
-                })
-                .cloned()
-                .collect::<Vec<_>>()
-        };
+        let agent_processes = self.agent_processes_among(driver, &live_processes);
 
         if !agent_processes.is_empty() {
             self.record_agent_processes(&agent_processes);
@@ -670,7 +762,8 @@ impl Drop for ConcretePtySession {
 }
 
 pub fn expected_agent_image_name(driver: DriverKind, image_name: &str) -> bool {
-    let base = process_image_basename(image_name).to_ascii_lowercase();
+    let lowered = process_image_basename(image_name).to_ascii_lowercase();
+    let base = without_updater_rename(&lowered).to_owned();
     if matches!(
         base.as_str(),
         "cmd.exe"
@@ -698,6 +791,26 @@ pub fn expected_agent_image_name(driver: DriverKind, image_name: &str) -> bool {
         DriverKind::Prime => false,
         DriverKind::GenericTerminal => false,
     }
+}
+
+/// Harness updaters rename the running executable in place: Claude Code to
+/// `<name>.old.<millis>.<pid>`, Grok to exactly `<name>.old`. The original
+/// name is what identifies the agent.
+fn without_updater_rename(base: &str) -> &str {
+    // Grok's updater renames the running executable to exactly `<name>.old`
+    // (PC3, 20 Oct 03:11Z: `grok.exe.old`).
+    if let Some(original) = base.strip_suffix(".old")
+        && original.contains('.')
+    {
+        return original;
+    }
+    let mut parts = base.rsplitn(4, '.');
+    let (Some(pid), Some(millis), Some(old), Some(original)) = (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return base;
+    };
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    if old == "old" && digits(pid) && digits(millis) { original } else { base }
 }
 
 /// The lower-cased file name of a process image ("codex.exe", "node").
@@ -810,6 +923,27 @@ fn process_image_name(process_id: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn missing_executable_spawn_error_omits_private_prompt_arguments() {
+        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let missing = std::env::temp_dir().join(format!("prim1-missing-{}-{unique}.exe", std::process::id()));
+        let spec = LaunchSpec {
+            program: missing.to_string_lossy().into_owned(),
+            args: vec!["--".into(), "PRIVATE_PROMPT_SENTINEL_не_логвай".into()],
+            working_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+            env: Vec::new(), display_name: "inert missing executable fixture".into(),
+        };
+        let error = match ConcretePtySession::spawn(&spec, Arc::new(|_| {})) {
+            Err(error) => error,
+            Ok(_) => panic!("unique missing executable unexpectedly started"),
+        };
+        let text = format!("{error:#}");
+        assert!(text.contains("CreateProcessW"), "must exercise the actual Windows spawn failure: {text}");
+        assert!(!text.contains("PRIVATE_PROMPT_SENTINEL"));
+        assert!(!text.contains("не_логвай"));
+    }
 
     fn decode_utf8_chunks(chunks: &[&[u8]]) -> String {
         let mut decoder = Utf8StreamDecoder::default();
@@ -1001,6 +1135,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn launch_environment_strips_inherited_webview_debugging_switches() {
+        let mut command = CommandBuilder::new("ignored");
+        for key in INHERITED_DEBUG_ENV {
+            command.env(key, "--remote-debugging-port=9222");
+        }
+
+        apply_launch_environment(&mut command, &[]).unwrap();
+
+        for key in INHERITED_DEBUG_ENV {
+            assert_eq!(command.get_env(key), None, "{key} reached the pane");
+        }
+
+        // Windows environment names are case-insensitive.
+        #[cfg(windows)]
+        {
+            let mut command = CommandBuilder::new("ignored");
+            command.env(
+                "webview2_additional_browser_arguments",
+                "--remote-debugging-port=9222",
+            );
+            apply_launch_environment(&mut command, &[]).unwrap();
+            assert_eq!(
+                command.get_env("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"),
+                None
+            );
+        }
+
+        // Only inheritance is cut: a value the launch spec states explicitly
+        // still applies, exactly like the control variables above.
+        let explicit = [EnvVar {
+            key: "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS".into(),
+            value: "--explicit".into(),
+        }];
+        apply_launch_environment(&mut command, &explicit).unwrap();
+        assert_eq!(
+            command.get_env("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"),
+            Some(std::ffi::OsStr::new("--explicit"))
+        );
+    }
+
     struct MembershipUnsupportedPty;
 
     impl PtySession for MembershipUnsupportedPty {
@@ -1058,6 +1233,32 @@ mod tests {
             error.to_string(),
             "PTY session does not expose pinned-process job membership"
         );
+    }
+
+    #[test]
+    fn expected_agent_image_name_sees_through_the_updater_rename_only() {
+        // PC3, 19 Oct: QueryFullProcessImageName of a live Claude member after a self-update.
+        assert!(expected_agent_image_name(
+            DriverKind::Claude,
+            r"C:\Users\operator\.local\bin\claude.exe.old.1792443263773.7128"
+        ));
+        assert!(expected_agent_image_name(DriverKind::Grok, r"C:\Users\me\.grok\bin\grok.exe.old.17924.42"));
+        // Only the exact updater shape is unwrapped, never a wrapper or another name.
+        assert!(!expected_agent_image_name(DriverKind::Claude, r"C:\x\cmd.exe.old.1792443263773.7128"));
+        assert!(!expected_agent_image_name(DriverKind::Claude, r"C:\x\claude.exe.old.notdigits.7128"));
+        assert!(!expected_agent_image_name(DriverKind::Claude, r"C:\x\claude.exe.bak"));
+        assert!(!expected_agent_image_name(DriverKind::Grok, r"C:\x\grok-helper.exe.old.1.2"));
+        // PC3, 20 Oct: Grok's updater renamed its running exe to exactly grok.exe.old.
+        assert!(expected_agent_image_name(DriverKind::Grok, r"C:\Users\operator\.grok\bin\grok.exe.old"));
+        assert!(!expected_agent_image_name(DriverKind::Grok, r"C:\x\cmd.exe.old"));
+        assert!(!expected_agent_image_name(DriverKind::Grok, r"C:\x\grok-helper.exe.old"));
+        assert!(!expected_agent_image_name(DriverKind::Grok, r"C:\x\grok.exe.older"));
+        assert_eq!(without_updater_rename("grok.exe.old"), "grok.exe");
+        assert_eq!(without_updater_rename("x.old"), "x.old", "only a name that keeps its extension is unwrapped");
+        assert_eq!(without_updater_rename(".old"), ".old");
+        assert_eq!(without_updater_rename("claude.exe.old.12.34"), "claude.exe");
+        assert_eq!(without_updater_rename("claude.exe"), "claude.exe");
+        assert_eq!(without_updater_rename("old.1.2"), "old.1.2");
     }
 
     #[test]
@@ -1170,6 +1371,13 @@ mod windows_real_process_tests {
             .env("PRIM1_PANE_IDENTITY", "stale-pane")
             .env("PRIM1_CONTROL_PLANE_SERVER_PID", "111")
             .env("PRIM1_CONTROL_PLANE_SERVER_STARTED_FILETIME", "222")
+            // R9: what a desktop process with debugging on, or a v1 pane, carries.
+            .env(
+                "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+                "--remote-debugging-port=9222 --remote-debugging-address=127.0.0.1",
+            )
+            .env("PRIM1_DEBUG_CDP_PORT", "9333")
+            .env("PRIM1_CDP_PORT", "9222")
             .status()
             .expect("run isolated environment scrub helper");
         assert!(status.success(), "isolated environment scrub helper failed");
@@ -1187,6 +1395,9 @@ mod windows_real_process_tests {
              echo ENDPOINT=[%PRIM1_CONTROL_PLANE_ENDPOINT%]\r\n\
              echo TRANSPORT=[%PRIM1_CONTROL_PLANE_TRANSPORT%]\r\n\
              echo IDENTITY=[%PRIM1_PANE_IDENTITY%]\r\n\
+             echo WEBVIEW2_ARGS=[%WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS%]\r\n\
+             echo DEBUG_CDP_PORT=[%PRIM1_DEBUG_CDP_PORT%]\r\n\
+             echo V1_CDP_PORT=[%PRIM1_CDP_PORT%]\r\n\
              echo SERVER_PID=[%PRIM1_CONTROL_PLANE_SERVER_PID%]\r\n\
              echo SERVER_STARTED=[%PRIM1_CONTROL_PLANE_SERVER_STARTED_FILETIME%]\r\n",
         );
@@ -1268,6 +1479,10 @@ mod windows_real_process_tests {
         );
         assert!(!observed.contains("SERVER_PID=[111]"), "{observed:?}");
         assert!(!observed.contains("SERVER_STARTED=[222]"), "{observed:?}");
+        assert!(observed.contains("WEBVIEW2_ARGS=[]"), "{observed:?}");
+        assert!(observed.contains("DEBUG_CDP_PORT=[]"), "{observed:?}");
+        assert!(observed.contains("V1_CDP_PORT=[]"), "{observed:?}");
+        assert!(!observed.contains("remote-debugging"), "{observed:?}");
         session.kill().expect("terminate environment probe child");
     }
 
@@ -1399,6 +1614,117 @@ mod windows_real_process_tests {
                     session.job.live_process_ids()
                 )
             });
+        }
+    }
+
+    #[test]
+    fn natural_conpty_exit_closes_producer_but_waits_for_reader_tail_callback() {
+        struct ReleaseReader(Arc<(Mutex<bool>, Condvar)>);
+        impl Drop for ReleaseReader {
+            fn drop(&mut self) {
+                *self.0.0.lock().unwrap() = true;
+                self.0.1.notify_all();
+            }
+        }
+        let batch = TempBatch::new("@echo off\r\necho NATURAL_OUTPUT_HEAD\r\necho NATURAL_OUTPUT_TAIL\r\n");
+        let output = Arc::new(Mutex::new(String::new()));
+        let captured = output.clone();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let reader_gate = gate.clone();
+        let blocked = AtomicBool::new(false);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let session = Arc::new(ConcretePtySession::spawn(&LaunchSpec {
+            program: "cmd.exe".into(), args: vec!["/d".into(), "/c".into(), batch.path_string()],
+            working_dir: batch.working_dir_string(), env: vec![], display_name: "natural-output-tail".into(),
+        }, Arc::new(move |event| match event {
+            PtyEvent::Output(chunk) => {
+                let tail = { let mut text = captured.lock().unwrap(); text.push_str(&chunk); text.contains("NATURAL_OUTPUT_TAIL") };
+                if tail && !blocked.swap(true, Ordering::SeqCst) {
+                    entered_tx.send(()).unwrap();
+                    let mut release = reader_gate.0.lock().unwrap();
+                    while !*release { release = reader_gate.1.wait(release).unwrap(); }
+                }
+            }
+            event => { let _ = closed_tx.send(event); }
+        })).expect("spawn natural ConPTY exit fixture"));
+        // Declared after the session so failure releases the reader before
+        // dropping a session whose ClosePseudoConsole may wait on that reader.
+        let release = ReleaseReader(gate);
+        poll_until(Duration::from_secs(2), || output.lock().unwrap().contains("\u{1b}[6n").then_some(()))
+            .expect("ConPTY cursor query");
+        session.send_input("\u{1b}[1;1R").expect("answer cursor query");
+        entered_rx.recv_timeout(Duration::from_secs(5)).expect("tail callback entered");
+        poll_until(Duration::from_secs(5), || (session.try_wait().unwrap().is_some() && session.job.has_exited().unwrap()).then_some(()))
+            .expect("root and full job exited naturally");
+        assert!(session.master.lock().unwrap().is_some(), "session still owns HPCON before explicit producer close");
+        let closer = session.clone();
+        let (close_tx, close_rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || { let _ = close_tx.send(closer.finish_output_if_scope_exited()); });
+        poll_until(Duration::from_secs(2), || session.master.try_lock().ok().and_then(|master| master.is_none().then_some(())))
+            .expect("producer close releases master mutex while reader callback is held");
+        assert!(matches!(closed_rx.recv_timeout(Duration::from_millis(100)), Err(mpsc::RecvTimeoutError::Timeout)),
+            "reader EOF cannot precede its held tail callback");
+        drop(release);
+        assert!(close_rx.recv_timeout(Duration::from_secs(5)).expect("producer close completed").unwrap());
+        assert!(matches!(closed_rx.recv_timeout(Duration::from_secs(5)).expect("real reader reached EOF"), PtyEvent::Closed));
+        thread.join().unwrap();
+        let text = output.lock().unwrap();
+        assert!(text.contains("NATURAL_OUTPUT_HEAD") && text.contains("NATURAL_OUTPUT_TAIL"));
+        assert!(session.master.lock().unwrap().is_none());
+        assert!(session.finish_output_if_scope_exited().unwrap(), "producer close is idempotent");
+    }
+
+    #[test]
+    fn natural_conpty_exit_preserves_live_descendant_until_its_own_exit() {
+        let release = TempInputDrainControl::new();
+        let output = Arc::new(Mutex::new(String::new()));
+        let captured = output.clone();
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let session = ConcretePtySession::spawn(&LaunchSpec {
+            program: std::env::current_exe().unwrap().to_string_lossy().into_owned(),
+            args: vec!["--exact".into(), "windows_real_process_tests::natural_output_descendant_helper".into(), "--nocapture".into()],
+            working_dir: release.working_dir_string(),
+            env: vec![EnvVar { key: "PRIM1_NATURAL_OUTPUT_HELPER".into(), value: "root".into() },
+                EnvVar { key: INPUT_WRITE_CANCEL_RELEASE_ENV.into(), value: release.release_path_string() }],
+            display_name: "natural-output-descendant".into(),
+        }, Arc::new(move |event| match event {
+            PtyEvent::Output(chunk) => captured.lock().unwrap().push_str(&chunk),
+            event => { let _ = closed_tx.send(event); }
+        })).expect("spawn descendant fixture");
+        poll_until(Duration::from_secs(2), || output.lock().unwrap().contains("\u{1b}[6n").then_some(()))
+            .expect("ConPTY cursor query");
+        session.send_input("\u{1b}[1;1R").expect("answer cursor query");
+        poll_until(Duration::from_secs(5), || session.try_wait().unwrap().is_some().then_some(()))
+            .expect("original child exited");
+        assert!(!session.job.has_exited().unwrap(), "descendant remains in the exact job");
+        assert!(!session.finish_output_if_scope_exited().unwrap(), "root exit alone must not close ConPTY");
+        assert!(session.master.lock().unwrap().is_some());
+        assert!(matches!(closed_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        release.release();
+        poll_until(Duration::from_secs(5), || session.job.has_exited().unwrap().then_some(()))
+            .expect("descendant exited naturally");
+        assert!(session.finish_output_if_scope_exited().unwrap());
+        assert!(matches!(closed_rx.recv_timeout(Duration::from_secs(5)).expect("reader EOF after descendant"), PtyEvent::Closed));
+        assert!(output.lock().unwrap().contains("NATURAL_DESCENDANT_TAIL"), "descendant's final output survived");
+    }
+
+    #[test]
+    fn natural_output_descendant_helper() {
+        match std::env::var("PRIM1_NATURAL_OUTPUT_HELPER").as_deref() {
+            Ok("root") => {
+                let _child = Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "windows_real_process_tests::natural_output_descendant_helper", "--nocapture"])
+                    .env("PRIM1_NATURAL_OUTPUT_HELPER", "descendant")
+                    .spawn().expect("spawn console descendant in inherited job");
+                println!("NATURAL_ROOT_DONE");
+            }
+            Ok("descendant") => {
+                let path = PathBuf::from(std::env::var(INPUT_WRITE_CANCEL_RELEASE_ENV).unwrap());
+                poll_until(Duration::from_secs(30), || path.exists().then_some(())).expect("test releases descendant");
+                println!("NATURAL_DESCENDANT_TAIL");
+            }
+            _ => {}
         }
     }
 
@@ -1766,6 +2092,52 @@ mod windows_real_process_tests {
     }
 
     #[test]
+    fn agent_alive_keeps_an_agent_whose_running_exe_the_updater_renamed() {
+        // PC3, 19 Oct: Claude Code's updater renamed the running claude.exe to
+        // claude.exe.old.<millis>.<pid>. Reproduce exactly that: run a copy of a
+        // harmless system exe named claude.exe, rename it while it runs, and query.
+        let dir = std::env::temp_dir().join(format!("prim1-rename-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let exe = dir.join("claude.exe");
+        let system_root = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        std::fs::copy(system_root.join(r"System32\PING.EXE"), &exe).expect("copy stand-in agent");
+        let job = ProcessJob::new().expect("create process job");
+        let child = Command::new(&exe)
+            .args(["-n", "30", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn stand-in agent");
+        job.assign_raw(AsRawHandle::as_raw_handle(&child))
+            .expect("assign stand-in agent to job");
+        let pid = child.id();
+        let session = concrete_session_for_job_child(job, child);
+
+        match session.agent_alive(DriverKind::Claude).expect("liveness") {
+            AgentLiveness::Alive(agents) => assert!(agents.iter().any(|process| process.process_id == pid), "{agents:?}"),
+            other => panic!("claude.exe must be the agent: {other:?}"),
+        }
+        let renamed = dir.join(format!("claude.exe.old.1792443263773.{pid}"));
+        std::fs::rename(&exe, &renamed).expect("rename the running exe like the updater");
+        match session.agent_alive(DriverKind::Claude).expect("liveness after rename") {
+            AgentLiveness::Alive(agents) => assert!(agents.iter().any(|process| process.process_id == pid), "{agents:?}"),
+            other => panic!("a renamed running agent must stay Alive: {other:?}"),
+        }
+
+        terminate_process_id(pid).expect("terminate stand-in agent");
+        let exited = poll_until(Duration::from_secs(8), || {
+            match session.agent_alive(DriverKind::Claude).expect("liveness after exit") {
+                AgentLiveness::Exited { last_agent_pids, .. } => Some(last_agent_pids),
+                _ => None,
+            }
+        })
+        .expect("the agent's real exit is still reported");
+        assert!(exited.contains(&pid));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn agent_alive_reports_exited_when_only_cmd_wrapper_survives() {
         let batch = TempBatch::new(
             "@echo off\r\n\
@@ -1804,6 +2176,12 @@ mod windows_real_process_tests {
                 return None;
             }
 
+            // Establish the historical hint through output, before allowing
+            // agent_alive to seed it. Failed/empty discovery must keep retrying.
+            session.note_real_output(DriverKind::Codex);
+            if !session.agent_seen.load(Ordering::SeqCst) {
+                return None;
+            }
             match session
                 .agent_alive(DriverKind::Codex)
                 .expect("query agent liveness")
@@ -1830,6 +2208,9 @@ mod windows_real_process_tests {
 
         let mut last_liveness = String::new();
         let (last_agent_pids, wrapper_only_processes) = poll_until(Duration::from_secs(8), || {
+            // Once seen, output stops discovery; liveness must still inspect
+            // the current Job and distinguish the surviving wrapper.
+            session.note_real_output(DriverKind::Codex);
             let liveness = session
                 .agent_alive(DriverKind::Codex)
                 .expect("query agent liveness after node.exe termination");

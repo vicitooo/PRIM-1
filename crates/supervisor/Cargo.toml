@@ -13,15 +13,28 @@ driver-generic-terminal = { path = "../driver-generic-terminal" }
 driver-grok = { path = "../driver-grok" }
 driver-prime = { path = "../driver-prime" }
 flate2.workspace = true
+juniper = { version = "=0.17.1", default-features = false }
 libc.workspace = true
 parking_lot.workspace = true
 pty-host = { path = "../pty-host" }
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10.9"
 shared-types = { path = "../shared-types" }
+terminal-viewport = { path = "../terminal-viewport" }
 tokio.workspace = true
 uuid.workspace = true
-windows-sys.workspace = true
+windows-sys = { workspace = true, features = ["Win32_UI_Shell", "Win32_System_Com", "Wdk_Storage_FileSystem", "Wdk_System_Threading", "Win32_System_Kernel", "Win32_System_Diagnostics_ToolHelp", "Win32_Networking_WinSock"] }
 
 [dev-dependencies]
+# Pinned exactly: task_graphql uses two #[doc(hidden)] juniper parser helpers.
+# `as_sdl` (tests only) prints and pins the schema.
+juniper = { version = "=0.17.1", default-features = false, features = ["schema-language"] }
 tempfile = "3"
+
+# v3 W4 (Claude PRIM-1 8ed4d106): the Codex App Server client, a websocket
+# over the owner's private AF_UNIX socket. Exact versions; tungstenite has
+# its default features off and only the client handshake, no TLS.
+[target.'cfg(windows)'.dependencies]
+uds_windows = "=1.2.1"
+tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }

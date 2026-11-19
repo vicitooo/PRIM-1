@@ -78,6 +78,7 @@ mod tests {
             driver: DriverKind::GenericTerminal,
             working_dir: WORKSPACE_ROOT.into(),
             permission_profile,
+            codex_transport: Default::default(),
         }
     }
 

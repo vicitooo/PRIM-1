@@ -2,7 +2,7 @@
 use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle, RawHandle};
 #[cfg(windows)]
 use std::{
-    sync::Mutex,
+    sync::{Mutex, OnceLock},
     thread,
     time::{Duration, Instant},
 };
@@ -32,6 +32,19 @@ use windows_sys::Win32::{
 const JOB_TERMINATION_WAIT: Duration = Duration::from_secs(4);
 #[cfg(windows)]
 const JOB_TERMINATION_POLL: Duration = Duration::from_millis(5);
+
+/// `PinnedProcess::open` found the process object but it has already exited:
+/// a known fact, unlike a failed query.
+#[derive(Debug)]
+pub struct ProcessAlreadyExited(pub u32);
+
+impl std::fmt::Display for ProcessAlreadyExited {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "cannot pin process {}: process has already exited", self.0)
+    }
+}
+
+impl std::error::Error for ProcessAlreadyExited {}
 
 /// An owned handle to one exact Windows process object.
 ///
@@ -75,7 +88,7 @@ impl PinnedProcess {
             creation_time,
         };
         if !process.is_alive()? {
-            bail!("cannot pin process {process_id}: process has already exited");
+            return Err(anyhow::Error::new(ProcessAlreadyExited(process_id)));
         }
 
         Ok(process)
@@ -94,8 +107,40 @@ impl PinnedProcess {
             .with_context(|| format!("failed to query liveness for process {}", self.process_id))
     }
 
+    /// Waits up to `timeout` for this exact process to exit; true once it has.
+    /// The handle carries SYNCHRONIZE, so this is a kernel wait, not a poll.
+    pub fn wait_for_exit(&self, timeout: Duration) -> Result<bool> {
+        let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
+        match unsafe { WaitForSingleObject(self.handle.as_raw_handle() as HANDLE, millis) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            WAIT_FAILED => Err(std::io::Error::last_os_error())
+                .with_context(|| format!("WaitForSingleObject failed for process {}", self.process_id)),
+            result => Err(anyhow!(
+                "WaitForSingleObject returned unexpected status {result:#x} for process {}",
+                self.process_id
+            )),
+        }
+    }
+
     pub fn same_identity(&self, other: &Self) -> bool {
         self.process_id == other.process_id && self.creation_time == other.creation_time
+    }
+
+    /// Win32 image path of this exact process (the pinned handle, not the pid).
+    pub fn image_path(&self) -> Result<String> {
+        use windows_sys::Win32::System::Threading::{PROCESS_NAME_WIN32, QueryFullProcessImageNameW};
+        let mut buffer = vec![0_u16; 32_768];
+        let mut size = buffer.len() as u32;
+        let ok = unsafe {
+            QueryFullProcessImageNameW(self.handle.as_raw_handle() as HANDLE, PROCESS_NAME_WIN32,
+                buffer.as_mut_ptr(), &mut size)
+        };
+        if ok == 0 || size == 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("QueryFullProcessImageNameW failed for process {}", self.process_id));
+        }
+        Ok(String::from_utf16_lossy(&buffer[..size as usize]))
     }
 }
 
@@ -327,7 +372,7 @@ impl ProcessJob {
         Ok(result != 0)
     }
 
-    fn active_process_count(&self) -> Result<u32> {
+    fn basic_accounting(&self) -> Result<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION> {
         let mut information = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
         let ok = unsafe {
             QueryInformationJobObject(
@@ -342,7 +387,72 @@ impl ProcessJob {
             return Err(std::io::Error::last_os_error())
                 .context("QueryInformationJobObject(BasicAccountingInformation) failed");
         }
-        Ok(information.ActiveProcesses)
+        Ok(information)
+    }
+
+    fn active_process_count(&self) -> Result<u32> {
+        Ok(self.basic_accounting()?.ActiveProcesses)
+    }
+
+    /// Non-destructive whole-scope exit proof. Accounting can reach zero before
+    /// an explicitly assigned root handle becomes signaled, so require both.
+    pub(crate) fn has_exited(&self) -> Result<bool> {
+        if self.active_process_count()? != 0 {
+            return Ok(false);
+        }
+        let assigned = self.explicitly_assigned_processes
+            .lock()
+            .map_err(|_| anyhow!("assigned-process handle registry was poisoned"))?;
+        for process in assigned.iter() {
+            if process_handle_is_alive(process.as_raw_handle() as HANDLE)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Resource accounting for telemetry. The CPU time covers every process
+    /// that ever ran in the job, exited ones included, so a delta between two
+    /// readings keeps short-lived children; the peak is the kernel's own
+    /// record of the job's commit charge since it was created. Each listed
+    /// member is read through a fresh handle that is rechecked against this
+    /// job, so an ID reused between listing and opening is never counted.
+    pub fn accounting(&self, image_names: bool) -> Result<crate::ScopeAccounting> {
+        let basic = self.basic_accounting()?;
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        let ok = unsafe {
+            QueryInformationJobObject(
+                self.handle.as_raw_handle() as HANDLE,
+                JobObjectExtendedLimitInformation,
+                (&mut limits as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("QueryInformationJobObject(ExtendedLimitInformation) failed");
+        }
+        let mut members = Vec::new();
+        let mut unreadable = Vec::new();
+        for process_id in self.live_process_ids()? {
+            match crate::usage::read_job_member(
+                self.handle.as_raw_handle() as HANDLE,
+                process_id,
+                image_names,
+            ) {
+                crate::usage::MemberReading::Measured(usage) => members.push(usage),
+                crate::usage::MemberReading::Gone => {}
+                crate::usage::MemberReading::Unreadable => unreadable.push(process_id),
+            }
+        }
+        let ticks = |value: i64| u64::try_from(value).unwrap_or(0);
+        Ok(crate::ScopeAccounting {
+            cpu_time_100ns: ticks(basic.TotalUserTime).saturating_add(ticks(basic.TotalKernelTime)),
+            peak_memory_bytes: limits.PeakJobMemoryUsed as u64,
+            members,
+            unreadable,
+        })
     }
 
     pub fn terminate(&self) -> Result<()> {
@@ -396,6 +506,31 @@ impl ProcessJob {
     }
 }
 
+/// The job the application process put itself into at startup. Every process
+/// it starts, directly or not, inherits it and cannot break away, so its
+/// members are the application's whole process tree, live orphans included.
+#[cfg(windows)]
+static APP_JOB: OnceLock<ProcessJob> = OnceLock::new();
+
+/// Keeps the startup job for the life of the process and makes it the
+/// application job. The caller has already assigned the current process to
+/// it. Registration happens once.
+#[cfg(windows)]
+pub fn register_app_job(job: ProcessJob) -> Result<&'static ProcessJob> {
+    APP_JOB
+        .set(job)
+        .map_err(|_| anyhow!("the application job is already registered"))?;
+    Ok(APP_JOB
+        .get()
+        .expect("the application job was registered above"))
+}
+
+/// The application job, when this process registered one at startup.
+#[cfg(windows)]
+pub fn app_job() -> Option<&'static ProcessJob> {
+    APP_JOB.get()
+}
+
 #[cfg(not(windows))]
 pub struct ProcessJob;
 
@@ -424,11 +559,13 @@ mod tests {
     use super::{PinnedProcess, ProcessJob};
     use std::{
         fs,
-        os::windows::io::AsRawHandle,
+        os::windows::{io::AsRawHandle, process::CommandExt},
         path::{Path, PathBuf},
         process::{Child, Command, Stdio},
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     struct KillChild(Child);
 
@@ -476,6 +613,14 @@ mod tests {
                 Err(error) => panic!("try_wait failed: {error}"),
             }
         }
+    }
+
+    #[test]
+    fn pinned_process_reports_its_own_image_path() {
+        let process = PinnedProcess::open(std::process::id()).expect("pin self");
+        let image = process.image_path().expect("image path");
+        let expected = std::env::current_exe().unwrap();
+        assert!(image.eq_ignore_ascii_case(&expected.display().to_string()), "{image}");
     }
 
     #[test]
@@ -633,6 +778,175 @@ mod tests {
                 .is_empty(),
             "job termination returned with an active process still assigned"
         );
+    }
+
+    #[test]
+    fn job_accounting_sees_a_completed_allocation_in_the_member_and_the_kernel_peak() {
+        const BLOCK_BYTES: u64 = 64 * 1024 * 1024;
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos();
+        let test_dir = std::env::temp_dir().join(format!(
+            "prim1-process-job-accounting-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&test_dir).expect("create accounting test directory");
+        let _test_dir = RemoveDir(test_dir.clone());
+        let release_path = test_dir.join("release");
+        let allocated_path = test_dir.join("allocated");
+        // Commits a 64 MiB block only after it has joined the job, then says
+        // so; the block stays referenced while the test reads.
+        let script = format!(
+            "while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 10 }}; \
+             $block = New-Object byte[] {BLOCK_BYTES}; $block[0] = 1; \
+             [IO.File]::WriteAllText('{}', 'allocated'); Start-Sleep -Seconds 30; $block[1] = 1",
+            powershell_literal(&release_path),
+            powershell_literal(&allocated_path),
+        );
+
+        let job = ProcessJob::new().expect("create process job");
+        let root = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command"])
+            .arg(script)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map(KillChild)
+            .expect("spawn PowerShell root");
+        let pinned_root = PinnedProcess::open(root.0.id()).expect("pin PowerShell root");
+        job.assign_process(&pinned_root)
+            .expect("assign PowerShell root to job");
+        let root_reading = |accounting: &crate::ScopeAccounting| {
+            accounting
+                .members
+                .iter()
+                .find(|member| member.pid == root.0.id())
+                .cloned()
+                .unwrap_or_else(|| panic!("the root is a measured member: {accounting:?}"))
+        };
+        let before = job
+            .accounting(true)
+            .expect("read accounting before the block");
+        let root_before = root_reading(&before);
+        assert_eq!(root_before.created, pinned_root.creation_time_filetime());
+        assert_eq!(
+            root_before
+                .image_name
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("powershell.exe")
+        );
+        assert!(before.unreadable.is_empty(), "{before:?}");
+
+        fs::write(&release_path, b"release").expect("release PowerShell root");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !allocated_path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "PowerShell never acknowledged the allocation"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let after = job
+            .accounting(false)
+            .expect("read accounting after the block");
+        let root_after = root_reading(&after);
+        // The member's own reading holds the block...
+        assert!(
+            root_after.private_bytes >= root_before.private_bytes + BLOCK_BYTES * 15 / 16,
+            "the member's commit did not grow by the block: {root_before:?} -> {root_after:?}"
+        );
+        // ...and the kernel's job peak rose with it. Half the block is far
+        // above PowerShell's own drift, and the peak was read before the
+        // allocation, so only the block explains the rise.
+        assert!(
+            after.peak_memory_bytes >= before.peak_memory_bytes + BLOCK_BYTES / 2,
+            "the job peak did not follow the allocation: {before:?} -> {after:?}"
+        );
+        assert!(
+            after.cpu_time_100ns > before.cpu_time_100ns,
+            "allocating and zeroing the block takes CPU: {before:?} -> {after:?}"
+        );
+
+        job.terminate().expect("terminate accounting test job");
+        let drained = job
+            .accounting(false)
+            .expect("read accounting after termination");
+        assert!(
+            drained.members.is_empty() && drained.unreadable.is_empty(),
+            "{drained:?}"
+        );
+        assert!(
+            drained.cpu_time_100ns >= after.cpu_time_100ns,
+            "exited processes keep their CPU time in the job: {after:?} -> {drained:?}"
+        );
+    }
+
+    #[test]
+    fn a_listed_member_is_rechecked_against_the_job_through_its_own_handle() {
+        use crate::usage::{MemberReading, read_job_member};
+        use windows_sys::Win32::Foundation::HANDLE;
+
+        let sleeper = || {
+            Command::new("ping")
+                .args(["-n", "30", "127.0.0.1"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
+                .map(KillChild)
+                .expect("spawn ping")
+        };
+        let job = ProcessJob::new().expect("create process job");
+        let member = sleeper();
+        let pinned_member = PinnedProcess::open(member.0.id()).expect("pin member");
+        job.assign_process(&pinned_member)
+            .expect("assign member to job");
+        let outsider = sleeper();
+        let job_handle = job.raw_handle() as HANDLE;
+
+        // An ID listed by the job that now names a process outside it (the
+        // reuse race between listing and opening) is not a member.
+        assert!(
+            matches!(
+                read_job_member(job_handle, outsider.0.id(), false),
+                MemberReading::Gone
+            ),
+            "an outsider was read as a member"
+        );
+        // An ID no process has is gone as well.
+        assert!(matches!(
+            read_job_member(job_handle, u32::MAX - 3, false),
+            MemberReading::Gone
+        ));
+        match read_job_member(job_handle, member.0.id(), true) {
+            MemberReading::Measured(usage) => {
+                assert_eq!(usage.pid, member.0.id());
+                assert_eq!(usage.created, pinned_member.creation_time_filetime());
+                assert!(usage.private_bytes > 0, "{usage:?}");
+                assert_eq!(
+                    usage
+                        .image_name
+                        .as_deref()
+                        .map(str::to_ascii_lowercase)
+                        .as_deref(),
+                    Some("ping.exe")
+                );
+            }
+            other => panic!("the member was not measured: {other:?}"),
+        }
+
+        let accounting = job.accounting(false).expect("account the job");
+        let pids = accounting
+            .members
+            .iter()
+            .map(|usage| usage.pid)
+            .collect::<Vec<_>>();
+        assert!(pids.contains(&member.0.id()), "{accounting:?}");
+        assert!(!pids.contains(&outsider.0.id()), "{accounting:?}");
     }
 
     #[test]
